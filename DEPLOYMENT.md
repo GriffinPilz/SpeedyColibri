@@ -106,9 +106,11 @@ coli backend            # -> "backend: cuda (Cuda(0))" + per-device free/total m
 `build.rs` compiles `backend_cuda.cu` with `nvcc` and links `cudart` + `stdc++`.
 `CUDA_ARCH` defaults to `native`; use `sm_121` for the GB10.
 
-**Status (honest):** the FFI surface (`coli_cuda_init` / `mem_info` /
-`tensor_upload` / `matmul` / `expert_mlp` / lifecycle) is bound and type-checks;
-`coli backend` reports the GPU. It is **not yet wired into the forward pass** —
+**Status:** GPU-verified on a DGX Spark (GB10, sm_121, CUDA 13.0) — the FFI
+surface (`coli_cuda_init` / `mem_info` / `tensor_upload` / `matmul` /
+`expert_mlp` / lifecycle) builds, links, initializes the GPU (130.7 GB VRAM), and
+a GPU matmul smoke test passes (`cargo test -p colibri-backend --features cuda`).
+`coli backend` reports the GB10. It is **not yet wired into the forward pass** —
 the next step is to upload the resident dense weights + hot experts on load and
 route `matmul_qt` / the expert FFN to `coli_cuda_matmul` / `coli_cuda_expert_mlp`,
 falling back to CPU. That integration must be built and validated **on real GPU

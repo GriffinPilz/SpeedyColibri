@@ -210,11 +210,12 @@ pub struct CudaBackend {
 impl CudaBackend {
     /// Probe for a usable CUDA device and initialize device 0. Honors the
     /// `COLI_CUDA=0` opt-out. `None` when no device / init fails.
+    ///
+    /// `init` performs the real `cudaGetDeviceCount` + context setup internally
+    /// (`device_count()` only reports *configured* contexts, so it is 0 until
+    /// after init — don't gate on it here).
     pub fn probe() -> Option<CudaBackend> {
         if std::env::var("COLI_CUDA").map(|v| v == "0").unwrap_or(false) {
-            return None;
-        }
-        if device_count() <= 0 {
             return None;
         }
         if !init(&[0]) {
@@ -233,5 +234,35 @@ impl Backend for CudaBackend {
     }
     fn device(&self) -> Device {
         Device::Cuda(self.device)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Runs only when built `--features cuda` on a machine with a GPU. Proves the
+    // GPU compute path (upload + gemm + download), not just device init.
+    #[test]
+    fn cuda_matmul_matches_hand_computed() {
+        if !init(&[0]) {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+        // W = [[1,2,3],[4,5,6]] (O=2, I=3), x = [1,1,1] -> y = [6, 15]
+        let w: Vec<f32> = vec![1., 2., 3., 4., 5., 6.];
+        let wb: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let x = vec![1.0f32, 1.0, 1.0];
+        let scales = vec![1.0f32; 2];
+        let mut y = vec![0f32; 2];
+        let mut slot: *mut ColiCudaTensor = std::ptr::null_mut();
+        let ok = unsafe { matmul(&mut slot, &mut y, &x, &wb, &scales, 0, 1, 3, 2, 0) };
+        assert!(ok, "coli_cuda_matmul returned 0");
+        assert!(
+            (y[0] - 6.0).abs() < 1e-3 && (y[1] - 15.0).abs() < 1e-3,
+            "GPU matmul y = {y:?}, expected [6, 15]"
+        );
+        unsafe { coli_cuda_tensor_free(slot) };
+        shutdown();
     }
 }

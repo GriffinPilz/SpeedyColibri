@@ -30,7 +30,7 @@ ships with unit tests; the C code is the oracle.
 | `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 **NEON int4·f32 / int8·f32 dots (5.4× vs scalar)** wired into `matmul_qt`; int2 + IDOT int8-activation path pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
 | `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache**; DSA/SIMD/speculation deferred |
-| `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; **CUDA FFI binding** to `backend_cuda.cu` (nvcc build.rs, type-checked; not GPU-verified / not yet wired into forward); Metal deprioritized |
+| `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; **CUDA FFI binding GPU-verified on a DGX Spark** (GB10, sm_121, CUDA 13 — builds/links/inits, GPU matmul smoke test passes); not yet wired into forward; Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack work; chat (tokenizer-wired)/serve pending |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
@@ -98,11 +98,13 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      expert LRU cache) and the deferred pieces (DSA, speculation, CUDA).
 4. **CUDA (Blackwell) backend:** primary GPU tier for DGX Spark.
    - ✅ FFI binding (`colibri-backend/src/cuda.rs` + `build.rs`): compiles
-     `c/backend_cuda.cu` with nvcc (`--features cuda`, `CUDA_ARCH=sm_121`), links
-     `cudart`+`stdc++`; safe wrappers for init/mem_info/tensor_upload/matmul/
-     expert_mlp/lifecycle; `CudaBackend::probe()`; `coli backend` reports it.
-     Type-checks; build.rs skips nvcc gracefully on non-CUDA hosts. **Not
-     GPU-verified here** (no nvcc/GPU on the dev box).
+     `c/backend_cuda.cu` with nvcc (`--features cuda`, `CUDA_ARCH=native`/`sm_121`),
+     links `cudart`+`stdc++`; safe wrappers for init/mem_info/tensor_upload/matmul/
+     expert_mlp/lifecycle; `CudaBackend::probe()` (init-based); `coli backend`.
+     **GPU-VERIFIED on a DGX Spark** (GB10, sm_121, CUDA 13.0): builds+links, inits
+     the GPU (130.7 GB VRAM), and a GPU matmul smoke test (`cargo test -p
+     colibri-backend --features cuda`) passes. build.rs skips nvcc gracefully on
+     non-CUDA hosts.
    - ⬜ wire into the forward pass: upload resident dense + hot experts on load,
      route `matmul_qt` / expert FFN to the GPU with CPU fallback; validate on
      hardware against the C-vs-Rust harness. Then port kernels from FFI to Rust.

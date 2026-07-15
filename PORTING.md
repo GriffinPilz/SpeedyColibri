@@ -212,11 +212,21 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      the eventual multi-node per-shard load. Steady-state decode did **not** speed up:
      its per-layer prefetch has only ~2-3 misses/layer, so it runs at 2-3-way
      parallelism and under-utilizes the 20-thread disk regardless of read efficiency.
-   - ⬜ next: higher-parallelism decode loading (the per-layer 2-3-miss structure
-     under-uses the disk — warm-up preloading the working set is the practical answer,
-     and it now runs at 8.75 GB/s); batch a layer's 8 experts into one GPU launch
-     (cut 600 tiny nr=1 launches/token); zero-copy `kv_b`; port kernels FFI→Rust.
-     (Metal deprioritized — not a target.)
+   - ✅ **chunked parallel reads** — the decode-loading fix. A single coalesced 18 MB
+     `pread` is *one stream* at ~1.8 GB/s, and a warm-ish layer has only 1-2 misses,
+     so the prefetch fed the NVMe 1-2 requests when it wants ~10. `Shards::pread_chunked`
+     splits each expert's read into up to `nthreads` disjoint positioned reads (1 MiB
+     floor), so a *single* miss saturates the drive. `prefetch` now loads experts
+     serially (each read self-parallelizes; cross-expert threads would only
+     oversubscribe). Same-session A/B, `COLI_LOAD_THREADS` 1→4→10→20: expert-load
+     77.5 → 51.9 → 35.9 → 32.2 s = **2.41×** (10≈20 confirms the ~10-thread disk
+     saturation from the QD sweep). Not the theoretical 5× — per-expert overhead +
+     shared-disk contention cap it, not thread count. Correct under eviction.
+   - ⬜ next: overlap load with compute is impossible (routing is per-layer
+     sequential), so warm-up preloading the working set (now 8.75 GB/s) is the
+     practical decode answer; batch a layer's 8 experts into one GPU launch (cut 600
+     tiny nr=1 launches/token); zero-copy `kv_b`; port kernels FFI→Rust. (Metal
+     deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

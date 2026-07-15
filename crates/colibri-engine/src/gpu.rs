@@ -20,7 +20,12 @@ thread_local! {
     static AVAIL: OnceCell<bool> = const { OnceCell::new() };
     static RESIDENT: RefCell<HashMap<usize, *mut ColiCudaTensor>> =
         RefCell::new(HashMap::new());
+    // resident device copies for the fused expert FFN, keyed by weight data ptr;
+    // ResidentTensor frees the device slot on drop.
+    static RESIDENT_FFN: RefCell<HashMap<usize, cuda::ResidentTensor>> =
+        RefCell::new(HashMap::new());
     static GPU_MATMULS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GPU_FFN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a CUDA device is usable (probed once; honors `COLI_CUDA=0`).
@@ -31,6 +36,63 @@ pub fn available() -> bool {
 /// How many matmuls actually ran on the GPU this thread (proof the path fired).
 pub fn matmul_count() -> u64 {
     GPU_MATMULS.with(|c| c.get())
+}
+
+/// How many fused expert FFNs ran on the GPU this thread.
+pub fn ffn_count() -> u64 {
+    GPU_FFN.with(|c| c.get())
+}
+
+fn weight_ptr(w: &QTensor) -> *const c_void {
+    match w.fmt_code {
+        0 => w.qf.as_ptr() as *const c_void,
+        1 => w.q8.as_ptr() as *const c_void,
+        _ => w.q4.as_ptr() as *const c_void,
+    }
+}
+
+/// Upload `w` to the GPU (once) and return its resident handle. Caches by data
+/// pointer; only for `gpu_eligible` weights.
+fn upload_ffn(w: &QTensor) -> Option<*mut ColiCudaTensor> {
+    let key = weight_ptr(w) as usize;
+    RESIDENT_FFN.with(|r| {
+        let mut map = r.borrow_mut();
+        if let Some(rt) = map.get(&key) {
+            return Some(rt.as_raw());
+        }
+        // SAFETY: weight_ptr/scales point at the live QTensor buffers, sized by
+        // the tensor's [O,I]/fmt.
+        let rt = unsafe {
+            cuda::ResidentTensor::upload_raw(weight_ptr(w), w.s.as_ptr(), w.fmt_code, w.i, w.o, 0)
+        }?;
+        let raw = rt.as_raw();
+        map.insert(key, rt);
+        Some(raw)
+    })
+}
+
+/// Try the fused expert FFN `out = down(silu(gate·x) ⊙ up·x)` on the GPU (one
+/// upload/download instead of three GEMMs). Returns `true` if it ran there.
+pub fn try_expert_ffn(
+    gate: &QTensor,
+    up: &QTensor,
+    down: &QTensor,
+    x: &[f32],
+    nr: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !gate.gpu_eligible || !up.gpu_eligible || !down.gpu_eligible {
+        return false;
+    }
+    let (Some(g), Some(u), Some(d)) = (upload_ffn(gate), upload_ffn(up), upload_ffn(down)) else {
+        return false;
+    };
+    // SAFETY: handles are resident on device 0; out/x sized [nr, O]/[nr, I] by ffn().
+    let ok = unsafe { cuda::expert_mlp_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32) };
+    if ok {
+        GPU_FFN.with(|c| c.set(c.get() + 1));
+    }
+    ok
 }
 
 /// Try to run `y[S,O] = x[S,I] @ W^T` on the GPU. Returns `true` if it ran there;

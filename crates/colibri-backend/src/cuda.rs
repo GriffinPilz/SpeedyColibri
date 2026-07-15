@@ -133,6 +133,34 @@ impl ResidentTensor {
         }
     }
 
+    /// Upload from raw pointers (no byte-slice reshaping). `weights` points at the
+    /// CPU code bytes, `scales` at the `O` row scales.
+    ///
+    /// # Safety
+    /// `weights`/`scales` must be valid for the tensor's `[O, I]` shape and `fmt`.
+    pub unsafe fn upload_raw(
+        weights: *const c_void,
+        scales: *const f32,
+        fmt: i32,
+        i: i32,
+        o: i32,
+        device: i32,
+    ) -> Option<ResidentTensor> {
+        let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
+        if coli_cuda_tensor_upload(&mut ptr, weights, scales, fmt, i, o, device) != 0
+            && !ptr.is_null()
+        {
+            Some(ResidentTensor { ptr })
+        } else {
+            None
+        }
+    }
+
+    /// Raw device handle (for the fused expert pipeline). Borrowed; do not free.
+    pub fn as_raw(&self) -> *mut ColiCudaTensor {
+        self.ptr
+    }
+
     /// Resident byte size on the device.
     pub fn bytes(&self) -> usize {
         unsafe { coli_cuda_tensor_bytes(self.ptr) }
@@ -234,6 +262,22 @@ pub fn expert_mlp(
     unsafe {
         coli_cuda_expert_mlp(gate.ptr, up.ptr, down.ptr, y.as_mut_ptr(), x.as_ptr(), s) != 0
     }
+}
+
+/// Raw-pointer fused expert FFN for the engine's dispatcher.
+///
+/// # Safety
+/// The three handles must be resident on the same device; `y`/`x` hold `s*O`/`s*I`
+/// floats.
+pub unsafe fn expert_mlp_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp(gate, up, down, y, x, s) != 0
 }
 
 /// The CUDA (Blackwell) backend on one device.

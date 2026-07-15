@@ -191,6 +191,13 @@ pub fn route(cfg: &Config, logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32
 /// Apply a SwiGLU FFN over `x[nr, D]` into `out[nr, D]`:
 /// `out = down(silu(gate·x) ⊙ up·x)`. Port of the expert compute in `moe()`.
 fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
+    // Fused GPU expert pipeline (one host round-trip) for resident weights.
+    #[cfg(feature = "cuda")]
+    {
+        if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
+            return;
+        }
+    }
     let inter = gate.o as usize; // moe_inter (or shared intermediate)
     let mut gg = vec![0f32; nr * inter];
     let mut uu = vec![0f32; nr * inter];
@@ -339,6 +346,54 @@ mod tests {
             up: mk(inter, d, seed + 1),
             down: mk(d, inter, seed + 2),
         }
+    }
+
+    // Fused GPU expert FFN vs CPU at GLM expert sizes (hidden 6144, moe_inter 2048).
+    // `cargo test -p colibri-engine --features cuda --release -- --ignored --nocapture bench_expert_ffn`
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_expert_ffn_gpu_vs_cpu() {
+        if !crate::gpu::available() {
+            eprintln!("skip: no CUDA device");
+            return;
+        }
+        let (d, inter) = (6144usize, 2048usize);
+        let mk = |o: usize, i: usize| {
+            let w: Vec<f32> = (0..o * i).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
+            let mut t = qtensor_from_f32(&w, o, i, 4);
+            t.gpu_eligible = true;
+            t
+        };
+        let mut gate = mk(inter, d);
+        let mut up = mk(inter, d);
+        let mut down = mk(d, inter);
+        let nr = 1usize;
+        let x = vec![0.01f32; nr * d];
+        let mut out = vec![0f32; nr * d];
+        let iters = 1000u64;
+        ffn(&gate, &up, &down, &x, nr, &mut out); // warm upload
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            ffn(&gate, &up, &down, &x, nr, &mut out);
+        }
+        let gpu = t.elapsed().as_secs_f64();
+        gate.gpu_eligible = false;
+        up.gpu_eligible = false;
+        down.gpu_eligible = false;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            ffn(&gate, &up, &down, &x, nr, &mut out);
+        }
+        let cpu = t.elapsed().as_secs_f64();
+        eprintln!(
+            "expert FFN (d={d} inter={inter} nr={nr}) x{iters}: GPU-fused {:.3}s ({:.0} us/expert) | CPU-NEON {:.3}s ({:.0} us) | {:.2}x",
+            gpu,
+            gpu / iters as f64 * 1e6,
+            cpu,
+            cpu / iters as f64 * 1e6,
+            cpu / gpu
+        );
     }
 
     #[test]

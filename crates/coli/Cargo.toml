@@ -14,7 +14,7 @@ path = "src/main.rs"
 [features]
 default = []
 # Build the CUDA (Blackwell) backend — requires nvcc (DGX Spark). Off by default.
-cuda = ["colibri-backend/cuda"]
+cuda = ["colibri-backend/cuda", "colibri-engine/cuda"]
 
 [dependencies]
 colibri-core = { workspace = true }

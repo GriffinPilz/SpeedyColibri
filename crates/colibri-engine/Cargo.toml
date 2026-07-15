@@ -16,3 +16,8 @@ colibri-kernels = { workspace = true }
 colibri-backend = { workspace = true }
 colibri-cluster = { workspace = true }
 colibri-json = { workspace = true }
+
+[features]
+default = []
+# Route the hot matmuls to the CUDA (Blackwell) backend. Requires nvcc.
+cuda = ["colibri-backend/cuda"]

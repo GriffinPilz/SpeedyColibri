@@ -21,6 +21,14 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
     assert_eq!(x.len(), s * i, "x must be [S,I]");
     assert_eq!(y.len(), s * o, "y must be [S,O]");
 
+    // GPU fast path for resident weights (falls through to CPU otherwise).
+    #[cfg(feature = "cuda")]
+    {
+        if crate::gpu::try_matmul_qt(y, x, w, s) {
+            return;
+        }
+    }
+
     match w.fmt_code {
         0 => {
             // f32

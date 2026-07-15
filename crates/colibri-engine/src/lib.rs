@@ -13,6 +13,8 @@
 pub mod attention;
 pub mod cache;
 pub mod forward;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod linear;
 pub mod loader;
 pub mod math;
@@ -188,7 +190,7 @@ pub fn load_model_with(
         shards.has(&format!("model.layers.{i}.self_attn.indexer.wq_b.weight"))
     });
 
-    Ok(Model {
+    let mut model = Model {
         cfg,
         shards,
         ebits: opts.ebits as i32,
@@ -199,7 +201,28 @@ pub fn load_model_with(
         layers,
         has_dsa,
         has_mtp,
-    })
+    };
+    // Dense weights are resident for the model's lifetime → GPU-cacheable.
+    model.embed.gpu_eligible = true;
+    model.lm_head.gpu_eligible = true;
+    for l in &mut model.layers {
+        for t in [
+            &mut l.q_a,
+            &mut l.q_b,
+            &mut l.kv_a,
+            &mut l.kv_b,
+            &mut l.o,
+            &mut l.gate_proj,
+            &mut l.up_proj,
+            &mut l.down_proj,
+            &mut l.sh_gate,
+            &mut l.sh_up,
+            &mut l.sh_down,
+        ] {
+            t.gpu_eligible = true;
+        }
+    }
+    Ok(model)
 }
 
 #[cfg(test)]

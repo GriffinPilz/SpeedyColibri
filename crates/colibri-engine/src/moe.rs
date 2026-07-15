@@ -42,6 +42,13 @@ impl Expert {
     pub fn bytes(&self) -> u64 {
         (self.gate.bytes() + self.up.bytes() + self.down.bytes()) as u64
     }
+
+    /// Mark all three tensors as GPU-cacheable (for preloaded/resident experts).
+    pub fn mark_gpu_eligible(&mut self) {
+        self.gate.gpu_eligible = true;
+        self.up.gpu_eligible = true;
+        self.down.gpu_eligible = true;
+    }
 }
 
 /// Supplies routed experts to the MoE block on demand. The split point between

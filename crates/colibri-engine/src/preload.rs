@@ -346,7 +346,8 @@ pub fn preload_parallel(
                             if used > per_thread_budget && !map.is_empty() {
                                 break;
                             }
-                            let ex = load_expert(shards, hidden, moe_inter, ebits, layer, eid)?;
+                            let mut ex = load_expert(shards, hidden, moe_inter, ebits, layer, eid)?;
+                            ex.mark_gpu_eligible(); // preloaded == resident/stable
                             used += ex.bytes();
                             map.insert((layer, eid), Arc::new(ex));
                         }
@@ -411,7 +412,8 @@ impl PreloadStore {
                                 }
                                 buf.resize(ebytes as usize, 0);
                                 read_exact_at(&file, loc.offset, &mut buf)?;
-                                let ex = expert_from_blob(&buf, hidden, moe_inter, fmt);
+                                let mut ex = expert_from_blob(&buf, hidden, moe_inter, fmt);
+                                ex.mark_gpu_eligible(); // preloaded == resident/stable
                                 map.insert((loc.layer, loc.eid), Arc::new(ex));
                                 used += ebytes;
                             }

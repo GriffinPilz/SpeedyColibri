@@ -1,0 +1,118 @@
+//! GPU matmul dispatch (feature `cuda`) — routes eligible `matmul_qt` calls to
+//! the resident CUDA (Blackwell) backend.
+//!
+//! `coli_cuda_matmul` uploads a weight into a device slot on first use and reuses
+//! it thereafter, so we keep a per-weight slot keyed by the weight's data
+//! pointer. Only [`QTensor::gpu_eligible`] tensors (dense weights + preloaded
+//! experts) are cached — their buffers live for the run, so the address key is
+//! stable. Streaming experts (fresh buffers, reused addresses) stay on the CPU.
+//!
+//! The forward pass is single-threaded, so the slot registry is a `thread_local`
+//! and needs no synchronization.
+
+use colibri_backend::cuda::{self, ColiCudaTensor};
+use colibri_core::QTensor;
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
+use std::os::raw::c_void;
+
+thread_local! {
+    static AVAIL: OnceCell<bool> = const { OnceCell::new() };
+    static RESIDENT: RefCell<HashMap<usize, *mut ColiCudaTensor>> =
+        RefCell::new(HashMap::new());
+    static GPU_MATMULS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a CUDA device is usable (probed once; honors `COLI_CUDA=0`).
+pub fn available() -> bool {
+    AVAIL.with(|c| *c.get_or_init(|| cuda::CudaBackend::probe().is_some()))
+}
+
+/// How many matmuls actually ran on the GPU this thread (proof the path fired).
+pub fn matmul_count() -> u64 {
+    GPU_MATMULS.with(|c| c.get())
+}
+
+/// Try to run `y[S,O] = x[S,I] @ W^T` on the GPU. Returns `true` if it ran there;
+/// `false` (do it on the CPU) when CUDA is unavailable or `w` isn't eligible.
+pub fn try_matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) -> bool {
+    if !w.gpu_eligible || !available() {
+        return false;
+    }
+    // weight bytes + a stable address key, per format
+    let (wptr, key): (*const c_void, usize) = match w.fmt_code {
+        0 => (w.qf.as_ptr() as *const c_void, w.qf.as_ptr() as usize),
+        1 => (w.q8.as_ptr() as *const c_void, w.q8.as_ptr() as usize),
+        _ => (w.q4.as_ptr() as *const c_void, w.q4.as_ptr() as usize),
+    };
+    let sptr = w.s.as_ptr();
+    RESIDENT.with(|r| {
+        let mut map = r.borrow_mut();
+        let slot = map.entry(key).or_insert(std::ptr::null_mut());
+        // SAFETY: y/x sized by the caller (matmul_qt asserts); slot persists in
+        // the registry; wptr/sptr point at the live QTensor buffers.
+        let ok = unsafe {
+            cuda::matmul_raw(
+                slot,
+                y.as_mut_ptr(),
+                x.as_ptr(),
+                wptr,
+                sptr,
+                w.fmt_code,
+                s as i32,
+                w.i,
+                w.o,
+                0,
+            )
+        };
+        if ok {
+            GPU_MATMULS.with(|c| c.set(c.get() + 1));
+        }
+        ok
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linear::matmul_qt;
+    use crate::quantize::qtensor_from_f32;
+
+    // GPU vs CPU-NEON matmul at GLM-scale sizes.
+    // `cargo test -p colibri-engine --features cuda --release -- --ignored --nocapture bench_matmul`
+    #[test]
+    #[ignore]
+    fn bench_matmul_gpu_vs_cpu() {
+        if !available() {
+            eprintln!("skip: no CUDA device");
+            return;
+        }
+        // o_proj-scale int4 weight [O, I]
+        let (o, i) = (8192usize, 6144usize);
+        let wf: Vec<f32> = (0..o * i).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
+        let mut w = qtensor_from_f32(&wf, o, i, 4);
+        for &s in &[1usize, 32] {
+            let x = vec![0.01f32; s * i];
+            let mut y = vec![0f32; s * o];
+            let iters = 1000u64;
+            w.gpu_eligible = true;
+            matmul_qt(&mut y, &x, &w, s); // warm upload
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                matmul_qt(&mut y, &x, &w, s);
+            }
+            let gpu = t.elapsed().as_secs_f64();
+            w.gpu_eligible = false; // force CPU (NEON int4)
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                matmul_qt(&mut y, &x, &w, s);
+            }
+            let cpu = t.elapsed().as_secs_f64();
+            let flops = iters as f64 * s as f64 * o as f64 * i as f64 * 2.0;
+            eprintln!(
+                "matmul [{o},{i}] S={s} x{iters}: GPU {:.3}s ({:.0} GFLOP/s) | CPU-NEON {:.3}s ({:.0} GFLOP/s) | {:.2}x",
+                gpu, flops / gpu / 1e9, cpu, flops / cpu / 1e9, cpu / gpu
+            );
+        }
+    }
+}

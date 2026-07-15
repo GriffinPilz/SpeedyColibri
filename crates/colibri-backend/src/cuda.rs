@@ -187,6 +187,40 @@ pub unsafe fn matmul(
     ) != 0
 }
 
+/// Raw-pointer matmul for the engine's dispatcher: `y[S,O] = x[S,I] @ W[O,I]^T`
+/// on the GPU, uploading `weights`/`scales` into `slot` on first use. Lower-level
+/// twin of [`matmul`] that avoids byte-slice reshaping at the call site.
+///
+/// # Safety
+/// `slot` persists across calls reusing this weight; `y` has `s*o` floats, `x`
+/// has `s*i` floats; `weights`/`scales` point to the CPU copy for the upload.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul_raw(
+    slot: &mut *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    weights: *const c_void,
+    scales: *const f32,
+    fmt: i32,
+    s: i32,
+    i: i32,
+    o: i32,
+    device: i32,
+) -> bool {
+    coli_cuda_matmul(
+        slot as *mut *mut ColiCudaTensor,
+        y,
+        x,
+        weights,
+        scales,
+        fmt,
+        s,
+        i,
+        o,
+        device,
+    ) != 0
+}
+
 /// Fused expert FFN `y = down(silu(gate(x)) * up(x))` for `S` rows, all three
 /// weights already resident on one device.
 pub fn expert_mlp(

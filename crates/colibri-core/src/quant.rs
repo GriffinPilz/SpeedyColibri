@@ -59,6 +59,11 @@ pub struct QTensor {
     pub o: i32,
     /// cols (input dim)
     pub i: i32,
+    /// Whether this tensor is stable/resident and may be cached on the GPU. Set
+    /// for dense weights and preloaded experts; left `false` for streaming
+    /// experts (whose buffers are reused for different ids, so a device cache
+    /// keyed by address would go stale). Mirrors the C engine's `cuda_eligible`.
+    pub gpu_eligible: bool,
 }
 
 impl QTensor {

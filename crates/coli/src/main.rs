@@ -329,6 +329,8 @@ fn finish_gen(
         Ok(seq) => {
             println!("prompt: {prompt:?}");
             println!("generated ({} tok): {:?}", seq.len() - prompt.len(), &seq[prompt.len()..]);
+            #[cfg(feature = "cuda")]
+            println!("gpu matmuls: {}", colibri_engine::gpu::matmul_count());
             ExitCode::SUCCESS
         }
         Err(e) => {

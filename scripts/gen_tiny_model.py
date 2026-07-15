@@ -20,7 +20,7 @@ cfg = {
     "qk_rope_head_dim": QK_ROPE, "v_head_dim": V_HEAD, "n_shared_experts": N_SHARED,
     "vocab_size": VOCAB, "n_group": 1, "topk_group": 1, "norm_topk_prob": False,
     "rms_norm_eps": 1e-5, "routed_scaling_factor": 1.0,
-    "rope_parameters": {"rope_theta": 10000.0}, "eos_token_id": [9],
+    "rope_parameters": {"rope_theta": 10000.0}, "eos_token_id": [999],
     "index_topk": 0, "index_n_heads": 0, "index_head_dim": 0,
 }
 json.dump(cfg, open(os.path.join(out, "config.json"), "w"))

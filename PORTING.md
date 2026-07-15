@@ -88,11 +88,14 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 ## Validation strategy
 
 - Unit tests per crate (the C behavior is the spec). 71 tests currently pass.
-- Byte-exactness: the C engine validates token-exact against a `transformers`
-  oracle (TF 32/32, greedy 20/20). The Rust engine must reproduce the C engine's
-  greedy stream under `DRAFT=0 IDOT=0 COLI_CUDA=0`.
-- Cross-check: keep the C `coli` buildable (`make -C c`) to diff outputs during
-  the port.
+- **C-vs-Rust harness (`scripts/validate_c_vs_rust.py`, see [VALIDATION.md](VALIDATION.md)):**
+  runs both engines on the same tiny synthetic model (real GLM architecture, no
+  torch / no 370 GB model) and diffs greedy generation + teacher-forcing at f32
+  and int4. **Currently PASSES** — byte-exact at f32, token-exact at int4, on
+  both modes. The C engine is forced onto the exact CPU path
+  (`IDOT=0 ABSORB=0 DRAFT=0`). Since the C engine is itself token-exact vs a
+  `transformers` oracle, this transitively validates the Rust dense path.
+- Not yet covered by the harness: DSA indexer, MTP speculation, CUDA (unported).
 
 ## Notes
 

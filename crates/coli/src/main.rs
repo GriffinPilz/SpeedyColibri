@@ -27,6 +27,7 @@ COMMANDS:
   config <snap>            print parsed hyperparameters   [working]
   load <snap>              load dense weights, print structure  [working]
   gen <snap> [ids...]      greedy-generate from token ids       [working]
+  tf <snap> <ids...>       teacher-forcing argmax per position  [working]
   version                  print version
   help                     show this help
 
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
         "config" => cmd_config(&args),
         "load" => cmd_load(&args),
         "gen" => cmd_gen(&args),
+        "tf" => cmd_tf(&args),
         "chat" | "web" | "serve" | "bench" | "convert" => {
             eprintln!(
                 "coli {cmd}: not yet ported — the CPU forward pass is still being \
@@ -154,7 +156,14 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         .filter(|v: &Vec<i32>| !v.is_empty())
         .unwrap_or_else(|| vec![1]);
 
-    let model = match colibri_engine::load_model(snap) {
+    // Bit-widths default to int4; overridable via env for the C-vs-Rust
+    // validation harness (e.g. COLI_DBITS=16 for the exact f32 path).
+    let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let opts = colibri_engine::LoadOptions {
+        dbits: envbits("COLI_DBITS", 4),
+        ebits: envbits("COLI_EBITS", 4),
+    };
+    let model = match colibri_engine::load_model_with(snap, opts) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("coli gen: {e}");
@@ -163,7 +172,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     };
     let provider =
         colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
-    let n_new = 16usize;
+    let n_new = envbits("COLI_NGEN", 16) as usize;
     let mut kv = colibri_engine::KvCache::new(
         model.cfg.n_layers as usize,
         model.cfg.kv_lora as usize,
@@ -182,6 +191,58 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `coli tf <snap> <id...>` — teacher-forcing: one forward over the token ids,
+/// print the argmax prediction at each position. Mirrors the C engine's `TF=1`
+/// mode (`forward_all`), for the validation harness. Honors COLI_DBITS/EBITS.
+fn cmd_tf(args: &[String]) -> ExitCode {
+    let snap = match args.get(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: coli tf <snapshot-dir> <token_id ...>");
+            return ExitCode::from(2);
+        }
+    };
+    let ids: Vec<i32> = args
+        .get(3..)
+        .map(|a| a.iter().filter_map(|s| s.parse().ok()).collect())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        eprintln!("coli tf: provide at least one token id");
+        return ExitCode::from(2);
+    }
+    let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let opts = colibri_engine::LoadOptions {
+        dbits: envbits("COLI_DBITS", 4),
+        ebits: envbits("COLI_EBITS", 4),
+    };
+    let model = match colibri_engine::load_model_with(snap, opts) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("coli tf: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let provider =
+        colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
+    let d = model.cfg.hidden as usize;
+    let mut kv = colibri_engine::KvCache::new(
+        model.cfg.n_layers as usize,
+        model.cfg.kv_lora as usize,
+        model.cfg.qk_rope as usize,
+        ids.len(),
+    );
+    let mut hidden = vec![0f32; ids.len() * d];
+    if let Err(e) = colibri_engine::forward(&model, &mut kv, &provider, &ids, 0, &mut hidden) {
+        eprintln!("coli tf: {e}");
+        return ExitCode::FAILURE;
+    }
+    let preds: Vec<i32> = (0..ids.len())
+        .map(|pos| colibri_engine::argmax(&colibri_engine::logits(&model, &hidden[pos * d..(pos + 1) * d])) as i32)
+        .collect();
+    println!("tf preds ({}): {preds:?}", preds.len());
+    ExitCode::SUCCESS
 }
 
 /// `coli config <snap>` — load and print the parsed, validated hyperparameters.

@@ -398,4 +398,88 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Write a shard of `U8` tensors at explicit `(name, offset, len)` positions in
+    /// the data section, with `data` as the raw payload blob.
+    fn write_u8_shard(dir: &Path, entries: &[(&str, usize, usize)], data: &[u8]) -> PathBuf {
+        let parts: Vec<String> = entries
+            .iter()
+            .map(|(name, off, len)| {
+                format!(
+                    r#""{}":{{"dtype":"U8","shape":[{}],"data_offsets":[{},{}]}}"#,
+                    name,
+                    len,
+                    off,
+                    off + len
+                )
+            })
+            .collect();
+        let header = format!("{{{}}}", parts.join(","));
+        let hbytes = header.as_bytes();
+        let path = dir.join("model.safetensors");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&(hbytes.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(hbytes).unwrap();
+        f.write_all(data).unwrap();
+        path
+    }
+
+    fn view(v: &(Arc<[u8]>, usize, usize)) -> Vec<u8> {
+        v.0[v.1..v.1 + v.2].to_vec()
+    }
+
+    #[test]
+    fn read_raw_shared_contiguous_shares_one_buffer() {
+        // gate|up|down contiguous on disk (like a real expert): one coalesced read
+        // into a single shared buffer, each tensor a correctly-bounded view.
+        let dir = temp_dir();
+        let data: Vec<u8> = (0..12).collect();
+        write_u8_shard(&dir, &[("g", 0, 4), ("u", 4, 4), ("d", 8, 4)], &data);
+        let s = Shards::open(&dir).unwrap();
+        let r = s.read_raw_shared(&["g", "u", "d"]).unwrap();
+        // all three views are into the same Arc allocation
+        assert!(Arc::ptr_eq(&r[0].0, &r[1].0));
+        assert!(Arc::ptr_eq(&r[1].0, &r[2].0));
+        // each view holds exactly its bytes, in range
+        assert_eq!(view(&r[0]), vec![0, 1, 2, 3]);
+        assert_eq!(view(&r[1]), vec![4, 5, 6, 7]);
+        assert_eq!(view(&r[2]), vec![8, 9, 10, 11]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_raw_shared_non_contiguous_separate_reads() {
+        // Gaps between tensors → separate reads (correctness preserved, no
+        // coalescing). Each view must still hold exactly its own bytes and skip
+        // the gap bytes entirely.
+        let dir = temp_dir();
+        let data: Vec<u8> = (0..20).collect();
+        write_u8_shard(&dir, &[("g", 0, 4), ("u", 8, 4), ("d", 16, 4)], &data);
+        let s = Shards::open(&dir).unwrap();
+        let r = s.read_raw_shared(&["g", "u", "d"]).unwrap();
+        assert!(!Arc::ptr_eq(&r[0].0, &r[1].0));
+        assert!(!Arc::ptr_eq(&r[1].0, &r[2].0));
+        assert_eq!(view(&r[0]), vec![0, 1, 2, 3]);
+        assert_eq!(view(&r[1]), vec![8, 9, 10, 11]); // gap [4,8) skipped
+        assert_eq!(view(&r[2]), vec![16, 17, 18, 19]); // gap [12,16) skipped
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_raw_shared_preserves_input_order() {
+        // On disk (offset order) a|b|c contiguous, but queried as c,a,b. Each result
+        // slot must map to its *input* name's bytes via its own computed offset —
+        // this is the physical-vs-input-order case that guards against wrong ranges.
+        let dir = temp_dir();
+        let data: Vec<u8> = (0..12).collect();
+        write_u8_shard(&dir, &[("a", 0, 4), ("b", 4, 4), ("c", 8, 4)], &data);
+        let s = Shards::open(&dir).unwrap();
+        let r = s.read_raw_shared(&["c", "a", "b"]).unwrap();
+        assert_eq!(view(&r[0]), vec![8, 9, 10, 11]); // c
+        assert_eq!(view(&r[1]), vec![0, 1, 2, 3]); // a
+        assert_eq!(view(&r[2]), vec![4, 5, 6, 7]); // b
+        // contiguous on disk → still one shared buffer despite the query order
+        assert!(Arc::ptr_eq(&r[0].0, &r[1].0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

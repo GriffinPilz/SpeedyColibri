@@ -24,6 +24,7 @@ use colibri_cluster::{ExpertSharding, NodeId};
 use colibri_core::{Config, QTensor};
 use colibri_safetensors::Shards;
 use std::io;
+use std::sync::Arc;
 
 /// One routed expert's SwiGLU weights.
 #[derive(Debug, Clone, Default)]
@@ -36,10 +37,20 @@ pub struct Expert {
     pub down: QTensor,
 }
 
+impl Expert {
+    /// Resident byte size of this expert (sum of the three tensors).
+    pub fn bytes(&self) -> u64 {
+        (self.gate.bytes() + self.up.bytes() + self.down.bytes()) as u64
+    }
+}
+
 /// Supplies routed experts to the MoE block on demand. The split point between
 /// single-node local loads and multi-node remote fetches.
+///
+/// Returns `Arc<Expert>` so a resident cache ([`crate::cache::ExpertCache`]) can
+/// hand out shared references without copying ~19 MB of weights per token.
 pub trait ExpertProvider {
-    fn expert(&self, layer: usize, eid: usize) -> io::Result<Expert>;
+    fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>>;
 }
 
 /// Loads experts from local safetensors shards, honoring `colibri-cluster`
@@ -86,7 +97,7 @@ impl<'a> ShardsExpertProvider<'a> {
 }
 
 impl ExpertProvider for ShardsExpertProvider<'_> {
-    fn expert(&self, layer: usize, eid: usize) -> io::Result<Expert> {
+    fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>> {
         // Expert-parallel ownership: local experts load from disk; non-local ones
         // would be fetched over the RDMA transport (not wired — single node now).
         if !self.sharding.is_local(self.this_node, eid as u32) {
@@ -96,11 +107,11 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
             ));
         }
         let name = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-        Ok(Expert {
+        Ok(Arc::new(Expert {
             gate: crate::loader::qt_load(self.shards, &name("gate_proj"), self.moe_inter, self.hidden, self.ebits)?,
             up: crate::loader::qt_load(self.shards, &name("up_proj"), self.moe_inter, self.hidden, self.ebits)?,
             down: crate::loader::qt_load(self.shards, &name("down_proj"), self.hidden, self.moe_inter, self.ebits)?,
-        })
+        }))
     }
 }
 
@@ -257,10 +268,10 @@ mod tests {
 
     // In-memory provider for MoE math tests (no safetensors needed).
     struct MapProvider {
-        experts: HashMap<(usize, usize), Expert>,
+        experts: HashMap<(usize, usize), Arc<Expert>>,
     }
     impl ExpertProvider for MapProvider {
-        fn expert(&self, layer: usize, eid: usize) -> io::Result<Expert> {
+        fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>> {
             self.experts
                 .get(&(layer, eid))
                 .cloned()
@@ -345,7 +356,7 @@ mod tests {
 
         let ex2 = expert(20, inter, d);
         let mut experts = HashMap::new();
-        experts.insert((0usize, 2usize), ex2.clone());
+        experts.insert((0usize, 2usize), Arc::new(ex2.clone()));
         let provider = MapProvider { experts };
 
         let x = vec![0.3f32, 0.5, -0.2, 0.7];
@@ -385,7 +396,7 @@ mod tests {
 
         let mut experts = HashMap::new();
         for e in 0..c.n_experts as usize {
-            experts.insert((0, e), expert(e * 5, inter, d));
+            experts.insert((0, e), Arc::new(expert(e * 5, inter, d)));
         }
         let provider = MapProvider { experts };
 

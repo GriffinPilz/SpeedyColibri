@@ -28,6 +28,7 @@ COMMANDS:
   load <snap>              load dense weights, print structure  [working]
   gen <snap> [ids...]      greedy-generate from token ids       [working]
   tf <snap> <ids...>       teacher-forcing argmax per position  [working]
+  capacity <snap> [ram_gb] expert residency / RAM planning      [working]
   version                  print version
   help                     show this help
 
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
         "load" => cmd_load(&args),
         "gen" => cmd_gen(&args),
         "tf" => cmd_tf(&args),
+        "capacity" => cmd_capacity(&args),
         "chat" | "web" | "serve" | "bench" | "convert" => {
             eprintln!(
                 "coli {cmd}: not yet ported — the CPU forward pass is still being \
@@ -170,8 +172,14 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let provider =
+    // Resident expert cache: experts loaded once stay in RAM until the budget
+    // forces an eviction (see `coli capacity`). Budget from COLI_RAM_GB, else
+    // available RAM, else unbounded.
+    let base =
         colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
+    let budget = ram_budget();
+    let provider = colibri_engine::ExpertCache::new(base, budget);
+
     let n_new = envbits("COLI_NGEN", 16) as usize;
     let mut kv = colibri_engine::KvCache::new(
         model.cfg.n_layers as usize,
@@ -184,6 +192,15 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             let cont: Vec<i32> = seq[prompt.len()..].to_vec();
             println!("prompt: {prompt:?}");
             println!("generated ({} tok): {cont:?}", cont.len());
+            let s = provider.stats();
+            println!(
+                "expert cache: {} resident ({:.1} MB), {} hits / {} misses, {} evictions",
+                s.resident,
+                s.bytes as f64 / (1024.0 * 1024.0),
+                s.hits,
+                s.misses,
+                s.evictions
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -191,6 +208,80 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Expert-cache byte budget: `COLI_RAM_GB` if set, else available RAM (Linux),
+/// else unbounded.
+fn ram_budget() -> u64 {
+    if let Ok(gb) = std::env::var("COLI_RAM_GB") {
+        if let Ok(g) = gb.parse::<u64>() {
+            return g << 30;
+        }
+    }
+    colibri_engine::available_ram_bytes().unwrap_or(u64::MAX)
+}
+
+/// `coli capacity <snap> [ram_gb]` — using the model's real dimensions, report
+/// per-expert size, total experts / bytes, and how many fit resident in a RAM
+/// budget (default: available RAM, else 110 GB ~ one DGX Spark after the dense
+/// part). Answers "how many experts can a Spark hold".
+fn cmd_capacity(args: &[String]) -> ExitCode {
+    use colibri_engine::capacity::{bytes_per_expert, experts_in_budget};
+    let snap = match args.get(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: coli capacity <snapshot-dir> [ram_gb]");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match colibri_core::Config::load(snap) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("coli capacity: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gib = 1u64 << 30;
+    let bpe = bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, 4);
+    let sparse_layers = (cfg.n_layers - cfg.first_dense).max(0) as u64;
+    let total_experts = sparse_layers * cfg.n_experts as u64;
+    let total_bytes = total_experts * bpe;
+
+    let ram_gb: u64 = args
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .or_else(|| colibri_engine::available_ram_bytes().map(|b| b / gib))
+        .unwrap_or(110);
+    // reserve the dense part (~10 GB int4) + headroom per node
+    let reserve_gb = 18u64;
+    let expert_budget = ram_gb.saturating_sub(reserve_gb) * gib;
+    // can't hold more experts resident than exist
+    let per_node = experts_in_budget(expert_budget, bpe).min(total_experts);
+    let raw_per_node = experts_in_budget(expert_budget, bpe);
+    let nodes_for_all = if raw_per_node > 0 {
+        total_experts.div_ceil(raw_per_node)
+    } else {
+        0
+    };
+
+    println!("model: hidden={} moe_inter={} experts/layer={} sparse_layers={}",
+        cfg.hidden, cfg.moe_inter, cfg.n_experts, sparse_layers);
+    println!("per expert (int4): {:.2} MB", bpe as f64 / (1024.0 * 1024.0));
+    println!(
+        "total routed experts: {} → {:.1} GB on disk",
+        total_experts,
+        total_bytes as f64 / gib as f64
+    );
+    println!(
+        "RAM budget: {ram_gb} GB/node (−{reserve_gb} GB dense+headroom → {:.0} GB for experts)",
+        expert_budget as f64 / gib as f64
+    );
+    let pct = |n: u64| if total_experts > 0 { 100.0 * n as f64 / total_experts as f64 } else { 0.0 };
+    let two_nodes = (2 * raw_per_node).min(total_experts);
+    println!("resident per node: {per_node} experts ({:.0}% of all)", pct(per_node));
+    println!("2 nodes: {two_nodes} experts ({:.0}%)", pct(two_nodes));
+    println!("nodes to hold ALL experts resident: {nodes_for_all}");
+    ExitCode::SUCCESS
 }
 
 /// `coli tf <snap> <id...>` — teacher-forcing: one forward over the token ids,

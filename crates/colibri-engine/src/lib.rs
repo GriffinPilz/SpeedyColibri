@@ -11,6 +11,7 @@
 //! are the active porting front — see PORTING.md for the milestone order.
 
 pub mod attention;
+pub mod cache;
 pub mod forward;
 pub mod linear;
 pub mod loader;
@@ -21,6 +22,7 @@ pub mod quantize;
 pub mod sampling;
 
 pub use attention::{attention, attention_with, AttnCore};
+pub use cache::{available_ram_bytes, capacity, CacheStats, ExpertCache};
 pub use colibri_core::Config;
 pub use forward::{forward, generate_greedy, logits};
 pub use linear::{embed_row, matmul_f32, matmul_qt};

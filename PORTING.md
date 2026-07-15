@@ -67,7 +67,12 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      experts, shared expert; experts streamed via an `ExpertProvider` whose
      `ShardsExpertProvider` checks `colibri-cluster` ownership (single-node local
      now, RDMA-remote later). Router/FFN/shared tested independently.
-     (Expert LRU/pin cache + CACHE_ROUTE/top-p variants still ⬜.)
+   - ✅ resident expert cache (`cache.rs`): `ExpertCache` keeps loaded experts in
+     RAM (returns `Arc<Expert>`), LFRU eviction (`colibri-core::tier`) only when
+     over a byte budget, optional pinned hot-store; hit/miss/eviction stats.
+     `coli gen` shows e.g. `32 hits / 2 misses` across decode. `capacity` module
+     + `coli capacity` size residency (GLM-5.2: 18 MB/expert, ~6.2k experts per
+     128 GB Spark ≈ 33%, ~4 nodes to hold all). (CACHE_ROUTE/top-p variants ⬜.)
    - ✅ per-layer forward (`forward.rs`): in_ln → MLA attention → residual →
      post_ln → MoE/dense → residual, then final norm + lm_head; greedy decode
      loop (`generate_greedy`). Runs end-to-end on a synthetic model with routed
@@ -87,7 +92,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 71 tests currently pass.
+- Unit tests per crate (the C behavior is the spec). 75 tests currently pass.
 - **C-vs-Rust harness (`scripts/validate_c_vs_rust.py`, see [VALIDATION.md](VALIDATION.md)):**
   runs both engines on the same tiny synthetic model (real GLM architecture, no
   torch / no 370 GB model) and diffs greedy generation + teacher-forcing at f32

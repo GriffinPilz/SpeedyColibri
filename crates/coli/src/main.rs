@@ -25,6 +25,7 @@ COMMANDS:
   convert ...              FP8 -> int4 converter       [pending: tools port]
   tokenize <tok.json> <text>   encode/decode round-trip   [working]
   config <snap>            print parsed hyperparameters   [working]
+  load <snap>              load dense weights, print structure  [working]
   version                  print version
   help                     show this help
 
@@ -48,6 +49,7 @@ fn main() -> ExitCode {
         }
         "tokenize" => cmd_tokenize(&args),
         "config" => cmd_config(&args),
+        "load" => cmd_load(&args),
         "chat" | "web" | "serve" | "bench" | "convert" => {
             eprintln!(
                 "coli {cmd}: not yet ported — the CPU forward pass is still being \
@@ -92,6 +94,44 @@ fn cmd_tokenize(args: &[String]) -> ExitCode {
     } else {
         println!("round-trip: MISMATCH (expected {text:?})");
         ExitCode::FAILURE
+    }
+}
+
+/// `coli load <snap>` — materialize the dense weights and print a structural
+/// summary. Streams no experts; this just proves the snapshot loads.
+fn cmd_load(args: &[String]) -> ExitCode {
+    let snap = match args.get(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: coli load <snapshot-dir>");
+            return ExitCode::from(2);
+        }
+    };
+    match colibri_engine::load_model(snap) {
+        Ok(m) => {
+            let dense = m.layers.iter().filter(|l| !l.sparse).count();
+            let sparse = m.layers.len() - dense;
+            println!("loaded {} layers ({dense} dense, {sparse} MoE)", m.layers.len());
+            println!(
+                "embed [{},{}] fmt={}  lm_head [{},{}]  final_norm[{}]",
+                m.embed.o,
+                m.embed.i,
+                m.embed.fmt_code,
+                m.lm_head.o,
+                m.lm_head.i,
+                m.final_norm.len()
+            );
+            println!(
+                "dense bits={}  expert bits={}  has_dsa={}  has_mtp={}",
+                m.dbits, m.ebits, m.has_dsa, m.has_mtp
+            );
+            println!("(routed experts stream on demand; not resident)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coli load: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

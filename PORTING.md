@@ -29,10 +29,10 @@ ships with unit tests; the C code is the oracle.
 | `colibri-tokenizer` | `c/tok.h`, `c/tok_unicode.h` | ✅ ported + tested |
 | `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 scalar reference + `qrow_i8`-exact activation quant; SIMD pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
-| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 primitives done (rmsnorm/layernorm/rope/matmul all 4 fmts/embed/quant/loader/sampling); attention+MoE assembly next |
+| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 primitives + dense weight-loader driver done (`load_model`); attention+MoE assembly next |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; CUDA primary (stub), Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
-| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config work; modes pending |
+| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load work; chat/serve pending |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
 | — | `c/olmoe.c` | ⬜ not started (second model variant) |
 | — | `c/openai_server.py`, `c/tools/*`, `web/` | ⬜ not started |
@@ -55,8 +55,10 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
    - ✅ primitives: RMSNorm/LayerNorm, interleaved-partial RoPE, `matmul_qt`
      (exact scalar for f32/int8/int4/int2), `embed_row`, weight quantizers, and
      the `qt_from_disk` weight loader — all unit-tested
-   - ⬜ weight loader driver: materialize embed/lm_head/layers by GLM tensor name;
-     expert LRU sizing; DSA/MTP detection
+   - ✅ weight-loader driver (`load_model`): materializes embed/lm_head/final_norm
+     + per-layer attention & dense-MLP / shared-expert / router by GLM tensor name,
+     detects DSA/MTP; tested end-to-end on a synthetic tiny model. (Expert LRU
+     sizing still ⬜ — experts stream at forward time.)
    - ⬜ MLA attention with weight absorption + compressed KV-cache
    - ⬜ MoE block (sigmoid router / noaux_tc, shared expert, streaming experts) —
      route each expert through `colibri-cluster` (`is_local`/`owner`) so the
@@ -75,7 +77,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 61 tests currently pass.
+- Unit tests per crate (the C behavior is the spec). 63 tests currently pass.
 - Byte-exactness: the C engine validates token-exact against a `transformers`
   oracle (TF 32/32, greedy 20/20). The Rust engine must reproduce the C engine's
   greedy stream under `DRAFT=0 IDOT=0 COLI_CUDA=0`.

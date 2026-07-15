@@ -80,6 +80,26 @@ extern "C" {
         t: c_int,
         scale: f32,
     ) -> c_int;
+    // Single-token (S=1) absorb with DEVICE latent/rope (the persistent-KV path).
+    #[allow(clippy::too_many_arguments)]
+    fn coli_cuda_attention_absorb_kvdev(
+        kv_b: *mut ColiCudaTensor,
+        ctx: *mut f32,
+        q: *const f32,
+        latent_dev: *const f32,
+        rope_dev: *const f32,
+        h: c_int,
+        q_nope: c_int,
+        r: c_int,
+        v: c_int,
+        k: c_int,
+        t: c_int,
+        scale: f32,
+    ) -> c_int;
+    // Device-memory pipeline primitives (for the KV shadow).
+    fn coli_cuda_pipe_alloc(device: c_int, bytes: usize) -> *mut c_void;
+    fn coli_cuda_pipe_free(device: c_int, p: *mut c_void);
+    fn coli_cuda_pipe_upload(device: c_int, dst: *mut c_void, src: *const c_void, bytes: usize) -> c_int;
     fn coli_cuda_tensor_free(tensor: *mut ColiCudaTensor);
     fn coli_cuda_tensor_bytes(tensor: *const ColiCudaTensor) -> usize;
     fn coli_cuda_tensor_device(tensor: *const ColiCudaTensor) -> c_int;
@@ -320,6 +340,57 @@ pub unsafe fn attention_absorb_batch_raw(
 ) -> bool {
     coli_cuda_attention_absorb_batch(kv_b, ctx, q, latent, rope, s, h, q_nope, r, v, k, t, scale)
         != 0
+}
+
+/// Single-token MLA absorb reading the KV cache from **device** memory (the
+/// persistent-KV decode path). `latent_dev`/`rope_dev` point into the device KV
+/// shadow; `ctx`/`q` are host.
+///
+/// # Safety
+/// `kv_b` resident; device pointers valid for `[T, K]`/`[T, R]`; `ctx`/`q` host.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn attention_absorb_kvdev_raw(
+    kv_b: *mut ColiCudaTensor,
+    ctx: *mut f32,
+    q: *const f32,
+    latent_dev: *const f32,
+    rope_dev: *const f32,
+    h: i32,
+    q_nope: i32,
+    r: i32,
+    v: i32,
+    k: i32,
+    t: i32,
+    scale: f32,
+) -> bool {
+    coli_cuda_attention_absorb_kvdev(kv_b, ctx, q, latent_dev, rope_dev, h, q_nope, r, v, k, t, scale)
+        != 0
+}
+
+/// Allocate `bytes` of device memory on `device`. `None` on failure.
+pub fn pipe_alloc(device: i32, bytes: usize) -> Option<*mut c_void> {
+    let p = unsafe { coli_cuda_pipe_alloc(device, bytes) };
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// Free device memory from [`pipe_alloc`].
+///
+/// # Safety
+/// `p` must be a live pointer from `pipe_alloc(device, _)`.
+pub unsafe fn pipe_free(device: i32, p: *mut c_void) {
+    coli_cuda_pipe_free(device, p);
+}
+
+/// Host→device copy of `bytes`.
+///
+/// # Safety
+/// `dst` is device memory ≥ `bytes`; `src` is host memory ≥ `bytes`.
+pub unsafe fn pipe_upload(device: i32, dst: *mut c_void, src: *const c_void, bytes: usize) -> bool {
+    coli_cuda_pipe_upload(device, dst, src, bytes) != 0
 }
 
 /// The CUDA (Blackwell) backend on one device.

@@ -49,6 +49,144 @@ pub fn attn_count() -> u64 {
     GPU_ATTN.with(|c| c.get())
 }
 
+/// Per-layer device-side shadow of the compressed KV cache, so decode uploads
+/// only the new row per token instead of re-sending the whole cache. Mirrors the
+/// C engine's `kv_dev_L`/`kv_dev_R` + `kv_dev_valid`.
+pub struct DeviceKv {
+    layers: Vec<DevLayer>,
+    max_t: usize,
+}
+
+struct DevLayer {
+    latent: *mut c_void, // [max_t * kv_lora] f32
+    rope: *mut c_void,   // [max_t * qk_rope] f32
+    valid: usize,        // rows already on device
+}
+
+impl DeviceKv {
+    pub fn new(n_layers: usize, max_t: usize) -> DeviceKv {
+        DeviceKv {
+            layers: (0..n_layers)
+                .map(|_| DevLayer {
+                    latent: std::ptr::null_mut(),
+                    rope: std::ptr::null_mut(),
+                    valid: 0,
+                })
+                .collect(),
+            max_t,
+        }
+    }
+
+    /// Ensure device rows `[0, tk)` for `layer` match the host cache, uploading
+    /// only what's missing. Returns device `(latent, rope)` base pointers.
+    /// Rewrites at `pos_base < valid` invalidate the stale tail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync(
+        &mut self,
+        layer: usize,
+        host_latent: &[f32],
+        host_rope: &[f32],
+        kvl: usize,
+        r: usize,
+        pos_base: usize,
+        tk: usize,
+    ) -> Option<(*const f32, *const f32)> {
+        let max_t = self.max_t;
+        let l = &mut self.layers[layer];
+        if l.latent.is_null() {
+            l.latent = cuda::pipe_alloc(0, max_t * kvl * 4)?;
+            l.rope = cuda::pipe_alloc(0, max_t * r * 4)?;
+            l.valid = 0;
+        }
+        if pos_base < l.valid {
+            l.valid = pos_base; // rewritten rows are stale
+        }
+        if tk > l.valid {
+            let from = l.valid;
+            let n = tk - from;
+            // SAFETY: device buffers hold max_t rows; host slices cover [from, tk).
+            let ok = unsafe {
+                cuda::pipe_upload(
+                    0,
+                    (l.latent as *mut f32).add(from * kvl) as *mut c_void,
+                    host_latent[from * kvl..tk * kvl].as_ptr() as *const c_void,
+                    n * kvl * 4,
+                ) && cuda::pipe_upload(
+                    0,
+                    (l.rope as *mut f32).add(from * r) as *mut c_void,
+                    host_rope[from * r..tk * r].as_ptr() as *const c_void,
+                    n * r * 4,
+                )
+            };
+            if !ok {
+                return None;
+            }
+            l.valid = tk;
+        }
+        Some((l.latent as *const f32, l.rope as *const f32))
+    }
+}
+
+impl Drop for DeviceKv {
+    fn drop(&mut self) {
+        for l in &self.layers {
+            if !l.latent.is_null() {
+                unsafe {
+                    cuda::pipe_free(0, l.latent);
+                    cuda::pipe_free(0, l.rope);
+                }
+            }
+        }
+    }
+}
+
+/// Single-token (S=1) GPU attention reading the KV cache from device memory.
+/// `latent_dev`/`rope_dev` come from [`DeviceKv::sync`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_absorb_kvdev(
+    kv_b: &QTensor,
+    ctx: &mut [f32],
+    q: &[f32],
+    latent_dev: *const f32,
+    rope_dev: *const f32,
+    h: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    v_head: usize,
+    kv_lora: usize,
+    t: usize,
+    scale: f32,
+) -> bool {
+    if !available() || !kv_b.gpu_eligible {
+        return false;
+    }
+    let Some(handle) = upload_ffn(kv_b) else {
+        return false;
+    };
+    // SAFETY: handle resident; latent/rope device pointers valid for [T,K]/[T,R];
+    // ctx/q host sized [H*V]/[H*qh].
+    let ok = unsafe {
+        cuda::attention_absorb_kvdev_raw(
+            handle,
+            ctx.as_mut_ptr(),
+            q.as_ptr(),
+            latent_dev,
+            rope_dev,
+            h as i32,
+            qk_nope as i32,
+            qk_rope as i32,
+            v_head as i32,
+            kv_lora as i32,
+            t as i32,
+            scale,
+        )
+    };
+    if ok {
+        GPU_ATTN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 /// Try the MLA weight-absorption attention core on the GPU: `ctx[S, H*V]` from
 /// the query and the compressed KV cache, using resident `kv_b`. Returns `true`
 /// if it ran there. Equivalent to the CPU `absorb_core`.

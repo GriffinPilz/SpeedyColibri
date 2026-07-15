@@ -58,6 +58,9 @@ pub struct KvCache {
     k_rot: Vec<Vec<f32>>,
     /// first valid position per layer (MTP partial caches start mid-sequence)
     pub kv_start: Vec<usize>,
+    /// device-side KV shadow (persistent-KV GPU decode path); lazily allocated
+    #[cfg(feature = "cuda")]
+    dev: Option<crate::gpu::DeviceKv>,
 }
 
 impl KvCache {
@@ -70,7 +73,26 @@ impl KvCache {
             latent: vec![vec![0.0; max_t * kv_lora]; n_layers],
             k_rot: vec![vec![0.0; max_t * qk_rope]; n_layers],
             kv_start: vec![0; n_layers],
+            #[cfg(feature = "cuda")]
+            dev: None,
         }
+    }
+
+    /// Sync the device KV shadow for `layer` up to `tk` rows and return the
+    /// device `(latent, rope)` base pointers. Uploads only the missing rows.
+    #[cfg(feature = "cuda")]
+    pub fn sync_device(
+        &mut self,
+        layer: usize,
+        pos_base: usize,
+        tk: usize,
+    ) -> Option<(*const f32, *const f32)> {
+        let n_layers = self.latent.len();
+        let (max_t, kvl, r) = (self.max_t, self.kv_lora, self.qk_rope);
+        let dev = self
+            .dev
+            .get_or_insert_with(|| crate::gpu::DeviceKv::new(n_layers, max_t));
+        dev.sync(layer, &self.latent[layer], &self.k_rot[layer], kvl, r, pos_base, tk)
     }
 
     pub fn kv_lora(&self) -> usize {

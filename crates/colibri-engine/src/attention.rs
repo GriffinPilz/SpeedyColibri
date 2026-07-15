@@ -110,21 +110,32 @@ pub fn attention_with(
     #[cfg(feature = "cuda")]
     let ran_gpu = {
         let tk = pos_base + s_len;
-        crate::gpu::try_attention_absorb(
-            &l.kv_b,
-            &mut ctx,
-            &q,
-            kv.latent_rows(layer, st0, tk),
-            kv.krot_rows(layer, st0, tk),
-            s_len,
-            h,
-            qk_nope,
-            r,
-            vh,
-            kvl,
-            tk - st0,
-            cfg.attn_scale,
-        )
+        if s_len == 1 && st0 == 0 && crate::gpu::available() && l.kv_b.gpu_eligible {
+            // Decode: persistent device KV — append the new row, read on device.
+            match kv.sync_device(layer, pos_base, tk) {
+                Some((lat_dev, rope_dev)) => crate::gpu::try_attention_absorb_kvdev(
+                    &l.kv_b, &mut ctx, &q, lat_dev, rope_dev, h, qk_nope, r, vh, kvl, tk, cfg.attn_scale,
+                ),
+                None => false,
+            }
+        } else {
+            // Prefill (S>1) or st0>0: one-time host upload of the cache slice.
+            crate::gpu::try_attention_absorb(
+                &l.kv_b,
+                &mut ctx,
+                &q,
+                kv.latent_rows(layer, st0, tk),
+                kv.krot_rows(layer, st0, tk),
+                s_len,
+                h,
+                qk_nope,
+                r,
+                vh,
+                kvl,
+                tk - st0,
+                cfg.attn_scale,
+            )
+        }
     };
     #[cfg(not(feature = "cuda"))]
     let ran_gpu = false;
@@ -354,7 +365,7 @@ mod tests {
         let mut l = Layer::default();
         l.kv_b = kv_b;
 
-        let t = 2048usize;
+        let t = 4096usize;
         let mut kv = KvCache::new(1, kvl, r, t);
         for pos in 0..t {
             for x in kv.latent_row_mut(0, pos).iter_mut() {
@@ -376,20 +387,33 @@ mod tests {
         absorb_core(&cfg, &l, 0, &kv, &q, 1, t - 1, 0, &mut cc);
         let maxerr = cg.iter().zip(&cc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
 
+        // persistent device KV: sync once, then the kernel reads device memory
+        let mut dev = crate::gpu::DeviceKv::new(1, t);
+        let (lat_dev, rope_dev) = dev.sync(0, &latent, &rope, kvl, r, 0, t).unwrap();
+
         let iters = 500u64;
         let tm = std::time::Instant::now();
         for _ in 0..iters {
             crate::gpu::try_attention_absorb(&l.kv_b, &mut cg, &q, &latent, &rope, 1, h, qk_nope, r, vh, kvl, t, scale);
         }
-        let gpu = tm.elapsed().as_secs_f64();
+        let gpu_host = tm.elapsed().as_secs_f64();
+        let tm = std::time::Instant::now();
+        for _ in 0..iters {
+            crate::gpu::try_attention_absorb_kvdev(&l.kv_b, &mut cg, &q, lat_dev, rope_dev, h, qk_nope, r, vh, kvl, t, scale);
+        }
+        let gpu_dev = tm.elapsed().as_secs_f64();
         let tm = std::time::Instant::now();
         for _ in 0..iters {
             absorb_core(&cfg, &l, 0, &kv, &q, 1, t - 1, 0, &mut cc);
         }
         let cpu = tm.elapsed().as_secs_f64();
         eprintln!(
-            "attention absorb (H={h} T={t}) x{iters}: GPU {:.3}s ({:.0} us) | CPU-NEON {:.3}s ({:.0} us) | {:.2}x | max|Δ|={maxerr:.1e}",
-            gpu, gpu / iters as f64 * 1e6, cpu, cpu / iters as f64 * 1e6, cpu / gpu,
+            "attention absorb (H={h} T={t}) x{iters}: GPU-hostKV {:.0} us | GPU-deviceKV {:.0} us | CPU-NEON {:.0} us | deviceKV {:.2}x hostKV, {:.1}x CPU | max|Δ|={maxerr:.1e}",
+            gpu_host / iters as f64 * 1e6,
+            gpu_dev / iters as f64 * 1e6,
+            cpu / iters as f64 * 1e6,
+            gpu_host / gpu_dev,
+            cpu / gpu_dev,
         );
     }
 

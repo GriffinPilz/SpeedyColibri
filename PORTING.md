@@ -197,9 +197,26 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      owned descriptor per call (wrapping is ~free) held only across the synchronous
      kernel — no pointer-keyed cache to go stale. Validated correct under eviction
      (`COLI_RAM_GB=25`, 2495 evictions).
-   - ⬜ next: batch a layer's 8 experts into one launch (cut 600 tiny nr=1 launches/
-     token); zero-copy `kv_b` too (thread `off` through the absorb kernels); port
-     kernels FFI→Rust. (Metal deprioritized — not a target.)
+   - ✅ **coalesced shared-buffer expert reads.** An `O_DIRECT` QD sweep on the NVMe:
+     it saturates at ~10 threads (**~10.5 GB/s**, flat to 160), so more load threads
+     do nothing. But our loader got ~5 GB/s — the gap is *per-expert code overhead*,
+     not disk/faults (plain malloc+read hits 9.8 GB/s cold; `MADV_HUGEPAGE` is
+     *slower*). Each expert did 6 reads (3× 6 MB weights + 3× 8 KB scale sidecars
+     2.3 GB away) into 6 fresh allocations. Fix: `QTensor.q4` is now a `Bytes`
+     enum (`Owned | Shared{Arc<[u8]>,off,len}`, `Deref<[u8]>`); `Shards::read_raw_shared`
+     coalesces contiguous same-file tensors into one read into a shared buffer; and
+     `load_expert` reads gate/up/down (18 MB, contiguous) in **one** read the three
+     tensors view. Bulk preload **4.98 → 8.75 GB/s (1.76×)**, near the ceiling.
+     Correct under eviction (the Arc outlives the expert; zero-copy uses fresh
+     descriptors). **Scope:** this speeds *bulk* loads — preload / AUTOPIN warm-up /
+     the eventual multi-node per-shard load. Steady-state decode did **not** speed up:
+     its per-layer prefetch has only ~2-3 misses/layer, so it runs at 2-3-way
+     parallelism and under-utilizes the 20-thread disk regardless of read efficiency.
+   - ⬜ next: higher-parallelism decode loading (the per-layer 2-3-miss structure
+     under-uses the disk — warm-up preloading the working set is the practical answer,
+     and it now runs at 8.75 GB/s); batch a layer's 8 experts into one GPU launch
+     (cut 600 tiny nr=1 launches/token); zero-copy `kv_b`; port kernels FFI→Rust.
+     (Metal deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

@@ -177,6 +177,26 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      to CPU, 0.5 GB VRAM, no caps needed. Same-session A/B/C: zero-copy **0.70 tok/s**
      vs copy-path 0.35 vs CPU-experts 0.23 (2× / 3×); ~1.05 best on a quiet machine.
      Now the default when zero-copy is available (`gpu_experts_enabled`).
+   - ✅ **parallel expert loading (disk→RAM).** With compute on the GPU, profiling
+     (`COLI_PROFILE` now splits out expert-load) showed **loading is ~74% of decode**
+     — the model can't live in RAM, so experts stream on demand, and the load was
+     single-threaded at ~1.8 GB/s. `ExpertProvider::prefetch` loads a layer's routed
+     experts across cores before the compute loop (reads happen off the cache lock →
+     N concurrent preads); a cold bulk read now saturates the NVMe at **~5 GB/s**
+     (~2.8×). The first version thrashed under memory pressure (concurrent
+     insert+evict dropped freshly-loaded experts — 10977 misses vs 2893); fixed by
+     doing parallel I/O only, then one serial insert + a batch-protected eviction
+     (`evict_to_protecting`). This is the mechanism behind the "core-sharded parallel
+     read" design — reading the *original* safetensors in parallel already hits the
+     NVMe ceiling, so a repacked contiguous layout isn't needed on one node (its
+     payoff is multi-node, where each node reads only its shard).
+   - 🐛 **fixed: zero-copy use-after-evict.** The wrapped-descriptor cache was keyed
+     by the expert's host pointer; when the RAM cache evicted an expert and its
+     address was reused, the kernel read stale memory → garbage tokens. Masked until
+     now because every run held the whole working set. `wrap_fresh` builds a fresh,
+     owned descriptor per call (wrapping is ~free) held only across the synchronous
+     kernel — no pointer-keyed cache to go stale. Validated correct under eviction
+     (`COLI_RAM_GB=25`, 2495 evictions).
    - ⬜ next: batch a layer's 8 experts into one launch (cut 600 tiny nr=1 launches/
      token); zero-copy `kv_b` too (thread `off` through the absorb kernels); port
      kernels FFI→Rust. (Metal deprioritized — not a target.)

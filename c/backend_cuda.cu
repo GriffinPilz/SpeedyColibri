@@ -343,6 +343,67 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* ---- Flash-attention decode absorb (S=1): T-parallel with online softmax ----
+ * The per-head kernel above serializes the whole context in one block (64 blocks
+ * for H=64 → low parallelism on the GB10). Flash splits the key dimension across
+ * blocks: kernel 1 precomputes the absorbed query, kernel 2 runs H×nTiles blocks
+ * each reducing one T-tile to a partial (m, l, acc[K]) with online softmax, and
+ * kernel 3 combines the tiles per head and applies W_V. FLASH_TILE tokens/block. */
+#define FLASH_TILE 512
+
+__global__ static void flash_qabs(float *qabs,const float *q,const void *weights,
+        const float *wscale,int fmt,int H,int Q,int R,int V,int K){
+    int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);size_t rb=row_bytes(fmt,K);
+    const float *qs=q+(size_t)h*(Q+R);
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;
+        for(int d=0;d<Q;d++)a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*rb,k)*(fmt?wscale[rbase+d]:1.f);
+        qabs[(size_t)h*K+k]=a;}
+}
+
+/* One block per (head, tile). Emits partial[(h*nTiles+tile)] = {m, l, acc[K]}. */
+__global__ static void flash_partial(float *partials,const float *qabs,const float *q,
+        const float *latent,const float *rope,int H,int Q,int R,int K,int T,int nTiles,float scale){
+    int h=blockIdx.x,tile=blockIdx.y,tid=threadIdx.x;
+    int t0=tile*FLASH_TILE,t1=t0+FLASH_TILE; if(t1>T)t1=T; int n=t1-t0; if(n<=0)return;
+    extern __shared__ float sm[];float *scores=sm,*acc=scores+FLASH_TILE,*red=acc+K;
+    const float *qa=qabs+(size_t)h*K,*qr=q+(size_t)h*(Q+R)+Q;
+    for(int i=tid;i<n;i+=blockDim.x){int t=t0+i;const float *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+        float a=0;for(int k=0;k<K;k++)a+=qa[k]*lt[k];for(int d=0;d<R;d++)a+=qr[d]*rt[d];scores[i]=a*scale;}
+    __syncthreads();
+    float local=-3.402823466e+38F;for(int i=tid;i<n;i+=blockDim.x)local=fmaxf(local,scores[i]);
+    red[tid]=local;__syncthreads();
+    for(int s=blockDim.x>>1;s;s>>=1){if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]);__syncthreads();}
+    float m=red[0];__syncthreads();
+    local=0;for(int i=tid;i<n;i+=blockDim.x){float e=expf(scores[i]-m);scores[i]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int s=blockDim.x>>1;s;s>>=1){if(tid<s)red[tid]+=red[tid+s];__syncthreads();}
+    float l=red[0];__syncthreads();
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int i=0;i<n;i++)a+=scores[i]*latent[(size_t)(t0+i)*K+k];acc[k]=a;}
+    __syncthreads();
+    float *p=partials+(size_t)(h*nTiles+tile)*(K+2);
+    if(tid==0){p[0]=m;p[1]=l;}
+    for(int k=tid;k<K;k+=blockDim.x)p[2+k]=acc[k];
+}
+
+/* One block per head: combine nTiles partials (online softmax) -> clat, apply W_V. */
+__global__ static void flash_combine(float *ctx,const float *partials,const void *weights,
+        const float *wscale,int fmt,int H,int Q,int V,int K,int nTiles){
+    int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);size_t rb=row_bytes(fmt,K);
+    extern __shared__ float sm[];float *clat=sm;__shared__ float M,L;
+    const float *base=partials+(size_t)h*nTiles*(K+2);
+    if(tid==0){float mx=-3.402823466e+38F;for(int i=0;i<nTiles;i++)mx=fmaxf(mx,base[(size_t)i*(K+2)]);M=mx;}
+    __syncthreads();
+    if(tid==0){float s=0;for(int i=0;i<nTiles;i++)s+=expf(base[(size_t)i*(K+2)]-M)*base[(size_t)i*(K+2)+1];L=s;}
+    __syncthreads();
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;
+        for(int i=0;i<nTiles;i++)a+=expf(base[(size_t)i*(K+2)]-M)*base[(size_t)i*(K+2)+2+k];
+        clat[k]=a/L;}
+    __syncthreads();
+    for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;
+        for(int k=0;k<K;k++)a+=clat[k]*weight_at(weights,fmt,(size_t)row*rb,k);
+        ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
+}
+
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
@@ -1015,10 +1076,18 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
     size_t qb=(size_t)H*(Q+R)*sizeof(float),cb=(size_t)H*V*sizeof(float);
     if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev q upload"))return 0;
-    size_t shared=(size_t)(2*K+T+ATTN_TPB)*sizeof(float);
-    attention_absorb_batch_kernel<<<dim3(H,1),ATTN_TPB,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,1,H,Q,R,V,K,T,scale);
-    if(!cuda_ok(cudaGetLastError(),"kvdev absorb launch")||
+    /* Flash decode: T-parallel absorb (qabs -> per-tile partials -> combine+W_V). */
+    int nTiles=(T+FLASH_TILE-1)/FLASH_TILE;
+    float *qabs=coli_cuda_pipe_scratch(w->device,22,(size_t)H*K*sizeof(float));
+    float *partials=coli_cuda_pipe_scratch(w->device,23,(size_t)H*nTiles*(K+2)*sizeof(float));
+    if(!qabs||!partials)return 0;
+    flash_qabs<<<H,ATTN_TPB,0,dc->stream>>>(qabs,dc->aq,w->weights,w->scales,w->fmt,H,Q,R,V,K);
+    size_t sh1=(size_t)(FLASH_TILE+K+ATTN_TPB)*sizeof(float);
+    flash_partial<<<dim3(H,nTiles),ATTN_TPB,sh1,dc->stream>>>(partials,qabs,dc->aq,latent_dev,
+        rope_dev,H,Q,R,K,T,nTiles,scale);
+    size_t sh2=(size_t)K*sizeof(float);
+    flash_combine<<<H,ATTN_TPB,sh2,dc->stream>>>(dc->ac,partials,w->weights,w->scales,w->fmt,H,Q,V,K,nTiles);
+    if(!cuda_ok(cudaGetLastError(),"kvdev flash launch")||
        !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"kvdev ctx download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"kvdev absorb sync"))return 0;
     return 1;

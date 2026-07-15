@@ -130,16 +130,17 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      memcpy (~57 GB/s), so this is only ~1.07× vs re-uploading — the attention
      *kernel* dominates decode here, not KV transfer. (Would matter more on a
      discrete PCIe GPU.)
-   - 🟡 attention-kernel profiling (the decode bottleneck, ~2.5 ms/core at T=4096):
-     source analysis — the absorb kernel launches one block per (head, query), 64
-     blocks × 256 threads for decode (~12% occupancy). Bumped to 1024 threads
-     (`ATTN_TPB`, all 5 absorb launches) → ~2% (occupancy wasn't the main limit).
-     A multi-head-per-block variant (read the shared latent once, reuse across G
-     heads) was **correct but ~1.5× slower** — halving the block count hurt more
-     than the redundant reads. **Finding: the kernel is parallelism-sensitive on
-     the GB10, not memory-bandwidth-bound**; the real win is flash-attention-style
-     T-parallelism (more blocks + online softmax + coalescing fixes), which needs
-     `ncu` perf-counter access (admin-gated on the shared DGX) to do well.
+   - ✅ flash-attention decode absorb (`flash_qabs`/`flash_partial`/`flash_combine`
+     in backend_cuda.cu): the decode (`kvdev`, S=1) path splits the key dimension
+     across `H×nTiles` blocks (512 vs the old 64), each reducing a T-tile with
+     **online softmax**, then a combine kernel + W_V. **1.50× over the original
+     absorb** at T=4096 (1744 vs 2610 µs), matching the CPU to `max|Δ|≈2.3e-10`,
+     same tokens. (Profiling notes: ncu perf counters are admin-gated on the
+     shared DGX; 256→1024 threads gave ~2% and a multi-head/fewer-block variant
+     was ~1.5× *slower* — the kernel is parallelism-sensitive, so flash's
+     more-blocks approach is the right lever. Tile size ≥256 saturates; the
+     remaining cap is DRAM traffic, unchanged by flash. Prefill/batch path
+     unchanged.)
    - ✅ VRAM eviction (`gpu.rs` `GpuFfnCache`): the GPU expert cache is now
      budget-bounded (LFRU eviction, `colibri-core::tier`), so the full 19k-expert
      set never exhausts device memory. Budget = `COLI_VRAM_GB` or free VRAM − a

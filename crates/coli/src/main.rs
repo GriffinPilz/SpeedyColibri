@@ -236,6 +236,24 @@ fn cmd_gen(args: &[String]) -> ExitCode {
                 s.misses,
                 s.evictions
             );
+            #[cfg(feature = "cuda")]
+            {
+                let (n, bytes, evict, budget) = colibri_engine::gpu::ffn_cache_stats();
+                let gib = 1u64 << 30;
+                println!(
+                    "gpu: {} matmuls, {} fused expert FFNs, {} attention cores",
+                    colibri_engine::gpu::matmul_count(),
+                    colibri_engine::gpu::ffn_count(),
+                    colibri_engine::gpu::attn_count()
+                );
+                println!(
+                    "gpu vram (experts): {} resident ({:.1} GB / {:.0} GB budget), {} evictions",
+                    n,
+                    bytes as f64 / gib as f64,
+                    budget as f64 / gib as f64,
+                    evict
+                );
+            }
             // Persist this session's selections into the usage history for the
             // next run's warm-up.
             history.merge(&provider.usage_snapshot());

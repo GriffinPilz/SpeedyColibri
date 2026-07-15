@@ -149,8 +149,34 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      up/down could evict the gate the same fused FFN still needs). Validated on the
      GB10: `COLI_VRAM_GB=0` holds exactly the 3-tensor working set, 151 evictions,
      same tokens; `coli gen` prints resident/budget/evictions.
-   - ⬜ next: end-to-end tok/s on a real-sized model; the flash-attention absorb
-     rewrite; then port kernels FFI→Rust. (Metal deprioritized — not a target.)
+   - ✅ **end-to-end on the real model** (`mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`,
+     358 GB, 78 layers / 3 dense + 75 MoE, 256 experts, MTP): loads and generates
+     on the GB10. This conversion ships **no DSA-indexer weights** (`has_dsa=false`),
+     so the dense attention path is exact. `qt_load` reads its `.weight`+`.weight.qs`
+     containers directly (int8 embed/lm_head, int4 everything else); dims confirmed
+     (`kv_b` O = H·(qk_nope+v_head) = 64·448). GPU and CPU produce identical tokens.
+   - 🟠 **decode ≈ 0.26 tok/s** (single GB10, single-node, experts streaming from
+     disk; best 0.32). `COLI_PROFILE` breakdown: **MoE is ~94%** of the step (attn,
+     dense, lm_head are together <6% — the flash attention is already a rounding
+     error at short context). The MoE cost is *data movement*, not matmul: each
+     decode token touches 8×75 = 600 experts (~11 GB of int4 weights), and routing
+     is position-dependent so the working set keeps growing. Two bottlenecks found:
+     (1) routed experts ran **single-threaded on CPU** — they were never marked
+     `gpu_eligible` (only preloaded experts were). Now opt-in via `COLI_GPU_EXPERTS=1`
+     (validated: identical tokens on the GB10). (2) The GPU FFN cache **copies** each
+     expert into VRAM, which on the GB10's *unified* memory double-stores it in the
+     same physical LPDDR as the RAM cache; at the budgets needed to avoid eviction
+     thrashing the two caches overflow the 121 GB pool and systemd-oomd SIGTERMs the
+     process. So `COLI_GPU_EXPERTS` is opt-in and needs `COLI_VRAM_GB`/`COLI_RAM_GB`
+     caps for now.
+   - ⬜ **next (the decode win): zero-copy experts on unified memory.** Instead of
+     cudaMalloc+memcpy per expert, `cudaHostRegister` the RAM copy and let the kernel
+     read it in place — one copy, no VRAM budget, no eviction, no OOM, and ~3× less
+     memory traffic. Needs an offset-binary int4 expert kernel (subtract-8 inline)
+     so we can skip the destructive on-device `offset_to_signed_s4`, plus lifecycle
+     coupling to the RAM cache (unregister on evict). Also open: batch a layer's 8
+     experts into one launch (cut 600 tiny nr=1 launches/token); port kernels FFI→Rust.
+     (Metal deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

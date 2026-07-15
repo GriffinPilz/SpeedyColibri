@@ -109,6 +109,14 @@ pub fn expert_gate_name(layer: usize, eid: usize) -> String {
     format!("model.layers.{layer}.mlp.experts.{eid}.gate_proj.weight")
 }
 
+/// Whether streamed experts should be marked GPU-eligible (`COLI_GPU_EXPERTS=1`).
+/// Read once. See [`load_expert`] for why this is opt-in on unified memory.
+fn gpu_experts_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_GPU_EXPERTS").ok().as_deref() == Some("1"))
+}
+
 /// Load one routed expert (gate/up/down) directly from the shards. Shared by
 /// `ShardsExpertProvider` and the direct parallel preloader.
 pub fn load_expert(
@@ -120,11 +128,23 @@ pub fn load_expert(
     eid: usize,
 ) -> io::Result<Expert> {
     let name = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-    Ok(Expert {
+    let mut ex = Expert {
         gate: crate::loader::qt_load(shards, &name("gate_proj"), moe_inter, hidden, ebits)?,
         up: crate::loader::qt_load(shards, &name("up_proj"), moe_inter, hidden, ebits)?,
         down: crate::loader::qt_load(shards, &name("down_proj"), hidden, moe_inter, ebits)?,
-    })
+    };
+    // `COLI_GPU_EXPERTS=1` routes streamed experts through the GPU fused-FFN path
+    // (validated correct — identical tokens to the CPU path). It is opt-in because
+    // the current GPU FFN cache copies each expert into VRAM, which on the GB10's
+    // *unified* memory double-stores it (same physical LPDDR as the RAM cache):
+    // at the budgets needed to avoid eviction thrashing that overflows the 121 GB
+    // pool and gets OOM-killed. The proper fix is the zero-copy path (GPU reads
+    // the RAM copy directly via cudaHostRegister; see PORTING.md). Until then the
+    // default keeps experts on the (stable, correct) CPU path.
+    if gpu_experts_enabled() {
+        ex.mark_gpu_eligible();
+    }
+    Ok(ex)
 }
 
 impl ExpertProvider for ShardsExpertProvider<'_> {

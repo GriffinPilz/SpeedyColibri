@@ -10,19 +10,19 @@
 //! Formats follow [`colibri_core::quant::QFormat`]: int8 is one byte/param with a
 //! per-row f32 scale; int4/int2 pack 2/4 values per byte with a per-row scale.
 
-/// Symmetric per-row int8 quantization (Q8_0 style): find the row's max-abs,
-/// scale so it maps to 127, and round to nearest. Returns `(codes, scale)` where
+/// Symmetric per-row int8 activation quantization — port of `qrow_i8` in
+/// `c/glm.c` (the IDOT activation path).
+///
+/// `scale = max|x| / 127` (floored at 1e-12), `codes[i] = round_ties_even(x[i] /
+/// scale)`. Ties-to-even matches C's `lrintf`. Returns `(codes, scale)` with
 /// `x[i] ≈ codes[i] as f32 * scale`.
 pub fn quantize_row_i8(x: &[f32]) -> (Vec<i8>, f32) {
     let amax = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-    let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+    let scale = (amax / 127.0).max(1e-12);
+    let inv = 1.0 / scale;
     let codes = x
         .iter()
-        .map(|&v| {
-            let q = (v * inv).round();
-            q.clamp(-127.0, 127.0) as i8
-        })
+        .map(|&v| (v * inv).round_ties_even().clamp(-128.0, 127.0) as i8)
         .collect();
     (codes, scale)
 }

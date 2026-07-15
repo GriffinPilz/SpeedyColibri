@@ -25,7 +25,9 @@ exclude = ["desktop"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+# 1.77 for f32::round_ties_even (matches C lrintf's round-half-to-even, which the
+# quantizers rely on for byte-exact weights).
+rust-version = "1.77"
 license = "Apache-2.0"
 repository = "https://github.com/GriffinPilz/SpeedyColibri"
 authors = ["colibrì contributors"]

@@ -27,9 +27,9 @@ ships with unit tests; the C code is the oracle.
 | `colibri-core` | `c/glm.c` (Cfg/QT), `c/st.h` (dtypes), `c/tier.h` | ✅ ported + tested |
 | `colibri-safetensors` | `c/st.h` | ✅ ported + tested (¹) |
 | `colibri-tokenizer` | `c/tok.h`, `c/tok_unicode.h` | ✅ ported + tested |
-| `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 scalar reference done; SIMD pending |
+| `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 scalar reference + `qrow_i8`-exact activation quant; SIMD pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
-| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 sampling done; rest scaffolded |
+| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 primitives done (rmsnorm/layernorm/rope/matmul all 4 fmts/embed/quant/loader/sampling); attention+MoE assembly next |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; CUDA primary (stub), Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config work; modes pending |
@@ -52,13 +52,16 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
    CPU fallback); the AVX2 (`maddubs`) path is kept for x86 dev boxes. The scalar
    reference in `colibri-kernels` is the oracle.
 3. **CPU forward pass (`colibri-engine`):**
-   - weight loader (`qt_from_disk`, expert LRU sizing, DSA/MTP detection)
-   - MLA attention with weight absorption + compressed KV-cache
-   - MoE block (sigmoid router / noaux_tc, shared expert, streaming experts) —
+   - ✅ primitives: RMSNorm/LayerNorm, interleaved-partial RoPE, `matmul_qt`
+     (exact scalar for f32/int8/int4/int2), `embed_row`, weight quantizers, and
+     the `qt_from_disk` weight loader — all unit-tested
+   - ⬜ weight loader driver: materialize embed/lm_head/layers by GLM tensor name;
+     expert LRU sizing; DSA/MTP detection
+   - ⬜ MLA attention with weight absorption + compressed KV-cache
+   - ⬜ MoE block (sigmoid router / noaux_tc, shared expert, streaming experts) —
      route each expert through `colibri-cluster` (`is_local`/`owner`) so the
      single-node path and the future split share one code path
-   - RMSNorm, RoPE (interleaved partial), embed/lm_head
-   - single-token decode loop → wire up `coli chat`
+   - ⬜ single-token decode loop → wire up `coli chat`
 4. **CUDA (Blackwell) backend:** primary GPU tier for DGX Spark — bind
    `c/backend_cuda.cu` via FFI first, then port; target sm_121. (Metal is
    deprioritized — not a deployment target.)
@@ -72,7 +75,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 36 tests currently pass.
+- Unit tests per crate (the C behavior is the spec). 61 tests currently pass.
 - Byte-exactness: the C engine validates token-exact against a `transformers`
   oracle (TF 32/32, greedy 20/20). The Rust engine must reproduce the C engine's
   greedy stream under `DRAFT=0 IDOT=0 COLI_CUDA=0`.

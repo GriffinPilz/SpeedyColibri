@@ -1,0 +1,136 @@
+//! Normalization, RoPE, and elementwise activations — ports of `rmsnorm`,
+//! `layernorm`, `rope_interleave`, `sigmoidf`, and `siluf` from `c/glm.c`.
+//!
+//! Mean/variance reductions accumulate in `f64` to match the C `double`
+//! accumulators; the final scale and elementwise math stay `f32`.
+
+/// RMSNorm: `out[i] = x[i] * w[i] / sqrt(mean(x^2) + eps)`. Port of `rmsnorm`.
+pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
+    let d = x.len();
+    debug_assert_eq!(out.len(), d);
+    debug_assert_eq!(w.len(), d);
+    let mut ms = 0f64;
+    for &v in x {
+        ms += v as f64 * v as f64;
+    }
+    let r = 1.0 / ((ms / d as f64) as f32 + eps).sqrt();
+    for k in 0..d {
+        out[k] = x[k] * r * w[k];
+    }
+}
+
+/// Classic LayerNorm (mean+variance, weight+bias), in place. Used by the DSA
+/// indexer's `k_norm`. Port of `layernorm`.
+pub fn layernorm(v: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
+    let n = v.len();
+    debug_assert_eq!(w.len(), n);
+    debug_assert_eq!(b.len(), n);
+    let mut mu = 0f64;
+    for &x in v.iter() {
+        mu += x as f64;
+    }
+    mu /= n as f64;
+    let mut var = 0f64;
+    for &x in v.iter() {
+        let d = x as f64 - mu;
+        var += d * d;
+    }
+    var /= n as f64;
+    let r = 1.0 / (var as f32 + eps).sqrt();
+    for k in 0..n {
+        v[k] = ((v[k] as f64 - mu) as f32) * r * w[k] + b[k];
+    }
+}
+
+/// Interleaved partial RoPE on a `qk_rope`-length vector at position `pos`.
+/// Port of `rope_interleave`.
+///
+/// Consumes interleaved pairs `(v[2j], v[2j+1])` and writes the rotated result
+/// into the split halves `v[j]` and `v[half+j]` (GLM's layout). `theta` is the
+/// rope base.
+pub fn rope_interleave(v: &mut [f32], pos: usize, qk_rope: usize, theta: f32) {
+    let half = qk_rope / 2;
+    debug_assert!(v.len() >= qk_rope);
+    // snapshot the input, since outputs overwrite positions we still read
+    let mut input = [0f32; 512];
+    debug_assert!(qk_rope <= input.len(), "qk_rope exceeds rope scratch");
+    input[..qk_rope].copy_from_slice(&v[..qk_rope]);
+    for j in 0..half {
+        let inv = theta.powf(-2.0 * j as f32 / qk_rope as f32);
+        let ang = pos as f32 * inv;
+        let (sn, cs) = ang.sin_cos();
+        let a = input[2 * j];
+        let b = input[2 * j + 1];
+        v[j] = a * cs - b * sn;
+        v[half + j] = b * cs + a * sn;
+    }
+}
+
+/// Sigmoid. Port of `sigmoidf`.
+#[inline]
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// SiLU / swish: `x * sigmoid(x)`. Port of `siluf`.
+#[inline]
+pub fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rmsnorm_gives_unit_rms_with_unit_weight() {
+        let x = [3.0f32, 4.0];
+        let w = [1.0f32, 1.0];
+        let mut out = [0f32; 2];
+        rmsnorm(&mut out, &x, &w, 0.0);
+        let rms = ((out[0] * out[0] + out[1] * out[1]) / 2.0).sqrt();
+        assert!((rms - 1.0).abs() < 1e-5, "rms was {rms}");
+        // direction preserved
+        assert!((out[1] / out[0] - 4.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn layernorm_zero_mean_unit_var() {
+        let mut v = [1.0f32, 2.0, 3.0];
+        let w = [1.0f32; 3];
+        let b = [0.0f32; 3];
+        layernorm(&mut v, &w, &b, 0.0);
+        let mean: f32 = v.iter().sum::<f32>() / 3.0;
+        assert!(mean.abs() < 1e-5);
+        let var: f32 = v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / 3.0;
+        assert!((var - 1.0).abs() < 1e-4, "var {var}");
+        assert!(v[0] < 0.0 && v[2] > 0.0);
+    }
+
+    #[test]
+    fn rope_at_pos_zero_is_identity() {
+        // pos 0 -> all angles 0 -> cos=1,sin=0, but note the layout still
+        // de-interleaves (v[2j],v[2j+1]) -> (v[j], v[half+j]).
+        let mut v = [1.0f32, 2.0, 3.0, 4.0]; // qk_rope=4, half=2
+        rope_interleave(&mut v, 0, 4, 10000.0);
+        // j=0: a=1,b=2 -> v[0]=1, v[2]=2 ; j=1: a=3,b=4 -> v[1]=3, v[3]=4
+        assert_eq!(v, [1.0, 3.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn rope_rotation_preserves_pair_norm() {
+        let mut v = [1.0f32, 0.0, 0.0, 1.0];
+        let before0 = v[0] * v[0] + v[1] * v[1];
+        rope_interleave(&mut v, 5, 4, 10000.0);
+        // pair j=0 maps to (v[0], v[2]); its norm is preserved by the rotation
+        let after0 = v[0] * v[0] + v[2] * v[2];
+        assert!((before0 - after0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn silu_and_sigmoid() {
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
+        assert!((silu(0.0)).abs() < 1e-6);
+        assert!((silu(1.0) - 1.0 * sigmoid(1.0)).abs() < 1e-6);
+    }
+}

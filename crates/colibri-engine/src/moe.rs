@@ -77,6 +77,17 @@ pub struct ShardsExpertProvider<'a> {
     ebits: u32,
     sharding: ExpertSharding,
     this_node: NodeId,
+    /// Cores each expert's ~18 MB read is chunked across (a single stream tops out
+    /// far below the NVMe). `COLI_LOAD_THREADS` overrides; defaults to core count.
+    read_threads: usize,
+}
+
+/// Read-thread count for on-demand expert streaming: `COLI_LOAD_THREADS` else cores.
+fn default_read_threads() -> usize {
+    std::env::var("COLI_LOAD_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(crate::preload::default_num_files)
 }
 
 impl<'a> ShardsExpertProvider<'a> {
@@ -89,6 +100,7 @@ impl<'a> ShardsExpertProvider<'a> {
             ebits,
             sharding: ExpertSharding::single(cfg.n_experts as u32),
             this_node: NodeId(0),
+            read_threads: default_read_threads(),
         }
     }
 
@@ -107,6 +119,7 @@ impl<'a> ShardsExpertProvider<'a> {
             ebits,
             sharding,
             this_node,
+            read_threads: default_read_threads(),
         }
     }
 }
@@ -149,6 +162,7 @@ pub fn load_expert(
     ebits: u32,
     layer: usize,
     eid: usize,
+    read_threads: usize,
 ) -> io::Result<Expert> {
     let wn = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
     let (gate_w, up_w, down_w) = (wn("gate_proj"), wn("up_proj"), wn("down_proj"));
@@ -156,8 +170,9 @@ pub fn load_expert(
         // Pre-quantized container: the 3 weights are contiguous on disk (~18 MB),
         // so read them in ONE coalesced read into a shared buffer the tensors view
         // — instead of 3 separate reads + allocations (the streaming bottleneck).
-        // Scales are tiny and elsewhere; keep them as small per-tensor reads.
-        let ws = shards.read_raw_shared(&[&gate_w, &up_w, &down_w])?;
+        // The read is chunked across `read_threads` cores so a single miss saturates
+        // the disk. Scales are tiny and elsewhere; keep them as small per-tensor reads.
+        let ws = shards.read_raw_shared(&[&gate_w, &up_w, &down_w], read_threads)?;
         let mk = |o: usize, i: usize, w: &(std::sync::Arc<[u8]>, usize, usize), sname: String| -> io::Result<QTensor> {
             let (buf, off, len) = w;
             let fmt = if *len == o * i {
@@ -219,6 +234,7 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
             self.ebits,
             layer,
             eid,
+            self.read_threads,
         )?))
     }
 }

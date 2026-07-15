@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
@@ -190,7 +190,11 @@ impl Shards {
     /// non-contiguous names fall back to their own reads. This is what lets an
     /// expert's gate/up/down (18 MB, contiguous) load in one shot instead of three,
     /// avoiding the per-tensor read + allocation overhead that dominated streaming.
-    pub fn read_raw_shared(&self, names: &[&str]) -> io::Result<Vec<(Arc<[u8]>, usize, usize)>> {
+    pub fn read_raw_shared(
+        &self,
+        names: &[&str],
+        nthreads: usize,
+    ) -> io::Result<Vec<(Arc<[u8]>, usize, usize)>> {
         let n = names.len();
         let mut meta = Vec::with_capacity(n); // (file_idx, off, nbytes)
         for &nm in names {
@@ -218,10 +222,10 @@ impl Shards {
             let span = (span_end - off0) as usize;
             // Read into an uninitialized buffer (pread_into fills it fully on Ok).
             let mut buf = Vec::<u8>::with_capacity(span);
-            // SAFETY: pread_into writes all `span` bytes on success; on error we
+            // SAFETY: pread_chunked writes all `span` bytes on success; on error we
             // drop `buf` without reading it.
             unsafe { buf.set_len(span) };
-            self.pread_into(file, off0, &mut buf)?;
+            self.pread_chunked(file, off0, &mut buf, nthreads)?;
             let arc: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
             for gi in g..end {
                 let idx = order[gi];
@@ -276,6 +280,53 @@ impl Shards {
         let mut f = self.files[file_idx].1.try_clone()?;
         f.seek(SeekFrom::Start(off))?;
         f.read_exact(buf)
+    }
+
+    /// Fill `buf` from `file` at `off`, splitting the read across up to `nthreads`
+    /// positioned reads of disjoint sub-ranges. A single synchronous stream tops out
+    /// far below the NVMe's bandwidth (it needs queue depth ~10); chunking one
+    /// expert's 18 MB read across threads lets even a single cache miss saturate the
+    /// drive, instead of feeding it 1–2 outstanding requests. Positioned reads
+    /// (`pread`/`read_exact_at`) don't touch a shared file cursor, so this is safe.
+    fn pread_chunked(
+        &self,
+        file: usize,
+        off: u64,
+        buf: &mut [u8],
+        nthreads: usize,
+    ) -> io::Result<()> {
+        const MIN_CHUNK: usize = 1 << 20; // 1 MiB floor — smaller reads lose throughput
+        let len = buf.len();
+        let nt = nthreads.min(len / MIN_CHUNK).max(1);
+        if nt <= 1 {
+            return self.pread_into(file, off, buf);
+        }
+        let per = len.div_ceil(nt);
+        let base = buf.as_mut_ptr() as usize;
+        let err: Mutex<Option<io::Error>> = Mutex::new(None);
+        std::thread::scope(|scope| {
+            let mut start = 0;
+            while start < len {
+                let clen = per.min(len - start);
+                let err = &err;
+                scope.spawn(move || {
+                    // SAFETY: each thread writes a disjoint [start, start+clen) sub-range
+                    // of a buffer valid for `len` bytes (checked: start+clen <= len); the
+                    // ranges never overlap and the buffer outlives the scope.
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut((base + start) as *mut u8, clen)
+                    };
+                    if let Err(e) = self.pread_into(file, off + start as u64, dst) {
+                        *err.lock().unwrap() = Some(e);
+                    }
+                });
+                start += clen;
+            }
+        });
+        match err.into_inner().unwrap() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -436,7 +487,7 @@ mod tests {
         let data: Vec<u8> = (0..12).collect();
         write_u8_shard(&dir, &[("g", 0, 4), ("u", 4, 4), ("d", 8, 4)], &data);
         let s = Shards::open(&dir).unwrap();
-        let r = s.read_raw_shared(&["g", "u", "d"]).unwrap();
+        let r = s.read_raw_shared(&["g", "u", "d"], 4).unwrap();
         // all three views are into the same Arc allocation
         assert!(Arc::ptr_eq(&r[0].0, &r[1].0));
         assert!(Arc::ptr_eq(&r[1].0, &r[2].0));
@@ -456,7 +507,7 @@ mod tests {
         let data: Vec<u8> = (0..20).collect();
         write_u8_shard(&dir, &[("g", 0, 4), ("u", 8, 4), ("d", 16, 4)], &data);
         let s = Shards::open(&dir).unwrap();
-        let r = s.read_raw_shared(&["g", "u", "d"]).unwrap();
+        let r = s.read_raw_shared(&["g", "u", "d"], 4).unwrap();
         assert!(!Arc::ptr_eq(&r[0].0, &r[1].0));
         assert!(!Arc::ptr_eq(&r[1].0, &r[2].0));
         assert_eq!(view(&r[0]), vec![0, 1, 2, 3]);
@@ -474,12 +525,30 @@ mod tests {
         let data: Vec<u8> = (0..12).collect();
         write_u8_shard(&dir, &[("a", 0, 4), ("b", 4, 4), ("c", 8, 4)], &data);
         let s = Shards::open(&dir).unwrap();
-        let r = s.read_raw_shared(&["c", "a", "b"]).unwrap();
+        let r = s.read_raw_shared(&["c", "a", "b"], 4).unwrap();
         assert_eq!(view(&r[0]), vec![8, 9, 10, 11]); // c
         assert_eq!(view(&r[1]), vec![0, 1, 2, 3]); // a
         assert_eq!(view(&r[2]), vec![4, 5, 6, 7]); // b
         // contiguous on disk → still one shared buffer despite the query order
         assert!(Arc::ptr_eq(&r[0].0, &r[1].0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pread_chunked_multi_chunk_matches_content() {
+        // A tensor several MiB larger than MIN_CHUNK (1 MiB) with a non-aligned tail,
+        // so read_raw_shared actually splits it into multiple disjoint reads. Every
+        // byte — including across chunk boundaries and the short final chunk — must
+        // match the on-disk content.
+        let dir = temp_dir();
+        let n = 9 * (1 << 20) + 777; // 9 MiB + tail → 8 chunks at nthreads=8
+        let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        write_u8_shard(&dir, &[("w", 0, n)], &data);
+        let s = Shards::open(&dir).unwrap();
+        let r = s.read_raw_shared(&["w"], 8).unwrap();
+        let got = view(&r[0]);
+        assert_eq!(got.len(), n);
+        assert_eq!(got, data);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

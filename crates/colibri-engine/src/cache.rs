@@ -223,12 +223,14 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
         self.fetch(layer, eid, true)
     }
 
-    /// Parallel disk→RAM for a layer's experts — the decode bottleneck once
-    /// compute is on the GPU. Reads the not-yet-resident experts across cores
-    /// **without touching the cache** (concurrent cache mutation corrupts the LFRU
-    /// recency and thrashes), then inserts the whole batch under one lock and
-    /// evicts once while protecting the batch. Preloads aren't router selections;
-    /// the compute loop's `expert` call then hits and records the selection.
+    /// Disk→RAM for a layer's experts — the decode bottleneck once compute is on the
+    /// GPU. Experts are loaded **serially**: each `inner.expert` read is chunked
+    /// across cores internally (`Shards::pread_chunked`), so even a single-miss layer
+    /// saturates the NVMe (which needs ~10 outstanding requests). Loading experts
+    /// concurrently would only oversubscribe the already-saturated drive. Loads run
+    /// **off the cache lock**; the batch is then inserted under one lock and evicted
+    /// once while protecting itself. Preloads aren't router selections — the compute
+    /// loop's `expert` call then hits and records the selection.
     fn prefetch(&self, layer: usize, eids: &[usize]) -> io::Result<()> {
         let missing: Vec<usize> = {
             let s = self.state.lock().unwrap();
@@ -240,31 +242,15 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
         if missing.is_empty() {
             return Ok(());
         }
-        // `COLI_LOAD_THREADS` overrides the worker count (1 = serial baseline).
-        let max_threads = std::env::var("COLI_LOAD_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or_else(crate::preload::default_num_files)
-            .max(1);
-        let nthreads = max_threads.clamp(1, missing.len());
 
-        // Parallel I/O only: load expert data off the cache lock. `inner.expert`
-        // reads from disk (or the remote transport); no shared cache state touched.
-        let per = missing.len().div_ceil(nthreads);
-        let loaded: Vec<(usize, Arc<Expert>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = missing
-                .chunks(per)
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        chunk
-                            .iter()
-                            .filter_map(|&e| self.inner.expert(layer, e).ok().map(|ex| (e, ex)))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
-        });
+        // Load off the cache lock; each read chunks itself across cores.
+        let mut loaded: Vec<(usize, Arc<Expert>)> = Vec::with_capacity(missing.len());
+        for &e in &missing {
+            // Best-effort: a load error surfaces when the compute loop calls `expert`.
+            if let Ok(ex) = self.inner.expert(layer, e) {
+                loaded.push((e, ex));
+            }
+        }
 
         // Serial bookkeeping: insert the batch, then a single protected eviction.
         let batch: HashSet<(usize, usize)> = missing.iter().map(|&e| (layer, e)).collect();

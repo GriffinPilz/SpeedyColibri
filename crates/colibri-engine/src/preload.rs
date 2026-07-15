@@ -346,7 +346,10 @@ pub fn preload_parallel(
                             if used > per_thread_budget && !map.is_empty() {
                                 break;
                             }
-                            let mut ex = load_expert(shards, hidden, moe_inter, ebits, layer, eid)?;
+                            // Bulk preload is already ~20-way parallel across experts,
+                            // so each expert's read stays a single stream (chunking it
+                            // too would only oversubscribe the drive).
+                            let mut ex = load_expert(shards, hidden, moe_inter, ebits, layer, eid, 1)?;
                             ex.mark_gpu_eligible(); // preloaded == resident/stable
                             used += ex.bytes();
                             map.insert((layer, eid), Arc::new(ex));

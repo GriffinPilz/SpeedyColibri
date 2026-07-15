@@ -29,10 +29,10 @@ ships with unit tests; the C code is the oracle.
 | `colibri-tokenizer` | `c/tok.h`, `c/tok_unicode.h` | ✅ ported + tested |
 | `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 scalar reference + `qrow_i8`-exact activation quant; SIMD pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
-| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 primitives + loader + MLA attention + MoE block done; per-layer forward + decode loop next |
+| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode runs end-to-end**; DSA/SIMD/expert-cache/speculation deferred |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; CUDA primary (stub), Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
-| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load work; chat/serve pending |
+| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen work; chat (tokenizer-wired)/serve pending |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
 | — | `c/olmoe.c` | ⬜ not started (second model variant) |
 | — | `c/openai_server.py`, `c/tools/*`, `web/` | ⬜ not started |
@@ -68,8 +68,12 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      `ShardsExpertProvider` checks `colibri-cluster` ownership (single-node local
      now, RDMA-remote later). Router/FFN/shared tested independently.
      (Expert LRU/pin cache + CACHE_ROUTE/top-p variants still ⬜.)
-   - ⬜ per-layer forward (residual wiring, dense-vs-MoE branch, final norm,
-     lm_head) + single-token decode loop → wire up `coli chat`
+   - ✅ per-layer forward (`forward.rs`): in_ln → MLA attention → residual →
+     post_ln → MoE/dense → residual, then final norm + lm_head; greedy decode
+     loop (`generate_greedy`). Runs end-to-end on a synthetic model with routed
+     experts (integration test + `coli gen`); deterministic. **The CPU forward
+     pass generates.** Next: wire a tokenizer into `coli chat`, then perf (SIMD,
+     expert LRU cache) and the deferred pieces (DSA, speculation, CUDA).
 4. **CUDA (Blackwell) backend:** primary GPU tier for DGX Spark — bind
    `c/backend_cuda.cu` via FFI first, then port; target sm_121. (Metal is
    deprioritized — not a deployment target.)
@@ -83,7 +87,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 70 tests currently pass.
+- Unit tests per crate (the C behavior is the spec). 71 tests currently pass.
 - Byte-exactness: the C engine validates token-exact against a `transformers`
   oracle (TF 32/32, greedy 20/20). The Rust engine must reproduce the C engine's
   greedy stream under `DRAFT=0 IDOT=0 COLI_CUDA=0`.

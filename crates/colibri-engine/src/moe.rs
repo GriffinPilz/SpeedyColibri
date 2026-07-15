@@ -158,6 +158,13 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
     matmul_qt(out, &gg, down, nr);
 }
 
+/// Dense MLP for non-MoE layers (the first `first_k_dense_replace` layers):
+/// the same SwiGLU as an expert, over `gate_proj`/`up_proj`/`down_proj`. Port of
+/// `dense_mlp` in `c/glm.c`.
+pub fn dense_mlp(l: &Layer, x: &[f32], s_len: usize, out: &mut [f32]) {
+    ffn(&l.gate_proj, &l.up_proj, &l.down_proj, x, s_len, out);
+}
+
 /// MoE forward over `x[S, hidden]` into `out[S, hidden]`. Routes each position,
 /// applies every selected expert (fetched via `provider`), and adds the shared
 /// expert when `with_shared`. Port of `moe()`'s default CPU path.

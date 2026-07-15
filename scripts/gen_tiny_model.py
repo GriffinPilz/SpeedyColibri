@@ -43,6 +43,10 @@ for i in range(NL):
         tensors += [(p("mlp.gate.weight"), E*D), (p("mlp.gate.e_score_correction_bias"), E),
             (p("mlp.shared_experts.gate_proj.weight"), S_I*D), (p("mlp.shared_experts.up_proj.weight"), S_I*D),
             (p("mlp.shared_experts.down_proj.weight"), D*S_I)]
+        for e in range(E):
+            pe = lambda s: f"model.layers.{i}.mlp.experts.{e}.{s}.weight"
+            tensors += [(pe("gate_proj"), MOE_INTER*D), (pe("up_proj"), MOE_INTER*D),
+                        (pe("down_proj"), D*MOE_INTER)]
 
 header, off, payload = {}, 0, bytearray()
 for name, numel in tensors:

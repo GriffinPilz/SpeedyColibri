@@ -11,6 +11,7 @@
 //! are the active porting front — see PORTING.md for the milestone order.
 
 pub mod attention;
+pub mod forward;
 pub mod linear;
 pub mod loader;
 pub mod math;
@@ -21,11 +22,12 @@ pub mod sampling;
 
 pub use attention::{attention, attention_with, AttnCore};
 pub use colibri_core::Config;
+pub use forward::{forward, generate_greedy, logits};
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
 pub use model::{KvCache, Layer, Model};
-pub use moe::{moe, route, Expert, ExpertProvider, ShardsExpertProvider};
+pub use moe::{dense_mlp, moe, route, Expert, ExpertProvider, ShardsExpertProvider};
 pub use quantize::qtensor_from_f32;
 pub use sampling::{argmax, sample_top_p, SampleConfig};
 

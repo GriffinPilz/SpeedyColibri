@@ -26,6 +26,7 @@ COMMANDS:
   tokenize <tok.json> <text>   encode/decode round-trip   [working]
   config <snap>            print parsed hyperparameters   [working]
   load <snap>              load dense weights, print structure  [working]
+  gen <snap> [ids...]      greedy-generate from token ids       [working]
   version                  print version
   help                     show this help
 
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
         "tokenize" => cmd_tokenize(&args),
         "config" => cmd_config(&args),
         "load" => cmd_load(&args),
+        "gen" => cmd_gen(&args),
         "chat" | "web" | "serve" | "bench" | "convert" => {
             eprintln!(
                 "coli {cmd}: not yet ported — the CPU forward pass is still being \
@@ -130,6 +132,53 @@ fn cmd_load(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("coli load: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `coli gen <snap> [id...]` — load a model and greedy-generate from the given
+/// token ids (default `[1]`), printing the continuation ids. Runs the full CPU
+/// forward pass; experts stream from the snapshot on demand.
+fn cmd_gen(args: &[String]) -> ExitCode {
+    let snap = match args.get(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: coli gen <snapshot-dir> [token_id ...]");
+            return ExitCode::from(2);
+        }
+    };
+    let prompt: Vec<i32> = args
+        .get(3..)
+        .map(|a| a.iter().filter_map(|s| s.parse().ok()).collect())
+        .filter(|v: &Vec<i32>| !v.is_empty())
+        .unwrap_or_else(|| vec![1]);
+
+    let model = match colibri_engine::load_model(snap) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("coli gen: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let provider =
+        colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
+    let n_new = 16usize;
+    let mut kv = colibri_engine::KvCache::new(
+        model.cfg.n_layers as usize,
+        model.cfg.kv_lora as usize,
+        model.cfg.qk_rope as usize,
+        prompt.len() + n_new,
+    );
+    match colibri_engine::generate_greedy(&model, &mut kv, &provider, &prompt, n_new) {
+        Ok(seq) => {
+            let cont: Vec<i32> = seq[prompt.len()..].to_vec();
+            println!("prompt: {prompt:?}");
+            println!("generated ({} tok): {cont:?}", cont.len());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coli gen: {e}");
             ExitCode::FAILURE
         }
     }

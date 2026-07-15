@@ -14,3 +14,4 @@ colibri-tokenizer = { workspace = true }
 colibri-grammar = { workspace = true }
 colibri-kernels = { workspace = true }
 colibri-backend = { workspace = true }
+colibri-cluster = { workspace = true }

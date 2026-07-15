@@ -1,24 +1,30 @@
 //! Compute-backend abstraction for the expert/attention matmuls.
 //!
-//! The C engine selects a backend at runtime via `c/backend_loader.c`, which
-//! `dlopen`s an optional CUDA shared library (`c/backend_cuda.cu`) or uses the
-//! Metal backend (`c/backend_metal.mm`); everything falls back to the CPU
-//! integer-dot kernels. This crate mirrors that: a [`Backend`] trait with a
-//! always-available [`CpuBackend`], and feature-gated CUDA/Metal implementations.
+//! Deployment target is **NVIDIA DGX Spark** (GB10 Grace Blackwell): the primary
+//! backend is **CUDA** on the Blackwell GPU; the CPU path (Grace, aarch64 NEON)
+//! is the fallback. Apple-Silicon **Metal is off the critical path** — kept only
+//! as an optional, deprioritized feature stub.
+//!
+//! The C engine selects a backend at runtime via `c/backend_loader.c` (which
+//! `dlopen`s `c/backend_cuda.cu`), falling back to the CPU integer-dot kernels.
+//! This crate mirrors that: a [`Backend`] trait, an always-available
+//! [`CpuBackend`], and a feature-gated CUDA backend (Metal behind a separate,
+//! optional feature).
 //!
 //! # Status
 //!
-//! [`CpuBackend`] is the real target for the CPU forward pass (it will delegate
-//! to `colibri-kernels`). The `cuda`/`metal` features are placeholders that will
-//! first bind the existing C backends over FFI, then be ported to Rust. Both are
-//! off by default so the CPU engine builds on any platform.
+//! [`CpuBackend`] is real (it will delegate to `colibri-kernels`). The `cuda`
+//! feature is the placeholder for the Blackwell backend — it will first bind
+//! `c/backend_cuda.cu` over FFI, then be ported. Off by default so the image
+//! builds without the CUDA toolkit present; the DGX Spark image turns it on.
 
 /// Which backend a resident tensor should run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Device {
     Cpu,
-    /// CUDA device by ordinal.
+    /// CUDA device by ordinal (Blackwell on DGX Spark).
     Cuda(u32),
+    /// Apple Metal — deprioritized, not a deployment target.
     Metal,
 }
 
@@ -35,7 +41,8 @@ pub trait Backend {
     fn device(&self) -> Device;
 }
 
-/// The always-available CPU backend. Delegates to `colibri-kernels`.
+/// The always-available CPU backend. On DGX Spark this is the Grace ARM cores;
+/// delegates to `colibri-kernels` (aarch64 NEON is the CPU SIMD target).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBackend;
 
@@ -52,22 +59,57 @@ impl Backend for CpuBackend {
 }
 
 /// Select the best available backend, honoring the `COLI_CUDA` env toggle the C
-/// engine reads. For now this always returns the CPU backend.
+/// engine reads. Prefers CUDA (Blackwell) when compiled in and available, else
+/// falls back to the CPU backend.
 pub fn autoselect() -> Box<dyn Backend> {
-    // TODO(port c/backend_loader.c): probe CUDA (COLI_CUDA), then Metal, then CPU.
+    #[cfg(feature = "cuda")]
+    {
+        if std::env::var("COLI_CUDA").map(|v| v != "0").unwrap_or(true) {
+            if let Some(b) = cuda::CudaBackend::probe() {
+                return Box::new(b);
+            }
+        }
+    }
+    // TODO(port c/backend_loader.c): full runtime probe order (CUDA -> CPU).
     Box::new(CpuBackend)
 }
 
 #[cfg(feature = "cuda")]
 pub mod cuda {
-    //! CUDA backend — port of `c/backend_cuda.cu` / `c/backend_cuda.h`.
-    //! TODO: bind the existing `.cu` via FFI, then port kernels.
+    //! CUDA backend for Blackwell (DGX Spark GB10) — port of `c/backend_cuda.cu`
+    //! / `c/backend_cuda.h`. TODO: bind the existing `.cu` via FFI, then port
+    //! kernels; target compute capability sm_121 (GB10 Blackwell).
+    use super::{Backend, Device};
+
+    /// Handle to a CUDA device. Placeholder until the FFI binding lands.
+    pub struct CudaBackend {
+        pub device: u32,
+    }
+
+    impl CudaBackend {
+        /// Probe for a usable CUDA device. TODO: `cudaGetDeviceCount` via FFI.
+        pub fn probe() -> Option<CudaBackend> {
+            None
+        }
+    }
+
+    impl Backend for CudaBackend {
+        fn name(&self) -> &'static str {
+            "cuda"
+        }
+        fn is_available(&self) -> bool {
+            false // until the FFI binding lands
+        }
+        fn device(&self) -> Device {
+            Device::Cuda(self.device)
+        }
+    }
 }
 
 #[cfg(feature = "metal")]
 pub mod metal {
-    //! Metal backend — port of `c/backend_metal.mm` / `c/backend_metal.h`.
-    //! TODO: bind the existing `.mm` via FFI, then port shaders.
+    //! Metal backend — port of `c/backend_metal.mm`. DEPRIORITIZED: not a
+    //! deployment target (DGX Spark is CUDA). Kept as an optional stub only.
 }
 
 #[cfg(test)]
@@ -75,10 +117,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_backend_is_default_and_available() {
+    fn cpu_backend_is_available_and_default_without_cuda() {
         let b = autoselect();
-        assert_eq!(b.name(), "cpu");
+        // Without the `cuda` feature (default), autoselect returns CPU.
         assert!(b.is_available());
-        assert_eq!(b.device(), Device::Cpu);
+        #[cfg(not(feature = "cuda"))]
+        {
+            assert_eq!(b.name(), "cpu");
+            assert_eq!(b.device(), Device::Cpu);
+        }
     }
 }

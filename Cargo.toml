@@ -14,6 +14,7 @@ members = [
     "crates/colibri-kernels",
     "crates/colibri-engine",
     "crates/colibri-backend",
+    "crates/colibri-cluster",
     "crates/coli",
 ]
 # The pre-existing Tauri desktop shell is a standalone crate (edition 2024,
@@ -38,6 +39,7 @@ colibri-grammar = { path = "crates/colibri-grammar" }
 colibri-kernels = { path = "crates/colibri-kernels" }
 colibri-engine = { path = "crates/colibri-engine" }
 colibri-backend = { path = "crates/colibri-backend" }
+colibri-cluster = { path = "crates/colibri-cluster" }
 
 # Optimized profile mirrors the C build (`-O3 -march=native` in c/Makefile).
 # Build hot crates with `RUSTFLAGS="-C target-cpu=native"` for the SIMD paths.

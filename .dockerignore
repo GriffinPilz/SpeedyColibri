@@ -1,0 +1,28 @@
+# Keep the Docker build context small and free of secrets/large artifacts.
+.git/
+target/
+**/target/
+
+# model weights & run artifacts (mounted at runtime, never baked in)
+*.safetensors
+*.coli_kv
+*.coli_usage
+.coli-cache/
+c/glm_tiny*/
+c/glm_bench*/
+c/bench/
+
+# node / web build output
+web/node_modules/
+web/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+
+# python caches
+**/__pycache__/
+*.pyc
+c/mio_env/
+
+# editor / OS cruft
+*.rs.bk
+.DS_Store

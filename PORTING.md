@@ -9,6 +9,12 @@ fully ported and validated.
 grammar, tokenizer, backends, tools) that runs GLM-5.2 token-exact against the
 same model files.
 
+**Deployment target:** a Docker container on **NVIDIA DGX Spark** (GB10 Grace
+Blackwell, aarch64 + CUDA), single node first, designed to split across nodes
+**expert-parallel** over an RDMA/RoCE link. Backend priority is **CUDA → CPU
+(Grace/aarch64 NEON)**; Apple-Silicon Metal is off the critical path. See
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
 **Approach:** bottom-up. Leaf modules first (no dependencies, easy to validate),
 then the forward pass, then the GPU backends and tooling. Every ported module
 ships with unit tests; the C code is the oracle.
@@ -24,8 +30,10 @@ ships with unit tests; the C code is the oracle.
 | `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 scalar reference done; SIMD pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
 | `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 sampling done; rest scaffolded |
-| `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*`, `backend_metal.*` | ⬜ CPU trait; GPU skeleton |
+| `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; CUDA primary (stub), Metal deprioritized |
+| `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config work; modes pending |
+| Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
 | — | `c/olmoe.c` | ⬜ not started (second model variant) |
 | — | `c/openai_server.py`, `c/tools/*`, `web/` | ⬜ not started |
 
@@ -39,21 +47,28 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 1. **Foundation (done):** json, config, dtypes, quant container, tier eviction,
    safetensors, tokenizer, sampling. All tested.
-2. **Kernels:** AVX2 (`maddubs`) int8/int4 dot + the shape-dependent rounding
-   that makes quantized output byte-exact; NEON path for Apple Silicon. The
-   scalar reference in `colibri-kernels` is the oracle.
+2. **Kernels:** int8/int4 dot + the shape-dependent rounding that makes quantized
+   output byte-exact. SIMD target is **aarch64 NEON** (Grace CPU, the DGX Spark
+   CPU fallback); the AVX2 (`maddubs`) path is kept for x86 dev boxes. The scalar
+   reference in `colibri-kernels` is the oracle.
 3. **CPU forward pass (`colibri-engine`):**
    - weight loader (`qt_from_disk`, expert LRU sizing, DSA/MTP detection)
    - MLA attention with weight absorption + compressed KV-cache
-   - MoE block (sigmoid router / noaux_tc, shared expert, streaming experts)
+   - MoE block (sigmoid router / noaux_tc, shared expert, streaming experts) —
+     route each expert through `colibri-cluster` (`is_local`/`owner`) so the
+     single-node path and the future split share one code path
    - RMSNorm, RoPE (interleaved partial), embed/lm_head
    - single-token decode loop → wire up `coli chat`
-4. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
+4. **CUDA (Blackwell) backend:** primary GPU tier for DGX Spark — bind
+   `c/backend_cuda.cu` via FFI first, then port; target sm_121. (Metal is
+   deprioritized — not a deployment target.)
+5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
-5. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,
+6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,
    OpenAI-compatible server, web dashboard.
-6. **GPU backends:** CUDA then Metal — bind existing C via FFI first, then port.
-7. **Second model:** `olmoe.c`.
+7. **Multi-node (expert-parallel):** real `num_nodes > 1` sharding + RDMA/RoCE
+   transport over ConnectX-7 (GPUDirect); split-model on-disk layout per node.
+8. **Second model:** `olmoe.c`.
 
 ## Validation strategy
 

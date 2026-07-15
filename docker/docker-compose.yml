@@ -1,0 +1,52 @@
+# SpeedyColibri on DGX Spark — single-node compose.
+#
+# Current target is one DGX Spark. The commented `node1` service sketches the
+# expert-parallel two-node layout (COLI_NUM_NODES=2) for when the RDMA transport
+# lands; it is intentionally left disabled.
+#
+#   docker compose -f docker/docker-compose.yml build
+#   docker compose -f docker/docker-compose.yml run --rm coli config /model
+services:
+  coli:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: speedycolibri:latest
+    environment:
+      COLI_NUM_NODES: "1"
+      COLI_NODE_RANK: "0"
+      # COLI_CUDA: "1"   # enable once the CUDA backend is wired
+    volumes:
+      - type: bind
+        source: ${COLI_MODEL_DIR:-/data/glm52-int4}
+        target: /model
+        read_only: true
+      # writable scratch for KV-cache (.coli_kv) and the learning cache (.coli_usage)
+      - type: bind
+        source: ${COLI_CACHE_DIR:-./.coli-cache}
+        target: /cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # default: print the parsed config of the mounted model
+    command: ["config", "/model"]
+
+  # --- expert-parallel second node (disabled; RDMA transport not yet wired) ---
+  # node1:
+  #   image: speedycolibri:latest
+  #   environment:
+  #     COLI_NUM_NODES: "2"
+  #     COLI_NODE_RANK: "1"
+  #   volumes:
+  #     - type: bind
+  #       source: ${COLI_MODEL_DIR_NODE1:-/data/glm52-int4}
+  #       target: /model
+  #       read_only: true
+  #   deploy:
+  #     resources: { reservations: { devices: [{ driver: nvidia, count: all, capabilities: [gpu] }] } }
+  #   # On real hardware the two nodes talk over the ConnectX-7 200GbE link via
+  #   # host networking / RDMA, not a compose bridge.

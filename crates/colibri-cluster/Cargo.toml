@@ -1,0 +1,17 @@
+[package]
+name = "colibri-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-node distribution for the colibrì engine: expert-parallel sharding + RDMA transport (DGX Spark)"
+
+[features]
+default = []
+# Enables the RDMA/RoCE transport over the ConnectX-7 200GbE link. Off by default
+# so single-node builds need no libibverbs. See src/transport.rs.
+rdma = []
+
+[dependencies]
+colibri-core = { workspace = true }

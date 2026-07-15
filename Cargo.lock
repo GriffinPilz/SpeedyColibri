@@ -19,6 +19,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "colibri-cluster"
+version = "0.1.0"
+dependencies = [
+ "colibri-core",
+]
+
+[[package]]
 name = "colibri-core"
 version = "0.1.0"
 dependencies = [
@@ -30,6 +37,7 @@ name = "colibri-engine"
 version = "0.1.0"
 dependencies = [
  "colibri-backend",
+ "colibri-cluster",
  "colibri-core",
  "colibri-grammar",
  "colibri-kernels",

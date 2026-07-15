@@ -607,4 +607,136 @@ mod tests {
             assert!((with[dd] - without[dd] - sh_out[dd]).abs() < 1e-5);
         }
     }
+
+    /// End-to-end: write a real int4 `.weight` + f32 `.qs` shard for one expert,
+    /// load it through the coalesced + chunked path (`read_threads=8`), and assert
+    /// the resulting `Bytes::Shared` views (a) hold exactly the on-disk bytes and
+    /// (b) dequant identically to an owned byte-for-byte reference via `matmul_qt`.
+    /// Dims chosen so the 2.25 MiB weight span splits into 2 chunks whose boundary
+    /// lands *inside* the gate tensor, and the disk order (down|gate|up) differs from
+    /// the request order (gate,up,down).
+    #[test]
+    fn load_expert_roundtrip_chunked_shared_dequant() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        fn temp_dir() -> PathBuf {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+            let mut p = PathBuf::from(base);
+            p.push(format!(
+                "colibri-loadexpert-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        // Write U8/F32 tensors laid out contiguously in the given order.
+        fn write_tensors(dir: &Path, entries: &[(&str, &str, Vec<u8>)]) -> PathBuf {
+            let mut hjson = String::from("{");
+            let mut off = 0usize;
+            for (i, (name, dtype, b)) in entries.iter().enumerate() {
+                if i > 0 {
+                    hjson.push(',');
+                }
+                let numel = if *dtype == "F32" { b.len() / 4 } else { b.len() };
+                hjson.push_str(&format!(
+                    "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+                    name,
+                    dtype,
+                    numel,
+                    off,
+                    off + b.len()
+                ));
+                off += b.len();
+            }
+            hjson.push('}');
+            let hbytes = hjson.as_bytes();
+            let path = dir.join("model.safetensors");
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&(hbytes.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(hbytes).unwrap();
+            for (_, _, b) in entries {
+                f.write_all(b).unwrap();
+            }
+            path
+        }
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+
+        let hidden = 768usize;
+        let moe_inter = 2048usize;
+        let rb_gu = hidden.div_ceil(2); // int4 row bytes for gate/up [moe_inter, hidden]
+        let rb_d = moe_inter.div_ceil(2); // for down [hidden, moe_inter]
+
+        // Distinct byte + scale patterns per tensor so a wrong offset/length shows up.
+        let gate_q4: Vec<u8> = (0..moe_inter * rb_gu).map(|k| (k * 7 + 1) as u8).collect();
+        let up_q4: Vec<u8> = (0..moe_inter * rb_gu).map(|k| (k * 5 + 2) as u8).collect();
+        let down_q4: Vec<u8> = (0..hidden * rb_d).map(|k| (k * 3 + 9) as u8).collect();
+        let gate_s: Vec<f32> = (0..moe_inter).map(|o| 0.011 + 0.001 * (o % 13) as f32).collect();
+        let up_s: Vec<f32> = (0..moe_inter).map(|o| 0.007 + 0.002 * (o % 11) as f32).collect();
+        let down_s: Vec<f32> = (0..hidden).map(|o| 0.013 + 0.001 * (o % 7) as f32).collect();
+
+        let dir = temp_dir();
+        let p = |suf: &str| format!("model.layers.0.mlp.experts.0.{suf}");
+        let (gw, uw, dw) = (p("gate_proj.weight"), p("up_proj.weight"), p("down_proj.weight"));
+        let (gs, us, ds) = (
+            p("gate_proj.weight.qs"),
+            p("up_proj.weight.qs"),
+            p("down_proj.weight.qs"),
+        );
+        // Physical order down|gate|up (weights contiguous → one coalesced read),
+        // then the scales — mirrors the real model, where request order != disk order.
+        write_tensors(
+            &dir,
+            &[
+                (&dw, "U8", down_q4.clone()),
+                (&gw, "U8", gate_q4.clone()),
+                (&uw, "U8", up_q4.clone()),
+                (&gs, "F32", f32_bytes(&gate_s)),
+                (&us, "F32", f32_bytes(&up_s)),
+                (&ds, "F32", f32_bytes(&down_s)),
+            ],
+        );
+
+        let shards = Shards::open(&dir).unwrap();
+        let ex = load_expert(&shards, hidden, moe_inter, 4, 0, 0, 8).unwrap();
+
+        // (a) each Bytes::Shared view holds exactly its on-disk bytes + scales + dims.
+        assert!(ex.gate.q4.as_slice() == gate_q4.as_slice(), "gate q4 mismatch");
+        assert!(ex.up.q4.as_slice() == up_q4.as_slice(), "up q4 mismatch");
+        assert!(ex.down.q4.as_slice() == down_q4.as_slice(), "down q4 mismatch");
+        assert_eq!(ex.gate.s, gate_s);
+        assert_eq!(ex.up.s, up_s);
+        assert_eq!(ex.down.s, down_s);
+        assert_eq!((ex.gate.fmt_code, ex.gate.o, ex.gate.i), (2, moe_inter as i32, hidden as i32));
+        assert_eq!((ex.down.fmt_code, ex.down.o, ex.down.i), (2, hidden as i32, moe_inter as i32));
+
+        // (b) the shared views dequant identically to an owned reference through the
+        // real matmul kernel (proves the QTensor is usable, not just byte-equal).
+        let check = |loaded: &QTensor, q4: &[u8], s: &[f32], o: usize, i: usize| {
+            let reference = QTensor {
+                fmt_code: 2,
+                q4: Bytes::Owned(q4.to_vec()),
+                s: s.to_vec(),
+                o: o as i32,
+                i: i as i32,
+                ..Default::default()
+            };
+            let x: Vec<f32> = (0..i).map(|k| 0.5 - 0.001 * (k % 17) as f32).collect();
+            let mut y_loaded = vec![0f32; o];
+            let mut y_ref = vec![0f32; o];
+            matmul_qt(&mut y_loaded, &x, loaded, 1);
+            matmul_qt(&mut y_ref, &x, &reference, 1);
+            assert_eq!(y_loaded, y_ref);
+        };
+        check(&ex.gate, &gate_q4, &gate_s, moe_inter, hidden);
+        check(&ex.up, &up_q4, &up_s, moe_inter, hidden);
+        check(&ex.down, &down_q4, &down_s, hidden, moe_inter);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -114,12 +114,12 @@ pub fn qtensor_from_f32(w: &[f32], o: usize, i: usize, bits: u32) -> QTensor {
     } else if bits >= 3 {
         t.fmt_code = 2;
         let (q, s) = pack_int4(w, o, i, bits);
-        t.q4 = q;
+        t.q4 = q.into();
         t.s = s;
     } else {
         t.fmt_code = 3;
         let (q, s) = pack_int2(w, o, i, bits);
-        t.q4 = q;
+        t.q4 = q.into();
         t.s = s;
     }
     t

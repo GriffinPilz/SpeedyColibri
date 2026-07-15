@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
@@ -180,6 +181,57 @@ impl Shards {
         let t = self.tensor(name)?;
         let n = t.nbytes as usize;
         self.pread_into(t.file_idx, t.off, &mut out[..n])
+    }
+
+    /// Read several raw (U8) tensors, coalescing any that are **contiguous in the
+    /// same file** into a single positioned read backed by a shared `Arc<[u8]>`.
+    /// Returns, in the input order, `(buf, offset, len)` per name — a view into the
+    /// shared allocation. One read (and one allocation) for a contiguous group;
+    /// non-contiguous names fall back to their own reads. This is what lets an
+    /// expert's gate/up/down (18 MB, contiguous) load in one shot instead of three,
+    /// avoiding the per-tensor read + allocation overhead that dominated streaming.
+    pub fn read_raw_shared(&self, names: &[&str]) -> io::Result<Vec<(Arc<[u8]>, usize, usize)>> {
+        let n = names.len();
+        let mut meta = Vec::with_capacity(n); // (file_idx, off, nbytes)
+        for &nm in names {
+            let t = self.tensor(nm)?;
+            meta.push((t.file_idx, t.off, t.nbytes));
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| (meta[i].0, meta[i].1));
+
+        let mut result: Vec<Option<(Arc<[u8]>, usize, usize)>> = (0..n).map(|_| None).collect();
+        let mut g = 0;
+        while g < n {
+            let (file, off0, nb0) = meta[order[g]];
+            let mut end = g + 1;
+            let mut span_end = off0 + nb0;
+            while end < n {
+                let (f, o, nb) = meta[order[end]];
+                if f == file && o == span_end {
+                    span_end = o + nb;
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            let span = (span_end - off0) as usize;
+            // Read into an uninitialized buffer (pread_into fills it fully on Ok).
+            let mut buf = Vec::<u8>::with_capacity(span);
+            // SAFETY: pread_into writes all `span` bytes on success; on error we
+            // drop `buf` without reading it.
+            unsafe { buf.set_len(span) };
+            self.pread_into(file, off0, &mut buf)?;
+            let arc: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
+            for gi in g..end {
+                let idx = order[gi];
+                let (_, o, nb) = meta[idx];
+                result[idx] = Some((arc.clone(), (o - off0) as usize, nb as usize));
+            }
+            g = end;
+        }
+        // Every index is assigned exactly once (each name lands in some group).
+        Ok(result.into_iter().map(|x| x.unwrap()).collect())
     }
 
     /// Read a slice of a tensor: `n_elems` starting at element `elem_off`. Used

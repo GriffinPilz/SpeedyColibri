@@ -44,7 +44,7 @@ pub fn qt_load(shards: &Shards, name: &str, o: usize, i: usize, bits: u32) -> io
             // reinterpret the code bytes as signed int8
             t.q8 = raw.into_iter().map(|b| b as i8).collect();
         } else {
-            t.q4 = raw;
+            t.q4 = raw.into();
         }
         // scales: O per-row f32 in `name.qs`
         let mut s = vec![0f32; o];

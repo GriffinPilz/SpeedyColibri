@@ -21,7 +21,7 @@ use crate::linear::{matmul_f32, matmul_qt};
 use crate::math::silu;
 use crate::model::Layer;
 use colibri_cluster::{ExpertSharding, NodeId};
-use colibri_core::{Config, QTensor};
+use colibri_core::{Bytes, Config, QTensor};
 use colibri_safetensors::Shards;
 use std::io;
 use std::sync::Arc;
@@ -150,11 +150,46 @@ pub fn load_expert(
     layer: usize,
     eid: usize,
 ) -> io::Result<Expert> {
-    let name = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-    let mut ex = Expert {
-        gate: crate::loader::qt_load(shards, &name("gate_proj"), moe_inter, hidden, ebits)?,
-        up: crate::loader::qt_load(shards, &name("up_proj"), moe_inter, hidden, ebits)?,
-        down: crate::loader::qt_load(shards, &name("down_proj"), hidden, moe_inter, ebits)?,
+    let wn = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
+    let (gate_w, up_w, down_w) = (wn("gate_proj"), wn("up_proj"), wn("down_proj"));
+    let mut ex = if shards.has(&format!("{gate_w}.qs")) {
+        // Pre-quantized container: the 3 weights are contiguous on disk (~18 MB),
+        // so read them in ONE coalesced read into a shared buffer the tensors view
+        // — instead of 3 separate reads + allocations (the streaming bottleneck).
+        // Scales are tiny and elsewhere; keep them as small per-tensor reads.
+        let ws = shards.read_raw_shared(&[&gate_w, &up_w, &down_w])?;
+        let mk = |o: usize, i: usize, w: &(std::sync::Arc<[u8]>, usize, usize), sname: String| -> io::Result<QTensor> {
+            let (buf, off, len) = w;
+            let fmt = if *len == o * i {
+                1
+            } else if *len == o * i.div_ceil(2) {
+                2
+            } else {
+                3
+            };
+            let mut s = vec![0f32; o];
+            shards.read_f32(&sname, &mut s)?;
+            let mut t = QTensor { fmt_code: fmt, o: o as i32, i: i as i32, s, ..Default::default() };
+            if fmt == 1 {
+                // int8 goes in q8 (signed) — a copy; experts are int4 so this is rare.
+                t.q8 = buf[*off..*off + *len].iter().map(|&b| b as i8).collect();
+            } else {
+                t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+            }
+            Ok(t)
+        };
+        Expert {
+            gate: mk(moe_inter, hidden, &ws[0], format!("{gate_w}.qs"))?,
+            up: mk(moe_inter, hidden, &ws[1], format!("{up_w}.qs"))?,
+            down: mk(hidden, moe_inter, &ws[2], format!("{down_w}.qs"))?,
+        }
+    } else {
+        // Full-tensor (runtime-quantized) path — the tiny oracle model.
+        Expert {
+            gate: crate::loader::qt_load(shards, &gate_w, moe_inter, hidden, ebits)?,
+            up: crate::loader::qt_load(shards, &up_w, moe_inter, hidden, ebits)?,
+            down: crate::loader::qt_load(shards, &down_w, hidden, moe_inter, ebits)?,
+        }
     };
     // Route streamed experts through the GPU fused-FFN path. On unified memory
     // (the GB10) this uses the zero-copy wrap — the kernel reads the RAM copy in
@@ -306,7 +341,14 @@ pub fn moe<P: ExpertProvider>(
 
     // Fetch this layer's experts disk→RAM in parallel before computing. Serial
     // per-expert loading is otherwise the decode bottleneck (~74% of MoE time).
-    provider.prefetch(layer, &uniq)?;
+    if crate::forward::profile_on() {
+        let t = std::time::Instant::now();
+        provider.prefetch(layer, &uniq)?;
+        crate::forward::LOAD_US
+            .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        provider.prefetch(layer, &uniq)?;
+    }
 
     // ---- apply each unique expert to the positions that route to it -------
     for &e in &uniq {
@@ -326,15 +368,7 @@ pub fn moe<P: ExpertProvider>(
         for (r, &s) in rows.iter().enumerate() {
             xg[r * d..(r + 1) * d].copy_from_slice(&x[s * d..(s + 1) * d]);
         }
-        let ex = if crate::forward::profile_on() {
-            let t = std::time::Instant::now();
-            let ex = provider.expert(layer, e)?;
-            crate::forward::LOAD_US
-                .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            ex
-        } else {
-            provider.expert(layer, e)?
-        };
+        let ex = provider.expert(layer, e)?;
         let mut hh = vec![0f32; nr * d];
         ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
         for (r, &s) in rows.iter().enumerate() {

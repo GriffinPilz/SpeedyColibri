@@ -37,6 +37,62 @@ impl QFormat {
     }
 }
 
+/// Packed byte payload of a quantized tensor: either owned, or a **view into a
+/// shared buffer**. The share case lets an expert's `gate`/`up`/`down` weights —
+/// contiguous on disk — be read in one shot into a single allocation the three
+/// tensors slice into, instead of three separate reads + allocations (the streaming
+/// decode bottleneck). Derefs to `[u8]`, so consumers see a plain byte slice.
+#[derive(Debug, Clone, Default)]
+pub enum Bytes {
+    #[default]
+    Empty,
+    Owned(Vec<u8>),
+    Shared {
+        buf: std::sync::Arc<[u8]>,
+        off: usize,
+        len: usize,
+    },
+}
+
+impl Bytes {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Bytes::Empty => &[],
+            Bytes::Owned(v) => v,
+            Bytes::Shared { buf, off, len } => &buf[*off..*off + *len],
+        }
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(v: Vec<u8>) -> Self {
+        Bytes::Owned(v)
+    }
+}
+
+impl PartialEq for Bytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
 /// A quantized tensor of logical shape `[O, I]` (rows × cols).
 ///
 /// Exactly one of the payload buffers is populated per `fmt`:
@@ -52,7 +108,7 @@ pub struct QTensor {
     pub fmt_code: i32,
     pub qf: Vec<f32>,
     pub q8: Vec<i8>,
-    pub q4: Vec<u8>,
+    pub q4: Bytes,
     /// per-row scales (length `O`), empty for `F32`
     pub s: Vec<f32>,
     /// rows (output dim)

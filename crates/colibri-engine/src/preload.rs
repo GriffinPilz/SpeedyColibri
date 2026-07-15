@@ -215,7 +215,7 @@ fn read_qt(blob: &[u8], off: &mut usize, qlen: usize, slen: usize, o: usize, i: 
     };
     match fmt {
         1 => t.q8 = q.iter().map(|&b| b as i8).collect(),
-        2 => t.q4 = q.to_vec(),
+        2 => t.q4 = q.to_vec().into(),
         f => panic!("preload: unsupported expert fmt {f}"),
     }
     t

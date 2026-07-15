@@ -118,8 +118,12 @@ path, and an int4 `[8192,6144]` matmul measured **~18× faster** than one Grace
 core (429–448 vs 24 GFLOP/s). The expert / shared / dense FFN is **fused** onto
 the GPU (`coli_cuda_expert_mlp`, one on-device `down(silu(gate·x)⊙up·x)`) —
 measured **19.2×** vs one Grace core (165 µs vs 3171 µs per expert at hidden 6144
-/ moe_inter 2048). Still to do: GPU attention absorb and VRAM eviction for the
-full model.
+/ moe_inter 2048). The MLA attention core also runs on the GPU
+(`coli_cuda_attention_absorb_batch`) — **31.9×** vs one Grace core (1349 µs vs
+43 ms at H=64 / T=2048), matching the CPU to ~1e-10. **The whole hot path —
+attention projections, the absorb core, the fused expert FFN, and lm_head — is
+on-device.** Still to do: a persistent device KV cache (avoid re-uploading the
+compressed KV each token) and VRAM eviction for the full model.
 
 ## Fast cold-start: parallel preload
 

@@ -323,6 +323,76 @@ mod tests {
         l
     }
 
+    // GPU vs CPU MLA absorb core at GLM dims (H=64, kv_lora=512) over a 2048-token
+    // context. `cargo test -p colibri-engine --features cuda --release -- --ignored
+    // --nocapture bench_attention`
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_attention_gpu_vs_cpu() {
+        if !crate::gpu::available() {
+            eprintln!("skip: no CUDA device");
+            return;
+        }
+        let json = colibri_json::Json::parse(
+            r#"{"hidden_size":6144,"num_hidden_layers":1,"num_attention_heads":64,
+                "n_routed_experts":256,"num_experts_per_tok":8,"moe_intermediate_size":2048,
+                "intermediate_size":12288,"first_k_dense_replace":0,"q_lora_rank":2048,
+                "kv_lora_rank":512,"qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
+                "n_shared_experts":1,"vocab_size":2000,"n_group":1,"topk_group":1,
+                "rms_norm_eps":1e-5,"routed_scaling_factor":1.0,
+                "rope_parameters":{"rope_theta":10000.0},"eos_token_id":[1],
+                "index_topk":0,"index_n_heads":0,"index_head_dim":0}"#,
+        )
+        .unwrap();
+        let cfg = Config::from_json(&json).unwrap();
+        let (h, qk_nope, r, vh, kvl) = (64usize, 128usize, 64usize, 128usize, 512usize);
+        let kvb_dim = h * (qk_nope + vh);
+        let wf: Vec<f32> = (0..kvb_dim * kvl).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
+        let mut kv_b = qtensor_from_f32(&wf, kvb_dim, kvl, 4);
+        kv_b.gpu_eligible = true;
+        let mut l = Layer::default();
+        l.kv_b = kv_b;
+
+        let t = 2048usize;
+        let mut kv = KvCache::new(1, kvl, r, t);
+        for pos in 0..t {
+            for x in kv.latent_row_mut(0, pos).iter_mut() {
+                *x = 0.01;
+            }
+            for x in kv.krot_row_mut(0, pos).iter_mut() {
+                *x = 0.01;
+            }
+        }
+        let q: Vec<f32> = (0..h * (qk_nope + r)).map(|k| ((k % 7) as f32 - 3.0) * 0.01).collect();
+        let latent = kv.latent_rows(0, 0, t).to_vec();
+        let rope = kv.krot_rows(0, 0, t).to_vec();
+        let scale = cfg.attn_scale;
+        let mut cg = vec![0f32; h * vh];
+        let mut cc = vec![0f32; h * vh];
+
+        // correctness + warm
+        crate::gpu::try_attention_absorb(&l.kv_b, &mut cg, &q, &latent, &rope, 1, h, qk_nope, r, vh, kvl, t, scale);
+        absorb_core(&cfg, &l, 0, &kv, &q, 1, t - 1, 0, &mut cc);
+        let maxerr = cg.iter().zip(&cc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+
+        let iters = 500u64;
+        let tm = std::time::Instant::now();
+        for _ in 0..iters {
+            crate::gpu::try_attention_absorb(&l.kv_b, &mut cg, &q, &latent, &rope, 1, h, qk_nope, r, vh, kvl, t, scale);
+        }
+        let gpu = tm.elapsed().as_secs_f64();
+        let tm = std::time::Instant::now();
+        for _ in 0..iters {
+            absorb_core(&cfg, &l, 0, &kv, &q, 1, t - 1, 0, &mut cc);
+        }
+        let cpu = tm.elapsed().as_secs_f64();
+        eprintln!(
+            "attention absorb (H={h} T={t}) x{iters}: GPU {:.3}s ({:.0} us) | CPU-NEON {:.3}s ({:.0} us) | {:.2}x | max|Δ|={maxerr:.1e}",
+            gpu, gpu / iters as f64 * 1e6, cpu, cpu / iters as f64 * 1e6, cpu / gpu,
+        );
+    }
+
     #[test]
     fn reconstruct_and_absorb_agree() {
         let c = cfg();

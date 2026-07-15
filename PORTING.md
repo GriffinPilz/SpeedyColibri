@@ -117,9 +117,17 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      (one upload+download vs 3 GEMMs). Validated on the GB10 (same tokens as CPU;
      `36 fused FFNs` replaced ~108 matmuls). **Measured 19.2×** vs 1-core CPU-NEON
      at hidden 6144 / moe_inter 2048 (165 µs vs 3171 µs per expert).
-   - ⬜ next: GPU attention absorb (`coli_cuda_attention_*`), VRAM eviction for the
-     full model, end-to-end tok/s on a real-sized model; then port kernels from
-     FFI to Rust. (Metal deprioritized — not a target.)
+   - ✅ GPU MLA attention (`coli_cuda_attention_absorb_batch`): `attention_with`
+     runs the weight-absorption core on the GPU for resident kv_b (ctx from
+     q+latent+rope), then o_proj (also GPU). Validated on the GB10 (same tokens;
+     `18 attention cores`, kv_b reconstruction gone). **Measured 31.9×** vs
+     1-core CPU-NEON at H=64/T=2048 (1349 µs vs 43 ms), matching the CPU to
+     `max|Δ|≈3.5e-10`. **The whole hot path (projections + attention + expert FFN
+     + lm_head) is on-device.**
+   - ⬜ next: persistent device KV (`kv_dev` shadow, avoid re-uploading
+     latent/rope each token), VRAM eviction for the full model, end-to-end tok/s
+     on a real-sized model; then port kernels from FFI to Rust. (Metal
+     deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

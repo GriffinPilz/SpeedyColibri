@@ -109,12 +109,27 @@ pub fn expert_gate_name(layer: usize, eid: usize) -> String {
     format!("model.layers.{layer}.mlp.experts.{eid}.gate_proj.weight")
 }
 
-/// Whether streamed experts should be marked GPU-eligible (`COLI_GPU_EXPERTS=1`).
-/// Read once. See [`load_expert`] for why this is opt-in on unified memory.
+/// Whether streamed experts should run on the GPU (marked `gpu_eligible`). Read
+/// once. Default: **on** when the zero-copy path is available (unified memory) —
+/// it's memory-safe and ~2× the copy path. `COLI_GPU_EXPERTS=1`/`=0` forces it;
+/// `=1` also enables the copy path (needs `COLI_VRAM_GB` caps, see [`load_expert`]).
 fn gpu_experts_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_GPU_EXPERTS").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| match std::env::var("COLI_GPU_EXPERTS").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => {
+            #[cfg(feature = "cuda")]
+            {
+                crate::gpu::zerocopy()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                false
+            }
+        }
+    })
 }
 
 /// Load one routed expert (gate/up/down) directly from the shards. Shared by
@@ -133,14 +148,11 @@ pub fn load_expert(
         up: crate::loader::qt_load(shards, &name("up_proj"), moe_inter, hidden, ebits)?,
         down: crate::loader::qt_load(shards, &name("down_proj"), hidden, moe_inter, ebits)?,
     };
-    // `COLI_GPU_EXPERTS=1` routes streamed experts through the GPU fused-FFN path
-    // (validated correct — identical tokens to the CPU path). It is opt-in because
-    // the current GPU FFN cache copies each expert into VRAM, which on the GB10's
-    // *unified* memory double-stores it (same physical LPDDR as the RAM cache):
-    // at the budgets needed to avoid eviction thrashing that overflows the 121 GB
-    // pool and gets OOM-killed. The proper fix is the zero-copy path (GPU reads
-    // the RAM copy directly via cudaHostRegister; see PORTING.md). Until then the
-    // default keeps experts on the (stable, correct) CPU path.
+    // Route streamed experts through the GPU fused-FFN path. On unified memory
+    // (the GB10) this uses the zero-copy wrap — the kernel reads the RAM copy in
+    // place, so there is no VRAM double-store, no eviction, and no OOM — and it is
+    // ~2× the copy path. Default-on there; see [`gpu_experts_enabled`] for the
+    // `COLI_GPU_EXPERTS` override and the copy-path caveats on other devices.
     if gpu_experts_enabled() {
         ex.mark_gpu_eligible();
     }
@@ -218,6 +230,11 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
             return;
         }
     }
+    ffn_cpu(gate, up, down, x, nr, out);
+}
+
+/// CPU SwiGLU FFN (the reference / fallback path).
+fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
     let inter = gate.o as usize; // moe_inter (or shared intermediate)
     let mut gg = vec![0f32; nr * inter];
     let mut uu = vec![0f32; nr * inter];

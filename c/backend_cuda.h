@@ -39,6 +39,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
 
+/* Zero-copy wrap: point at host (RAM) buffers directly instead of copying to
+ * device memory. Only valid on unified-memory devices with pageable host access
+ * (the GB10). int4 weights stay offset-binary. No device allocation. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
+                            const void *weights, const float *scales,
+                            int fmt, int I, int O, int device);
+
+/* 1 if the device can read pageable host memory directly (zero-copy wrap works). */
+COLI_CUDA_DLLEXPORT int coli_cuda_pageable_access(int device);
+
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
  * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2.

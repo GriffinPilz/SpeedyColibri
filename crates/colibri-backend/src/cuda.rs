@@ -44,6 +44,16 @@ extern "C" {
         o: c_int,
         device: c_int,
     ) -> c_int;
+    fn coli_cuda_tensor_wrap(
+        tensor: *mut *mut ColiCudaTensor,
+        weights: *const c_void,
+        scales: *const f32,
+        fmt: c_int,
+        i: c_int,
+        o: c_int,
+        device: c_int,
+    ) -> c_int;
+    fn coli_cuda_pageable_access(device: c_int) -> c_int;
     fn coli_cuda_matmul(
         tensor: *mut *mut ColiCudaTensor,
         y: *mut f32,
@@ -122,6 +132,13 @@ pub fn shutdown() {
     unsafe { coli_cuda_shutdown() }
 }
 
+/// Whether `device` can read pageable host memory directly (coherent unified
+/// memory like the GB10). When true, the zero-copy [`ResidentTensor::wrap_raw`]
+/// path avoids copying weights into device memory entirely.
+pub fn pageable_access(device: i32) -> bool {
+    unsafe { coli_cuda_pageable_access(device) != 0 }
+}
+
 /// `(free, total)` device memory in bytes.
 pub fn mem_info(device: i32) -> Option<(usize, usize)> {
     let mut free = 0usize;
@@ -184,6 +201,31 @@ impl ResidentTensor {
     ) -> Option<ResidentTensor> {
         let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
         if coli_cuda_tensor_upload(&mut ptr, weights, scales, fmt, i, o, device) != 0
+            && !ptr.is_null()
+        {
+            Some(ResidentTensor { ptr })
+        } else {
+            None
+        }
+    }
+
+    /// Zero-copy wrap of host buffers `[O, I]` (fmt: 0=f32, 1=int8, 2=int4). The
+    /// GPU reads the RAM copy in place — no device allocation, no memcpy. int4 must
+    /// be **offset-binary** (the on-disk / CPU form); the kernel handles it.
+    ///
+    /// # Safety
+    /// `weights`/`scales` must stay alive and valid for `[O, I]`/`fmt` for as long
+    /// as this tensor is used in a kernel. Only call when [`pageable_access`] is true.
+    pub unsafe fn wrap_raw(
+        weights: *const c_void,
+        scales: *const f32,
+        fmt: i32,
+        i: i32,
+        o: i32,
+        device: i32,
+    ) -> Option<ResidentTensor> {
+        let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
+        if coli_cuda_tensor_wrap(&mut ptr, weights, scales, fmt, i, o, device) != 0
             && !ptr.is_null()
         {
             Some(ResidentTensor { ptr })

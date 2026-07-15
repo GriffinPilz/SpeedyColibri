@@ -14,6 +14,10 @@ struct ColiCudaTensor {
     size_t weight_bytes;
     int fmt, I, O, device;
     int tracked;
+    // Zero-copy on unified memory (GB10): `weights`/`scales` point directly at the
+    // host (RAM) buffers — no cudaMalloc, no memcpy, no device-side offset→signed
+    // conversion. int4 stays offset-binary, so kernels must read it with off=1.
+    int wrapped;
 };
 
 typedef struct {
@@ -33,7 +37,7 @@ typedef struct {
 
 typedef struct {
     const void *g,*u,*d; const float *gs,*us,*ds;
-    int gf,uf,df,rows,offset;
+    int gf,uf,df,rows,offset,wrapped;
 } GroupDesc;
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
@@ -75,14 +79,20 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     return 0;
 }
 
-__device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
+// `off`=1 reads int4 as offset-binary (value = nibble − 8, the on-disk / host
+// format used by zero-copy wrapped tensors); off=0 reads the signed two's-complement
+// form produced by `offset_to_signed_s4` after a device copy. Both yield the same
+// value (signed_interp(raw^8) == raw−8); the flag just picks which representation
+// the bytes are currently in. Default off=0 so existing call sites are unchanged.
+__device__ static float weight_at(const void *weights, int fmt, size_t row, int i, int off=0) {
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
     const uint8_t *q = base;
     if (fmt == 2) {
         uint8_t v = q[i >> 1];
-        int n=(i&1)?(v>>4):(v&15); return static_cast<float>(n&8?n-16:n);
+        int n=(i&1)?(v>>4):(v&15);
+        return off ? static_cast<float>(n - 8) : static_cast<float>(n&8?n-16:n);
     }
     uint8_t v = q[i >> 2];
     return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
@@ -94,14 +104,14 @@ __global__ static void offset_to_signed_s4(uint8_t *q,size_t n){
 
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
                                     const float *scales, int fmt, int S, int I, int O,
-                                    size_t rb) {
+                                    size_t rb, int off) {
     int o = blockIdx.x;
     int s = blockIdx.y;
     float sum = 0.0f;
     size_t row = (size_t)o * rb;
     const float *xs = x + (size_t)s * I;
     for (int i = threadIdx.x; i < I; i += blockDim.x)
-        sum += xs[i] * weight_at(weights, fmt, row, i);
+        sum += xs[i] * weight_at(weights, fmt, row, i, off);
 
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
@@ -499,6 +509,15 @@ extern "C" int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_
     return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
 }
 
+// Whether the device can read pageable host memory directly (coherent unified
+// memory). 1 → the zero-copy `coli_cuda_tensor_wrap` path is usable.
+extern "C" int coli_cuda_pageable_access(int device) {
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrPageableMemoryAccess, device) != cudaSuccess)
+        return 0;
+    return v;
+}
+
 extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
     size_t count = 0, bytes = 0;
     for (int i = 0; i < g_nctx; i++) if (device < 0 || g_ctx[i].device == device) {
@@ -581,7 +600,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
     dim3 grid((unsigned)O, (unsigned)S);
-    quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb);
+    quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->wrapped);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
@@ -604,13 +623,13 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
     dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
     quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
-        gate->fmt,S,D,I,row_bytes(gate->fmt,D));
+        gate->fmt,S,D,I,row_bytes(gate->fmt,D),gate->wrapped);
     quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
-        up->fmt,S,D,I,row_bytes(up->fmt,D));
+        up->fmt,S,D,I,row_bytes(up->fmt,D),up->wrapped);
     size_t n=(size_t)S*I;
     silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
     quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
-        down->fmt,S,I,D,row_bytes(down->fmt,I));
+        down->fmt,S,I,D,row_bytes(down->fmt,I),down->wrapped);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
     return 1;
@@ -660,7 +679,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
-                 g->fmt,u->fmt,d->fmt,rows[c],total};
+                 g->fmt,u->fmt,d->fmt,rows[c],total,g->wrapped};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
@@ -724,12 +743,12 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                 /* piccoli batch: tile TC quasi vuoti + overhead di lancio — il
                  * kernel naive per-elemento resta piu' veloce (misurato in decode) */
                 quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
-                    host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D));
+                    host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D),host[c].wrapped);
                 quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
-                    host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D));
+                    host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D),host[c].wrapped);
                 silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
                 quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
-                    host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I));
+                    host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),host[c].wrapped);
             }
             off16+=r;
         }
@@ -815,7 +834,7 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
     if(proj){
         ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
         quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
-            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),proj->wrapped);
         if(!cuda_ok(cudaGetLastError(),"attention o_proj launch"))return 0;src=dc->y;
     }
     if(!cuda_ok(cudaMemcpyAsync(out,src,ob,cudaMemcpyDeviceToHost,dc->stream),
@@ -838,6 +857,9 @@ extern "C" int coli_cuda_attention_project_batch(ColiCudaTensor *w,ColiCudaTenso
 
 extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (!tensor) return;
+    // Wrapped tensors borrow host memory (owned by the Rust QTensor) — free only
+    // the descriptor, never the buffers.
+    if (tensor->wrapped) { std::free(tensor); return; }
     DeviceContext *ctx = find_ctx(tensor->device);
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
@@ -848,6 +870,32 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (tensor->weights) cudaFree(tensor->weights);
     if (tensor->scales) cudaFree(tensor->scales);
     std::free(tensor);
+}
+
+// Zero-copy tensor: wrap host (RAM) buffers so the GPU reads them in place. Only
+// valid where the device can access pageable host memory directly
+// (cudaDevAttrPageableMemoryAccess — true on the GB10's coherent unified memory).
+// `weights` stays in its on-disk layout: int4 is offset-binary (kernels pass off=1),
+// int8 is already signed. No cudaMalloc, no memcpy, no conversion, no device memory.
+extern "C" int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
+                                     const void *weights, const float *scales,
+                                     int fmt, int I, int O, int device) {
+    if (!tensor || !weights || I < 1 || O < 1) return 0;
+    size_t rb = row_bytes(fmt, I);
+    if (!rb || (fmt && !scales)) return 0;
+    if (*tensor) {
+        ColiCudaTensor *t = *tensor;
+        return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
+    }
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->device = device;
+    t->weight_bytes = rb * (size_t)O;
+    t->weights = const_cast<void *>(weights);
+    t->scales = const_cast<float *>(scales);
+    t->wrapped = 1;
+    *tensor = t;
+    return 1;
 }
 
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
@@ -989,7 +1037,7 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
     size_t ob=(size_t)S*proj->O*sizeof(float);
     if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
-        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),proj->wrapped);
     if(!cuda_ok(cudaGetLastError(),"pipe o_proj launch"))return 0;
     if(!cuda_ok(cudaMemcpyAsync(out,dc->y,ob,cudaMemcpyDeviceToHost,dc->stream),"pipe attention download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"pipe attention sync"))return 0;
@@ -1020,7 +1068,7 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
     dim3 grid((unsigned)t->O,(unsigned)S);
     quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
-        row_bytes(t->fmt,t->I));
+        row_bytes(t->fmt,t->I),t->wrapped);
     return cuda_ok(cudaGetLastError(),"pipe gemm");
 }
 /* copia diretta scheda->scheda (P2P se disponibile, altrimenti staging driver) */
@@ -1046,7 +1094,7 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
         rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch (dev out)"))return 0;
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(out_dev,dc->ac,proj->weights,
-        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+        proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),proj->wrapped);
     if(!cuda_ok(cudaGetLastError(),"pipe o_proj launch (dev out)"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe attention sync (dev out)");
 }

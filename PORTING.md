@@ -155,28 +155,31 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      so the dense attention path is exact. `qt_load` reads its `.weight`+`.weight.qs`
      containers directly (int8 embed/lm_head, int4 everything else); dims confirmed
      (`kv_b` O = H·(qk_nope+v_head) = 64·448). GPU and CPU produce identical tokens.
-   - 🟠 **decode ≈ 0.26 tok/s** (single GB10, single-node, experts streaming from
-     disk; best 0.32). `COLI_PROFILE` breakdown: **MoE is ~94%** of the step (attn,
-     dense, lm_head are together <6% — the flash attention is already a rounding
-     error at short context). The MoE cost is *data movement*, not matmul: each
-     decode token touches 8×75 = 600 experts (~11 GB of int4 weights), and routing
-     is position-dependent so the working set keeps growing. Two bottlenecks found:
-     (1) routed experts ran **single-threaded on CPU** — they were never marked
-     `gpu_eligible` (only preloaded experts were). Now opt-in via `COLI_GPU_EXPERTS=1`
-     (validated: identical tokens on the GB10). (2) The GPU FFN cache **copies** each
-     expert into VRAM, which on the GB10's *unified* memory double-stores it in the
-     same physical LPDDR as the RAM cache; at the budgets needed to avoid eviction
-     thrashing the two caches overflow the 121 GB pool and systemd-oomd SIGTERMs the
-     process. So `COLI_GPU_EXPERTS` is opt-in and needs `COLI_VRAM_GB`/`COLI_RAM_GB`
-     caps for now.
-   - ⬜ **next (the decode win): zero-copy experts on unified memory.** Instead of
-     cudaMalloc+memcpy per expert, `cudaHostRegister` the RAM copy and let the kernel
-     read it in place — one copy, no VRAM budget, no eviction, no OOM, and ~3× less
-     memory traffic. Needs an offset-binary int4 expert kernel (subtract-8 inline)
-     so we can skip the destructive on-device `offset_to_signed_s4`, plus lifecycle
-     coupling to the RAM cache (unregister on evict). Also open: batch a layer's 8
-     experts into one launch (cut 600 tiny nr=1 launches/token); port kernels FFI→Rust.
-     (Metal deprioritized — not a target.)
+   - ✅ **decode: MoE was ~94% of the step** (`COLI_PROFILE`; attn/dense/lm_head
+     together <6% — flash attention is a rounding error at short context). The cost
+     is *data movement*, not matmul: each token touches 8×75 = 600 experts (~11 GB
+     int4), routing is position-dependent so the working set grows. Two problems:
+     routed experts ran **single-threaded on CPU** (never marked `gpu_eligible`), and
+     the GPU FFN cache **copied** each expert into VRAM — which on the GB10's *unified*
+     memory double-stores it in the same LPDDR as the RAM cache, overflowing the
+     121 GB pool (systemd-oomd SIGTERM).
+   - ✅ **zero-copy experts on unified memory** (the decode win). The GB10 reports
+     `cudaDevAttrPageableMemoryAccess=1` / `usesHostPageTables=1` — the GPU reads
+     pageable host memory directly, coherently, at full bandwidth (no
+     `cudaHostRegister` needed; it's even "not supported"). So `coli_cuda_tensor_wrap`
+     points a `ColiCudaTensor` straight at the RAM `QTensor` (`gpu.rs` `wrap_ffn` /
+     `WRAPPED_FFN`): **no cudaMalloc, no memcpy, no VRAM budget, no eviction, no OOM.**
+     int4 stays offset-binary; `weight_at`/`quant_matmul` take an `off` flag that
+     subtracts 8 inline (skips the destructive `offset_to_signed_s4`). Only the FFN
+     path wraps — `kv_b` stays on the copy path because the attention absorb kernels
+     read int4 as signed (`upload_ffn(.., zc=false)`; that mismatch was the one bug,
+     caught by a per-FFN GPU-vs-CPU diff). **Validated on the GB10:** identical tokens
+     to CPU, 0.5 GB VRAM, no caps needed. Same-session A/B/C: zero-copy **0.70 tok/s**
+     vs copy-path 0.35 vs CPU-experts 0.23 (2× / 3×); ~1.05 best on a quiet machine.
+     Now the default when zero-copy is available (`gpu_experts_enabled`).
+   - ⬜ next: batch a layer's 8 experts into one launch (cut 600 tiny nr=1 launches/
+     token); zero-copy `kv_b` too (thread `off` through the absorb kernels); port
+     kernels FFI→Rust. (Metal deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

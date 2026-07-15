@@ -331,9 +331,10 @@ fn finish_gen(
             println!("generated ({} tok): {:?}", seq.len() - prompt.len(), &seq[prompt.len()..]);
             #[cfg(feature = "cuda")]
             println!(
-                "gpu: {} matmuls, {} fused expert FFNs",
+                "gpu: {} matmuls, {} fused expert FFNs, {} attention cores",
                 colibri_engine::gpu::matmul_count(),
-                colibri_engine::gpu::ffn_count()
+                colibri_engine::gpu::ffn_count(),
+                colibri_engine::gpu::attn_count()
             );
             ExitCode::SUCCESS
         }

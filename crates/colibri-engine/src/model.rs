@@ -101,6 +101,11 @@ impl KvCache {
     pub fn latent_rows(&self, layer: usize, start: usize, end: usize) -> &[f32] {
         &self.latent[layer][start * self.kv_lora..end * self.kv_lora]
     }
+
+    /// Contiguous roped-key rows `[start, end)` for a layer.
+    pub fn krot_rows(&self, layer: usize, start: usize, end: usize) -> &[f32] {
+        &self.k_rot[layer][start * self.qk_rope..end * self.qk_rope]
+    }
 }
 
 /// A fully loaded model.

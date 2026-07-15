@@ -26,6 +26,7 @@ thread_local! {
         RefCell::new(HashMap::new());
     static GPU_MATMULS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_FFN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GPU_ATTN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a CUDA device is usable (probed once; honors `COLI_CUDA=0`).
@@ -41,6 +42,60 @@ pub fn matmul_count() -> u64 {
 /// How many fused expert FFNs ran on the GPU this thread.
 pub fn ffn_count() -> u64 {
     GPU_FFN.with(|c| c.get())
+}
+
+/// How many MLA attention cores ran on the GPU this thread.
+pub fn attn_count() -> u64 {
+    GPU_ATTN.with(|c| c.get())
+}
+
+/// Try the MLA weight-absorption attention core on the GPU: `ctx[S, H*V]` from
+/// the query and the compressed KV cache, using resident `kv_b`. Returns `true`
+/// if it ran there. Equivalent to the CPU `absorb_core`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_absorb(
+    kv_b: &QTensor,
+    ctx: &mut [f32],
+    q: &[f32],
+    latent: &[f32],
+    rope: &[f32],
+    s: usize,
+    h: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    v_head: usize,
+    kv_lora: usize,
+    t: usize,
+    scale: f32,
+) -> bool {
+    if !available() || !kv_b.gpu_eligible {
+        return false;
+    }
+    let Some(handle) = upload_ffn(kv_b) else {
+        return false;
+    };
+    // SAFETY: handle resident on device 0; ctx/q/latent/rope sized by the dims.
+    let ok = unsafe {
+        cuda::attention_absorb_batch_raw(
+            handle,
+            ctx.as_mut_ptr(),
+            q.as_ptr(),
+            latent.as_ptr(),
+            rope.as_ptr(),
+            s as i32,
+            h as i32,
+            qk_nope as i32,
+            qk_rope as i32,
+            v_head as i32,
+            kv_lora as i32,
+            t as i32,
+            scale,
+        )
+    };
+    if ok {
+        GPU_ATTN.with(|c| c.set(c.get() + 1));
+    }
+    ok
 }
 
 fn weight_ptr(w: &QTensor) -> *const c_void {

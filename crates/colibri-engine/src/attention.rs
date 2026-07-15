@@ -106,12 +106,37 @@ pub fn attention_with(
     let st0 = kv.kv_start[layer];
     let mut ctx = vec![0f32; s_len * h * vh];
 
-    match core {
-        AttnCore::Reconstruct => {
-            reconstruct_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx);
-        }
-        AttnCore::Absorb => {
-            absorb_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx);
+    // GPU weight-absorption attention core for resident kv_b (falls back to CPU).
+    #[cfg(feature = "cuda")]
+    let ran_gpu = {
+        let tk = pos_base + s_len;
+        crate::gpu::try_attention_absorb(
+            &l.kv_b,
+            &mut ctx,
+            &q,
+            kv.latent_rows(layer, st0, tk),
+            kv.krot_rows(layer, st0, tk),
+            s_len,
+            h,
+            qk_nope,
+            r,
+            vh,
+            kvl,
+            tk - st0,
+            cfg.attn_scale,
+        )
+    };
+    #[cfg(not(feature = "cuda"))]
+    let ran_gpu = false;
+
+    if !ran_gpu {
+        match core {
+            AttnCore::Reconstruct => {
+                reconstruct_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx);
+            }
+            AttnCore::Absorb => {
+                absorb_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx);
+            }
         }
     }
 

@@ -180,6 +180,23 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     let budget = ram_budget();
     let provider = colibri_engine::ExpertCache::new(base, budget);
 
+    // Pinned hot-store warm-up (AUTOPIN): read the persistent usage history and
+    // pin the hottest experts (COLI_PIN_GB budget) so they stay resident.
+    let usage_path =
+        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let mut history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
+    let pin_gb: u64 = std::env::var("COLI_PIN_GB").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if pin_gb > 0 && !history.is_empty() {
+        match provider.warm_pin(&history, pin_gb << 30) {
+            Ok(n) => println!(
+                "hot-store: pinned {n} experts from usage history ({} entries, {} selections)",
+                history.len(),
+                history.total()
+            ),
+            Err(e) => eprintln!("coli gen: warm_pin: {e}"),
+        }
+    }
+
     let n_new = envbits("COLI_NGEN", 16) as usize;
     let mut kv = colibri_engine::KvCache::new(
         model.cfg.n_layers as usize,
@@ -194,13 +211,20 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             println!("generated ({} tok): {cont:?}", cont.len());
             let s = provider.stats();
             println!(
-                "expert cache: {} resident ({:.1} MB), {} hits / {} misses, {} evictions",
+                "expert cache: {} resident ({:.1} MB), {} pinned, {} hits / {} misses, {} evictions",
                 s.resident,
                 s.bytes as f64 / (1024.0 * 1024.0),
+                provider.pinned_count(),
                 s.hits,
                 s.misses,
                 s.evictions
             );
+            // Persist this session's selections into the usage history for the
+            // next run's warm-up.
+            history.merge(&provider.usage_snapshot());
+            if let Err(e) = history.save(&usage_path) {
+                eprintln!("coli gen: could not save usage history to {usage_path}: {e}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

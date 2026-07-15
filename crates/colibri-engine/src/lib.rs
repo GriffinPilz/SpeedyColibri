@@ -20,9 +20,11 @@ pub mod model;
 pub mod moe;
 pub mod quantize;
 pub mod sampling;
+pub mod usage;
 
 pub use attention::{attention, attention_with, AttnCore};
 pub use cache::{available_ram_bytes, capacity, CacheStats, ExpertCache};
+pub use usage::UsageHistory;
 pub use colibri_core::Config;
 pub use forward::{forward, generate_greedy, logits};
 pub use linear::{embed_row, matmul_f32, matmul_qt};

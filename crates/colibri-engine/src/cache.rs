@@ -13,6 +13,7 @@
 //! cache is a free L2 for the rest.
 
 use crate::moe::{Expert, ExpertProvider};
+use crate::usage::UsageHistory;
 use colibri_core::tier::lfru_score;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -34,6 +35,8 @@ struct State {
     hits: u64,
     misses: u64,
     evictions: u64,
+    /// per-(layer,eid) selections this session (feeds the persistent history)
+    session_usage: HashMap<(usize, usize), u64>,
 }
 
 /// Cache statistics snapshot.
@@ -72,16 +75,53 @@ impl<P: ExpertProvider> ExpertCache<P> {
                 hits: 0,
                 misses: 0,
                 evictions: 0,
+                session_usage: HashMap::new(),
             }),
         }
     }
 
     /// Pin `(layer, eid)` into the hot-store: once resident it is never evicted.
-    /// Loads it now if absent.
+    /// Loads it now if absent. (Warm-up loads are not counted as usage.)
     pub fn pin(&self, layer: usize, eid: usize) -> io::Result<()> {
-        self.expert(layer, eid)?; // ensure resident
+        self.fetch(layer, eid, false)?; // ensure resident
         self.state.lock().unwrap().pinned.insert((layer, eid));
         Ok(())
+    }
+
+    /// Warm the pinned hot-store from a usage history — the AUTOPIN startup step
+    /// (`pin_load` in `c/glm.c`). Pins the globally hottest experts (by
+    /// cumulative selection count) until `pin_budget_bytes` is reached. Returns
+    /// how many were pinned. Warm-up loads do not count as session usage.
+    pub fn warm_pin(&self, history: &UsageHistory, pin_budget_bytes: u64) -> io::Result<usize> {
+        let mut bytes = 0u64;
+        let mut n = 0usize;
+        for (layer, eid) in history.ranked() {
+            let ex = self.fetch(layer, eid, false)?; // load resident, not a selection
+            let b = ex.bytes();
+            if n > 0 && bytes + b > pin_budget_bytes {
+                break; // budget reached (the just-loaded one stays unpinned/LRU)
+            }
+            self.state.lock().unwrap().pinned.insert((layer, eid));
+            bytes += b;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Snapshot this session's expert selections as a [`UsageHistory`], to merge
+    /// into the persistent `.coli_usage` and save.
+    pub fn usage_snapshot(&self) -> UsageHistory {
+        let s = self.state.lock().unwrap();
+        let mut h = UsageHistory::new();
+        for (&(l, e), &c) in &s.session_usage {
+            h.add(l, e, c);
+        }
+        h
+    }
+
+    /// Number of currently-pinned experts.
+    pub fn pinned_count(&self) -> usize {
+        self.state.lock().unwrap().pinned.len()
     }
 
     /// Current cache statistics.
@@ -124,14 +164,19 @@ impl State {
     }
 }
 
-impl<P: ExpertProvider> ExpertProvider for ExpertCache<P> {
-    fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>> {
+impl<P: ExpertProvider> ExpertCache<P> {
+    /// Core cache access. `record` counts the access as a router selection in the
+    /// session usage (true for real MoE routing, false for warm-up/pin loads).
+    fn fetch(&self, layer: usize, eid: usize, record: bool) -> io::Result<Arc<Expert>> {
         let key = (layer, eid);
         // Fast path: resident hit.
         {
             let mut s = self.state.lock().unwrap();
             s.clock = s.clock.wrapping_add(1);
             let clock = s.clock;
+            if record {
+                *s.session_usage.entry(key).or_insert(0) += 1;
+            }
             if let Some(e) = s.entries.get_mut(&key) {
                 e.heat = e.heat.saturating_add(1);
                 e.last = clock;
@@ -163,6 +208,12 @@ impl<P: ExpertProvider> ExpertProvider for ExpertCache<P> {
         let budget = self.budget;
         s.evict_to(budget);
         Ok(ex)
+    }
+}
+
+impl<P: ExpertProvider> ExpertProvider for ExpertCache<P> {
+    fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>> {
+        self.fetch(layer, eid, true)
     }
 }
 
@@ -318,6 +369,49 @@ mod tests {
         let before = cache.inner.loads.load(Ordering::Relaxed);
         cache.expert(0, 0).unwrap();
         assert_eq!(cache.inner.loads.load(Ordering::Relaxed), before, "pinned reloaded");
+    }
+
+    #[test]
+    fn warm_pin_pins_hottest_within_budget() {
+        // History: expert (0,2) hottest, then (0,1), then (0,0).
+        let mut h = UsageHistory::new();
+        h.add(0, 0, 1);
+        h.add(0, 1, 10);
+        h.add(0, 2, 100);
+        let one = {
+            let c = ExpertCache::new(counting(), u64::MAX);
+            c.expert(0, 0).unwrap().bytes()
+        };
+        let cache = ExpertCache::new(counting(), u64::MAX);
+        // budget for exactly 2 experts -> pin the two hottest: (0,2) and (0,1).
+        let pinned = cache.warm_pin(&h, one * 2).unwrap();
+        assert_eq!(pinned, 2);
+        assert_eq!(cache.pinned_count(), 2);
+        // warm-up loads must NOT count as session usage
+        assert_eq!(cache.usage_snapshot().total(), 0);
+
+        // now churn other experts under a tight budget; the pinned two survive.
+        let cache = ExpertCache::new(counting(), one * 3);
+        cache.warm_pin(&h, one * 2).unwrap(); // pin (0,2),(0,1)
+        for e in 3..8 {
+            cache.expert(0, e).unwrap(); // real selections, evictable
+        }
+        // pinned experts still resident: accessing them is a hit (no reload)
+        let before = cache.inner.loads.load(Ordering::Relaxed);
+        cache.expert(0, 2).unwrap();
+        cache.expert(0, 1).unwrap();
+        assert_eq!(cache.inner.loads.load(Ordering::Relaxed), before, "pinned reloaded");
+    }
+
+    #[test]
+    fn session_usage_tracks_selections() {
+        let cache = ExpertCache::new(counting(), u64::MAX);
+        cache.expert(3, 5).unwrap();
+        cache.expert(3, 5).unwrap();
+        cache.expert(3, 7).unwrap();
+        let u = cache.usage_snapshot();
+        assert_eq!(u.get(3, 5), 2);
+        assert_eq!(u.get(3, 7), 1);
     }
 
     #[test]

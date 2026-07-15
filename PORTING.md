@@ -70,9 +70,16 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
    - ✅ resident expert cache (`cache.rs`): `ExpertCache` keeps loaded experts in
      RAM (returns `Arc<Expert>`), LFRU eviction (`colibri-core::tier`) only when
      over a byte budget, optional pinned hot-store; hit/miss/eviction stats.
-     `coli gen` shows e.g. `32 hits / 2 misses` across decode. `capacity` module
-     + `coli capacity` size residency (GLM-5.2: 18 MB/expert, ~6.2k experts per
-     128 GB Spark ≈ 33%, ~4 nodes to hold all). (CACHE_ROUTE/top-p variants ⬜.)
+     `coli gen` shows e.g. `32 hits / 2 misses` across decode.
+   - ✅ pinned hot-store warm-up / AUTOPIN (`usage.rs` + `cache.warm_pin`): a
+     persistent `.coli_usage` history (C-compatible `layer eid count` format,
+     `UsageHistory`) is loaded at startup and the globally-hottest experts are
+     pinned resident (`COLI_PIN_GB` budget); the session's selections are merged
+     back and saved. Port of `usage_load`/`usage_save`/`pin_load`.
+   - ✅ capacity/KV planning (`capacity` module + `coli capacity <snap> [ram] [ctx]`):
+     18 MB/expert int4; KV = 175.5 KB/token (compressed MLA, 78 layers) so 256K
+     ctx ≈ 44 GB KV. One 128 GB Spark: ~3,980 experts at 256K ctx (~6,000 at ≤47K).
+     (CACHE_ROUTE/top-p routing variants ⬜.)
    - ✅ per-layer forward (`forward.rs`): in_ln → MLA attention → residual →
      post_ln → MoE/dense → residual, then final norm + lm_head; greedy decode
      loop (`generate_greedy`). Runs end-to-end on a synthetic model with routed
@@ -92,7 +99,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 75 tests currently pass.
+- Unit tests per crate (the C behavior is the spec). 81 tests currently pass.
 - **C-vs-Rust harness (`scripts/validate_c_vs_rust.py`, see [VALIDATION.md](VALIDATION.md)):**
   runs both engines on the same tiny synthetic model (real GLM architecture, no
   torch / no 370 GB model) and diffs greedy generation + teacher-forcing at f32

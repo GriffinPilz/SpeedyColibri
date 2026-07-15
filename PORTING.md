@@ -140,9 +140,16 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      the GB10, not memory-bandwidth-bound**; the real win is flash-attention-style
      T-parallelism (more blocks + online softmax + coalescing fixes), which needs
      `ncu` perf-counter access (admin-gated on the shared DGX) to do well.
-   - ⬜ next: VRAM eviction for the full model; end-to-end tok/s on a real-sized
-     model; the flash-attention absorb rewrite; then port kernels FFI→Rust.
-     (Metal deprioritized — not a target.)
+   - ✅ VRAM eviction (`gpu.rs` `GpuFfnCache`): the GPU expert cache is now
+     budget-bounded (LFRU eviction, `colibri-core::tier`), so the full 19k-expert
+     set never exhausts device memory. Budget = `COLI_VRAM_GB` or free VRAM − a
+     dense/working reserve; dense/attention weights stay resident (hot). Eviction
+     protects the active op's tensors (fixed a use-after-free where uploading
+     up/down could evict the gate the same fused FFN still needs). Validated on the
+     GB10: `COLI_VRAM_GB=0` holds exactly the 3-tensor working set, 151 evictions,
+     same tokens; `coli gen` prints resident/budget/evictions.
+   - ⬜ next: end-to-end tok/s on a real-sized model; the flash-attention absorb
+     rewrite; then port kernels FFI→Rust. (Metal deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

@@ -330,12 +330,23 @@ fn finish_gen(
             println!("prompt: {prompt:?}");
             println!("generated ({} tok): {:?}", seq.len() - prompt.len(), &seq[prompt.len()..]);
             #[cfg(feature = "cuda")]
-            println!(
-                "gpu: {} matmuls, {} fused expert FFNs, {} attention cores",
-                colibri_engine::gpu::matmul_count(),
-                colibri_engine::gpu::ffn_count(),
-                colibri_engine::gpu::attn_count()
-            );
+            {
+                println!(
+                    "gpu: {} matmuls, {} fused expert FFNs, {} attention cores",
+                    colibri_engine::gpu::matmul_count(),
+                    colibri_engine::gpu::ffn_count(),
+                    colibri_engine::gpu::attn_count()
+                );
+                let (n, bytes, evict, budget) = colibri_engine::gpu::ffn_cache_stats();
+                let gib = 1u64 << 30;
+                println!(
+                    "gpu vram (experts): {} resident ({:.1} GB / {:.0} GB budget), {} evictions",
+                    n,
+                    bytes as f64 / gib as f64,
+                    budget as f64 / gib as f64,
+                    evict
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

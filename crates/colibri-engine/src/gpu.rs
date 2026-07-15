@@ -11,22 +11,100 @@
 //! and needs no synchronization.
 
 use colibri_backend::cuda::{self, ColiCudaTensor};
+use colibri_core::tier::lfru_score;
 use colibri_core::QTensor;
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::os::raw::c_void;
 
+/// One GPU-resident FFN weight (expert / shared / dense) + LFRU bookkeeping.
+struct GpuEntry {
+    tensor: cuda::ResidentTensor, // frees the device slot on drop
+    bytes: u64,
+    heat: u32,
+    last: u32,
+}
+
+/// Budget-bounded cache of GPU-resident FFN weights, keyed by CPU data pointer.
+/// Evicts the coldest (LFRU) when over the VRAM budget so the full expert set
+/// never exhausts device memory. Hot weights (shared expert, dense MLP — touched
+/// every token) survive; cold routed experts are dropped and re-uploaded on use.
+struct GpuFfnCache {
+    entries: HashMap<usize, GpuEntry>,
+    bytes: u64,
+    budget: u64,
+    clock: u32,
+    evictions: u64,
+}
+
+impl GpuFfnCache {
+    fn new() -> GpuFfnCache {
+        GpuFfnCache {
+            entries: HashMap::new(),
+            bytes: 0,
+            budget: ffn_budget(),
+            clock: 0,
+            evictions: 0,
+        }
+    }
+
+    /// Evict coldest entries until resident bytes are at or under `budget`,
+    /// never evicting a `protect`ed key (the tensors the current op still needs).
+    /// If everything left is protected, it stops (holding the minimum working set
+    /// even if that exceeds the nominal budget).
+    fn evict_to(&mut self, budget: u64, protect: &[usize]) {
+        while self.bytes > budget {
+            let clock = self.clock;
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(k, _)| !protect.contains(k))
+                .min_by_key(|(_, e)| lfru_score(e.heat, e.last, clock))
+                .map(|(&k, _)| k);
+            match victim {
+                Some(k) => {
+                    if let Some(e) = self.entries.remove(&k) {
+                        self.bytes -= e.bytes; // ResidentTensor::drop frees the VRAM
+                        self.evictions += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// GPU-resident expert VRAM budget: `COLI_VRAM_GB` if set, else free device
+/// memory minus a reserve for the dense weights + working buffers.
+fn ffn_budget() -> u64 {
+    if let Ok(gb) = std::env::var("COLI_VRAM_GB") {
+        if let Ok(g) = gb.parse::<u64>() {
+            return g << 30;
+        }
+    }
+    match cuda::mem_info(0) {
+        Some((free, _total)) => (free as u64).saturating_sub(14u64 << 30), // ~dense+working reserve
+        None => u64::MAX,
+    }
+}
+
 thread_local! {
     static AVAIL: OnceCell<bool> = const { OnceCell::new() };
     static RESIDENT: RefCell<HashMap<usize, *mut ColiCudaTensor>> =
         RefCell::new(HashMap::new());
-    // resident device copies for the fused expert FFN, keyed by weight data ptr;
-    // ResidentTensor frees the device slot on drop.
-    static RESIDENT_FFN: RefCell<HashMap<usize, cuda::ResidentTensor>> =
-        RefCell::new(HashMap::new());
+    // budget-bounded GPU FFN cache (experts + shared + dense MLP)
+    static RESIDENT_FFN: RefCell<GpuFfnCache> = RefCell::new(GpuFfnCache::new());
     static GPU_MATMULS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_FFN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_ATTN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// GPU FFN cache stats: `(resident_count, resident_bytes, evictions, budget)`.
+pub fn ffn_cache_stats() -> (usize, u64, u64, u64) {
+    RESIDENT_FFN.with(|r| {
+        let c = r.borrow();
+        (c.entries.len(), c.bytes, c.evictions, c.budget)
+    })
 }
 
 /// Whether a CUDA device is usable (probed once; honors `COLI_CUDA=0`).
@@ -160,7 +238,7 @@ pub fn try_attention_absorb_kvdev(
     if !available() || !kv_b.gpu_eligible {
         return false;
     }
-    let Some(handle) = upload_ffn(kv_b) else {
+    let Some(handle) = upload_ffn(kv_b, &[]) else {
         return false;
     };
     // SAFETY: handle resident; latent/rope device pointers valid for [T,K]/[T,R];
@@ -209,7 +287,7 @@ pub fn try_attention_absorb(
     if !available() || !kv_b.gpu_eligible {
         return false;
     }
-    let Some(handle) = upload_ffn(kv_b) else {
+    let Some(handle) = upload_ffn(kv_b, &[]) else {
         return false;
     };
     // SAFETY: handle resident on device 0; ctx/q/latent/rope sized by the dims.
@@ -244,22 +322,42 @@ fn weight_ptr(w: &QTensor) -> *const c_void {
     }
 }
 
-/// Upload `w` to the GPU (once) and return its resident handle. Caches by data
-/// pointer; only for `gpu_eligible` weights.
-fn upload_ffn(w: &QTensor) -> Option<*mut ColiCudaTensor> {
+/// Upload `w` to the GPU (once) and return its resident handle, caching by data
+/// pointer under the VRAM budget. `protect` lists the current op's other tensor
+/// keys so eviction never drops a tensor still needed this op. Only for
+/// `gpu_eligible` weights.
+fn upload_ffn(w: &QTensor, protect: &[usize]) -> Option<*mut ColiCudaTensor> {
     let key = weight_ptr(w) as usize;
     RESIDENT_FFN.with(|r| {
-        let mut map = r.borrow_mut();
-        if let Some(rt) = map.get(&key) {
-            return Some(rt.as_raw());
+        let mut c = r.borrow_mut();
+        c.clock = c.clock.wrapping_add(1);
+        let clock = c.clock;
+        if let Some(e) = c.entries.get_mut(&key) {
+            e.heat = e.heat.saturating_add(1);
+            e.last = clock;
+            return Some(e.tensor.as_raw());
         }
+        // Miss: make room (estimate from the CPU size), protecting this op's other
+        // tensors, then upload + insert.
+        let budget = c.budget;
+        c.evict_to(budget.saturating_sub(w.bytes() as u64), protect);
         // SAFETY: weight_ptr/scales point at the live QTensor buffers, sized by
         // the tensor's [O,I]/fmt.
         let rt = unsafe {
             cuda::ResidentTensor::upload_raw(weight_ptr(w), w.s.as_ptr(), w.fmt_code, w.i, w.o, 0)
         }?;
         let raw = rt.as_raw();
-        map.insert(key, rt);
+        let bytes = rt.bytes() as u64; // actual device bytes
+        c.bytes += bytes;
+        c.entries.insert(
+            key,
+            GpuEntry {
+                tensor: rt,
+                bytes,
+                heat: 1,
+                last: clock,
+            },
+        );
         Some(raw)
     })
 }
@@ -277,7 +375,17 @@ pub fn try_expert_ffn(
     if !available() || !gate.gpu_eligible || !up.gpu_eligible || !down.gpu_eligible {
         return false;
     }
-    let (Some(g), Some(u), Some(d)) = (upload_ffn(gate), upload_ffn(up), upload_ffn(down)) else {
+    // all three must stay resident together for the fused kernel — protect them
+    let keys = [
+        weight_ptr(gate) as usize,
+        weight_ptr(up) as usize,
+        weight_ptr(down) as usize,
+    ];
+    let (Some(g), Some(u), Some(d)) = (
+        upload_ffn(gate, &keys),
+        upload_ffn(up, &keys),
+        upload_ffn(down, &keys),
+    ) else {
         return false;
     };
     // SAFETY: handles are resident on device 0; out/x sized [nr, O]/[nr, I] by ffn().

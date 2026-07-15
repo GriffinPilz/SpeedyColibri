@@ -130,9 +130,19 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      memcpy (~57 GB/s), so this is only ~1.07× vs re-uploading — the attention
      *kernel* dominates decode here, not KV transfer. (Would matter more on a
      discrete PCIe GPU.)
-   - ⬜ next: VRAM eviction for the full model, end-to-end tok/s on a real-sized
-     model, and profiling the attention kernel (the actual decode bottleneck);
-     then port kernels from FFI to Rust. (Metal deprioritized — not a target.)
+   - 🟡 attention-kernel profiling (the decode bottleneck, ~2.5 ms/core at T=4096):
+     source analysis — the absorb kernel launches one block per (head, query), 64
+     blocks × 256 threads for decode (~12% occupancy). Bumped to 1024 threads
+     (`ATTN_TPB`, all 5 absorb launches) → ~2% (occupancy wasn't the main limit).
+     A multi-head-per-block variant (read the shared latent once, reuse across G
+     heads) was **correct but ~1.5× slower** — halving the block count hurt more
+     than the redundant reads. **Finding: the kernel is parallelism-sensitive on
+     the GB10, not memory-bandwidth-bound**; the real win is flash-attention-style
+     T-parallelism (more blocks + online softmax + coalescing fixes), which needs
+     `ncu` perf-counter access (admin-gated on the shared DGX) to do well.
+   - ⬜ next: VRAM eviction for the full model; end-to-end tok/s on a real-sized
+     model; the flash-attention absorb rewrite; then port kernels FFI→Rust.
+     (Metal deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

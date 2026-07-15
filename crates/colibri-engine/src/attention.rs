@@ -391,7 +391,10 @@ mod tests {
         let mut dev = crate::gpu::DeviceKv::new(1, t);
         let (lat_dev, rope_dev) = dev.sync(0, &latent, &rope, kvl, r, 0, t).unwrap();
 
-        let iters = 500u64;
+        let iters: u64 = std::env::var("COLI_BENCH_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
         let tm = std::time::Instant::now();
         for _ in 0..iters {
             crate::gpu::try_attention_absorb(&l.kv_b, &mut cg, &q, &latent, &rope, 1, h, qk_nope, r, vh, kvl, t, scale);

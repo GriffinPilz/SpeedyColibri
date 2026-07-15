@@ -141,14 +141,21 @@ impl<P: ExpertProvider> ExpertCache<P> {
 impl State {
     /// Evict coldest unpinned experts until at or under `budget`.
     fn evict_to(&mut self, budget: u64) {
+        self.evict_to_protecting(budget, &HashSet::new());
+    }
+
+    /// Like [`State::evict_to`] but never evicts a key in `protect` — used when
+    /// bulk-inserting a layer's freshly-loaded batch, so the just-loaded experts
+    /// (heat = 1, so "cold" to LFRU) survive to the compute loop instead of being
+    /// evicted by their own batch and reloaded.
+    fn evict_to_protecting(&mut self, budget: u64, protect: &HashSet<(usize, usize)>) {
         while self.bytes > budget {
             let clock = self.clock;
             let pinned = &self.pinned;
-            // coldest unpinned entry by LFRU score
             let victim = self
                 .entries
                 .iter()
-                .filter(|(k, _)| !pinned.contains(*k))
+                .filter(|(k, _)| !pinned.contains(*k) && !protect.contains(*k))
                 .min_by_key(|(_, e)| lfru_score(e.heat, e.last, clock))
                 .map(|(k, _)| *k);
             match victim {
@@ -158,7 +165,7 @@ impl State {
                         self.evictions += 1;
                     }
                 }
-                None => break, // everything left is pinned
+                None => break, // everything left is pinned or protected
             }
         }
     }
@@ -211,9 +218,71 @@ impl<P: ExpertProvider> ExpertCache<P> {
     }
 }
 
-impl<P: ExpertProvider> ExpertProvider for ExpertCache<P> {
+impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
     fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>> {
         self.fetch(layer, eid, true)
+    }
+
+    /// Parallel disk→RAM for a layer's experts — the decode bottleneck once
+    /// compute is on the GPU. Reads the not-yet-resident experts across cores
+    /// **without touching the cache** (concurrent cache mutation corrupts the LFRU
+    /// recency and thrashes), then inserts the whole batch under one lock and
+    /// evicts once while protecting the batch. Preloads aren't router selections;
+    /// the compute loop's `expert` call then hits and records the selection.
+    fn prefetch(&self, layer: usize, eids: &[usize]) -> io::Result<()> {
+        let missing: Vec<usize> = {
+            let s = self.state.lock().unwrap();
+            eids.iter()
+                .copied()
+                .filter(|&e| !s.entries.contains_key(&(layer, e)))
+                .collect()
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // `COLI_LOAD_THREADS` overrides the worker count (1 = serial baseline).
+        let max_threads = std::env::var("COLI_LOAD_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(crate::preload::default_num_files)
+            .max(1);
+        let nthreads = max_threads.clamp(1, missing.len());
+
+        // Parallel I/O only: load expert data off the cache lock. `inner.expert`
+        // reads from disk (or the remote transport); no shared cache state touched.
+        let per = missing.len().div_ceil(nthreads);
+        let loaded: Vec<(usize, Arc<Expert>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = missing
+                .chunks(per)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .filter_map(|&e| self.inner.expert(layer, e).ok().map(|ex| (e, ex)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+
+        // Serial bookkeeping: insert the batch, then a single protected eviction.
+        let batch: HashSet<(usize, usize)> = missing.iter().map(|&e| (layer, e)).collect();
+        let mut s = self.state.lock().unwrap();
+        let clock = s.clock;
+        for (e, ex) in loaded {
+            let key = (layer, e);
+            if s.entries.contains_key(&key) {
+                continue;
+            }
+            let bytes = ex.bytes();
+            s.entries.insert(key, Entry { expert: ex, bytes, heat: 1, last: clock });
+            s.bytes += bytes;
+            s.misses += 1;
+        }
+        let budget = self.budget;
+        s.evict_to_protecting(budget, &batch);
+        Ok(())
     }
 }
 

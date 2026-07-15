@@ -58,6 +58,14 @@ impl Expert {
 /// hand out shared references without copying ~19 MB of weights per token.
 pub trait ExpertProvider {
     fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>>;
+
+    /// Preload `eids` for `layer` into RAM ahead of use. A resident cache reads
+    /// the missing ones **in parallel** (disk→RAM is the decode bottleneck once
+    /// compute is on the GPU); the default is a no-op for cacheless providers,
+    /// which load lazily in [`ExpertProvider::expert`].
+    fn prefetch(&self, _layer: usize, _eids: &[usize]) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Loads experts from local safetensors shards, honoring `colibri-cluster`
@@ -296,6 +304,10 @@ pub fn moe<P: ExpertProvider>(
         }
     }
 
+    // Fetch this layer's experts disk→RAM in parallel before computing. Serial
+    // per-expert loading is otherwise the decode bottleneck (~74% of MoE time).
+    provider.prefetch(layer, &uniq)?;
+
     // ---- apply each unique expert to the positions that route to it -------
     for &e in &uniq {
         let mut rows = Vec::new();
@@ -314,7 +326,15 @@ pub fn moe<P: ExpertProvider>(
         for (r, &s) in rows.iter().enumerate() {
             xg[r * d..(r + 1) * d].copy_from_slice(&x[s * d..(s + 1) * d]);
         }
-        let ex = provider.expert(layer, e)?;
+        let ex = if crate::forward::profile_on() {
+            let t = std::time::Instant::now();
+            let ex = provider.expert(layer, e)?;
+            crate::forward::LOAD_US
+                .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            ex
+        } else {
+            provider.expert(layer, e)?
+        };
         let mut hh = vec![0f32; nr * d];
         ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
         for (r, &s) in rows.iter().enumerate() {

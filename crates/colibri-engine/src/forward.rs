@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 
 /// COLI_PROFILE=1 accumulates per-section wall time (microseconds) across the
 /// forward pass so `generate_greedy` can print a breakdown. Off by default.
-fn profile_on() -> bool {
+pub(crate) fn profile_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_PROFILE").ok().as_deref() == Some("1"))
 }
@@ -26,6 +26,9 @@ static ATTN_US: AtomicU64 = AtomicU64::new(0);
 static MOE_US: AtomicU64 = AtomicU64::new(0);
 static DENSE_US: AtomicU64 = AtomicU64::new(0);
 static EMBED_US: AtomicU64 = AtomicU64::new(0);
+/// Time spent fetching experts through the provider (disk→RAM on a cache miss).
+/// A sub-total of `MOE_US`. Incremented from `moe`.
+pub(crate) static LOAD_US: AtomicU64 = AtomicU64::new(0);
 
 /// Time `f` into `acc` when profiling is enabled (else just run it).
 #[inline]
@@ -186,9 +189,10 @@ pub fn generate_greedy<P: ExpertProvider>(
         // Totals across prefill + all decode steps (microseconds -> ms).
         let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e3;
         eprintln!(
-            "[profile] totals: attn {:.0} ms | moe {:.0} ms | dense {:.0} ms | embed {:.0} ms | logits {:.0} ms",
+            "[profile] totals: attn {:.0} ms | moe {:.0} ms (of which expert-load {:.0} ms) | dense {:.0} ms | embed {:.0} ms | logits {:.0} ms",
             ms(&ATTN_US),
             ms(&MOE_US),
+            ms(&LOAD_US),
             ms(&DENSE_US),
             ms(&EMBED_US),
             logits_us as f64 / 1e3,

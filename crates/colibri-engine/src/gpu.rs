@@ -97,11 +97,6 @@ thread_local! {
         RefCell::new(HashMap::new());
     // budget-bounded GPU FFN cache (experts + shared + dense MLP), copy path
     static RESIDENT_FFN: RefCell<GpuFfnCache> = RefCell::new(GpuFfnCache::new());
-    // Zero-copy FFN descriptors on unified memory: each just points at the RAM
-    // QTensor, so there is no device memory to budget or evict. Keyed by CPU
-    // weight pointer; the `ResidentTensor` frees only the tiny descriptor on drop.
-    static WRAPPED_FFN: RefCell<HashMap<usize, cuda::ResidentTensor>> =
-        RefCell::new(HashMap::new());
     static GPU_MATMULS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_FFN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_ATTN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -259,7 +254,7 @@ pub fn try_attention_absorb_kvdev(
     if !available() || !kv_b.gpu_eligible {
         return false;
     }
-    let Some(handle) = upload_ffn(kv_b, &[], false) else {
+    let Some(handle) = upload_ffn(kv_b, &[]) else {
         return false;
     };
     // SAFETY: handle resident; latent/rope device pointers valid for [T,K]/[T,R];
@@ -308,7 +303,7 @@ pub fn try_attention_absorb(
     if !available() || !kv_b.gpu_eligible {
         return false;
     }
-    let Some(handle) = upload_ffn(kv_b, &[], false) else {
+    let Some(handle) = upload_ffn(kv_b, &[]) else {
         return false;
     };
     // SAFETY: handle resident on device 0; ctx/q/latent/rope sized by the dims.
@@ -343,42 +338,27 @@ fn weight_ptr(w: &QTensor) -> *const c_void {
     }
 }
 
-/// Zero-copy wrap of `w` on unified memory: cache a descriptor pointing at the
-/// live RAM buffers (no device allocation, no eviction, no budget). Keyed by CPU
-/// data pointer so repeated tokens reuse the descriptor.
-fn wrap_ffn(w: &QTensor) -> Option<*mut ColiCudaTensor> {
-    let key = weight_ptr(w) as usize;
-    WRAPPED_FFN.with(|r| {
-        let mut m = r.borrow_mut();
-        if let Some(rt) = m.get(&key) {
-            return Some(rt.as_raw());
-        }
-        // SAFETY: weight_ptr/scales point at the live QTensor buffers (owned by the
-        // Arc<Expert> in the resident cache), sized by [O,I]/fmt; int4 stays
-        // offset-binary (the kernel reads it with off=1). Only called when
-        // `zerocopy()` (device supports pageable host access).
-        let rt = unsafe {
-            cuda::ResidentTensor::wrap_raw(weight_ptr(w), w.s.as_ptr(), w.fmt_code, w.i, w.o, 0)
-        }?;
-        let raw = rt.as_raw();
-        m.insert(key, rt);
-        Some(raw)
-    })
+/// Zero-copy wrap of `w`: a **fresh, owned** descriptor pointing at the live RAM
+/// buffers (no device allocation, no cache). The caller holds it for the duration
+/// of one kernel call and drops it after. Crucially *not* cached by pointer — an
+/// expert can be evicted (its RAM freed) and its address reused by another expert,
+/// so a pointer-keyed descriptor cache would hand the kernel stale memory. Wrapping
+/// is ~free (a `calloc` + storing pointers), so per-call is fine.
+///
+/// # Safety
+/// `weight_ptr(w)`/`w.s` must stay valid until the returned tensor is dropped —
+/// true while the caller holds the `Arc<Expert>` across the kernel call. int4 stays
+/// offset-binary (the kernel reads it with off=1). Only valid when `zerocopy()`.
+fn wrap_fresh(w: &QTensor) -> Option<cuda::ResidentTensor> {
+    unsafe { cuda::ResidentTensor::wrap_raw(weight_ptr(w), w.s.as_ptr(), w.fmt_code, w.i, w.o, 0) }
 }
 
-/// Upload `w` to the GPU (once) and return its resident handle. When `zc` and the
-/// device supports it, this wraps the RAM copy in place (zero-copy, offset-binary
-/// int4); otherwise it copies to device memory (converting int4 to signed),
-/// caching by data pointer under the VRAM budget. `protect` lists the current op's
-/// other tensor keys so eviction never drops a tensor still needed this op.
-///
-/// `zc` must be **false** for weights whose kernel reads int4 with the signed
-/// interpretation (the attention absorb kernels): those have no offset-binary path,
-/// so they need the converted device copy. Expert/MLP FFN kernels pass `zc=true`.
-fn upload_ffn(w: &QTensor, protect: &[usize], zc: bool) -> Option<*mut ColiCudaTensor> {
-    if zc && zerocopy() {
-        return wrap_ffn(w);
-    }
+/// Upload `w` to the GPU (once) and return its resident handle, caching by data
+/// pointer under the VRAM budget (the copy path — device copy with int4 converted
+/// to signed). `protect` lists the current op's other tensor keys so eviction never
+/// drops a tensor still needed this op. The zero-copy path uses [`wrap_fresh`]
+/// instead; this is only reached when zero-copy is unavailable/disabled.
+fn upload_ffn(w: &QTensor, protect: &[usize]) -> Option<*mut ColiCudaTensor> {
     let key = weight_ptr(w) as usize;
     RESIDENT_FFN.with(|r| {
         let mut c = r.borrow_mut();
@@ -427,17 +407,33 @@ pub fn try_expert_ffn(
     if !available() || !gate.gpu_eligible || !up.gpu_eligible || !down.gpu_eligible {
         return false;
     }
-    // all three must stay resident together for the fused kernel — protect them
+    if zerocopy() {
+        // Fresh, owned descriptors held only for this call — see `wrap_fresh`. Safe
+        // under cache eviction (no stale pointer-keyed descriptors).
+        let (Some(g), Some(u), Some(d)) = (wrap_fresh(gate), wrap_fresh(up), wrap_fresh(down))
+        else {
+            return false;
+        };
+        // SAFETY: g/u/d live until end of scope, covering the synchronous kernel +
+        // download in expert_mlp_raw; out/x sized [nr, O]/[nr, I] by ffn().
+        let ok = unsafe {
+            cuda::expert_mlp_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        };
+        if ok {
+            GPU_FFN.with(|c| c.set(c.get() + 1));
+        }
+        return ok;
+    }
+    // Copy path: cached device uploads. all three must stay resident together for
+    // the fused kernel — protect them from eviction.
     let keys = [
         weight_ptr(gate) as usize,
         weight_ptr(up) as usize,
         weight_ptr(down) as usize,
     ];
-    let (Some(g), Some(u), Some(d)) = (
-        upload_ffn(gate, &keys, true),
-        upload_ffn(up, &keys, true),
-        upload_ffn(down, &keys, true),
-    ) else {
+    let (Some(g), Some(u), Some(d)) =
+        (upload_ffn(gate, &keys), upload_ffn(up, &keys), upload_ffn(down, &keys))
+    else {
         return false;
     };
     // SAFETY: handles are resident on device 0; out/x sized [nr, O]/[nr, I] by ffn().

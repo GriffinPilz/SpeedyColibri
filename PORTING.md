@@ -29,7 +29,7 @@ ships with unit tests; the C code is the oracle.
 | `colibri-tokenizer` | `c/tok.h`, `c/tok_unicode.h` | ✅ ported + tested |
 | `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 scalar reference + `qrow_i8`-exact activation quant; SIMD pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
-| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 primitives + dense weight-loader driver done (`load_model`); attention+MoE assembly next |
+| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 primitives + loader + MLA attention (both cores, compressed KV) done; MoE block + decode loop next |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; CUDA primary (stub), Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load work; chat/serve pending |
@@ -59,7 +59,10 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      + per-layer attention & dense-MLP / shared-expert / router by GLM tensor name,
      detects DSA/MTP; tested end-to-end on a synthetic tiny model. (Expert LRU
      sizing still ⬜ — experts stream at forward time.)
-   - ⬜ MLA attention with weight absorption + compressed KV-cache
+   - ✅ MLA attention (`attention.rs`) with compressed KV-cache (`KvCache`) — both
+     the reconstruction reference and the DeepSeek weight-absorption decode core;
+     tested that the two agree, and that batched prefill == step-by-step decode.
+     (DSA sparse-indexer top-k selection still ⬜ — this is the dense path.)
    - ⬜ MoE block (sigmoid router / noaux_tc, shared expert, streaming experts) —
      route each expert through `colibri-cluster` (`is_local`/`owner`) so the
      single-node path and the future split share one code path
@@ -77,7 +80,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 63 tests currently pass.
+- Unit tests per crate (the C behavior is the spec). 66 tests currently pass.
 - Byte-exactness: the C engine validates token-exact against a `transformers`
   oracle (TF 32/32, greedy 20/20). The Rust engine must reproduce the C engine's
   greedy stream under `DRAFT=0 IDOT=0 COLI_CUDA=0`.

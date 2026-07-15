@@ -40,6 +40,7 @@ dependencies = [
  "colibri-cluster",
  "colibri-core",
  "colibri-grammar",
+ "colibri-json",
  "colibri-kernels",
  "colibri-safetensors",
  "colibri-tokenizer",

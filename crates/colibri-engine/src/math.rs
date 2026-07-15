@@ -19,6 +19,39 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
     }
 }
 
+/// In-place RMSNorm: `x[i] = x[i] * w[i] / sqrt(mean(x^2) + eps)`.
+pub fn rmsnorm_inplace(x: &mut [f32], w: &[f32], eps: f32) {
+    let d = x.len();
+    debug_assert_eq!(w.len(), d);
+    let mut ms = 0f64;
+    for &v in x.iter() {
+        ms += v as f64 * v as f64;
+    }
+    let r = 1.0 / ((ms / d as f64) as f32 + eps).sqrt();
+    for k in 0..d {
+        x[k] = x[k] * r * w[k];
+    }
+}
+
+/// Plain softmax in place (max-subtract for stability). Port of the `softmax`
+/// used by attention scores in `c/glm.c`.
+pub fn softmax(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let m = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut s = 0f32;
+    for v in x.iter_mut() {
+        *v = (*v - m).exp();
+        s += *v;
+    }
+    if s > 0.0 {
+        for v in x.iter_mut() {
+            *v /= s;
+        }
+    }
+}
+
 /// Classic LayerNorm (mean+variance, weight+bias), in place. Used by the DSA
 /// indexer's `k_norm`. Port of `layernorm`.
 pub fn layernorm(v: &mut [f32], w: &[f32], b: &[f32], eps: f32) {

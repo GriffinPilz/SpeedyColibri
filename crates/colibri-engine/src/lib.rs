@@ -10,6 +10,7 @@
 //! KV-cache, and generation loop are scaffolded with faithful signatures and
 //! are the active porting front — see PORTING.md for the milestone order.
 
+pub mod attention;
 pub mod linear;
 pub mod loader;
 pub mod math;
@@ -17,11 +18,12 @@ pub mod model;
 pub mod quantize;
 pub mod sampling;
 
+pub use attention::{attention, attention_with, AttnCore};
 pub use colibri_core::Config;
 pub use linear::{embed_row, matmul_qt};
 pub use loader::{ld, qt_load};
-pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu};
-pub use model::{KvState, Layer, Model};
+pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
+pub use model::{KvCache, Layer, Model};
 pub use quantize::qtensor_from_f32;
 pub use sampling::{argmax, sample_top_p, SampleConfig};
 

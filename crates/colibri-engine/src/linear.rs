@@ -103,6 +103,66 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     acc
 }
 
+/// Dequantize one row `row` of a [`QTensor`] `[O, I]` into a fresh `Vec<f32>` of
+/// length `I`. Backs the weight-absorption attention helpers (`qt_addrow`,
+/// `qt_matvec_rows`). Allocation-per-call is fine for the reference path.
+pub fn qt_row_dequant(w: &QTensor, row: usize) -> Vec<f32> {
+    let i = w.i as usize;
+    let mut out = vec![0f32; i];
+    match w.fmt_code {
+        0 => out.copy_from_slice(&w.qf[row * i..(row + 1) * i]),
+        1 => {
+            let q = &w.q8[row * i..(row + 1) * i];
+            let s = w.s[row];
+            for (dst, &c) in out.iter_mut().zip(q) {
+                *dst = c as f32 * s;
+            }
+        }
+        2 => {
+            let rb = (i + 1) / 2;
+            let q = &w.q4[row * rb..(row + 1) * rb];
+            let s = w.s[row];
+            let mut k = 0;
+            while k < i {
+                let byte = q[k >> 1];
+                out[k] = ((byte & 0x0F) as i32 - 8) as f32 * s;
+                if k + 1 < i {
+                    out[k + 1] = ((byte >> 4) as i32 - 8) as f32 * s;
+                }
+                k += 2;
+            }
+        }
+        3 => {
+            let rb = (i + 3) / 4;
+            let q = &w.q4[row * rb..(row + 1) * rb];
+            let s = w.s[row];
+            for (k, dst) in out.iter_mut().enumerate() {
+                let byte = q[k >> 2];
+                let sh = (k & 3) * 2;
+                *dst = (((byte >> sh) & 3) as i32 - 2) as f32 * s;
+            }
+        }
+        other => panic!("qt_row_dequant: unknown format {other}"),
+    }
+    out
+}
+
+/// `acc += scale * W[row, :]` (dequantized). Port of `qt_addrow`.
+pub fn qt_addrow(w: &QTensor, row: usize, scale: f32, acc: &mut [f32]) {
+    let r = qt_row_dequant(w, row);
+    for (a, v) in acc.iter_mut().zip(&r) {
+        *a += scale * v;
+    }
+}
+
+/// `out[d] = W[row0 + d, :] · vec` for `d in 0..nrows`. Port of `qt_matvec_rows`.
+pub fn qt_matvec_rows(w: &QTensor, row0: usize, nrows: usize, vec: &[f32], out: &mut [f32]) {
+    for d in 0..nrows {
+        let r = qt_row_dequant(w, row0 + d);
+        out[d] = dot_f32(&r, vec);
+    }
+}
+
 /// Dequantize one row `tok` of an embedding [`QTensor`] `[vocab, D]` into `out`.
 /// Port of `embed_row`.
 pub fn embed_row(embed: &QTensor, tok: usize, out: &mut [f32]) {

@@ -105,10 +105,16 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      the GPU (130.7 GB VRAM), and a GPU matmul smoke test (`cargo test -p
      colibri-backend --features cuda`) passes. build.rs skips nvcc gracefully on
      non-CUDA hosts.
-   - ⬜ wire into the forward pass: upload resident dense + hot experts on load,
-     route `matmul_qt` / expert FFN to the GPU with CPU fallback; validate on
-     hardware against the C-vs-Rust harness. Then port kernels from FFI to Rust.
-   (Metal is deprioritized — not a deployment target.)
+   - ✅ wired into the forward pass (`colibri-engine/src/gpu.rs`, feature `cuda`):
+     `matmul_qt` routes GPU-eligible (resident) weights — dense + preloaded
+     experts (`QTensor.gpu_eligible`) — to `coli_cuda_matmul` (upload-once, reuse
+     by data-pointer slot), CPU fallback otherwise. **Validated on the GB10**:
+     `COLI_PRELOAD=1 coli gen` runs matmuls on the GPU and produces the SAME
+     tokens as the CPU path. **Measured 17.9–18.6× vs 1-core CPU-NEON** on an
+     int4 `[8192,6144]` matmul (429–448 vs 24 GFLOP/s).
+   - ⬜ next: expert-FFN fusion (`coli_cuda_expert_mlp`), GPU attention absorb,
+     VRAM eviction for the full model, end-to-end tok/s on a real-sized model;
+     then port kernels from FFI to Rust. (Metal deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

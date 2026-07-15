@@ -110,12 +110,14 @@ coli backend            # -> "backend: cuda (Cuda(0))" + per-device free/total m
 surface (`coli_cuda_init` / `mem_info` / `tensor_upload` / `matmul` /
 `expert_mlp` / lifecycle) builds, links, initializes the GPU (130.7 GB VRAM), and
 a GPU matmul smoke test passes (`cargo test -p colibri-backend --features cuda`).
-`coli backend` reports the GB10. It is **not yet wired into the forward pass** —
-the next step is to upload the resident dense weights + hot experts on load and
-route `matmul_qt` / the expert FFN to `coli_cuda_matmul` / `coli_cuda_expert_mlp`,
-falling back to CPU. That integration must be built and validated **on real GPU
-hardware** (it can't be compiled or run without `nvcc` + an NVIDIA device), then
-checked against the C-vs-Rust harness the same way the CPU path was.
+`coli backend` reports the GB10. The forward pass is **wired to the GPU**:
+`matmul_qt` routes resident weights (dense + preloaded experts) to
+`coli_cuda_matmul`, CPU fallback otherwise. Validated on the GB10 —
+`COLI_PRELOAD=1 coli gen` runs matmuls on the GPU with output identical to the CPU
+path, and an int4 `[8192,6144]` matmul measured **~18× faster** than one Grace
+core (429–448 vs 24 GFLOP/s). Still to do: fuse the expert FFN
+(`coli_cuda_expert_mlp`), GPU attention absorb, and VRAM eviction for the full
+model.
 
 ## Fast cold-start: parallel preload
 

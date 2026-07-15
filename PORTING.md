@@ -112,9 +112,14 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      `COLI_PRELOAD=1 coli gen` runs matmuls on the GPU and produces the SAME
      tokens as the CPU path. **Measured 17.9–18.6× vs 1-core CPU-NEON** on an
      int4 `[8192,6144]` matmul (429–448 vs 24 GFLOP/s).
-   - ⬜ next: expert-FFN fusion (`coli_cuda_expert_mlp`), GPU attention absorb,
-     VRAM eviction for the full model, end-to-end tok/s on a real-sized model;
-     then port kernels from FFI to Rust. (Metal deprioritized — not a target.)
+   - ✅ fused expert FFN (`coli_cuda_expert_mlp`): `moe::ffn` routes resident
+     experts / shared / dense MLP to one on-device `down(silu(gate·x)⊙up·x)` call
+     (one upload+download vs 3 GEMMs). Validated on the GB10 (same tokens as CPU;
+     `36 fused FFNs` replaced ~108 matmuls). **Measured 19.2×** vs 1-core CPU-NEON
+     at hidden 6144 / moe_inter 2048 (165 µs vs 3171 µs per expert).
+   - ⬜ next: GPU attention absorb (`coli_cuda_attention_*`), VRAM eviction for the
+     full model, end-to-end tok/s on a real-sized model; then port kernels from
+     FFI to Rust. (Metal deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

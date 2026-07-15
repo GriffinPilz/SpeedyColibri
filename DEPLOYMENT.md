@@ -115,9 +115,11 @@ a GPU matmul smoke test passes (`cargo test -p colibri-backend --features cuda`)
 `coli_cuda_matmul`, CPU fallback otherwise. Validated on the GB10 —
 `COLI_PRELOAD=1 coli gen` runs matmuls on the GPU with output identical to the CPU
 path, and an int4 `[8192,6144]` matmul measured **~18× faster** than one Grace
-core (429–448 vs 24 GFLOP/s). Still to do: fuse the expert FFN
-(`coli_cuda_expert_mlp`), GPU attention absorb, and VRAM eviction for the full
-model.
+core (429–448 vs 24 GFLOP/s). The expert / shared / dense FFN is **fused** onto
+the GPU (`coli_cuda_expert_mlp`, one on-device `down(silu(gate·x)⊙up·x)`) —
+measured **19.2×** vs one Grace core (165 µs vs 3171 µs per expert at hidden 6144
+/ moe_inter 2048). Still to do: GPU attention absorb and VRAM eviction for the
+full model.
 
 ## Fast cold-start: parallel preload
 

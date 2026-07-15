@@ -1,21 +1,26 @@
 # SpeedyColibri container for NVIDIA DGX Spark (GB10 Grace Blackwell, aarch64).
 #
-# Two stages on a matched Ubuntu 24.04 / CUDA base so glibc lines up and nvcc is
-# available for the CUDA backend when it lands:
-#   - builder: CUDA -devel + rustup, compiles the Rust workspace
-#   - runtime: CUDA -runtime + just the `coli` binary
+# Two stages on a matched Ubuntu 24.04 / CUDA base so glibc lines up:
+#   - builder: CUDA -devel + rustup, compiles `coli` with the CUDA backend (nvcc)
+#   - runtime: CUDA -runtime + the `coli` binary + the `hf` downloader CLI
 #
-# The 744B model is NOT baked into the image — mount the snapshot as a volume at
-# run time (see docker/README and DEPLOYMENT.md). The engine streams experts from
-# that mount.
+# The 744B model is NOT baked into the image. At run time the entrypoint resolves
+# it in this order (see docker/entrypoint.sh):
+#   1. a snapshot mounted at /model,
+#   2. the Hugging Face cache (mount the host's ~/.cache/huggingface),
+#   3. download from the Hub — pass an HF token as the first argument (hf_...)
+#      or via HF_TOKEN / HUGGING_FACE_HUB_TOKEN in the environment.
 #
 # Build (on/for aarch64):
 #   docker build -f docker/Dockerfile -t speedycolibri:latest .
-# Run (single node, GPU + model mount):
+# Run on a DGX Spark host (GPU passthrough + HF cache handled for you):
+#   docker/run-dgx.sh [hf_TOKEN] gen 100 200 300
+# Or by hand:
 #   docker run --rm -it --gpus all \
-#     -v /data/glm52-int4:/model:ro speedycolibri:latest config /model
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     -e HF_TOKEN speedycolibri:latest gen 100 200 300
 
-ARG CUDA_TAG=12.8.0
+ARG CUDA_TAG=13.0.1
 ARG UBUNTU=ubuntu24.04
 
 # ---- builder ---------------------------------------------------------------
@@ -37,11 +42,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 COPY . .
 
-# Build the `coli` release binary. Set CUDA_FEATURE=1 to compile the CUDA
-# (Blackwell) backend via nvcc from this -devel base; CUDA_ARCH=sm_121 for GB10.
-#   docker build --build-arg CUDA_FEATURE=1 --build-arg CUDA_ARCH=sm_121 ...
-ARG CUDA_FEATURE=0
-ARG CUDA_ARCH=native
+# The CUDA (Blackwell) backend is the default. CUDA_ARCH must be an explicit
+# sm_* here — `native` probes a GPU, and there is none during `docker build`.
+# CPU-only image: --build-arg CUDA_FEATURE=0.
+ARG CUDA_FEATURE=1
+ARG CUDA_ARCH=sm_121
 ENV CUDA_HOME=/usr/local/cuda
 RUN if [ "$CUDA_FEATURE" = "1" ]; then \
         CUDA_ARCH="$CUDA_ARCH" cargo build --release -p coli --features cuda; \
@@ -62,14 +67,26 @@ LABEL org.opencontainers.image.title="SpeedyColibri" \
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     COLI_NUM_NODES=1 \
-    COLI_NODE_RANK=0
+    COLI_NODE_RANK=0 \
+    HF_HOME=/root/.cache/huggingface
+
+# `hf` CLI for pulling the model snapshot on first run (Ubuntu 24.04 is
+# PEP 668 externally-managed, so it lives in its own venv).
+RUN apt-get update && apt-get install -y --no-install-recommends python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/hf \
+    && /opt/hf/bin/pip install --no-cache-dir -q huggingface_hub \
+    && for cli in hf huggingface-cli; do \
+         [ -x "/opt/hf/bin/$cli" ] && ln -s "/opt/hf/bin/$cli" "/usr/local/bin/$cli"; \
+       done \
+    && { [ -x /usr/local/bin/hf ] || [ -x /usr/local/bin/huggingface-cli ]; }
 
 COPY --from=builder /usr/local/bin/coli /usr/local/bin/coli
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Model snapshot is mounted here at run time (read-only); KV/usage caches go to a
-# writable path the entrypoint can point at.
+# Optional pre-resolved snapshot mount (read-only); otherwise the HF cache
+# (mount the host's) or a fresh download provides the model.
 VOLUME ["/model"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -9,15 +9,44 @@ it; multiple Sparks split the experts across nodes.
 
 | Piece | Status |
 |---|---|
-| Container image (aarch64 + CUDA base) | ✅ Dockerfile ready |
-| Single-node run | 🟡 image runs `coli` (`tokenize`/`config` today; `chat` pending the forward-pass port) |
-| CUDA (Blackwell) backend | ⬜ stub — CPU path only for now |
+| Container image (aarch64 + CUDA 13 base) | ✅ CUDA backend compiled in by default (`sm_121`) |
+| Single-node run | ✅ full pipeline in-container: zero-copy GPU experts, flash-attention decode, pooled streaming loads — ~1.2 tok/s steady disk-streaming on one Spark |
+| Model provisioning | ✅ entrypoint resolves `/model` mount → HF cache → `hf download` (token as first arg or `HF_TOKEN`) |
+| GPU passthrough without root | ✅ `docker/run-dgx.sh` (manual device+driver-lib binds when CDI/nvidia-runtime absent) |
+| CUDA (Blackwell) backend | ✅ GB10-validated, token-exact vs CPU |
 | Expert-parallel sharding math | ✅ `colibri-cluster` (tested) |
-| Multi-node RDMA transport | ⬜ designed, not wired (single-node first) |
+| Multi-node RDMA transport | ⬜ designed, not wired (next up) |
 
 The **compute backend priority is CUDA → CPU**. Apple-Silicon Metal is off the
 critical path (kept only as an optional stub). The CPU fallback targets the Grace
 ARM cores (aarch64 NEON is the CPU SIMD target).
+
+## Quick start (DGX Spark)
+
+One command; the launcher builds the image on first use, wires up the GPU, and
+the container fetches the model if the host's HF cache doesn't have it:
+
+```bash
+# token from the environment...
+HF_TOKEN=hf_abc123 docker/run-dgx.sh gen 100 200 300
+# ...or as the first argument
+docker/run-dgx.sh hf_abc123 gen 100 200 300
+# already downloaded (or public repo)? no token needed:
+docker/run-dgx.sh gen 100 200 300
+```
+
+The model resolves in this order: a snapshot mounted at `/model`
+(`COLI_MODEL_DIR=<dir> docker/run-dgx.sh ...`), the HF cache (the launcher
+mounts the host's `~/.cache/huggingface`, so the 358 GB download happens at most
+once and is shared with non-container runs), else `hf download
+$COLI_MODEL_REPO` (default `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
+
+`run-dgx.sh` picks the GPU passthrough that the host supports: CDI
+(`--device nvidia.com/gpu=all`), the nvidia runtime (`--gpus all`), or — on a
+stock shared DGX where neither is configured and you have no root — it binds
+`/dev/nvidia*` and the driver's user-space libraries directly (the entrypoint
+re-runs `ldconfig` so `libcuda.so.1` resolves). Tuning env vars (`COLI_RAM_GB`,
+`COLI_PROFILE`, ...) pass through automatically.
 
 ## Build the image
 
@@ -27,40 +56,44 @@ build needs no registry access. Build on an aarch64 host (or with buildx for
 
 ```bash
 docker build -f docker/Dockerfile -t speedycolibri:latest .
+# CPU-only image: --build-arg CUDA_FEATURE=0
 # cross-build for DGX Spark from another arch:
 # docker buildx build --platform linux/arm64 -f docker/Dockerfile -t speedycolibri:latest .
 ```
 
-`CUDA_TAG` (default `12.8.0`) is an `ARG` — bump it to match your Spark's CUDA/
-driver. Blackwell (GB10, sm_121) needs CUDA ≥ 12.8.
+`CUDA_TAG` (default `13.0.1`) is an `ARG` — match it to your Spark's driver
+(driver 580+ for CUDA 13). The CUDA backend builds in by default with
+`CUDA_ARCH=sm_121` (GB10); `native` doesn't work inside `docker build` (no GPU
+to probe).
 
-## Run (single node)
-
-The model snapshot is **mounted, never baked in**:
+## Run by hand (without run-dgx.sh)
 
 ```bash
 docker run --rm -it --gpus all \
-  -v /data/glm52-int4:/model:ro \
-  -v "$PWD/.coli-cache":/cache \
-  speedycolibri:latest config /model
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -e HF_TOKEN \
+  speedycolibri:latest gen 100 200 300
 ```
 
-or with compose:
+or with compose (requires CDI or the nvidia runtime on the host):
 
 ```bash
-COLI_MODEL_DIR=/data/glm52-int4 \
-  docker compose -f docker/docker-compose.yml run --rm coli config /model
+HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm coli gen 100 200 300
 ```
 
 ### Environment variables
 
 | Var | Meaning | Default |
 |---|---|---|
+| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | Hugging Face token for the model download (or pass `hf_...` as the first argument) | unset — fine if the model is cached/public |
+| `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
+| `COLI_MODEL_DIR` | host path to a pre-resolved snapshot → mounted at `/model` | unset |
+| `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budgets (cap on a shared box to avoid the OOM killer) | available RAM / VRAM |
 | `COLI_NUM_NODES` | cluster size (expert-parallel) | `1` |
 | `COLI_NODE_RANK` | this node's rank `0..NUM_NODES` | `0` |
-| `COLI_CUDA` | enable CUDA backend when compiled in | on if present |
-| `COLI_MODEL_DIR` | host path to the model snapshot (compose) | `/data/glm52-int4` |
 | `COLI_CACHE_DIR` | writable path for `.coli_kv` / `.coli_usage` (compose) | `./.coli-cache` |
+| `COLI_IMAGE` | image tag used by `run-dgx.sh` | `speedycolibri:latest` |
+| `COLI_DOCKER_ARGS` | extra `docker run` flags injected by `run-dgx.sh` | unset |
 
 `colibri-cluster::ClusterConfig::from_env` reads `COLI_NUM_NODES` / `COLI_NODE_RANK`.
 

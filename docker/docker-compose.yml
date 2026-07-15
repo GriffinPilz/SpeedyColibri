@@ -1,26 +1,35 @@
 # SpeedyColibri on DGX Spark — single-node compose.
 #
-# Current target is one DGX Spark. The commented `node1` service sketches the
-# expert-parallel two-node layout (COLI_NUM_NODES=2) for when the RDMA transport
-# lands; it is intentionally left disabled.
+# NOTE: compose needs the host to expose the GPU via CDI or the nvidia runtime.
+# On a stock shared DGX with neither configured (no root), use docker/run-dgx.sh
+# instead — it binds the device nodes and driver libraries by hand.
 #
 #   docker compose -f docker/docker-compose.yml build
-#   docker compose -f docker/docker-compose.yml run --rm coli config /model
+#   HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm coli gen 100 200 300
+#
+# The model resolves from (1) a /model mount (set COLI_MODEL_DIR), (2) the HF
+# cache volume below, or (3) a fresh download using HF_TOKEN.
+#
+# The commented `node1` service sketches the expert-parallel two-node layout
+# (COLI_NUM_NODES=2) for when the RDMA transport lands.
 services:
   coli:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # CUDA backend on by default (CUDA_FEATURE=1, CUDA_ARCH=sm_121 for GB10)
     image: speedycolibri:latest
     environment:
       COLI_NUM_NODES: "1"
       COLI_NODE_RANK: "0"
-      # COLI_CUDA: "1"   # enable once the CUDA backend is wired
+      HF_TOKEN: "${HF_TOKEN:-}"
+      COLI_RAM_GB: "${COLI_RAM_GB:-}"
+      COLI_VRAM_GB: "${COLI_VRAM_GB:-}"
     volumes:
+      # HF cache: download the 358 GB model at most once, share it with the host
       - type: bind
-        source: ${COLI_MODEL_DIR:-/data/glm52-int4}
-        target: /model
-        read_only: true
+        source: ${HF_HOME:-~/.cache/huggingface}
+        target: /root/.cache/huggingface
       # writable scratch for KV-cache (.coli_kv) and the learning cache (.coli_usage)
       - type: bind
         source: ${COLI_CACHE_DIR:-./.coli-cache}
@@ -32,8 +41,8 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    # default: print the parsed config of the mounted model
-    command: ["config", "/model"]
+    # default: show the compute backend; override with `run --rm coli gen ...`
+    command: ["backend"]
 
   # --- expert-parallel second node (disabled; RDMA transport not yet wired) ---
   # node1:
@@ -43,9 +52,8 @@ services:
   #     COLI_NODE_RANK: "1"
   #   volumes:
   #     - type: bind
-  #       source: ${COLI_MODEL_DIR_NODE1:-/data/glm52-int4}
-  #       target: /model
-  #       read_only: true
+  #       source: ${HF_HOME:-~/.cache/huggingface}
+  #       target: /root/.cache/huggingface
   #   deploy:
   #     resources: { reservations: { devices: [{ driver: nvidia, count: all, capabilities: [gpu] }] } }
   #   # On real hardware the two nodes talk over the ConnectX-7 200GbE link via

@@ -88,29 +88,36 @@ On real hardware the two Sparks talk over the direct 200 GbE link with host
 networking, not a compose bridge (the disabled `node1` service in the compose
 file is only a placeholder for the topology).
 
-## Fast cold-start: repack + parallel preload
+## Fast cold-start: parallel preload
 
-Loading experts from the original safetensors means many small, scattered
-`pread`s. To saturate the DGX Spark NVMe on cold start, repack the experts into
-one contiguous shard file per CPU core, then read all shards in parallel:
+To saturate the DGX Spark NVMe on cold start, read the experts across all CPU
+cores instead of one scattered `pread` at a time. The recommended path needs **no
+repack and no second copy** — the safetensors index already knows every tensor's
+`(file, offset)`:
 
 ```bash
-# one-time: repack experts into <cores> byte-balanced shards + a manifest
-coli repack /model /model/repacked            # or: coli repack /model /model/repacked 20
+# direct parallel preload from the original model (one thread per core)
+COLI_PRELOAD=1 coli gen /model <ids...>
+```
 
-# serve with a parallel preload (one reader thread per shard, no per-token I/O)
+`preload_parallel` sorts experts by on-disk offset, gives each core a contiguous
+slice to scan, and loads up to the `COLI_RAM_GB` budget — near-sequential reads
+with a deep NVMe queue. Output is byte-identical to the serial disk path.
+
+**Optional** — repack for maximum sequentiality (contiguous per-expert blobs),
+at the cost of a one-time ~model-sized second copy on disk:
+
+```bash
+coli repack /model /model/repacked           # writes experts_NNNN.bin + manifest.json
 COLI_PRELOAD=/model/repacked coli gen /model <ids...>
 ```
 
-`coli repack` writes `experts_NNNN.bin` shards + `manifest.json`
-(`(layer,eid) → (file,offset)`). `COLI_PRELOAD` makes `coli gen` read every shard
-in parallel into RAM up to the `COLI_RAM_GB` budget (per-shard = budget/cores),
-then serve with the experts resident. Output is byte-identical to the disk path.
+`COLI_PRELOAD` picks the repacked path automatically when the value is a directory
+containing `manifest.json`; otherwise it preloads directly.
 
-Rule of thumb: N cores reading N sequential streams approaches the drive's
-aggregate bandwidth — e.g. a drive that does ~1 GB/s per random stream but
-~5–10 GB/s sequential aggregate loads the resident set several times faster.
-Pair with `COLI_PIN_GB` (AUTOPIN) so the *hottest* experts fill the resident set.
+Rule of thumb: N cores keeping the NVMe queue deep approaches the drive's
+aggregate bandwidth — several× a single random stream. Pair with `COLI_PIN_GB`
+(AUTOPIN) so the *hottest* experts fill the resident set.
 
 ## Notes
 

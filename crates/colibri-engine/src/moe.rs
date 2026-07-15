@@ -96,6 +96,30 @@ impl<'a> ShardsExpertProvider<'a> {
     }
 }
 
+/// GLM tensor name of a routed expert's `gate_proj` (also the sort key for
+/// offset-ordered parallel loading).
+pub fn expert_gate_name(layer: usize, eid: usize) -> String {
+    format!("model.layers.{layer}.mlp.experts.{eid}.gate_proj.weight")
+}
+
+/// Load one routed expert (gate/up/down) directly from the shards. Shared by
+/// `ShardsExpertProvider` and the direct parallel preloader.
+pub fn load_expert(
+    shards: &Shards,
+    hidden: usize,
+    moe_inter: usize,
+    ebits: u32,
+    layer: usize,
+    eid: usize,
+) -> io::Result<Expert> {
+    let name = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
+    Ok(Expert {
+        gate: crate::loader::qt_load(shards, &name("gate_proj"), moe_inter, hidden, ebits)?,
+        up: crate::loader::qt_load(shards, &name("up_proj"), moe_inter, hidden, ebits)?,
+        down: crate::loader::qt_load(shards, &name("down_proj"), hidden, moe_inter, ebits)?,
+    })
+}
+
 impl ExpertProvider for ShardsExpertProvider<'_> {
     fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>> {
         // Expert-parallel ownership: local experts load from disk; non-local ones
@@ -106,12 +130,14 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
                 format!("expert {eid} owned by another node; RDMA transport not wired"),
             ));
         }
-        let name = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-        Ok(Arc::new(Expert {
-            gate: crate::loader::qt_load(self.shards, &name("gate_proj"), self.moe_inter, self.hidden, self.ebits)?,
-            up: crate::loader::qt_load(self.shards, &name("up_proj"), self.moe_inter, self.hidden, self.ebits)?,
-            down: crate::loader::qt_load(self.shards, &name("down_proj"), self.hidden, self.moe_inter, self.ebits)?,
-        }))
+        Ok(Arc::new(load_expert(
+            self.shards,
+            self.hidden,
+            self.moe_inter,
+            self.ebits,
+            layer,
+            eid,
+        )?))
     }
 }
 

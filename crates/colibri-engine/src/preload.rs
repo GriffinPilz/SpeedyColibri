@@ -17,9 +17,10 @@
 //! the layer's `(fmt, dims)` in the manifest say how to slice it. int4 (fmt 2)
 //! and int8 (fmt 1) experts are supported.
 
-use crate::moe::{Expert, ExpertProvider};
+use crate::moe::{expert_gate_name, load_expert, Expert, ExpertProvider};
 use colibri_core::{Config, QTensor};
 use colibri_json::Json;
+use colibri_safetensors::Shards;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
@@ -297,8 +298,75 @@ pub fn repack<P: ExpertProvider>(
     Ok(manifest)
 }
 
-/// Experts read resident from repacked shards. Serves inference with zero disk
-/// I/O per token.
+/// Preload experts **directly from the original safetensors** in parallel — no
+/// repack, no second copy on disk. The `Shards` index already gives every
+/// tensor's `(file, offset)`, so this is the loader you usually want.
+///
+/// Experts are sorted by their gate tensor's on-disk offset and split into
+/// `num_threads` contiguous chunks, so each thread scans a contiguous region of
+/// the model (near-sequential reads) while N threads together keep the NVMe
+/// queue deep. Each thread loads until its share of `budget_bytes` is used.
+pub fn preload_parallel(
+    shards: &Shards,
+    cfg: &Config,
+    ebits: u32,
+    num_threads: usize,
+    budget_bytes: u64,
+) -> io::Result<PreloadStore> {
+    let hidden = cfg.hidden as usize;
+    let moe_inter = cfg.moe_inter as usize;
+    let nthreads = num_threads.max(1);
+
+    // (layer, eid) sorted by on-disk offset of the gate tensor → sequential reads
+    let mut experts: Vec<(usize, usize)> = Vec::new();
+    for layer in cfg.first_dense as usize..cfg.n_layers as usize {
+        for eid in 0..cfg.n_experts as usize {
+            experts.push((layer, eid));
+        }
+    }
+    experts.sort_by_key(|&(l, e)| {
+        shards
+            .find(&expert_gate_name(l, e))
+            .map(|t| (t.file_idx, t.off))
+            .unwrap_or((usize::MAX, u64::MAX))
+    });
+
+    let per_thread = experts.len().div_ceil(nthreads).max(1);
+    let per_thread_budget = budget_bytes / nthreads as u64;
+
+    let results: Vec<io::Result<HashMap<(usize, usize), Arc<Expert>>>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = experts
+                .chunks(per_thread)
+                .map(|chunk| {
+                    scope.spawn(move || -> io::Result<HashMap<(usize, usize), Arc<Expert>>> {
+                        let mut map = HashMap::new();
+                        let mut used = 0u64;
+                        for &(layer, eid) in chunk {
+                            if used > per_thread_budget && !map.is_empty() {
+                                break;
+                            }
+                            let ex = load_expert(shards, hidden, moe_inter, ebits, layer, eid)?;
+                            used += ex.bytes();
+                            map.insert((layer, eid), Arc::new(ex));
+                        }
+                        Ok(map)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+    let mut all = HashMap::new();
+    for r in results {
+        all.extend(r?);
+    }
+    Ok(PreloadStore { experts: all })
+}
+
+/// Experts held resident in RAM. Serves inference with zero disk I/O per token.
+/// Built either by [`preload_parallel`] (direct from the model) or
+/// [`PreloadStore::load`] (from repacked shards).
 pub struct PreloadStore {
     experts: HashMap<(usize, usize), Arc<Expert>>,
 }

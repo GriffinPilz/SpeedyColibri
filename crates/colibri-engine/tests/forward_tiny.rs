@@ -5,8 +5,8 @@
 //! deterministic.
 
 use colibri_engine::{
-    forward, generate_greedy, load_model_with, logits, repack, ExpertProvider, KvCache,
-    LoadOptions, PreloadStore, ShardsExpertProvider,
+    forward, generate_greedy, load_model_with, logits, preload_parallel, repack, ExpertProvider,
+    KvCache, LoadOptions, PreloadStore, ShardsExpertProvider,
 };
 use std::fs::File;
 use std::io::Write;
@@ -197,6 +197,35 @@ fn repack_then_parallel_preload_matches_disk() {
     let mut kv2 = KvCache::new(NL, KV_LORA, QK_ROPE, 16);
     let from_preload = generate_greedy(&model, &mut kv2, &store, &prompt, 6).unwrap();
     assert_eq!(from_disk, from_preload, "preloaded output must match disk");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn direct_parallel_preload_matches_disk() {
+    // No repack: read experts straight from the original model in parallel.
+    let dir = temp_dir();
+    std::fs::write(dir.join("config.json"), config_json()).unwrap();
+    write_model(&dir);
+
+    let model = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load");
+    let shards = ShardsExpertProvider::new(&model.shards, &model.cfg, 4);
+
+    let store = preload_parallel(&model.shards, &model.cfg, 4, 4, u64::MAX).expect("preload");
+    assert_eq!(store.len(), E);
+    for eid in 0..E {
+        let a = shards.expert(1, eid).unwrap();
+        let b = store.expert(1, eid).unwrap();
+        assert_eq!(a.gate.q4, b.gate.q4);
+        assert_eq!(a.down.s, b.down.s);
+    }
+
+    let prompt = [1i32, 5, 2];
+    let mut kv1 = KvCache::new(NL, KV_LORA, QK_ROPE, 16);
+    let from_disk = generate_greedy(&model, &mut kv1, &shards, &prompt, 6).unwrap();
+    let mut kv2 = KvCache::new(NL, KV_LORA, QK_ROPE, 16);
+    let from_preload = generate_greedy(&model, &mut kv2, &store, &prompt, 6).unwrap();
+    assert_eq!(from_disk, from_preload, "direct preload output must match disk");
 
     std::fs::remove_dir_all(&dir).ok();
 }

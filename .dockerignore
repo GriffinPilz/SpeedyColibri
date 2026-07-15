@@ -12,12 +12,6 @@ c/glm_tiny*/
 c/glm_bench*/
 c/bench/
 
-# node / web build output
-web/node_modules/
-web/dist/
-desktop/src-tauri/target/
-desktop/src-tauri/gen/
-
 # python caches
 **/__pycache__/
 *.pyc

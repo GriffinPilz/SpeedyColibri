@@ -35,7 +35,7 @@ ships with unit tests; the C code is the oracle.
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack work; chat (tokenizer-wired)/serve pending |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
 | — | `c/olmoe.c` | ⬜ not started (second model variant) |
-| — | `c/openai_server.py`, `c/tools/*`, `web/` | ⬜ not started |
+| — | `c/openai_server.py`, `c/tools/*` | ⬜ not started (upstream `web/` + `desktop/` UIs dropped — not port targets) |
 
 ¹ `colibri-safetensors` omits the `posix_fadvise(DONTNEED)` + `O_DIRECT` twin-fd
 behavior for now (performance/RSS, not correctness). Reintroduce via

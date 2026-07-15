@@ -7,11 +7,6 @@ c/mio_env/
 __pycache__/
 **/__pycache__/
 *.pyc
-web/node_modules/
-web/dist/
-web/*.tsbuildinfo
-desktop/src-tauri/target/
-desktop/src-tauri/gen/
 
 # binari compilati (si rigenerano con make / coli build)
 c/glm

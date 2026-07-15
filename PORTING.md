@@ -30,7 +30,7 @@ ships with unit tests; the C code is the oracle.
 | `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 **NEON int4·f32 / int8·f32 dots (5.4× vs scalar)** wired into `matmul_qt`; int2 + IDOT int8-activation path pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
 | `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache**; DSA/SIMD/speculation deferred |
-| `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; CUDA primary (stub), Metal deprioritized |
+| `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; **CUDA FFI binding** to `backend_cuda.cu` (nvcc build.rs, type-checked; not GPU-verified / not yet wired into forward); Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack work; chat (tokenizer-wired)/serve pending |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
@@ -96,9 +96,17 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      experts (integration test + `coli gen`); deterministic. **The CPU forward
      pass generates.** Next: wire a tokenizer into `coli chat`, then perf (SIMD,
      expert LRU cache) and the deferred pieces (DSA, speculation, CUDA).
-4. **CUDA (Blackwell) backend:** primary GPU tier for DGX Spark — bind
-   `c/backend_cuda.cu` via FFI first, then port; target sm_121. (Metal is
-   deprioritized — not a deployment target.)
+4. **CUDA (Blackwell) backend:** primary GPU tier for DGX Spark.
+   - ✅ FFI binding (`colibri-backend/src/cuda.rs` + `build.rs`): compiles
+     `c/backend_cuda.cu` with nvcc (`--features cuda`, `CUDA_ARCH=sm_121`), links
+     `cudart`+`stdc++`; safe wrappers for init/mem_info/tensor_upload/matmul/
+     expert_mlp/lifecycle; `CudaBackend::probe()`; `coli backend` reports it.
+     Type-checks; build.rs skips nvcc gracefully on non-CUDA hosts. **Not
+     GPU-verified here** (no nvcc/GPU on the dev box).
+   - ⬜ wire into the forward pass: upload resident dense + hot experts on load,
+     route `matmul_qt` / expert FFN to the GPU with CPU fallback; validate on
+     hardware against the C-vs-Rust harness. Then port kernels from FFI to Rust.
+   (Metal is deprioritized — not a deployment target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

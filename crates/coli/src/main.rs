@@ -30,6 +30,7 @@ COMMANDS:
   tf <snap> <ids...>       teacher-forcing argmax per position  [working]
   capacity <snap> [ram_gb] expert residency / RAM planning      [working]
   repack <snap> <out> [n]  repack experts into n core-sharded binary files [working]
+  backend                  show the selected compute backend (cpu/cuda)   [working]
   version                  print version
   help                     show this help
 
@@ -58,6 +59,7 @@ fn main() -> ExitCode {
         "tf" => cmd_tf(&args),
         "capacity" => cmd_capacity(&args),
         "repack" => cmd_repack(&args),
+        "backend" => cmd_backend(),
         "chat" | "web" | "serve" | "bench" | "convert" => {
             eprintln!(
                 "coli {cmd}: not yet ported — the CPU forward pass is still being \
@@ -247,6 +249,31 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `coli backend` — report the selected compute backend. On a CUDA build/host it
+/// prints the GPU and its free/total memory; otherwise CPU.
+fn cmd_backend() -> ExitCode {
+    let b = colibri_backend::autoselect();
+    println!("backend: {} ({:?})", b.name(), b.device());
+    #[cfg(feature = "cuda")]
+    {
+        let n = colibri_backend::cuda::device_count();
+        println!("cuda devices: {n}");
+        for d in 0..n {
+            if let Some((free, total)) = colibri_backend::cuda::mem_info(d) {
+                let gib = 1u64 << 30;
+                println!(
+                    "  device {d}: {:.1} / {:.1} GB free",
+                    free as f64 / gib as f64,
+                    total as f64 / gib as f64
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    println!("(built without `cuda` — CPU only; rebuild with --features cuda on a DGX Spark)");
+    ExitCode::SUCCESS
 }
 
 /// Direct parallel preload from the original model (no repack). One thread per

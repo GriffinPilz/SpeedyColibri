@@ -37,10 +37,17 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 COPY . .
 
-# Build the release binary. CUDA backend is still a stub, so we build the default
-# (CPU) feature set for now; flip to `--features cuda` once colibri-backend's CUDA
-# path is wired (the -devel base already has nvcc).
-RUN cargo build --release --workspace \
+# Build the `coli` release binary. Set CUDA_FEATURE=1 to compile the CUDA
+# (Blackwell) backend via nvcc from this -devel base; CUDA_ARCH=sm_121 for GB10.
+#   docker build --build-arg CUDA_FEATURE=1 --build-arg CUDA_ARCH=sm_121 ...
+ARG CUDA_FEATURE=0
+ARG CUDA_ARCH=native
+ENV CUDA_HOME=/usr/local/cuda
+RUN if [ "$CUDA_FEATURE" = "1" ]; then \
+        CUDA_ARCH="$CUDA_ARCH" cargo build --release -p coli --features cuda; \
+    else \
+        cargo build --release -p coli; \
+    fi \
     && cp target/release/coli /usr/local/bin/coli \
     && strip /usr/local/bin/coli
 

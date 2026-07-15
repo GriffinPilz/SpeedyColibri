@@ -1,0 +1,237 @@
+//! CUDA backend for Blackwell (DGX Spark GB10) — an FFI binding to the reference
+//! `c/backend_cuda.cu` (declared in `c/backend_cuda.h`).
+//!
+//! Approach (per the roadmap): **bind the battle-tested `.cu` first, then port
+//! kernels.** `build.rs` compiles `backend_cuda.cu` with `nvcc` when the `cuda`
+//! feature is on and links `cudart` + `stdc++`; this module declares its
+//! `extern "C"` surface and wraps the essential entry points safely.
+//!
+//! # Cannot be verified without hardware
+//!
+//! This binds real CUDA kernels; it can only be compiled with `nvcc` present and
+//! only exercised on an NVIDIA GPU. On a host without CUDA, `build.rs` skips the
+//! `nvcc` step (with a warning) so `cargo check --features cuda` still
+//! type-checks this FFI, but the symbols won't link and nothing runs.
+//!
+//! Compute capability defaults to the C build's `-arch=native`; set
+//! `CUDA_ARCH=sm_121` when cross-building for the DGX Spark GB10 (Blackwell).
+
+use crate::{Backend, Device};
+use std::os::raw::{c_int, c_void};
+
+/// Opaque, persistent device copy of one resident quantized tensor
+/// (`ColiCudaTensor` in the C ABI).
+#[repr(C)]
+pub struct ColiCudaTensor {
+    _private: [u8; 0],
+}
+
+// The essential slice of backend_cuda.h. More entry points (attention absorb,
+// resident-pipeline primitives) are bound as the forward pass is moved onto the
+// GPU.
+extern "C" {
+    fn coli_cuda_init(devices: *const c_int, count: c_int) -> c_int;
+    fn coli_cuda_shutdown();
+    fn coli_cuda_device_count() -> c_int;
+    fn coli_cuda_mem_info(device: c_int, free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
+
+    fn coli_cuda_tensor_upload(
+        tensor: *mut *mut ColiCudaTensor,
+        weights: *const c_void,
+        scales: *const f32,
+        fmt: c_int,
+        i: c_int,
+        o: c_int,
+        device: c_int,
+    ) -> c_int;
+    fn coli_cuda_matmul(
+        tensor: *mut *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        weights: *const c_void,
+        scales: *const f32,
+        fmt: c_int,
+        s: c_int,
+        i: c_int,
+        o: c_int,
+        device: c_int,
+    ) -> c_int;
+    fn coli_cuda_expert_mlp(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
+    fn coli_cuda_tensor_free(tensor: *mut ColiCudaTensor);
+    fn coli_cuda_tensor_bytes(tensor: *const ColiCudaTensor) -> usize;
+    fn coli_cuda_tensor_device(tensor: *const ColiCudaTensor) -> c_int;
+}
+
+// ---- safe wrappers ---------------------------------------------------------
+
+/// Number of usable CUDA devices (0 if none / driver missing).
+pub fn device_count() -> i32 {
+    unsafe { coli_cuda_device_count() }
+}
+
+/// Initialize the given CUDA device ordinals. Returns whether init succeeded.
+pub fn init(devices: &[i32]) -> bool {
+    unsafe { coli_cuda_init(devices.as_ptr(), devices.len() as c_int) != 0 }
+}
+
+/// Release all CUDA resources.
+pub fn shutdown() {
+    unsafe { coli_cuda_shutdown() }
+}
+
+/// `(free, total)` device memory in bytes.
+pub fn mem_info(device: i32) -> Option<(usize, usize)> {
+    let mut free = 0usize;
+    let mut total = 0usize;
+    if unsafe { coli_cuda_mem_info(device, &mut free, &mut total) } != 0 {
+        Some((free, total))
+    } else {
+        None
+    }
+}
+
+/// A resident weight tensor on a CUDA device. Owns the device slot and frees it
+/// on drop.
+pub struct ResidentTensor {
+    ptr: *mut ColiCudaTensor,
+}
+
+impl ResidentTensor {
+    /// Upload a quantized weight `[O, I]` (fmt: 0=f32, 1=int8, 2=int4, 3=int2)
+    /// to `device`, so a later matmul reuses it. `weights` is the raw code bytes.
+    pub fn upload(
+        weights: &[u8],
+        scales: &[f32],
+        fmt: i32,
+        i: i32,
+        o: i32,
+        device: i32,
+    ) -> Option<ResidentTensor> {
+        let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
+        let ok = unsafe {
+            coli_cuda_tensor_upload(
+                &mut ptr,
+                weights.as_ptr() as *const c_void,
+                scales.as_ptr(),
+                fmt,
+                i,
+                o,
+                device,
+            )
+        };
+        if ok != 0 && !ptr.is_null() {
+            Some(ResidentTensor { ptr })
+        } else {
+            None
+        }
+    }
+
+    /// Resident byte size on the device.
+    pub fn bytes(&self) -> usize {
+        unsafe { coli_cuda_tensor_bytes(self.ptr) }
+    }
+
+    /// CUDA ordinal this tensor lives on.
+    pub fn device(&self) -> i32 {
+        unsafe { coli_cuda_tensor_device(self.ptr) }
+    }
+}
+
+impl Drop for ResidentTensor {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { coli_cuda_tensor_free(self.ptr) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+/// `y[S,O] = x[S,I] @ W[O,I]^T` on the GPU. On the first call the weight is
+/// uploaded into `slot` and reused thereafter. `weights`/`scales` are the CPU
+/// copy used for the initial upload. Returns whether the GPU path ran.
+///
+/// # Safety
+/// `slot` must be a persistent cell whose lifetime spans all calls reusing this
+/// weight; `y` must hold `S*O` floats and `x` `S*I` floats.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul(
+    slot: &mut *mut ColiCudaTensor,
+    y: &mut [f32],
+    x: &[f32],
+    weights: &[u8],
+    scales: &[f32],
+    fmt: i32,
+    s: i32,
+    i: i32,
+    o: i32,
+    device: i32,
+) -> bool {
+    coli_cuda_matmul(
+        slot as *mut *mut ColiCudaTensor,
+        y.as_mut_ptr(),
+        x.as_ptr(),
+        weights.as_ptr() as *const c_void,
+        scales.as_ptr(),
+        fmt,
+        s,
+        i,
+        o,
+        device,
+    ) != 0
+}
+
+/// Fused expert FFN `y = down(silu(gate(x)) * up(x))` for `S` rows, all three
+/// weights already resident on one device.
+pub fn expert_mlp(
+    gate: &ResidentTensor,
+    up: &ResidentTensor,
+    down: &ResidentTensor,
+    y: &mut [f32],
+    x: &[f32],
+    s: i32,
+) -> bool {
+    unsafe {
+        coli_cuda_expert_mlp(gate.ptr, up.ptr, down.ptr, y.as_mut_ptr(), x.as_ptr(), s) != 0
+    }
+}
+
+/// The CUDA (Blackwell) backend on one device.
+pub struct CudaBackend {
+    pub device: u32,
+}
+
+impl CudaBackend {
+    /// Probe for a usable CUDA device and initialize device 0. Honors the
+    /// `COLI_CUDA=0` opt-out. `None` when no device / init fails.
+    pub fn probe() -> Option<CudaBackend> {
+        if std::env::var("COLI_CUDA").map(|v| v == "0").unwrap_or(false) {
+            return None;
+        }
+        if device_count() <= 0 {
+            return None;
+        }
+        if !init(&[0]) {
+            return None;
+        }
+        Some(CudaBackend { device: 0 })
+    }
+}
+
+impl Backend for CudaBackend {
+    fn name(&self) -> &'static str {
+        "cuda"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn device(&self) -> Device {
+        Device::Cuda(self.device)
+    }
+}

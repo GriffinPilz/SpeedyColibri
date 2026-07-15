@@ -88,6 +88,33 @@ On real hardware the two Sparks talk over the direct 200 GbE link with host
 networking, not a compose bridge (the disabled `node1` service in the compose
 file is only a placeholder for the topology).
 
+## CUDA (Blackwell) backend
+
+`colibri-backend` binds the reference CUDA kernels (`c/backend_cuda.cu`) over FFI.
+It is **off by default**; enable it on a CUDA host:
+
+```bash
+# in the image (nvcc comes from the -devel base):
+docker build --build-arg CUDA_FEATURE=1 --build-arg CUDA_ARCH=sm_121 \
+  -f docker/Dockerfile -t speedycolibri:cuda .
+
+# or directly on a DGX Spark:
+CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 cargo build --release -p coli --features cuda
+coli backend            # -> "backend: cuda (Cuda(0))" + per-device free/total memory
+```
+
+`build.rs` compiles `backend_cuda.cu` with `nvcc` and links `cudart` + `stdc++`.
+`CUDA_ARCH` defaults to `native`; use `sm_121` for the GB10.
+
+**Status (honest):** the FFI surface (`coli_cuda_init` / `mem_info` /
+`tensor_upload` / `matmul` / `expert_mlp` / lifecycle) is bound and type-checks;
+`coli backend` reports the GPU. It is **not yet wired into the forward pass** —
+the next step is to upload the resident dense weights + hot experts on load and
+route `matmul_qt` / the expert FFN to `coli_cuda_matmul` / `coli_cuda_expert_mlp`,
+falling back to CPU. That integration must be built and validated **on real GPU
+hardware** (it can't be compiled or run without `nvcc` + an NVIDIA device), then
+checked against the C-vs-Rust harness the same way the CPU path was.
+
 ## Fast cold-start: parallel preload
 
 To saturate the DGX Spark NVMe on cold start, read the experts across all CPU

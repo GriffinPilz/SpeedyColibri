@@ -11,7 +11,13 @@ description = "colibrì command-line entry point (chat / web / serve / bench / t
 name = "coli"
 path = "src/main.rs"
 
+[features]
+default = []
+# Build the CUDA (Blackwell) backend — requires nvcc (DGX Spark). Off by default.
+cuda = ["colibri-backend/cuda"]
+
 [dependencies]
 colibri-core = { workspace = true }
 colibri-engine = { workspace = true }
 colibri-tokenizer = { workspace = true }
+colibri-backend = { workspace = true }

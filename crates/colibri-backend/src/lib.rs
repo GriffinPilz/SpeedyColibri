@@ -75,36 +75,9 @@ pub fn autoselect() -> Box<dyn Backend> {
 }
 
 #[cfg(feature = "cuda")]
-pub mod cuda {
-    //! CUDA backend for Blackwell (DGX Spark GB10) — port of `c/backend_cuda.cu`
-    //! / `c/backend_cuda.h`. TODO: bind the existing `.cu` via FFI, then port
-    //! kernels; target compute capability sm_121 (GB10 Blackwell).
-    use super::{Backend, Device};
-
-    /// Handle to a CUDA device. Placeholder until the FFI binding lands.
-    pub struct CudaBackend {
-        pub device: u32,
-    }
-
-    impl CudaBackend {
-        /// Probe for a usable CUDA device. TODO: `cudaGetDeviceCount` via FFI.
-        pub fn probe() -> Option<CudaBackend> {
-            None
-        }
-    }
-
-    impl Backend for CudaBackend {
-        fn name(&self) -> &'static str {
-            "cuda"
-        }
-        fn is_available(&self) -> bool {
-            false // until the FFI binding lands
-        }
-        fn device(&self) -> Device {
-            Device::Cuda(self.device)
-        }
-    }
-}
+pub mod cuda;
+#[cfg(feature = "cuda")]
+pub use cuda::CudaBackend;
 
 #[cfg(feature = "metal")]
 pub mod metal {

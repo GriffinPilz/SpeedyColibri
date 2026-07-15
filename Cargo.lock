@@ -6,6 +6,7 @@ version = 3
 name = "coli"
 version = "0.1.0"
 dependencies = [
+ "colibri-backend",
  "colibri-core",
  "colibri-engine",
  "colibri-tokenizer",

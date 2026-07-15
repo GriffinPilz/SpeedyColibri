@@ -27,7 +27,7 @@ ships with unit tests; the C code is the oracle.
 | `colibri-core` | `c/glm.c` (Cfg/QT), `c/st.h` (dtypes), `c/tier.h` | ✅ ported + tested |
 | `colibri-safetensors` | `c/st.h` | ✅ ported + tested (¹) |
 | `colibri-tokenizer` | `c/tok.h`, `c/tok_unicode.h` | ✅ ported + tested |
-| `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 scalar reference + `qrow_i8`-exact activation quant; SIMD pending |
+| `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 **NEON int4·f32 / int8·f32 dots (5.4× vs scalar)** wired into `matmul_qt`; int2 + IDOT int8-activation path pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
 | `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache**; DSA/SIMD/speculation deferred |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; CUDA primary (stub), Metal deprioritized |
@@ -47,10 +47,12 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 1. **Foundation (done):** json, config, dtypes, quant container, tier eviction,
    safetensors, tokenizer, sampling. All tested.
-2. **Kernels:** int8/int4 dot + the shape-dependent rounding that makes quantized
-   output byte-exact. SIMD target is **aarch64 NEON** (Grace CPU, the DGX Spark
-   CPU fallback); the AVX2 (`maddubs`) path is kept for x86 dev boxes. The scalar
-   reference in `colibri-kernels` is the oracle.
+2. **Kernels:** ✅ **aarch64 NEON** `dot_i4_f32` / `dot_i8_f32` (two-accumulator
+   `vfmaq`/`vaddvq`, mirroring the C `matmul_i4`/`matmul_q`) wired into
+   `matmul_qt` — **5.4× over scalar** at n=6144 (17.2 vs 3.2 GFLOP/s), byte-exact
+   with the scalar reference, harness still passes. The f32 path stays scalar
+   (byte-exact with the C f32 kernel). ⬜ pending: int2 NEON, the IDOT
+   int8-activation dot (`dot_i8i8`), and an x86 AVX2 path for dev boxes.
 3. **CPU forward pass (`colibri-engine`):**
    - ✅ primitives: RMSNorm/LayerNorm, interleaved-partial RoPE, `matmul_qt`
      (exact scalar for f32/int8/int4/int2), `embed_row`, weight quantizers, and
@@ -99,7 +101,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 81 tests currently pass.
+- Unit tests per crate (the C behavior is the spec). 83 tests currently pass.
 - **C-vs-Rust harness (`scripts/validate_c_vs_rust.py`, see [VALIDATION.md](VALIDATION.md)):**
   runs both engines on the same tiny synthetic model (real GLM architecture, no
   torch / no 370 GB model) and diffs greedy generation + teacher-forcing at f32

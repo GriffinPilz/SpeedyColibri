@@ -34,23 +34,19 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
             }
         }
         1 => {
-            // int8: y = (Σ x_i * (f32)q_oi) * scale_o
+            // int8: y = (Σ x_i * (f32)q_oi) * scale_o  — NEON dot on aarch64
             let q = &w.q8;
             for row in 0..o {
                 let wr = &q[row * i..(row + 1) * i];
                 let sc = w.s[row];
                 for si in 0..s {
                     let xs = &x[si * i..(si + 1) * i];
-                    let mut a = 0f32;
-                    for k in 0..i {
-                        a += xs[k] * wr[k] as f32;
-                    }
-                    y[si * o + row] = a * sc;
+                    y[si * o + row] = colibri_kernels::dot_i8_f32(wr, xs, i) * sc;
                 }
             }
         }
         2 => {
-            // int4 packed 2/byte, value = nibble - 8
+            // int4 packed 2/byte, value = nibble - 8  — NEON dot on aarch64
             let q4 = &w.q4;
             let rb = (i + 1) / 2;
             for row in 0..o {
@@ -58,17 +54,7 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
                 let sc = w.s[row];
                 for si in 0..s {
                     let xs = &x[si * i..(si + 1) * i];
-                    let mut a = 0f32;
-                    let mut k = 0;
-                    while k < i {
-                        let byte = wr[k >> 1];
-                        a += ((byte & 0x0F) as i32 - 8) as f32 * xs[k];
-                        if k + 1 < i {
-                            a += ((byte >> 4) as i32 - 8) as f32 * xs[k + 1];
-                        }
-                        k += 2;
-                    }
-                    y[si * o + row] = a * sc;
+                    y[si * o + row] = colibri_kernels::dot_i4_f32(wr, xs, i) * sc;
                 }
             }
         }

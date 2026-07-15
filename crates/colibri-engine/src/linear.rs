@@ -103,6 +103,21 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     acc
 }
 
+/// `y[S, O] = x[S, I] @ W^T` with a plain f32 weight `W[O, I]`. Port of `matmul`;
+/// used for the numerically-sensitive MoE router, which stays f32.
+pub fn matmul_f32(y: &mut [f32], x: &[f32], w: &[f32], s: usize, i: usize, o: usize) {
+    assert_eq!(w.len(), o * i);
+    assert_eq!(x.len(), s * i);
+    assert_eq!(y.len(), s * o);
+    for row in 0..o {
+        let wr = &w[row * i..(row + 1) * i];
+        for si in 0..s {
+            let xs = &x[si * i..(si + 1) * i];
+            y[si * o + row] = dot_f32(xs, wr);
+        }
+    }
+}
+
 /// Dequantize one row `row` of a [`QTensor`] `[O, I]` into a fresh `Vec<f32>` of
 /// length `I`. Backs the weight-absorption attention helpers (`qt_addrow`,
 /// `qt_matvec_rows`). Allocation-per-call is fine for the reference path.

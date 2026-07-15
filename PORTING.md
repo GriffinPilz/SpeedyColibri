@@ -124,10 +124,15 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      1-core CPU-NEON at H=64/T=2048 (1349 µs vs 43 ms), matching the CPU to
      `max|Δ|≈3.5e-10`. **The whole hot path (projections + attention + expert FFN
      + lm_head) is on-device.**
-   - ⬜ next: persistent device KV (`kv_dev` shadow, avoid re-uploading
-     latent/rope each token), VRAM eviction for the full model, end-to-end tok/s
-     on a real-sized model; then port kernels from FFI to Rust. (Metal
-     deprioritized — not a target.)
+   - ✅ persistent device KV (`coli_cuda_attention_absorb_kvdev` + `DeviceKv`
+     shadow): decode uploads only the new KV row per token; validated same tokens.
+     **Finding:** on the GB10's *unified* memory the H2D re-upload is a fast local
+     memcpy (~57 GB/s), so this is only ~1.07× vs re-uploading — the attention
+     *kernel* dominates decode here, not KV transfer. (Would matter more on a
+     discrete PCIe GPU.)
+   - ⬜ next: VRAM eviction for the full model, end-to-end tok/s on a real-sized
+     model, and profiling the attention kernel (the actual decode bottleneck);
+     then port kernels from FFI to Rust. (Metal deprioritized — not a target.)
 5. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
    schema→GBNF.
 6. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,

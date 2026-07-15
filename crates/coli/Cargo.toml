@@ -19,5 +19,6 @@ cuda = ["colibri-backend/cuda", "colibri-engine/cuda"]
 [dependencies]
 colibri-core = { workspace = true }
 colibri-engine = { workspace = true }
+colibri-safetensors = { workspace = true }
 colibri-tokenizer = { workspace = true }
 colibri-backend = { workspace = true }

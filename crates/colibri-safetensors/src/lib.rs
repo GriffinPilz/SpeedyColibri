@@ -15,6 +15,7 @@
 //! to reintroduce via `libc::posix_fadvise` behind a `cfg(unix)` gate.
 
 use colibri_core::dtype::{bf16_to_f32, f16_to_f32, DType};
+use colibri_core::SharedBuf;
 use colibri_json::Json;
 use std::collections::HashMap;
 use std::fs::File;
@@ -184,17 +185,22 @@ impl Shards {
     }
 
     /// Read several raw (U8) tensors, coalescing any that are **contiguous in the
-    /// same file** into a single positioned read backed by a shared `Arc<[u8]>`.
-    /// Returns, in the input order, `(buf, offset, len)` per name — a view into the
-    /// shared allocation. One read (and one allocation) for a contiguous group;
-    /// non-contiguous names fall back to their own reads. This is what lets an
-    /// expert's gate/up/down (18 MB, contiguous) load in one shot instead of three,
-    /// avoiding the per-tensor read + allocation overhead that dominated streaming.
+    /// same file** into a single positioned read backed by a shared
+    /// `Arc<SharedBuf>`. Returns, in the input order, `(buf, offset, len)` per
+    /// name — a view into the shared allocation. One read (and one allocation) for
+    /// a contiguous group; non-contiguous names fall back to their own reads. This
+    /// is what lets an expert's gate/up/down (18 MB, contiguous) load in one shot
+    /// instead of three. The buffer comes from the [`SharedBuf`] recycle pool and
+    /// is wrapped with `Arc::new` (header-only move): no fresh mmap, no zero-fill
+    /// page faults, and no payload copy in steady state — the naive
+    /// `Arc::<[u8]>::from(Box<[u8]>)` alternative re-allocates and memcpys the
+    /// 18 MB payload, which (with the fault churn) made warm expert loads 8×
+    /// slower than the underlying read.
     pub fn read_raw_shared(
         &self,
         names: &[&str],
         nthreads: usize,
-    ) -> io::Result<Vec<(Arc<[u8]>, usize, usize)>> {
+    ) -> io::Result<Vec<(Arc<SharedBuf>, usize, usize)>> {
         let n = names.len();
         let mut meta = Vec::with_capacity(n); // (file_idx, off, nbytes)
         for &nm in names {
@@ -204,7 +210,7 @@ impl Shards {
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&i| (meta[i].0, meta[i].1));
 
-        let mut result: Vec<Option<(Arc<[u8]>, usize, usize)>> = (0..n).map(|_| None).collect();
+        let mut result: Vec<Option<(Arc<SharedBuf>, usize, usize)>> = (0..n).map(|_| None).collect();
         let mut g = 0;
         while g < n {
             let (file, off0, nb0) = meta[order[g]];
@@ -220,13 +226,10 @@ impl Shards {
                 }
             }
             let span = (span_end - off0) as usize;
-            // Read into an uninitialized buffer (pread_into fills it fully on Ok).
-            let mut buf = Vec::<u8>::with_capacity(span);
-            // SAFETY: pread_chunked writes all `span` bytes on success; on error we
-            // drop `buf` without reading it.
-            unsafe { buf.set_len(span) };
-            self.pread_chunked(file, off0, &mut buf, nthreads)?;
-            let arc: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
+            // Pool-recycled buffer; on error it returns to the pool unread.
+            let mut buf = SharedBuf::with_len(span);
+            self.pread_chunked(file, off0, buf.as_mut_slice(), nthreads)?;
+            let arc = Arc::new(buf);
             for gi in g..end {
                 let idx = order[gi];
                 let (_, o, nb) = meta[idx];
@@ -475,7 +478,7 @@ mod tests {
         path
     }
 
-    fn view(v: &(Arc<[u8]>, usize, usize)) -> Vec<u8> {
+    fn view(v: &(Arc<SharedBuf>, usize, usize)) -> Vec<u8> {
         v.0[v.1..v.1 + v.2].to_vec()
     }
 

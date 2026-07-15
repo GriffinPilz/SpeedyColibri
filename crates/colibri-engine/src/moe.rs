@@ -173,7 +173,7 @@ pub fn load_expert(
         // The read is chunked across `read_threads` cores so a single miss saturates
         // the disk. Scales are tiny and elsewhere; keep them as small per-tensor reads.
         let ws = shards.read_raw_shared(&[&gate_w, &up_w, &down_w], read_threads)?;
-        let mk = |o: usize, i: usize, w: &(std::sync::Arc<[u8]>, usize, usize), sname: String| -> io::Result<QTensor> {
+        let mk = |o: usize, i: usize, w: &(std::sync::Arc<colibri_core::SharedBuf>, usize, usize), sname: String| -> io::Result<QTensor> {
             let (buf, off, len) = w;
             let fmt = if *len == o * i {
                 1

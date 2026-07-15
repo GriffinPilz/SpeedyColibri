@@ -9,6 +9,7 @@ dependencies = [
  "colibri-backend",
  "colibri-core",
  "colibri-engine",
+ "colibri-safetensors",
  "colibri-tokenizer",
 ]
 

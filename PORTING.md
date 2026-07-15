@@ -222,6 +222,22 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      77.5 → 51.9 → 35.9 → 32.2 s = **2.41×** (10≈20 confirms the ~10-thread disk
      saturation from the QD sweep). Not the theoretical 5× — per-expert overhead +
      shared-disk contention cap it, not thread count. Correct under eviction.
+   - ✅ **pooled read buffers** — the *warm*-loading fix. `coli loadbench`
+     (decomposes the per-expert load cost against the real model) showed the warm
+     path ran at 1.1 GB/s while a read into a reused buffer hits 9.9 GB/s: nearly
+     all of the 15 ms/expert gap was allocation churn — a fresh 18 MB mmap +
+     zero-fill page fault per 4 KiB page for the read buffer, then a **second**
+     alloc + full 18 MB memcpy hidden in `Arc::<[u8]>::from(Box<[u8]>)` (Arc's
+     refcount header is inline, so it can't adopt an allocation). Fix:
+     `SharedBuf` — a `Vec<u8>`-backed buffer whose `Drop` recycles the allocation
+     through a bounded global pool (`COLI_BUF_POOL`, default 32 entries, ≥1 MiB
+     only), wrapped with `Arc::new` (header-only move, payload never copied).
+     `Bytes::Shared` now holds `Arc<SharedBuf>`. Steady state pays neither faults
+     nor copies: warm `load_expert` **12.1 → 0.56 ms/expert (21.7×, 33.8 GB/s)**;
+     single-thread 17.1 → 2.0 ms. Chunking earns its keep warm too (parallel
+     memcpy: 33.8 vs 9.6 GB/s). Safe under zero-copy GPU reads: the buffer only
+     reaches the pool when the last `Arc` drops, after the FFN's synchronous
+     result copy-back.
    - ⬜ next: overlap load with compute is impossible (routing is per-layer
      sequential), so warm-up preloading the working set (now 8.75 GB/s) is the
      practical decode answer; batch a layer's 8 experts into one GPU launch (cut 600

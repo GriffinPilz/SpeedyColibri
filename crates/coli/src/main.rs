@@ -29,6 +29,7 @@ COMMANDS:
   gen <snap> [ids...]      greedy-generate from token ids       [working]
   tf <snap> <ids...>       teacher-forcing argmax per position  [working]
   capacity <snap> [ram_gb] expert residency / RAM planning      [working]
+  loadbench <snap> [n] [layer]  decompose warm per-expert load cost  [working]
   repack <snap> <out> [n]  repack experts into n core-sharded binary files [working]
   backend                  show the selected compute backend (cpu/cuda)   [working]
   version                  print version
@@ -58,6 +59,7 @@ fn main() -> ExitCode {
         "gen" => cmd_gen(&args),
         "tf" => cmd_tf(&args),
         "capacity" => cmd_capacity(&args),
+        "loadbench" => cmd_loadbench(&args),
         "repack" => cmd_repack(&args),
         "backend" => cmd_backend(),
         "chat" | "web" | "serve" | "bench" | "convert" => {
@@ -464,6 +466,193 @@ fn cmd_repack(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `coli loadbench <snap> [n_experts] [layer]` — decompose the *warm* (page-cache
+/// hot) per-expert load cost. Steady-state decode is bound by expert loading even
+/// when every byte is in the page cache, so this isolates where the time goes:
+/// the chunked read's thread spawns, the fresh 18 MB allocation (mmap + zero-fill
+/// page faults), the coalesced read itself, and the 3 small scale reads.
+fn cmd_loadbench(args: &[String]) -> ExitCode {
+    let snap = match args.get(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: coli loadbench <snapshot-dir> [n_experts] [layer]");
+            return ExitCode::from(2);
+        }
+    };
+    let n_experts: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
+
+    let cfg = match colibri_core::Config::load(snap) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("coli loadbench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let shards = match colibri_safetensors::Shards::open(snap) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("coli loadbench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (hidden, moe_inter) = (cfg.hidden as usize, cfg.moe_inter as usize);
+    let wn = |l: usize, e: usize, suf: &str| {
+        format!("model.layers.{l}.mlp.experts.{e}.{suf}.weight")
+    };
+    // Default to the first layer that actually has routed experts (GLM: layer 3).
+    let layer = match args.get(4).and_then(|s| s.parse().ok()) {
+        Some(l) => l,
+        None => match (0..cfg.n_layers as usize).find(|&l| shards.has(&wn(l, 0, "gate_proj"))) {
+            Some(l) => l,
+            None => {
+                eprintln!("coli loadbench: no routed experts found in snapshot");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let n_experts = n_experts.min(cfg.n_experts as usize);
+    let threads: usize = std::env::var("COLI_LOAD_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+
+    // Per-expert byte counts (gate+up+down weights; scales are the tiny sidecars).
+    let names = |e: usize| [wn(layer, e, "gate_proj"), wn(layer, e, "up_proj"), wn(layer, e, "down_proj")];
+    let sizes: Vec<usize> = names(0).iter().map(|n| shards.nbytes(n) as usize).collect();
+    let span: usize = sizes.iter().sum();
+    let total_bytes = (span * n_experts) as f64;
+    println!(
+        "loadbench: layer {layer}, {n_experts} experts, {:.1} MB/expert, T={threads}",
+        span as f64 / (1 << 20) as f64
+    );
+
+    // Warm the page cache: read every byte of the set once (results discarded).
+    let t0 = std::time::Instant::now();
+    for e in 0..n_experts {
+        let nm = names(e);
+        let nr: Vec<&str> = nm.iter().map(String::as_str).collect();
+        if let Err(err) = shards.read_raw_shared(&nr, threads) {
+            eprintln!("coli loadbench: warm-up read failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+    println!(
+        "warm-up pass: {:.2} s ({:.2} GB/s cold-ish)\n",
+        t0.elapsed().as_secs_f64(),
+        total_bytes / t0.elapsed().as_secs_f64() / 1e9
+    );
+
+    println!("{:<34} {:>9} {:>10} {:>8}", "phase", "total ms", "ms/expert", "GB/s");
+    let report = |name: &str, secs: f64, bytes: f64| {
+        let gbs = if bytes > 0.0 { format!("{:.2}", bytes / secs / 1e9) } else { "-".into() };
+        println!(
+            "{:<34} {:>9.1} {:>10.3} {:>8}",
+            name,
+            secs * 1e3,
+            secs * 1e3 / n_experts as f64,
+            gbs
+        );
+        secs
+    };
+
+    // 1+2. Full production path, chunked (T) vs single-thread.
+    let mut full = [0f64; 2];
+    for (i, t) in [threads, 1].into_iter().enumerate() {
+        let t0 = std::time::Instant::now();
+        for e in 0..n_experts {
+            let ex = colibri_engine::moe::load_expert(&shards, hidden, moe_inter, 4, layer, e, t)
+                .expect("load_expert");
+            std::hint::black_box(&ex);
+        }
+        full[i] = report(&format!("full load_expert (T={t})"), t0.elapsed().as_secs_f64(), total_bytes);
+    }
+
+    // 3+4. Coalesced read only (fresh alloc + read; no scales, no QTensor).
+    let mut read = [0f64; 2];
+    for (i, t) in [threads, 1].into_iter().enumerate() {
+        let t0 = std::time::Instant::now();
+        for e in 0..n_experts {
+            let nm = names(e);
+            let nr: Vec<&str> = nm.iter().map(String::as_str).collect();
+            let ws = shards.read_raw_shared(&nr, t).expect("read_raw_shared");
+            std::hint::black_box(&ws);
+        }
+        read[i] = report(&format!("coalesced read, fresh alloc (T={t})"), t0.elapsed().as_secs_f64(), total_bytes);
+    }
+
+    // 5. Read into one REUSED, pre-faulted buffer (single-thread) — no allocation.
+    let mut reused = vec![1u8; span];
+    let t0 = std::time::Instant::now();
+    for e in 0..n_experts {
+        let nm = names(e);
+        let mut off = 0;
+        for (j, n) in nm.iter().enumerate() {
+            shards.read_raw(n, &mut reused[off..off + sizes[j]]).expect("read_raw");
+            off += sizes[j];
+        }
+        std::hint::black_box(&reused);
+    }
+    let reused_s = report("read into reused buffer (T=1)", t0.elapsed().as_secs_f64(), total_bytes);
+
+    // 6. Fresh allocation + touch one byte per page — mmap/munmap churn + zero-fill
+    //    faults, the allocation cost the read path pays before any byte arrives.
+    let t0 = std::time::Instant::now();
+    for _ in 0..n_experts {
+        let mut v = Vec::<u8>::with_capacity(span);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            v.set_len(span)
+        };
+        let p = v.as_mut_ptr();
+        let mut i = 0;
+        while i < span {
+            unsafe { p.add(i).write(1) };
+            i += 4096;
+        }
+        std::hint::black_box(&v);
+    }
+    let alloc_s = report("fresh alloc + page-touch only", t0.elapsed().as_secs_f64(), total_bytes);
+
+    // 7. Scale sidecar reads only (3 small preads + f32 convert, fresh vecs).
+    let t0 = std::time::Instant::now();
+    for e in 0..n_experts {
+        for (n, o) in [
+            (format!("{}.qs", wn(layer, e, "gate_proj")), moe_inter),
+            (format!("{}.qs", wn(layer, e, "up_proj")), moe_inter),
+            (format!("{}.qs", wn(layer, e, "down_proj")), hidden),
+        ] {
+            let mut s = vec![0f32; o];
+            shards.read_f32(&n, &mut s).expect("read_f32");
+            std::hint::black_box(&s);
+        }
+    }
+    let scales_s = report("scale reads only (3x .qs)", t0.elapsed().as_secs_f64(), 0.0);
+
+    // 8. Bare thread spawn/join of T no-op scoped threads — the fixed price
+    //    pread_chunked pays per expert regardless of what the disk does.
+    let nt = threads.min(span >> 20).max(1);
+    let t0 = std::time::Instant::now();
+    for _ in 0..n_experts {
+        std::thread::scope(|s| {
+            for _ in 0..nt {
+                s.spawn(|| std::hint::black_box(0));
+            }
+        });
+    }
+    let spawn_s = report(&format!("thread spawn/join only ({nt} thr)"), t0.elapsed().as_secs_f64(), 0.0);
+
+    let ms = |s: f64| s * 1e3 / n_experts as f64;
+    println!("\nattribution (ms/expert, warm):");
+    println!("  chunking delta (full T={threads} vs T=1): {:+.3}", ms(full[0]) - ms(full[1]));
+    println!("  alloc cost (fresh vs reused read):        {:+.3}  (direct alloc+fault: {:.3})",
+        ms(read[1]) - ms(reused_s), ms(alloc_s));
+    println!("  scales + QTensor (full - read, T=1):      {:+.3}  (scales alone: {:.3})",
+        ms(full[1]) - ms(read[1]), ms(scales_s));
+    println!("  spawn overhead ({nt} threads):              {:.3}", ms(spawn_s));
+    println!("  pure read, reused buf:                    {:.3}", ms(reused_s));
+    ExitCode::SUCCESS
 }
 
 /// Expert-cache byte budget: `COLI_RAM_GB` if set, else available RAM (Linux),

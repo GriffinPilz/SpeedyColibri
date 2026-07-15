@@ -29,6 +29,7 @@ COMMANDS:
   gen <snap> [ids...]      greedy-generate from token ids       [working]
   tf <snap> <ids...>       teacher-forcing argmax per position  [working]
   capacity <snap> [ram_gb] expert residency / RAM planning      [working]
+  repack <snap> <out> [n]  repack experts into n core-sharded binary files [working]
   version                  print version
   help                     show this help
 
@@ -56,6 +57,7 @@ fn main() -> ExitCode {
         "gen" => cmd_gen(&args),
         "tf" => cmd_tf(&args),
         "capacity" => cmd_capacity(&args),
+        "repack" => cmd_repack(&args),
         "chat" | "web" | "serve" | "bench" | "convert" => {
             eprintln!(
                 "coli {cmd}: not yet ported — the CPU forward pass is still being \
@@ -172,6 +174,14 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let n_new = envbits("COLI_NGEN", 16) as usize;
+
+    // COLI_PRELOAD=<repacked dir>: parallel-load the repacked expert shards into
+    // RAM (one thread per shard) and serve with no per-token disk I/O.
+    if let Ok(pre_dir) = std::env::var("COLI_PRELOAD") {
+        return cmd_gen_preload(&model, &pre_dir, &prompt, n_new);
+    }
+
     // Resident expert cache: experts loaded once stay in RAM until the budget
     // forces an eviction (see `coli capacity`). Budget from COLI_RAM_GB, else
     // available RAM, else unbounded.
@@ -197,7 +207,6 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         }
     }
 
-    let n_new = envbits("COLI_NGEN", 16) as usize;
     let mut kv = colibri_engine::KvCache::new(
         model.cfg.n_layers as usize,
         model.cfg.kv_lora as usize,
@@ -229,6 +238,115 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("coli gen: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `coli gen` with `COLI_PRELOAD` — parallel-load the repacked shards, then generate.
+fn cmd_gen_preload(
+    model: &colibri_engine::Model,
+    pre_dir: &str,
+    prompt: &[i32],
+    n_new: usize,
+) -> ExitCode {
+    use std::path::Path;
+    let manifest = match colibri_engine::Manifest::load(Path::new(pre_dir).join("manifest.json")) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("coli gen: preload manifest: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // per-shard budget so total ~= the RAM budget (loads "as many as fit").
+    let per_file = (ram_budget() / manifest.num_files.max(1) as u64).max(1);
+    let t0 = std::time::Instant::now();
+    let store = match colibri_engine::PreloadStore::load(&manifest, Path::new(pre_dir), per_file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("coli gen: preload: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let secs = t0.elapsed().as_secs_f64().max(1e-9);
+    let gb = manifest.total_bytes() as f64 / (1u64 << 30) as f64;
+    let loaded_gb = gb * store.len() as f64 / manifest.experts.len().max(1) as f64;
+    println!(
+        "preload: {} experts from {} shards in {:.2}s ({:.2} GB, {:.2} GB/s across cores)",
+        store.len(),
+        manifest.num_files,
+        secs,
+        loaded_gb,
+        loaded_gb / secs
+    );
+
+    let mut kv = colibri_engine::KvCache::new(
+        model.cfg.n_layers as usize,
+        model.cfg.kv_lora as usize,
+        model.cfg.qk_rope as usize,
+        prompt.len() + n_new,
+    );
+    match colibri_engine::generate_greedy(model, &mut kv, &store, prompt, n_new) {
+        Ok(seq) => {
+            println!("prompt: {prompt:?}");
+            println!("generated ({} tok): {:?}", seq.len() - prompt.len(), &seq[prompt.len()..]);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coli gen: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `coli repack <snap> <out_dir> [num_files]` — repack every routed expert into
+/// `num_files` (default: CPU cores) contiguous binary shards + a manifest, for
+/// fast parallel preloading (`COLI_PRELOAD`).
+fn cmd_repack(args: &[String]) -> ExitCode {
+    use std::path::Path;
+    let (snap, out) = match (args.get(2), args.get(3)) {
+        (Some(s), Some(o)) => (s, o),
+        _ => {
+            eprintln!("usage: coli repack <snapshot-dir> <out-dir> [num_files]");
+            return ExitCode::from(2);
+        }
+    };
+    let num_files = args
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(colibri_engine::default_num_files);
+
+    let model = match colibri_engine::load_model(snap) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("coli repack: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let provider =
+        colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
+    println!(
+        "repacking experts into {num_files} shards (one per core: {} available)...",
+        colibri_engine::default_num_files()
+    );
+    let t0 = std::time::Instant::now();
+    match colibri_engine::repack(&provider, &model.cfg, Path::new(out), num_files) {
+        Ok(m) => {
+            let secs = t0.elapsed().as_secs_f64();
+            let gb = m.total_bytes() as f64 / (1u64 << 30) as f64;
+            println!(
+                "repacked {} experts → {} shards, {:.1} GB in {:.1}s. manifest: {}/manifest.json",
+                m.experts.len(),
+                m.num_files,
+                gb,
+                secs,
+                out
+            );
+            println!("run: COLI_PRELOAD={out} coli gen {snap} <ids...>");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coli repack: {e}");
             ExitCode::FAILURE
         }
     }

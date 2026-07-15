@@ -32,7 +32,7 @@ ships with unit tests; the C code is the oracle.
 | `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache**; DSA/SIMD/speculation deferred |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; CUDA primary (stub), Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
-| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen work; chat (tokenizer-wired)/serve pending |
+| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack work; chat (tokenizer-wired)/serve pending |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
 | — | `c/olmoe.c` | ⬜ not started (second model variant) |
 | — | `c/openai_server.py`, `c/tools/*`, `web/` | ⬜ not started |
@@ -78,6 +78,13 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      `UsageHistory`) is loaded at startup and the globally-hottest experts are
      pinned resident (`COLI_PIN_GB` budget); the session's selections are merged
      back and saved. Port of `usage_load`/`usage_save`/`pin_load`.
+   - ✅ parallel expert preload (`preload.rs`): `coli repack` writes every routed
+     expert as a contiguous blob into `num_cores` byte-balanced shard files + a
+     JSON `Manifest`; `PreloadStore::load` reads all shards **in parallel** (one
+     thread per shard, sequential scan, per-shard byte budget) into RAM.
+     `COLI_PRELOAD=<dir> coli gen` serves with zero per-token disk I/O. Tested
+     byte-identical to the disk path incl. generation output. (Repack write is
+     still single-threaded; parallelize later.)
    - ✅ capacity/KV planning (`capacity` module + `coli capacity <snap> [ram] [ctx]`):
      18 MB/expert int4; KV = 175.5 KB/token (compressed MLA, 78 layers) so 256K
      ctx ≈ 44 GB KV. One 128 GB Spark: ~3,980 experts at 256K ctx (~6,000 at ≤47K).
@@ -101,7 +108,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 83 tests currently pass.
+- Unit tests per crate (the C behavior is the spec). 86 tests currently pass.
 - **C-vs-Rust harness (`scripts/validate_c_vs_rust.py`, see [VALIDATION.md](VALIDATION.md)):**
   runs both engines on the same tiny synthetic model (real GLM architecture, no
   torch / no 370 GB model) and diffs greedy generation + teacher-forcing at f32

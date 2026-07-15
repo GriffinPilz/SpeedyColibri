@@ -5,7 +5,8 @@
 //! deterministic.
 
 use colibri_engine::{
-    forward, generate_greedy, load_model_with, logits, KvCache, LoadOptions, ShardsExpertProvider,
+    forward, generate_greedy, load_model_with, logits, repack, ExpertProvider, KvCache,
+    LoadOptions, PreloadStore, ShardsExpertProvider,
 };
 use std::fs::File;
 use std::io::Write;
@@ -156,6 +157,46 @@ fn full_forward_and_greedy_decode() {
     let mut kv3 = KvCache::new(NL, KV_LORA, QK_ROPE, 32);
     let seq2 = generate_greedy(&model, &mut kv3, &provider, &prompt, 5).unwrap();
     assert_eq!(seq, seq2, "greedy decode must be deterministic");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repack_then_parallel_preload_matches_disk() {
+    let dir = temp_dir();
+    std::fs::write(dir.join("config.json"), config_json()).unwrap();
+    write_model(&dir);
+
+    let model = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load");
+    let shards = ShardsExpertProvider::new(&model.shards, &model.cfg, 4);
+
+    // repack the E experts of the sparse layer into 3 shard files
+    let out = dir.join("repacked");
+    let manifest = repack(&shards, &model.cfg, &out, 3).expect("repack");
+    assert_eq!(manifest.experts.len(), E); // sparse layer's experts
+    assert_eq!(manifest.num_files, 3);
+
+    // parallel load everything, then check each expert is byte-identical to disk
+    let store = PreloadStore::load(&manifest, &out, u64::MAX).expect("preload");
+    assert_eq!(store.len(), E);
+    for eid in 0..E {
+        let a = shards.expert(1, eid).unwrap(); // layer 1 is the sparse one
+        let b = store.expert(1, eid).unwrap();
+        assert_eq!(a.gate.q4, b.gate.q4, "gate.q4 eid {eid}");
+        assert_eq!(a.gate.s, b.gate.s, "gate.s eid {eid}");
+        assert_eq!(a.up.q4, b.up.q4);
+        assert_eq!(a.up.s, b.up.s);
+        assert_eq!(a.down.q4, b.down.q4);
+        assert_eq!(a.down.s, b.down.s);
+    }
+
+    // generation with the preloaded store must equal generation from disk
+    let prompt = [1i32, 5, 2];
+    let mut kv1 = KvCache::new(NL, KV_LORA, QK_ROPE, 16);
+    let from_disk = generate_greedy(&model, &mut kv1, &shards, &prompt, 6).unwrap();
+    let mut kv2 = KvCache::new(NL, KV_LORA, QK_ROPE, 16);
+    let from_preload = generate_greedy(&model, &mut kv2, &store, &prompt, 6).unwrap();
+    assert_eq!(from_disk, from_preload, "preloaded output must match disk");
 
     std::fs::remove_dir_all(&dir).ok();
 }

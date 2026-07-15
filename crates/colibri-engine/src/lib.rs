@@ -18,6 +18,7 @@ pub mod loader;
 pub mod math;
 pub mod model;
 pub mod moe;
+pub mod preload;
 pub mod quantize;
 pub mod sampling;
 pub mod usage;
@@ -32,6 +33,7 @@ pub use loader::{ld, qt_load};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
 pub use model::{KvCache, Layer, Model};
 pub use moe::{dense_mlp, moe, route, Expert, ExpertProvider, ShardsExpertProvider};
+pub use preload::{default_num_files, repack, Manifest, PreloadStore};
 pub use quantize::qtensor_from_f32;
 pub use sampling::{argmax, sample_top_p, SampleConfig};
 

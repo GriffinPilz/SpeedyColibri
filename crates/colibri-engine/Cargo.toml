@@ -15,6 +15,4 @@ colibri-grammar = { workspace = true }
 colibri-kernels = { workspace = true }
 colibri-backend = { workspace = true }
 colibri-cluster = { workspace = true }
-
-[dev-dependencies]
 colibri-json = { workspace = true }

@@ -198,6 +198,23 @@ pub mod capacity {
             budget_bytes / bytes_per_expert
         }
     }
+
+    /// Compressed MLA KV-cache bytes per token — exactly what `KvCache`
+    /// allocates: every one of `n_layers` attention layers caches a normalized
+    /// latent (`kv_lora` floats) and a roped key (`qk_rope` floats) per token.
+    /// (The DSA indexer, if enabled, adds a little more; not counted here.)
+    pub fn kv_bytes_per_token(kv_lora: u64, qk_rope: u64, n_layers: u64) -> u64 {
+        (kv_lora + qk_rope) * 4 * n_layers
+    }
+
+    /// Max context (tokens) whose KV cache fits in `budget_bytes`.
+    pub fn context_in_kv_budget(budget_bytes: u64, kv_bytes_per_token: u64) -> u64 {
+        if kv_bytes_per_token == 0 {
+            0
+        } else {
+            budget_bytes / kv_bytes_per_token
+        }
+    }
 }
 
 /// Available RAM in bytes, best-effort. Reads `/proc/meminfo` `MemAvailable` on

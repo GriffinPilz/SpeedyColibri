@@ -221,16 +221,32 @@ fn ram_budget() -> u64 {
     colibri_engine::available_ram_bytes().unwrap_or(u64::MAX)
 }
 
-/// `coli capacity <snap> [ram_gb]` — using the model's real dimensions, report
-/// per-expert size, total experts / bytes, and how many fit resident in a RAM
-/// budget (default: available RAM, else 110 GB ~ one DGX Spark after the dense
-/// part). Answers "how many experts can a Spark hold".
+/// Parse a token count like `256k`, `1m`, or `262144`.
+fn parse_ctx(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    let (num, mul) = if let Some(n) = s.strip_suffix('k') {
+        (n, 1024u64)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 1024 * 1024)
+    } else {
+        (s.as_str(), 1)
+    };
+    num.parse::<f64>().ok().map(|v| (v * mul as f64) as u64)
+}
+
+/// `coli capacity <snap> [ram_gb] [ctx]` — using the model's real dimensions,
+/// report per-expert size and how many experts fit resident in a RAM budget
+/// after reserving the dense weights, working headroom, and the KV cache for a
+/// given context length (`ctx`, e.g. `256k`). Answers "how many experts can a
+/// Spark hold while keeping N context".
 fn cmd_capacity(args: &[String]) -> ExitCode {
-    use colibri_engine::capacity::{bytes_per_expert, experts_in_budget};
+    use colibri_engine::capacity::{
+        bytes_per_expert, context_in_kv_budget, experts_in_budget, kv_bytes_per_token,
+    };
     let snap = match args.get(2) {
         Some(p) => p,
         None => {
-            eprintln!("usage: coli capacity <snapshot-dir> [ram_gb]");
+            eprintln!("usage: coli capacity <snapshot-dir> [ram_gb] [ctx e.g. 256k]");
             return ExitCode::from(2);
         }
     };
@@ -242,45 +258,53 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
         }
     };
     let gib = 1u64 << 30;
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let gb = |b: u64| b as f64 / gib as f64;
+
     let bpe = bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, 4);
     let sparse_layers = (cfg.n_layers - cfg.first_dense).max(0) as u64;
     let total_experts = sparse_layers * cfg.n_experts as u64;
-    let total_bytes = total_experts * bpe;
 
     let ram_gb: u64 = args
         .get(3)
         .and_then(|s| s.parse().ok())
         .or_else(|| colibri_engine::available_ram_bytes().map(|b| b / gib))
-        .unwrap_or(110);
-    // reserve the dense part (~10 GB int4) + headroom per node
-    let reserve_gb = 18u64;
-    let expert_budget = ram_gb.saturating_sub(reserve_gb) * gib;
-    // can't hold more experts resident than exist
-    let per_node = experts_in_budget(expert_budget, bpe).min(total_experts);
-    let raw_per_node = experts_in_budget(expert_budget, bpe);
-    let nodes_for_all = if raw_per_node > 0 {
-        total_experts.div_ceil(raw_per_node)
-    } else {
-        0
-    };
+        .unwrap_or(128);
+    let ctx = args.get(4).and_then(|s| parse_ctx(s)).unwrap_or(0);
 
-    println!("model: hidden={} moe_inter={} experts/layer={} sparse_layers={}",
-        cfg.hidden, cfg.moe_inter, cfg.n_experts, sparse_layers);
-    println!("per expert (int4): {:.2} MB", bpe as f64 / (1024.0 * 1024.0));
-    println!(
-        "total routed experts: {} → {:.1} GB on disk",
-        total_experts,
-        total_bytes as f64 / gib as f64
-    );
-    println!(
-        "RAM budget: {ram_gb} GB/node (−{reserve_gb} GB dense+headroom → {:.0} GB for experts)",
-        expert_budget as f64 / gib as f64
-    );
+    // Fixed reserves (GLM-5.2 int4 estimates): resident dense ~10 GB, working
+    // buffers / OS headroom ~4 GB.
+    let dense_gb = 10u64;
+    let working_gb = 4u64;
+    let kv_per_tok = kv_bytes_per_token(cfg.kv_lora as u64, cfg.qk_rope as u64, cfg.n_layers as u64);
+    let kv_bytes = kv_per_tok * ctx;
+
+    let ram_bytes = ram_gb * gib;
+    let expert_budget =
+        ram_bytes.saturating_sub((dense_gb + working_gb) * gib).saturating_sub(kv_bytes);
+    let per_node = experts_in_budget(expert_budget, bpe).min(total_experts);
     let pct = |n: u64| if total_experts > 0 { 100.0 * n as f64 / total_experts as f64 } else { 0.0 };
-    let two_nodes = (2 * raw_per_node).min(total_experts);
-    println!("resident per node: {per_node} experts ({:.0}% of all)", pct(per_node));
-    println!("2 nodes: {two_nodes} experts ({:.0}%)", pct(two_nodes));
-    println!("nodes to hold ALL experts resident: {nodes_for_all}");
+
+    println!("model: hidden={} moe_inter={} experts/layer={} attn_layers={} sparse_layers={}",
+        cfg.hidden, cfg.moe_inter, cfg.n_experts, cfg.n_layers, sparse_layers);
+    println!("per expert (int4): {:.2} MB   total routed: {total_experts} → {:.0} GB",
+        mb(bpe), gb(total_experts * bpe));
+    println!("KV cache: {:.1} KB/token (compressed MLA, {} layers)",
+        kv_per_tok as f64 / 1024.0, cfg.n_layers);
+    println!("  8 GB KV holds ~{} tokens ({}K)",
+        context_in_kv_budget(8 * gib, kv_per_tok),
+        context_in_kv_budget(8 * gib, kv_per_tok) / 1024);
+    for &c in &[131072u64, 262144, 524288] {
+        println!("  {}K context → {:.1} GB KV", c / 1024, gb(kv_per_tok * c));
+    }
+    println!();
+    println!("budget: {ram_gb} GB − {dense_gb} dense − {working_gb} working{} → {:.0} GB for experts",
+        if ctx > 0 { format!(" − {:.0} KV({}K ctx)", gb(kv_bytes), ctx / 1024) } else { String::new() },
+        gb(expert_budget));
+    println!("==> resident experts per node: {per_node} ({:.0}% of all {total_experts})", pct(per_node));
+    if ctx > 0 {
+        println!("    (keeping {}K-token context in a {}-GB KV cache)", ctx / 1024, kv_bytes.div_ceil(gib));
+    }
     ExitCode::SUCCESS
 }
 

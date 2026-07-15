@@ -1,0 +1,11 @@
+[package]
+name = "colibri-grammar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GBNF grammar engine and JSON-schema->GBNF (ports of c/grammar.h and c/schema_gbnf.h)"
+
+[dependencies]
+colibri-json = { workspace = true }

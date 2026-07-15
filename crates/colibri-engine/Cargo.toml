@@ -1,0 +1,16 @@
+[package]
+name = "colibri-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GLM-5.2 MoE forward pass, KV-cache, MoE routing, sampling, generation (port of c/glm.c)"
+
+[dependencies]
+colibri-core = { workspace = true }
+colibri-safetensors = { workspace = true }
+colibri-tokenizer = { workspace = true }
+colibri-grammar = { workspace = true }
+colibri-kernels = { workspace = true }
+colibri-backend = { workspace = true }

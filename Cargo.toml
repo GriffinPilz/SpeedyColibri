@@ -1,0 +1,47 @@
+# SpeedyColibri — Rust port of the colibrì MoE inference engine.
+#
+# This workspace is a faithful, module-by-module rewrite of the C engine under
+# `c/`. The C sources remain in the tree during the port as the reference
+# implementation; see PORTING.md for the C→Rust mapping and current status.
+[workspace]
+resolver = "2"
+members = [
+    "crates/colibri-json",
+    "crates/colibri-core",
+    "crates/colibri-safetensors",
+    "crates/colibri-tokenizer",
+    "crates/colibri-grammar",
+    "crates/colibri-kernels",
+    "crates/colibri-engine",
+    "crates/colibri-backend",
+    "crates/coli",
+]
+# The pre-existing Tauri desktop shell is a standalone crate (edition 2024,
+# system deps); keep it out of the engine workspace so `cargo build` at the
+# root stays self-contained.
+exclude = ["desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+repository = "https://github.com/GriffinPilz/SpeedyColibri"
+authors = ["colibrì contributors"]
+
+[workspace.dependencies]
+colibri-json = { path = "crates/colibri-json" }
+colibri-core = { path = "crates/colibri-core" }
+colibri-safetensors = { path = "crates/colibri-safetensors" }
+colibri-tokenizer = { path = "crates/colibri-tokenizer" }
+colibri-grammar = { path = "crates/colibri-grammar" }
+colibri-kernels = { path = "crates/colibri-kernels" }
+colibri-engine = { path = "crates/colibri-engine" }
+colibri-backend = { path = "crates/colibri-backend" }
+
+# Optimized profile mirrors the C build (`-O3 -march=native` in c/Makefile).
+# Build hot crates with `RUSTFLAGS="-C target-cpu=native"` for the SIMD paths.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

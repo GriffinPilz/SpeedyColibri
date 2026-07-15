@@ -1,0 +1,10 @@
+[package]
+name = "colibri-json"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal JSON parser for safetensors headers and config.json (port of c/json.h)"
+
+[dependencies]

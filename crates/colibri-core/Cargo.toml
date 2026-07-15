@@ -1,0 +1,11 @@
+[package]
+name = "colibri-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types for the colibrì engine: config, dtypes, quantized tensors, tier eviction"
+
+[dependencies]
+colibri-json = { workspace = true }

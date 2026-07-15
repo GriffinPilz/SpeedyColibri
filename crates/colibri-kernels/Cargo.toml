@@ -1,0 +1,11 @@
+[package]
+name = "colibri-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Integer-dot and quant/dequant kernels (Q8_0-style int8, packed int4/int2), port of c/glm.c kernels"
+
+[dependencies]
+colibri-core = { workspace = true }

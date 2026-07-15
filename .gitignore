@@ -1,3 +1,7 @@
+# rust build artifacts (workspace root). Cargo.lock IS committed (binary crate).
+/target/
+**/*.rs.bk
+
 # ambienti python / cache
 c/mio_env/
 __pycache__/

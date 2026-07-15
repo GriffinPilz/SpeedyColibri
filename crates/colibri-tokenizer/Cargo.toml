@@ -1,0 +1,11 @@
+[package]
+name = "colibri-tokenizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GLM-5.2 byte-level BPE tokenizer (cl100k/tiktoken style), port of c/tok.h + tok_unicode.h"
+
+[dependencies]
+colibri-json = { workspace = true }

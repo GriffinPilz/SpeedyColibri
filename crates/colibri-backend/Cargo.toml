@@ -1,0 +1,18 @@
+[package]
+name = "colibri-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compute backend abstraction: CPU, plus CUDA/Metal FFI (ports of c/backend_*.c/.cu/.mm)"
+
+[features]
+default = []
+# Opt-in GPU tiers. When enabled these will link the C/CUDA/Metal backends via
+# FFI initially, then be ported. Off by default so the CPU engine builds anywhere.
+cuda = []
+metal = []
+
+[dependencies]
+colibri-core = { workspace = true }

@@ -1,0 +1,74 @@
+# colibrì → Rust port status (SpeedyColibri)
+
+This repository is being converted from the original C engine (`c/`) to Rust.
+The Rust workspace lives at the repo root (`Cargo.toml` + `crates/`); the C
+sources stay in the tree as the reference implementation until each module is
+fully ported and validated.
+
+**Goal:** a full 1:1 rewrite of the whole engine (CPU forward pass, kernels,
+grammar, tokenizer, backends, tools) that runs GLM-5.2 token-exact against the
+same model files.
+
+**Approach:** bottom-up. Leaf modules first (no dependencies, easy to validate),
+then the forward pass, then the GPU backends and tooling. Every ported module
+ships with unit tests; the C code is the oracle.
+
+## Workspace layout
+
+| Rust crate | Ports (C source) | Status |
+|---|---|---|
+| `colibri-json` | `c/json.h` | ✅ ported + tested |
+| `colibri-core` | `c/glm.c` (Cfg/QT), `c/st.h` (dtypes), `c/tier.h` | ✅ ported + tested |
+| `colibri-safetensors` | `c/st.h` | ✅ ported + tested (¹) |
+| `colibri-tokenizer` | `c/tok.h`, `c/tok_unicode.h` | ✅ ported + tested |
+| `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 scalar reference done; SIMD pending |
+| `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
+| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 sampling done; rest scaffolded |
+| `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*`, `backend_metal.*` | ⬜ CPU trait; GPU skeleton |
+| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config work; modes pending |
+| — | `c/olmoe.c` | ⬜ not started (second model variant) |
+| — | `c/openai_server.py`, `c/tools/*`, `web/` | ⬜ not started |
+
+¹ `colibri-safetensors` omits the `posix_fadvise(DONTNEED)` + `O_DIRECT` twin-fd
+behavior for now (performance/RSS, not correctness). Reintroduce via
+`libc::posix_fadvise` behind a `cfg(unix)` gate.
+
+Legend: ✅ done · 🟡 partial · ⬜ not started
+
+## Milestone order
+
+1. **Foundation (done):** json, config, dtypes, quant container, tier eviction,
+   safetensors, tokenizer, sampling. All tested.
+2. **Kernels:** AVX2 (`maddubs`) int8/int4 dot + the shape-dependent rounding
+   that makes quantized output byte-exact; NEON path for Apple Silicon. The
+   scalar reference in `colibri-kernels` is the oracle.
+3. **CPU forward pass (`colibri-engine`):**
+   - weight loader (`qt_from_disk`, expert LRU sizing, DSA/MTP detection)
+   - MLA attention with weight absorption + compressed KV-cache
+   - MoE block (sigmoid router / noaux_tc, shared expert, streaming experts)
+   - RMSNorm, RoPE (interleaved partial), embed/lm_head
+   - single-token decode loop → wire up `coli chat`
+4. **Speculative + grammar:** MTP head, grammar-forced drafts, GBNF engine,
+   schema→GBNF.
+5. **Persistence & serving:** KV-cache `.coli_kv`, `.coli_usage` learning cache,
+   OpenAI-compatible server, web dashboard.
+6. **GPU backends:** CUDA then Metal — bind existing C via FFI first, then port.
+7. **Second model:** `olmoe.c`.
+
+## Validation strategy
+
+- Unit tests per crate (the C behavior is the spec). 36 tests currently pass.
+- Byte-exactness: the C engine validates token-exact against a `transformers`
+  oracle (TF 32/32, greedy 20/20). The Rust engine must reproduce the C engine's
+  greedy stream under `DRAFT=0 IDOT=0 COLI_CUDA=0`.
+- Cross-check: keep the C `coli` buildable (`make -C c`) to diff outputs during
+  the port.
+
+## Notes
+
+- `scripts/gen_unicode.py` regenerates `crates/colibri-tokenizer/src/unicode_tables.rs`
+  from `c/tok_unicode.h` — do not hand-edit the generated file.
+- Clippy style-lints (e.g. `needless_range_loop`) are deferred where the Rust
+  deliberately mirrors a C index loop; they do not affect correctness.
+- Comments in `c/glm.c` are mixed Italian/English (upstream); ported comments
+  are in English.

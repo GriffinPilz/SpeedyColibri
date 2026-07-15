@@ -1,0 +1,17 @@
+[package]
+name = "coli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "colibrì command-line entry point (chat / web / serve / bench / tokenize)"
+
+[[bin]]
+name = "coli"
+path = "src/main.rs"
+
+[dependencies]
+colibri-core = { workspace = true }
+colibri-engine = { workspace = true }
+colibri-tokenizer = { workspace = true }

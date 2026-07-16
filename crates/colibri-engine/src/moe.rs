@@ -20,7 +20,7 @@
 use crate::linear::{matmul_f32, matmul_qt};
 use crate::math::silu;
 use crate::model::Layer;
-use colibri_cluster::{ExpertSharding, NodeId};
+use colibri_cluster::{ExpertRequest, ExpertSharding, NodeId, Transport};
 use colibri_core::{Bytes, Config, QTensor};
 use colibri_safetensors::Shards;
 use std::io;
@@ -312,6 +312,205 @@ pub fn dense_mlp(l: &Layer, x: &[f32], s_len: usize, out: &mut [f32]) {
     ffn(&l.gate_proj, &l.up_proj, &l.down_proj, x, s_len, out);
 }
 
+/// Union of the routed experts across the batch, plus a dense `[S, n_uniq]` weight
+/// matrix: `w_mat[s * n_uniq + ui]` is the routing weight of token `s` for
+/// `uniq[ui]` (0 if it doesn't route there). This is the exact per-(token,expert)
+/// weight the expert loop applies, laid out for [`compute_experts_partial`].
+fn union_and_weights(
+    idxs: &[usize],
+    ws: &[f32],
+    s_len: usize,
+    k: usize,
+    e_n: usize,
+) -> (Vec<usize>, Vec<f32>) {
+    let mut seen = vec![usize::MAX; e_n]; // expert id -> its column in uniq
+    let mut uniq = Vec::new();
+    for &e in idxs {
+        if seen[e] == usize::MAX {
+            seen[e] = uniq.len();
+            uniq.push(e);
+        }
+    }
+    let n_uniq = uniq.len();
+    let mut w_mat = vec![0f32; s_len * n_uniq];
+    for s in 0..s_len {
+        for kk in 0..k {
+            let e = idxs[s * k + kk];
+            w_mat[s * n_uniq + seen[e]] = ws[s * k + kk];
+        }
+    }
+    (uniq, w_mat)
+}
+
+/// The one expert-compute primitive: for each token `t`, accumulate
+/// `Σ_e weights[t * n_experts + e] * expert_e(activations[t])` and return the flat
+/// `[n_tokens * hidden]` partial MoE sum. `moe()` runs it over all experts locally;
+/// `moe_sharded()` runs it over the node's own experts; and the transport server
+/// runs it as the handler for a peer's [`ExpertRequest`]. Zero-weight (token,
+/// expert) pairs are skipped, so a token only touches the experts it routes to.
+pub fn compute_experts_partial<P: ExpertProvider>(
+    provider: &P,
+    layer: usize,
+    experts: &[u32],
+    weights: &[f32],
+    activations: &[f32],
+    n_tokens: usize,
+    hidden: usize,
+) -> io::Result<Vec<f32>> {
+    let d = hidden;
+    let ne = experts.len();
+    let mut out = vec![0f32; n_tokens * d];
+    if ne == 0 {
+        return Ok(out);
+    }
+    let eids: Vec<usize> = experts.iter().map(|&e| e as usize).collect();
+
+    // Fetch this layer's experts disk→RAM in parallel before computing (serial
+    // per-expert loading is otherwise ~74% of MoE time).
+    if crate::forward::profile_on() {
+        let t = std::time::Instant::now();
+        provider.prefetch(layer, &eids)?;
+        crate::forward::LOAD_US
+            .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        provider.prefetch(layer, &eids)?;
+    }
+
+    for (ei, &e) in eids.iter().enumerate() {
+        // Rows (tokens) that route to this expert, with their weights.
+        let mut rows = Vec::new();
+        let mut rw = Vec::new();
+        for t in 0..n_tokens {
+            let w = weights[t * ne + ei];
+            if w != 0.0 {
+                rows.push(t);
+                rw.push(w);
+            }
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        let nr = rows.len();
+        let mut xg = vec![0f32; nr * d];
+        for (r, &t) in rows.iter().enumerate() {
+            xg[r * d..(r + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
+        }
+        let ex = provider.expert(layer, e)?;
+        let mut hh = vec![0f32; nr * d];
+        ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
+        for (r, &t) in rows.iter().enumerate() {
+            let wgt = rw[r];
+            for dd in 0..d {
+                out[t * d + dd] += wgt * hh[r * d + dd];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Sub-column a `[S, n_uniq]` weight matrix down to the experts in `cols` (their
+/// positions in `uniq`), giving a `[S, cols.len()]` matrix aligned to `cols`.
+fn subcols(w_mat: &[f32], s_len: usize, n_uniq: usize, cols: &[usize]) -> Vec<f32> {
+    let mut out = vec![0f32; s_len * cols.len()];
+    for s in 0..s_len {
+        for (j, &c) in cols.iter().enumerate() {
+            out[s * cols.len() + j] = w_mat[s * n_uniq + c];
+        }
+    }
+    out
+}
+
+/// Expert-parallel MoE: identical to [`moe`], but the routed experts are split by
+/// ownership — this node computes the experts it owns in-process and fetches the
+/// partial sums for experts owned by peers over `transport` (sending the token
+/// activations + routing weights, receiving `Σ w·expert(x)`). On a single node
+/// (`sharding.num_nodes() == 1`) every expert is local and no `exchange` happens,
+/// so it matches `moe` exactly. `provider` must be able to load *this node's*
+/// experts; the peer's `serve_experts` handler computes theirs.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_sharded<P: ExpertProvider, T: Transport>(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    x: &[f32],
+    s_len: usize,
+    out: &mut [f32],
+    with_shared: bool,
+    provider: &P,
+    sharding: &ExpertSharding,
+    transport: &T,
+) -> io::Result<()> {
+    let d = cfg.hidden as usize;
+    let e_n = cfg.n_experts as usize;
+    let k = (cfg.topk as usize).min(e_n);
+
+    let mut logits = vec![0f32; s_len * e_n];
+    matmul_f32(&mut logits, x, &l.router, s_len, d, e_n);
+    let mut idxs = vec![0usize; s_len * k];
+    let mut ws = vec![0f32; s_len * k];
+    for s in 0..s_len {
+        let (idx, w) = route(cfg, &logits[s * e_n..(s + 1) * e_n], &l.router_bias);
+        idxs[s * k..s * k + k].copy_from_slice(&idx);
+        ws[s * k..s * k + k].copy_from_slice(&w);
+    }
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+
+    let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
+    let n_uniq = uniq.len();
+    let me = transport.this_node();
+
+    // Partition the unique experts by owning node (columns into w_mat).
+    let mut by_node: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+    for (ui, &e) in uniq.iter().enumerate() {
+        by_node.entry(sharding.owner(e as u32).0).or_default().push(ui);
+    }
+
+    for (node, cols) in by_node {
+        let experts: Vec<u32> = cols.iter().map(|&ui| uniq[ui] as u32).collect();
+        let weights = subcols(&w_mat, s_len, n_uniq, &cols);
+        if NodeId(node) == me {
+            // Local: compute in-process against our provider.
+            let partial = compute_experts_partial(provider, layer, &experts, &weights, x, s_len, d)?;
+            for (o, p) in out.iter_mut().zip(partial.iter()) {
+                *o += *p;
+            }
+        } else {
+            // Remote: ship activations + weights to the owner, add its partial sum.
+            let req = ExpertRequest {
+                experts,
+                weights,
+                activations: x.to_vec(),
+                n_tokens: s_len,
+                hidden: d,
+                layer: layer as u32,
+            };
+            let resp = transport
+                .exchange(NodeId(node), &req)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if resp.outputs.len() != s_len * d {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("node {node}: expected {} outputs, got {}", s_len * d, resp.outputs.len()),
+                ));
+            }
+            for (o, p) in out.iter_mut().zip(resp.outputs.iter()) {
+                *o += *p;
+            }
+        }
+    }
+
+    if with_shared {
+        let mut sh = vec![0f32; s_len * d];
+        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
+        for (o, &s) in out.iter_mut().zip(sh.iter()) {
+            *o += s;
+        }
+    }
+    Ok(())
+}
+
 /// MoE forward over `x[S, hidden]` into `out[S, hidden]`. Routes each position,
 /// applies every selected expert (fetched via `provider`), and adds the shared
 /// expert when `with_shared`. Port of `moe()`'s default CPU path.
@@ -345,54 +544,12 @@ pub fn moe<P: ExpertProvider>(
         *v = 0.0;
     }
 
-    // ---- union of experts across the batch --------------------------------
-    let mut seen = vec![false; e_n];
-    let mut uniq = Vec::new();
-    for &e in &idxs {
-        if !seen[e] {
-            seen[e] = true;
-            uniq.push(e);
-        }
-    }
-
-    // Fetch this layer's experts disk→RAM in parallel before computing. Serial
-    // per-expert loading is otherwise the decode bottleneck (~74% of MoE time).
-    if crate::forward::profile_on() {
-        let t = std::time::Instant::now();
-        provider.prefetch(layer, &uniq)?;
-        crate::forward::LOAD_US
-            .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        provider.prefetch(layer, &uniq)?;
-    }
-
-    // ---- apply each unique expert to the positions that route to it -------
-    for &e in &uniq {
-        let mut rows = Vec::new();
-        let mut rw = Vec::new();
-        for s in 0..s_len {
-            for kk in 0..k {
-                if idxs[s * k + kk] == e {
-                    rows.push(s);
-                    rw.push(ws[s * k + kk]);
-                    break;
-                }
-            }
-        }
-        let nr = rows.len();
-        let mut xg = vec![0f32; nr * d];
-        for (r, &s) in rows.iter().enumerate() {
-            xg[r * d..(r + 1) * d].copy_from_slice(&x[s * d..(s + 1) * d]);
-        }
-        let ex = provider.expert(layer, e)?;
-        let mut hh = vec![0f32; nr * d];
-        ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
-        for (r, &s) in rows.iter().enumerate() {
-            let wgt = rw[r];
-            for dd in 0..d {
-                out[s * d + dd] += wgt * hh[r * d + dd];
-            }
-        }
+    // ---- routed experts (all local on a single node) ----------------------
+    let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
+    let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+    let partial = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, x, s_len, d)?;
+    for (o, p) in out.iter_mut().zip(partial.iter()) {
+        *o += *p;
     }
 
     // ---- shared expert (weight 1.0, all positions) ------------------------
@@ -605,6 +762,83 @@ mod tests {
         ffn(&sh.gate, &sh.up, &sh.down, &x, 1, &mut sh_out);
         for dd in 0..d {
             assert!((with[dd] - without[dd] - sh_out[dd]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn moe_sharded_two_nodes_equals_single_node() {
+        // The expert-parallel path must reproduce the single-node result exactly:
+        // node 0 owns experts {0,1}, node 1 owns {2,3}; node 1's experts are served
+        // over a real TCP loopback whose handler runs `compute_experts_partial`. With
+        // topk=2 the token routes to one expert per node, exercising both the local
+        // and the remote (transport) branch.
+        use colibri_cluster::{serve_experts, ExpertResponse, TcpTransport};
+
+        let c = cfg(); // 4 experts, topk 2, hidden 4
+        let d = c.hidden as usize;
+        let inter = c.moe_inter as usize;
+
+        // Router rows are per-expert constants, so logit_e ∝ const_e: order 2>1>3>0,
+        // top-2 = {2 (node 1), 1 (node 0)}.
+        let consts = [-1.0f32, 0.5, 1.0, 0.0];
+        let mut router = vec![0f32; c.n_experts as usize * d];
+        for (e, &cst) in consts.iter().enumerate() {
+            for i in 0..d {
+                router[e * d + i] = cst;
+            }
+        }
+        let mut l = Layer::default();
+        l.router = router;
+        l.router_bias = vec![0.0; c.n_experts as usize];
+        let sh = expert(50, (c.moe_inter * c.n_shared) as usize, d);
+        l.sh_gate = sh.gate.clone();
+        l.sh_up = sh.up.clone();
+        l.sh_down = sh.down.clone();
+
+        // All four experts live in one provider (both "nodes" share it here).
+        let experts: HashMap<(usize, usize), Arc<Expert>> =
+            (0..4).map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d)))).collect();
+        let provider = Arc::new(MapProvider { experts });
+
+        let x = vec![0.3f32, 0.5, -0.2, 0.7];
+
+        // Reference: single-node moe (all local), with the shared expert.
+        let mut out_single = vec![0f32; d];
+        moe(&c, &l, 0, &x, 1, &mut out_single, true, &*provider).unwrap();
+
+        // Node 1's expert server (loopback TCP), handler = compute_experts_partial.
+        let hp = provider.clone();
+        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), move |req| {
+            let outputs = compute_experts_partial(
+                &*hp,
+                req.layer as usize,
+                &req.experts,
+                &req.weights,
+                &req.activations,
+                req.n_tokens,
+                req.hidden,
+            )
+            .unwrap();
+            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
+        })
+        .unwrap();
+
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), addr);
+        let transport = TcpTransport::new(NodeId(0), peers);
+        let sharding = ExpertSharding::new(2, c.n_experts as u32);
+
+        let mut out_sharded = vec![0f32; d];
+        moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
+            .unwrap();
+
+        for dd in 0..d {
+            assert!(
+                (out_single[dd] - out_sharded[dd]).abs() < 1e-5,
+                "mismatch at {dd}: single {} vs sharded {}",
+                out_single[dd],
+                out_sharded[dd]
+            );
         }
     }
 

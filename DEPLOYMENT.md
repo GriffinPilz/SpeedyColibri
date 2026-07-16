@@ -120,6 +120,7 @@ HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm -p 8080:808
 | `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | Hugging Face token for the model download (or pass `hf_...` as the first argument) | unset — fine if the model is cached/public |
 | `COLI_PORT` | `serve` listen port (a positional arg after `serve` overrides) | `8080` |
 | `COLI_WARMUP` | `serve` warm-up prompts, `\|`-separated | unset |
+| `COLI_CTX` | `serve` context length (prompt + completion), e.g. `64k`. Clamped to the model max (`max_position_embeddings`, 1M for GLM-5.2). KV is ~175 KB/token (~5.6 GB at 32K, ~22 GB at 128K), so raise it within your RAM budget. Requests over the limit get a `context_length_exceeded` 400. | `32768` |
 | `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
 | `COLI_MODEL_DIR` | host path to a pre-resolved snapshot → mounted at `/model` | unset |
 | `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budgets (cap on a shared box to avoid the OOM killer) | available RAM / VRAM |

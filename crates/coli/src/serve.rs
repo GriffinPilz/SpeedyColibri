@@ -29,11 +29,33 @@ use colibri_tokenizer::Tokenizer;
 
 /// Default listen port; overridden by a positional arg or `COLI_PORT`.
 const DEFAULT_PORT: u16 = 8080;
-/// Default and hard cap on generated tokens per request.
+/// Default number of tokens generated when a request omits `max_tokens`.
 const DEFAULT_MAX_TOKENS: usize = 128;
-const MAX_TOKENS_CAP: usize = 2048;
+/// Default served context length (prompt + completion) when `COLI_CTX` is unset.
+/// GLM-5.2 supports up to 1M positions, but the KV cache is ~175 KB/token
+/// (~5.6 GB at 32K), so we cap to a memory-safe default and let `COLI_CTX` raise
+/// it as far as the model max.
+const DEFAULT_CTX: usize = 32_768;
 /// Tokens generated per warm-up prompt (enough to route a spread of experts).
 const WARMUP_TOKENS: usize = 8;
+
+/// Parse a token count like `32k`, `1m`, or `131072`.
+fn parse_ctx(s: &str) -> Option<usize> {
+    let s = s.trim().to_lowercase();
+    let (num, mul) = if let Some(n) = s.strip_suffix('k') {
+        (n, 1024usize)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 1024 * 1024)
+    } else {
+        (s.as_str(), 1)
+    };
+    num.parse::<f64>().ok().map(|v| (v * mul as f64) as usize)
+}
+
+/// KV-cache bytes per token: two f32 latent/rotary buffers per layer.
+fn kv_bytes_per_token(cfg: &colibri_core::Config) -> usize {
+    cfg.n_layers as usize * (cfg.kv_lora as usize + cfg.qk_rope as usize) * 4
+}
 
 type Provider<'a> = ExpertCache<ShardsExpertProvider<'a>>;
 
@@ -90,6 +112,16 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     let provider = ExpertCache::new(base, crate::ram_budget());
     let model_id = model_id_from(&snap);
 
+    // Served context length (prompt + completion). The model's hard ceiling is
+    // `max_position_embeddings`; the served value is COLI_CTX (else a memory-safe
+    // default), clamped to that ceiling. Requests are validated against it.
+    let model_max = if model.cfg.max_ctx > 0 { model.cfg.max_ctx as usize } else { usize::MAX };
+    let ctx_len = std::env::var("COLI_CTX")
+        .ok()
+        .and_then(|s| parse_ctx(&s))
+        .unwrap_or(DEFAULT_CTX)
+        .clamp(1, model_max);
+
     // ---- warm-up ----------------------------------------------------------
     for (i, w) in warmups.iter().enumerate() {
         let ids = tok.encode(w);
@@ -117,11 +149,18 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
     println!("[serve] OpenAI-compatible server on http://{addr}  (model: {model_id})");
+    let kv_at_ctx = kv_bytes_per_token(&model.cfg).saturating_mul(ctx_len) as f64 / (1u64 << 30) as f64;
+    let model_max_str =
+        if model.cfg.max_ctx > 0 { model.cfg.max_ctx.to_string() } else { "unknown".to_string() };
+    println!(
+        "[serve]   context length: {ctx_len} tokens (model max {model_max_str}; up to {:.1} GB KV) — set COLI_CTX to change",
+        kv_at_ctx
+    );
     println!("[serve]   POST /v1/chat/completions   POST /v1/completions   GET /v1/models   GET /health");
 
     for conn in listener.incoming() {
         match conn {
-            Ok(stream) => handle(stream, &model, &provider, &tok, &model_id),
+            Ok(stream) => handle(stream, &model, &provider, &tok, &model_id, ctx_len),
             Err(e) => eprintln!("[serve] accept: {e}"),
         }
     }
@@ -160,7 +199,15 @@ struct Request {
     body: String,
 }
 
-fn handle(mut stream: TcpStream, model: &Model, provider: &Provider, tok: &Tokenizer, model_id: &str) {
+#[allow(clippy::too_many_arguments)]
+fn handle(
+    mut stream: TcpStream,
+    model: &Model,
+    provider: &Provider,
+    tok: &Tokenizer,
+    model_id: &str,
+    ctx_len: usize,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_nodelay(true);
     let mut reader = match stream.try_clone() {
@@ -174,17 +221,30 @@ fn handle(mut stream: TcpStream, model: &Model, provider: &Provider, tok: &Token
 
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") | ("GET", "/health") => {
-            send_json(&mut stream, 200, &format!("{{\"status\":\"ok\",\"model\":{}}}", jstr(model_id)));
+            send_json(
+                &mut stream,
+                200,
+                &format!(
+                    "{{\"status\":\"ok\",\"model\":{},\"max_model_len\":{ctx_len}}}",
+                    jstr(model_id)
+                ),
+            );
         }
         ("GET", "/v1/models") => {
+            // `max_model_len` mirrors the field vLLM/others expose so clients can
+            // discover the served context window.
             let body = format!(
-                "{{\"object\":\"list\",\"data\":[{{\"id\":{},\"object\":\"model\",\"owned_by\":\"colibri\"}}]}}",
+                "{{\"object\":\"list\",\"data\":[{{\"id\":{},\"object\":\"model\",\"owned_by\":\"colibri\",\"max_model_len\":{ctx_len}}}]}}",
                 jstr(model_id)
             );
             send_json(&mut stream, 200, &body);
         }
-        ("POST", "/v1/completions") => complete(&mut stream, model, provider, tok, model_id, &req.body, false),
-        ("POST", "/v1/chat/completions") => complete(&mut stream, model, provider, tok, model_id, &req.body, true),
+        ("POST", "/v1/completions") => {
+            complete(&mut stream, model, provider, tok, model_id, &req.body, false, ctx_len)
+        }
+        ("POST", "/v1/chat/completions") => {
+            complete(&mut stream, model, provider, tok, model_id, &req.body, true, ctx_len)
+        }
         ("OPTIONS", _) => send_json(&mut stream, 204, ""),
         _ => send_json(&mut stream, 404, "{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}"),
     }
@@ -227,6 +287,7 @@ fn read_request<R: BufRead>(reader: &mut R) -> Option<Request> {
 /// Shared handler for `/v1/completions` (chat=false) and `/v1/chat/completions`
 /// (chat=true): parse the request, build the prompt token ids, then either stream
 /// SSE chunks or return one JSON object.
+#[allow(clippy::too_many_arguments)]
 fn complete(
     stream: &mut TcpStream,
     model: &Model,
@@ -235,6 +296,7 @@ fn complete(
     model_id: &str,
     body: &str,
     chat: bool,
+    ctx_len: usize,
 ) {
     let req = match Json::parse(body) {
         Some(j) => j,
@@ -251,10 +313,10 @@ fn complete(
         }
     };
 
-    let max_tokens = obj
+    let requested_max = obj
         .get("max_tokens")
         .and_then(|v| v.as_i64())
-        .map(|n| (n.max(1) as usize).min(MAX_TOKENS_CAP))
+        .map(|n| n.max(1) as usize)
         .unwrap_or(DEFAULT_MAX_TOKENS);
     let stream_mode = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -281,6 +343,23 @@ fn complete(
         send_json(stream, 400, "{\"error\":{\"message\":\"empty prompt\",\"type\":\"invalid_request_error\"}}");
         return;
     }
+
+    // Enforce the served context window (prompt + completion). A prompt at/over
+    // the limit is rejected (OpenAI-style); otherwise the completion is clamped to
+    // the remaining room so it always fits the KV cache.
+    if ids.len() >= ctx_len {
+        let msg = format!(
+            "This model's maximum context length is {ctx_len} tokens, but the prompt is {} tokens. Shorten the prompt or raise COLI_CTX.",
+            ids.len()
+        );
+        send_json(
+            stream,
+            400,
+            &format!("{{\"error\":{{\"message\":{},\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}}}", jstr(&msg)),
+        );
+        return;
+    }
+    let max_tokens = requested_max.min(ctx_len - ids.len());
 
     let object = if chat { "chat.completion" } else { "text_completion" };
     let id = format!("cmpl-{}", ids.len().wrapping_mul(2654435761) ^ max_tokens);
@@ -336,9 +415,14 @@ fn block_completion(
             return;
         }
     };
-    let cont = &seq[prompt.len()..];
+    // Drop the trailing stop token (e.g. GLM's `<|user|>`) from the visible text —
+    // generation halts right after emitting it, so it's always the last token. The
+    // streaming path already excludes it; keep the two consistent.
+    let full = &seq[prompt.len()..];
+    let hit_stop = full.last().is_some_and(|t| model.cfg.stop_ids.contains(t));
+    let cont = if hit_stop { &full[..full.len() - 1] } else { full };
     let text = tok.decode(cont);
-    let finish = if cont.last().is_some_and(|t| model.cfg.stop_ids.contains(t)) { "stop" } else { "length" };
+    let finish = if hit_stop { "stop" } else { "length" };
     let choice = if chat {
         format!("{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":{}}},\"finish_reason\":{}}}", jstr(&text), jstr(finish))
     } else {
@@ -563,5 +647,24 @@ mod tests {
     fn read_request_empty_is_none() {
         let mut r = Cursor::new(&b""[..]);
         assert!(read_request(&mut r).is_none());
+    }
+
+    #[test]
+    fn parse_ctx_units() {
+        assert_eq!(parse_ctx("32768"), Some(32768));
+        assert_eq!(parse_ctx("32k"), Some(32768));
+        assert_eq!(parse_ctx("128K"), Some(131072));
+        assert_eq!(parse_ctx("1m"), Some(1024 * 1024));
+        assert_eq!(parse_ctx("0.5m"), Some(512 * 1024));
+        assert_eq!(parse_ctx("  8k "), Some(8192));
+        assert_eq!(parse_ctx("nope"), None);
+    }
+
+    #[test]
+    fn ctx_clamp_to_model_max() {
+        // COLI_CTX request is bounded by the model's max_position_embeddings.
+        let model_max = 1_048_576usize;
+        assert_eq!(parse_ctx("2m").unwrap().clamp(1, model_max), model_max);
+        assert_eq!(parse_ctx("128k").unwrap().clamp(1, model_max), 131072);
     }
 }

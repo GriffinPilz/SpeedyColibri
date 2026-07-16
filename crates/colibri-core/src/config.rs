@@ -31,6 +31,8 @@ pub struct Config {
     pub v_head: i32,
     pub n_shared: i32,
     pub vocab: i32,
+    /// model's max context (`max_position_embeddings`); 0 if the config omits it
+    pub max_ctx: i32,
     pub n_group: i32,
     pub topk_group: i32,
     pub norm_topk: bool,
@@ -128,6 +130,7 @@ impl Config {
             v_head: gi(r, "v_head_dim"),
             n_shared: gi(r, "n_shared_experts"),
             vocab: gi(r, "vocab_size"),
+            max_ctx: gi(r, "max_position_embeddings"),
             n_group: gi(r, "n_group"),
             topk_group: gi(r, "topk_group"),
             norm_topk: r.get("norm_topk_prob").and_then(Json::as_bool).unwrap_or(false),

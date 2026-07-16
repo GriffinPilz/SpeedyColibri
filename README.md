@@ -150,6 +150,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_RAM_GB` | cap the RAM expert cache — set below the box's free RAM so the OOM killer stays away (85 leaves headroom on a 128 GB Spark) | all free RAM |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
+| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`; bounded by the model max (1M) and by RAM (~175 KB/token of KV) | `32768` |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
 | `COLI_VRAM_GB` | cap the VRAM expert store | all free VRAM |

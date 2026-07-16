@@ -213,26 +213,58 @@ pub fn expert_gate_name(layer: usize, eid: usize) -> String {
 }
 
 /// Whether streamed experts should run on the GPU (marked `gpu_eligible`). Read
-/// once. Default: **on** when the zero-copy path is available (unified memory) —
-/// it's memory-safe and ~2× the copy path. `COLI_GPU_EXPERTS=1`/`=0` forces it;
-/// `=1` also enables the copy path (needs `COLI_VRAM_GB` caps, see [`load_expert`]).
+/// once. **On exactly when the zero-copy path is available** (unified memory, e.g.
+/// GB10) — there the GPU reads the expert's RAM buffer in place: no device copy, no
+/// pointer-keyed device cache, and ~2× the copy path.
+///
+/// Streamed experts are *never* eligible off the zero-copy path, and
+/// `COLI_GPU_EXPERTS=1` cannot force it. This is a safety property, not a tuning
+/// knob: their payloads live in `SharedBuf` buffers that are **recycled through a
+/// global pool**, so an address is reused by a different expert as soon as the
+/// cache evicts. The copy path's device cache is keyed by exactly that address
+/// (`upload_ffn`), so it would hit a stale entry and compute the wrong expert's
+/// weights — silently. `=1` therefore only opts in when zero-copy is available;
+/// `=0` opts out. Off the zero-copy path streamed experts run on the CPU, which is
+/// slower but correct. (Unified memory is the only supported target, so this is not
+/// a live configuration — the guard exists so it can't become one by accident.)
 fn gpu_experts_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("COLI_GPU_EXPERTS").ok().as_deref() {
-        Some("1") => true,
-        Some("0") => false,
-        _ => {
-            #[cfg(feature = "cuda")]
-            {
-                crate::gpu::zerocopy()
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                false
-            }
+    *ON.get_or_init(|| {
+        let setting = std::env::var("COLI_GPU_EXPERTS").ok();
+        let zerocopy = zerocopy_available();
+        if setting.as_deref() == Some("1") && !zerocopy {
+            eprintln!(
+                "coli: COLI_GPU_EXPERTS=1 ignored — zero-copy is unavailable, and streamed \
+                 experts cannot use the device copy path (their pooled buffers are recycled, \
+                 so its address-keyed cache would return another expert's weights). \
+                 Running them on the CPU instead."
+            );
         }
+        experts_gpu_decision(setting.as_deref(), zerocopy)
     })
+}
+
+/// Whether the zero-copy path is usable; always `false` without the `cuda` feature.
+fn zerocopy_available() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        crate::gpu::zerocopy()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+/// Pure decision behind [`gpu_experts_enabled`]: `=0` opts out; anything else opts
+/// in *only* when zero-copy is available. Split out so the safety property is
+/// unit-testable without a GPU or the environment.
+fn experts_gpu_decision(setting: Option<&str>, zerocopy: bool) -> bool {
+    match setting {
+        Some("0") => false,
+        _ => zerocopy,
+    }
 }
 
 /// Load one routed expert (gate/up/down) directly from the shards. Shared by
@@ -288,11 +320,12 @@ pub fn load_expert(
             down: crate::loader::qt_load(shards, &down_w, hidden, moe_inter, ebits)?,
         }
     };
-    // Route streamed experts through the GPU fused-FFN path. On unified memory
-    // (the GB10) this uses the zero-copy wrap — the kernel reads the RAM copy in
-    // place, so there is no VRAM double-store, no eviction, and no OOM — and it is
-    // ~2× the copy path. Default-on there; see [`gpu_experts_enabled`] for the
-    // `COLI_GPU_EXPERTS` override and the copy-path caveats on other devices.
+    // Route streamed experts through the GPU fused-FFN path. This only ever happens
+    // on unified memory (the GB10), via the zero-copy wrap: the kernel reads the RAM
+    // copy in place, so there is no VRAM double-store, no eviction and no OOM — and
+    // it is ~2× the copy path. Off the zero-copy path they stay on the CPU by
+    // construction; see [`gpu_experts_enabled`] for why that is a safety property
+    // rather than a tuning choice.
     if gpu_experts_enabled() {
         ex.mark_gpu_eligible();
     }
@@ -866,6 +899,31 @@ mod tests {
         let mut buf = Vec::new();
         write_routing_lines(&mut buf, 5, 3, 2, 2, &[10, 20, 30, 40]).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "5 3 0 10 20\n5 3 1 30 40\n");
+    }
+
+    #[test]
+    fn streamed_experts_are_gpu_eligible_only_with_zerocopy() {
+        // The safety property: streamed experts live in recycled pool buffers, and the
+        // copy path's device cache is keyed by their address, so caching them there
+        // would compute a *different* expert's weights. COLI_GPU_EXPERTS=1 must not be
+        // able to force that — it may only opt in when zero-copy is available.
+        assert!(experts_gpu_decision(Some("1"), true), "=1 opts in when zero-copy is available");
+        assert!(
+            !experts_gpu_decision(Some("1"), false),
+            "=1 must NOT force streamed experts onto the address-keyed copy path"
+        );
+
+        // =0 always opts out.
+        assert!(!experts_gpu_decision(Some("0"), true));
+        assert!(!experts_gpu_decision(Some("0"), false));
+
+        // Unset follows zero-copy availability.
+        assert!(experts_gpu_decision(None, true));
+        assert!(!experts_gpu_decision(None, false));
+
+        // Unrecognised values behave like unset, never like a force.
+        assert!(!experts_gpu_decision(Some("yes"), false));
+        assert!(!experts_gpu_decision(Some(""), false));
     }
 
     #[test]

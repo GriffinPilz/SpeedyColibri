@@ -21,6 +21,15 @@
 //! instead assigns experts to nodes by a weighted longest-processing-time greedy so
 //! each node's total selection weight is near-equal — spreading the hot experts.
 //!
+//! **Measured: no throughput gain on 2 nodes.** Warm 32-token decode over 6 repeats
+//! came out at ~1.95 tok/s contiguous vs ~1.96 hot-aware — indistinguishable. Expert
+//! popularity is uncorrelated with expert *id*, so a contiguous half already draws
+//! ~half the traffic by the law of large numbers; LPT tightens the worst case, not
+//! the mean. It may still earn its keep with few experts per node, a pathological
+//! workload, or many nodes (where each block is small enough for the split to be
+//! lumpy) — but it is not a default, and it costs a usage history that every node
+//! must replicate byte-for-byte or the handshake (rightly) refuses to run.
+//!
 //! **Every node must build the identical map**, or the activation exchange in
 //! `moe_sharded` misroutes (node A ships expert `e` to the node it thinks owns it,
 //! which may differ from where B computes it). The balanced map is therefore a pure

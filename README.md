@@ -39,9 +39,10 @@ experts are computed on the GPU with **zero copies** — no VRAM double-store, n
 `cudaMemcpy`, no eviction churn. Attention, the fused expert FFN, and the
 projections all run on-device and are **token-exact vs the CPU path**.
 
-The result runs the real model end-to-end today. It is **disk-streaming-bound**,
-not compute-bound — which is exactly the problem multi-Spark is meant to solve
-(see [Roadmap](#roadmap-multi-spark)).
+The result runs the real model end-to-end today. On one Spark it is
+**disk-streaming-bound**, not compute-bound — which is exactly what
+[multi-Spark](#multi-spark-expert-parallel) solves: splitting the experts across two
+Sparks measured **2.6× faster** decode, with bit-identical output.
 
 ## Quick start (DGX Spark)
 
@@ -154,8 +155,14 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
 | `COLI_VRAM_GB` | cap the VRAM expert store | all free VRAM |
+| `COLI_PIN_GB` | pin the hottest experts resident from the usage history so they never churn out of the cache. A number = that many GB; `auto` = size it to the knee of the usage curve (capped at 80% of the cache, leaving room for the cold tail to stream). Costs a one-time warm-up that reads every pinned expert — minutes, at `auto` scale | off |
 | `COLI_PROFILE` | `1` → print the attention/MoE/expert-load time breakdown | off |
 | `COLI_TIMING` | `1` → print per-token latency + steady-state tok/s | off |
+| `COLI_EXPERT_LOG` | path → log every routing decision (`step layer pos e0..e7`) for `scripts/expert_hotset_analysis.py` | off |
+| `COLI_PREFETCH` | speculative next-layer expert prefetch. **Leave off**: measured *slower* at every degree (0.82–0.99 vs 1.01 tok/s) — speculative loads evict the working set and contend for an already-saturated NVMe | off |
+
+Multi-node variables (`COLI_NUM_NODES`, `COLI_PEERS`, …) are in
+[Multi-Spark](#multi-spark-expert-parallel) below.
 
 Full deployment notes — GPU passthrough modes, building by hand or with compose,
 the CUDA base image — are in **[DEPLOYMENT.md](DEPLOYMENT.md)**.
@@ -167,7 +174,11 @@ direct build needs only the CUDA toolkit and rustup:
 
 ```bash
 # Build (~3–5 min): the CUDA backend compiles c/backend_cuda.cu with nvcc.
-CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
+# NVCC and CUDA_HOME are set explicitly because a non-interactive shell often lacks
+# nvcc on PATH (a login shell, `bash -lc`, usually has it). If nvcc is missing the
+# build now fails immediately and says so, instead of dying later at link time with
+# `undefined reference to coli_cuda_*`.
+NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
   cargo build --release -p coli --features cuda
 
 # Serve: serve <snapshot-dir> [port] [warm-up prompt...]
@@ -218,24 +229,75 @@ What's landed to push on that wall:
 
 Per-module port status and the milestone order live in **[PORTING.md](PORTING.md)**.
 
-## Roadmap: multi-Spark
+## Multi-Spark (expert-parallel)
 
-A single Spark holds only ~5% of the experts resident, so it streams the rest from
-disk every token — that's the whole ceiling. The design answer, and the reason
-this port exists, is **expert-parallel across multiple Sparks**:
+**Working, and it's the single biggest win available.** The 256 experts/layer are
+split across nodes: each Spark owns half, loads and computes only its own half, and
+answers its peers over the ConnectX/RoCE fabric. The dense part (attention, shared
+expert, embeddings) is replicated per node, so only expert activations cross the wire
+(~24 KB each way, not expert weights).
 
-- **Shard the 256 experts/layer across nodes.** Each Spark owns a contiguous block,
-  streams and computes only its shard, and keeps that shard *resident* — so the
-  disk-streaming wall disappears. The dense part (attention, shared expert,
-  embeddings) is replicated per node, so only expert I/O crosses the wire.
-- **Transport: RDMA/RoCE over the ConnectX-7 200 GbE link**, ideally with GPUDirect
-  so the Blackwell GPU DMAs activations straight to the fabric.
-- The sharding math already lives in the [`colibri-cluster`](crates/colibri-cluster)
-  crate (tested); the RDMA transport is designed and stubbed. Wiring it is the
-  **next milestone**.
+Measured on two DGX Sparks, 32-token greedy decode, 6 consecutive repeats against a
+warm server. **Both rows use a 40 GB expert cache per node** so the comparison is
+like-for-like — that is why the 1-Spark row is below the ~1.2 tok/s quoted in
+[Where it stands](#where-it-stands), which uses an 85 GB cache:
 
-Two Sparks with the experts split and pinned turn a disk-bound ~1.2 tok/s into a
-compute-bound engine. That's the target.
+| | cold (1st run) | warm (converged) |
+|---|---|---|
+| 1 Spark | 0.71 tok/s | **0.76 tok/s** |
+| 2 Sparks | 1.15 tok/s | **~1.95 tok/s** (**2.6×**) |
+
+The cold/warm gap is the point: the first request pays for filling the cache, and a
+`serve` warm-up prompt buys that back before real traffic arrives.
+
+Output is **bit-identical** to single-node (all 32 tokens), verified on the real 744 B
+model. The win is *residency, not compute*: at the same per-node budget each Spark
+caches a 128-expert shard instead of all 256, so it hits disk far less. Fabric latency
+is a rounding error by comparison — RoCE RTT is ~0.36 ms, so all 75 layers of
+round-trips cost ~27 ms of a ~510 ms token (~5%).
+
+### Running it
+
+Start the **workers first** — the driver verifies every peer at startup and exits if
+one is unreachable.
+
+```bash
+# --- on each worker node (rank 1..N-1) ---
+COLI_NUM_NODES=2 COLI_NODE_RANK=1 COLI_RAM_GB=40 \
+  docker/run-dgx.sh worker                    # serves its shard on :48800
+
+# --- on the driver (rank 0) — this is the node you send requests to ---
+COLI_NUM_NODES=2 COLI_NODE_RANK=0 \
+  COLI_PEERS=1=192.168.100.10:48800 \
+  COLI_RAM_GB=40 docker/run-dgx.sh serve 8080
+```
+
+`docker/run-dgx.sh cluster` scans the fabric and prints the Sparks it can see, with
+their RoCE addresses — use it to fill in `COLI_PEERS`.
+
+Both nodes print a **sharding fingerprint** at startup; they must match. They also
+print their build revision (`coli v0.1.0 (abc1234)`) — that must match too, or one
+node is running stale code. Nodes that disagree about the expert map are refused at
+connect time rather than silently producing wrong tokens, so a mismatch is a startup
+failure, never a wrong answer.
+
+| Var | Meaning | Default |
+|---|---|---|
+| `COLI_NUM_NODES` | cluster size; `1` disables expert-parallel entirely | `1` |
+| `COLI_NODE_RANK` | this node's rank, `0..NUM_NODES-1`. Rank 0 is the driver (runs `serve`); the rest run `worker` | `0` |
+| `COLI_PEERS` | `rank=host:port` for **every** other rank, comma-separated. Required on the driver; a missing rank is a startup error | none |
+| `COLI_EXPERT_PORT` | port a `worker` listens on | `48800` |
+| `COLI_SHARD` | `hot` → assign experts to balance *traffic* rather than count, from the usage history. **Measured no gain on 2 nodes** (~1.96 vs ~1.95 tok/s) and it requires every node to share a byte-identical `.coli_usage` or the handshake refuses. Leave unset. | contiguous |
+| `COLI_USAGE` | path to the usage history. Point every node at the *same* file (shared storage) if using `COLI_SHARD=hot` | `<snap>/.coli_usage` |
+
+**Scaling past 2.** Per-node cache (~5 900 experts at 106 GB) versus 19 200 total
+routed experts means at **4+ Sparks each node's whole shard is resident** and expert
+streaming stops entirely. Sharding does *not* reduce disk footprint — every node
+holds the full 358 GB snapshot and simply reads less of it.
+
+**Next:** the RDMA transport (`colibri-cluster`, stubbed behind the same `Transport`
+trait) would cut the ~27 ms/token of fabric latency — worth ~5%. The larger remaining
+lever is still expert residency, i.e. more nodes.
 
 ## Repository layout
 

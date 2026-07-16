@@ -48,23 +48,37 @@ resolve_model() {
     echo "[coli] no snapshot at /model and no hf CLI in the image" >&2
     exit 1
   }
-  # `hf download` prints the snapshot dir on stdout — as a bare path
-  # (huggingface-cli) or as "  path: <dir>" (hf ≥1.0). Normalize both.
-  snap_path() { tail -1 | sed -E 's/^[[:space:]]*(path:[[:space:]]*)?//'; }
-  # Cached and complete → instant, no network, no token needed.
-  if snap=$(HF_HUB_OFFLINE=1 "$hf_bin" download "$COLI_MODEL_REPO" 2>/dev/null | snap_path) \
-     && [[ -f "$snap/config.json" ]]; then
+  # Pull the HF snapshot dir out of `hf download` output — robust against progress
+  # bars (\r) and the "path:" prefix (hf ≥1.0): the last ".../snapshots/<rev>".
+  snap_path() { tr '\r' '\n' | grep -oE '/[^ ]*/snapshots/[^/ ]+' | tail -1; }
+
+  # Primary path: complete/verify from the Hub. `hf download` is idempotent — it
+  # fetches only files that are missing or the wrong size, so a full cache returns
+  # in seconds, while a PARTIAL cache (an interrupted earlier download) is
+  # COMPLETED here instead of being served broken. The old code short-circuited to
+  # HF_HUB_OFFLINE and handed a half-downloaded snapshot to the engine, which then
+  # died on the first missing tensor (e.g. `model.norm.weight`). Progress → stderr;
+  # the snapshot path → stdout, captured here.
+  echo "[coli] resolving ${COLI_MODEL_REPO} — fetching any missing files from the Hub..." >&2
+  echo "[coli] (mount the host HF cache to persist it: -v ~/.cache/huggingface:/root/.cache/huggingface)" >&2
+  if snap=$("$hf_bin" download "$COLI_MODEL_REPO" | snap_path) \
+     && [[ -n "$snap" && -f "$snap/config.json" ]]; then
     echo "$snap"
     return
   fi
-  echo "[coli] model not cached — downloading ${COLI_MODEL_REPO} to ${HF_HOME:-~/.cache/huggingface}" >&2
-  echo "[coli] (mount the host HF cache to persist it: -v ~/.cache/huggingface:/root/.cache/huggingface)" >&2
-  snap=$("$hf_bin" download "$COLI_MODEL_REPO" | snap_path)
-  [[ -f "$snap/config.json" ]] || {
-    echo "[coli] download did not produce a usable snapshot at '$snap'" >&2
-    exit 1
-  }
-  echo "$snap"
+
+  # Fallback: Hub unreachable (offline node). Serve the local cache if present, but
+  # it may be incomplete — warn, and let the engine surface any missing tensor.
+  echo "[coli] Hub unreachable — falling back to the local cache" >&2
+  if snap=$(HF_HUB_OFFLINE=1 "$hf_bin" download "$COLI_MODEL_REPO" 2>/dev/null | snap_path) \
+     && [[ -n "$snap" && -f "$snap/config.json" ]]; then
+    echo "[coli] WARNING: serving from an UNVERIFIED cache. If load fails with a missing tensor, the download is incomplete — re-run with network access (and HF_TOKEN if the repo is gated)." >&2
+    echo "$snap"
+    return
+  fi
+
+  echo "[coli] could not resolve ${COLI_MODEL_REPO}: no /model mount, Hub unreachable, and no usable cache" >&2
+  exit 1
 }
 
 cmd="${1:-help}"

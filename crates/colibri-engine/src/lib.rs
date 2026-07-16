@@ -114,6 +114,38 @@ pub fn load_model_with(
     let cfg = Config::load(snap)?;
     let shards = colibri_safetensors::Shards::open(snap)?;
 
+    // Fail fast with an actionable message on a partial download. An interrupted HF
+    // pull leaves config.json plus only some `*.safetensors` shards, so tensors go
+    // missing deep in loading (the "missing tensor: model.norm.weight" that a
+    // half-downloaded node hits). Probe a few sentinels spanning the file set first.
+    {
+        let last = cfg.n_layers.saturating_sub(1) as usize;
+        let sentinels = [
+            "model.embed_tokens.weight".to_string(),
+            "lm_head.weight".to_string(),
+            "model.norm.weight".to_string(),
+            format!("model.layers.{last}.input_layernorm.weight"),
+        ];
+        let missing: Vec<&str> =
+            sentinels.iter().map(String::as_str).filter(|t| !shards.has(t)).collect();
+        if !missing.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "model snapshot at {} looks INCOMPLETE: missing {}/{} core tensors [{}]. \
+                     This is almost always a partial download — fetch the remaining .safetensors \
+                     shards (re-run the Hugging Face download with network access, plus a token if \
+                     the repo is gated) or mount a complete snapshot.",
+                    snap.display(),
+                    missing.len(),
+                    sentinels.len(),
+                    missing.join(", ")
+                ),
+            )
+            .into());
+        }
+    }
+
     let d = cfg.hidden as usize;
     let h = cfg.n_heads as usize;
     let dbits = opts.dbits;

@@ -45,33 +45,49 @@ not compute-bound — which is exactly the problem multi-Spark is meant to solve
 
 ## Quick start (DGX Spark)
 
-One command. It builds the container on first use, wires up the GPU (even on a
-stock shared Spark with no `--gpus` runtime and no root), and fetches the model
-into your Hugging Face cache if it isn't already there:
+The deliverable is an **OpenAI-compatible inference server**. One command builds
+the container on first use, wires up the GPU (even on a stock shared Spark with no
+`--gpus` runtime and no root), fetches the model into your Hugging Face cache if
+needed, and starts serving:
 
 ```bash
-# HF token as the first argument (only needed for the first, uncached download)
-docker/run-dgx.sh hf_xxxxxxxxxxxxxxxxxxxx gen 100 200 300 400
-
-# ...or from the environment
-HF_TOKEN=hf_xxxx docker/run-dgx.sh gen 100 200 300 400
+# `serve [port] [warm-up prompt...]` — publishes the port and starts the HTTP API.
+# The HF token (first arg, or HF_TOKEN) is only needed for the first, uncached download.
+docker/run-dgx.sh hf_xxxxxxxxxxxxxxxxxxxx serve 8080 "hello, warm up the cache"
 
 # already downloaded (or a public repo)? no token needed:
-docker/run-dgx.sh gen 100 200 300 400
+COLI_RAM_GB=85 docker/run-dgx.sh serve 8080
 ```
+
+Then talk to it like any OpenAI endpoint — streaming works, which matters at
+~1 tok/s:
+
+```bash
+# chat, streamed (SSE)
+curl -N http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "glm-5.2", "stream": true, "max_tokens": 64,
+  "messages": [{"role": "user", "content": "Explain MoE routing in one sentence."}]
+}'
+
+# raw completion, non-streamed
+curl http://localhost:8080/v1/completions -H 'Content-Type: application/json' -d '{
+  "prompt": "The capital of France is", "max_tokens": 16
+}'
+
+curl http://localhost:8080/v1/models      # what is served
+curl http://localhost:8080/health         # liveness
+```
+
+**Warm-up prompts** (positional args after the port, and/or `COLI_WARMUP="a|b"`)
+run through a short generation at startup so the hottest experts are already
+resident before the first real request. The **port** is a positional arg after
+`serve`, or `COLI_PORT`, default `8080`.
 
 The model resolves in order: a snapshot mounted at `/model`
 (`COLI_MODEL_DIR=<dir> docker/run-dgx.sh ...`) → the Hugging Face cache (the
 launcher mounts the host's `~/.cache/huggingface`, so the 358 GB download happens
 **at most once** and is shared with non-container runs) → `hf download` of
 `$COLI_MODEL_REPO` (default `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
-
-Cap the expert cache on a shared box so the OOM killer stays away:
-
-```bash
-COLI_RAM_GB=85 COLI_TIMING=1 COLI_PROFILE=1 \
-  docker/run-dgx.sh gen 100 200 300 400
-```
 
 Full deployment notes — GPU passthrough modes, every environment variable,
 building by hand or with compose — are in **[DEPLOYMENT.md](DEPLOYMENT.md)**.
@@ -84,8 +100,21 @@ The workspace has **no crates.io dependencies** (std + path crates only):
 CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
   cargo build --release -p coli --features cuda
 
-COLI_RAM_GB=85 COLI_TIMING=1 \
-  ./target/release/coli gen /path/to/snapshot 100 200 300 400
+COLI_RAM_GB=85 ./target/release/coli serve /path/to/snapshot 8080 "warm-up prompt"
+```
+
+### Low-level: `gen` (forward-pass smoke test)
+
+`coli gen <snap> [token_id...]` runs the raw forward pass and greedy-generates a
+continuation. Its arguments are **token ids, not text** — e.g. `gen 100 200 300 400`
+feeds the four-token prompt `[100, 200, 300, 400]` and prints the generated ids.
+It's a benchmark/debug driver that bypasses the tokenizer (the server is the
+text-in/text-out path); pass any valid ids (`< 154880`), or none to default to
+`[1]`. `COLI_TIMING=1` and `COLI_PROFILE=1` print per-token latency and the
+attention/MoE/load breakdown.
+
+```bash
+COLI_RAM_GB=85 COLI_TIMING=1 COLI_PROFILE=1 docker/run-dgx.sh gen 100 200 300 400
 ```
 
 ## Where it stands

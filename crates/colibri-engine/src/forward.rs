@@ -118,6 +118,32 @@ pub fn generate_greedy<P: ExpertProvider>(
     prompt: &[i32],
     n_new: usize,
 ) -> io::Result<Vec<i32>> {
+    let mut out = prompt.to_vec();
+    generate_stream(model, kv, provider, prompt, n_new, |tok| {
+        out.push(tok);
+        true
+    })?;
+    Ok(out)
+}
+
+/// Streaming greedy generation: like [`generate_greedy`], but invokes `on_token`
+/// with each newly decoded token id as it is produced (before the next forward
+/// step), so a caller can stream output live. Returning `false` from `on_token`
+/// stops generation early — used by the server to abort when a client
+/// disconnects. A config stop token is delivered to `on_token` and then ends the
+/// run. `generate_greedy` is a thin wrapper that collects the tokens.
+pub fn generate_stream<P, F>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    prompt: &[i32],
+    n_new: usize,
+    mut on_token: F,
+) -> io::Result<()>
+where
+    P: ExpertProvider,
+    F: FnMut(i32) -> bool,
+{
     let d = model.cfg.hidden as usize;
     assert!(!prompt.is_empty(), "prompt must be non-empty");
     assert!(
@@ -141,7 +167,6 @@ pub fn generate_greedy<P: ExpertProvider>(
         let ms = t_pre.elapsed().as_secs_f64() * 1e3;
         eprintln!("[timing] prefill {s} tok: {ms:.1} ms ({:.1} tok/s)", s as f64 / (ms / 1e3));
     }
-    let mut out = prompt.to_vec();
     let mut logits_us = 0u64;
     let mut logit = {
         let t = std::time::Instant::now();
@@ -154,8 +179,11 @@ pub fn generate_greedy<P: ExpertProvider>(
     let mut decode_ms: Vec<f64> = Vec::with_capacity(n_new);
     for _ in 0..n_new {
         let next = argmax(&logit) as i32;
-        out.push(next);
+        let keep_going = on_token(next);
         if model.cfg.stop_ids.contains(&next) {
+            break;
+        }
+        if !keep_going {
             break;
         }
         let mut h = vec![0f32; d];
@@ -198,5 +226,5 @@ pub fn generate_greedy<P: ExpertProvider>(
             logits_us as f64 / 1e3,
         );
     }
-    Ok(out)
+    Ok(())
 }

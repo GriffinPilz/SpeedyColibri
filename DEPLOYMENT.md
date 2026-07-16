@@ -46,7 +46,39 @@ $COLI_MODEL_REPO` (default `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
 stock shared DGX where neither is configured and you have no root — it binds
 `/dev/nvidia*` and the driver's user-space libraries directly (the entrypoint
 re-runs `ldconfig` so `libcuda.so.1` resolves). Tuning env vars (`COLI_RAM_GB`,
-`COLI_PROFILE`, ...) pass through automatically.
+`COLI_PROFILE`, ...) pass through automatically. When the command is `serve`, the
+launcher also publishes the listen port (`-p`).
+
+## The inference server
+
+`coli serve [port] [warm-up prompt...]` is an **OpenAI-compatible HTTP server**
+(a minimal HTTP/1.1 server on `std::net`, requests parsed with `colibri-json`,
+no external dependency):
+
+| Route | |
+|---|---|
+| `POST /v1/chat/completions` | chat messages → reply (honors `"stream": true`) |
+| `POST /v1/completions` | text `prompt` → completion (honors `"stream": true`) |
+| `GET /v1/models` | list the served model |
+| `GET /health`, `GET /` | liveness |
+
+Streaming replies use Server-Sent Events (the OpenAI chunk protocol, terminated
+by `data: [DONE]`), so tokens appear live — important at ~1 tok/s. Text in/out
+goes through the ported tokenizer (`tokenizer.json` from the snapshot); chat
+messages are assembled with the GLM template (`[gMASK]<sop><|role|>…<|assistant|>`).
+
+Generation is served **one request at a time** — a single GPU streaming a 744B
+model runs one forward pass anyway, so connections are handled sequentially.
+
+```bash
+COLI_RAM_GB=85 docker/run-dgx.sh serve 8080 "warm up the expert cache"
+curl -N localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+**Warm-up prompts** — the positional args after the port and/or
+`COLI_WARMUP="a|b"` — are generated through at startup so the hottest experts are
+resident before the first client request.
 
 ## Build the image
 
@@ -69,16 +101,16 @@ to probe).
 ## Run by hand (without run-dgx.sh)
 
 ```bash
-docker run --rm -it --gpus all \
+docker run --rm -it --gpus all -p 8080:8080 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -e HF_TOKEN \
-  speedycolibri:latest gen 100 200 300
+  -e HF_TOKEN -e COLI_RAM_GB=85 \
+  speedycolibri:latest serve 8080
 ```
 
 or with compose (requires CDI or the nvidia runtime on the host):
 
 ```bash
-HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm coli gen 100 200 300
+HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm -p 8080:8080 coli serve 8080
 ```
 
 ### Environment variables
@@ -86,6 +118,8 @@ HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm coli gen 10
 | Var | Meaning | Default |
 |---|---|---|
 | `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | Hugging Face token for the model download (or pass `hf_...` as the first argument) | unset — fine if the model is cached/public |
+| `COLI_PORT` | `serve` listen port (a positional arg after `serve` overrides) | `8080` |
+| `COLI_WARMUP` | `serve` warm-up prompts, `\|`-separated | unset |
 | `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
 | `COLI_MODEL_DIR` | host path to a pre-resolved snapshot → mounted at `/model` | unset |
 | `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budgets (cap on a shared box to avoid the OOM killer) | available RAM / VRAM |

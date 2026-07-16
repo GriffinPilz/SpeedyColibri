@@ -29,7 +29,7 @@ pub use attention::{attention, attention_with, AttnCore};
 pub use cache::{available_ram_bytes, capacity, CacheStats, ExpertCache};
 pub use usage::UsageHistory;
 pub use colibri_core::Config;
-pub use forward::{forward, generate_greedy, logits};
+pub use forward::{forward, generate_greedy, generate_stream, logits};
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};

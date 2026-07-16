@@ -76,13 +76,23 @@ vols+=(-v "$host_hf:/root/.cache/huggingface")
 envs=()
 for v in HF_TOKEN COLI_RAM_GB COLI_VRAM_GB COLI_NGEN COLI_PROFILE COLI_TIMING \
          COLI_LOAD_THREADS COLI_GPU_EXPERTS COLI_NO_ZEROCOPY COLI_BUF_POOL \
-         COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK; do
+         COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP; do
   [[ -n "${!v:-}" ]] && envs+=(-e "$v=${!v}")
 done
+
+# For `serve`, publish the listen port. Port precedence matches the server: a
+# bare integer right after `serve`, else COLI_PORT, else 8080.
+ports=()
+if [[ "${1:-}" == serve ]]; then
+  port="${COLI_PORT:-8080}"
+  [[ "${2:-}" =~ ^[0-9]+$ ]] && port="$2"
+  ports+=(-p "${port}:${port}")
+  echo "[run-dgx] serving on host port ${port}" >&2
+fi
 
 tty=()
 [[ -t 0 && -t 1 ]] && tty=(-it)
 
 # shellcheck disable=SC2086
-exec docker run --rm "${tty[@]}" "${gpu[@]}" "${vols[@]}" "${envs[@]}" \
+exec docker run --rm "${tty[@]}" "${gpu[@]}" "${vols[@]}" "${envs[@]}" "${ports[@]}" \
   ${COLI_DOCKER_ARGS:-} "$IMAGE" "$@"

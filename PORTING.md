@@ -32,10 +32,11 @@ ships with unit tests; the C code is the oracle.
 | `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache**; DSA/SIMD/speculation deferred |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; **CUDA FFI binding GPU-verified on a DGX Spark** (GB10, sm_121, CUDA 13 — builds/links/inits, GPU matmul smoke test passes); not yet wired into forward; Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
-| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack work; chat (tokenizer-wired)/serve pending |
+| `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack/**serve** work; interactive chat REPL dropped (server is the interface) |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
 | — | `c/olmoe.c` | ⬜ not started (second model variant) |
-| — | `c/openai_server.py`, `c/tools/*` | ⬜ not started (upstream `web/` + `desktop/` UIs dropped — not port targets) |
+| OpenAI HTTP server | `c/openai_server.py` | ✅ reimplemented natively as `coli serve` (std `net` HTTP/1.1, SSE streaming, `colibri-json`) — not a line port |
+| — | `c/tools/*` | ⬜ not started (upstream `web/` + `desktop/` UIs dropped — not port targets) |
 
 ¹ `colibri-safetensors` omits the `posix_fadvise(DONTNEED)` + `O_DIRECT` twin-fd
 behavior for now (performance/RSS, not correctness). Reintroduce via

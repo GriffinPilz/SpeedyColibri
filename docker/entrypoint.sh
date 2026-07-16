@@ -70,7 +70,7 @@ resolve_model() {
 cmd="${1:-help}"
 case "$cmd" in
   # snapshot-taking commands: inject the resolved model dir as their 1st arg
-  config | load | gen | tf | capacity | loadbench | repack | chat | web | serve | bench)
+  config | load | gen | tf | capacity | loadbench | repack | serve | bench)
     shift
     snap=$(resolve_model)
     echo "[coli] model: $snap" >&2

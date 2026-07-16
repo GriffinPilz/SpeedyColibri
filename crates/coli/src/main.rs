@@ -7,6 +7,8 @@
 
 use std::process::ExitCode;
 
+mod serve;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn usage() {
@@ -18,10 +20,8 @@ USAGE:
   coli <command> [args]
 
 COMMANDS:
-  chat <snap>              interactive chat            [pending: forward pass]
-  web <snap>               web dashboard               [pending: forward pass]
-  serve <snap>             OpenAI-compatible server    [pending: forward pass]
-  bench <snap>             throughput benchmark        [pending: forward pass]
+  serve <snap> [port] [warm-up prompt...]  OpenAI-compatible HTTP server  [working]
+  bench <snap>             throughput benchmark        [pending]
   convert ...              FP8 -> int4 converter       [pending: tools port]
   tokenize <tok.json> <text>   encode/decode round-trip   [working]
   config <snap>            print parsed hyperparameters   [working]
@@ -62,11 +62,9 @@ fn main() -> ExitCode {
         "loadbench" => cmd_loadbench(&args),
         "repack" => cmd_repack(&args),
         "backend" => cmd_backend(),
-        "chat" | "web" | "serve" | "bench" | "convert" => {
-            eprintln!(
-                "coli {cmd}: not yet ported — the CPU forward pass is still being \
-                 converted from c/glm.c. See PORTING.md for status."
-            );
+        "serve" => serve::cmd_serve(&args),
+        "bench" | "convert" => {
+            eprintln!("coli {cmd}: not yet ported. See PORTING.md for status.");
             ExitCode::from(2)
         }
         other => {

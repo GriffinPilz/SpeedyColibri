@@ -24,7 +24,28 @@ use colibri_cluster::{ExpertRequest, ExpertSharding, NodeId, Transport};
 use colibri_core::{Bytes, Config, QTensor};
 use colibri_safetensors::Shards;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Process-wide expert-parallel context. `serve`/`worker` set this once at startup
+/// when `COLI_NUM_NODES > 1`; while present, [`moe`] transparently dispatches to
+/// [`moe_sharded`] so the forward pass needs no signature change. Left unset on a
+/// single node (and in tests), so `moe` runs the plain local path.
+pub struct ClusterCtx {
+    pub sharding: ExpertSharding,
+    pub transport: Box<dyn Transport>,
+}
+
+static CLUSTER: OnceLock<ClusterCtx> = OnceLock::new();
+
+/// Install the cluster context (idempotent; a second call is ignored).
+pub fn set_cluster(ctx: ClusterCtx) {
+    let _ = CLUSTER.set(ctx);
+}
+
+/// The installed cluster context, if multi-node.
+pub fn cluster_ctx() -> Option<&'static ClusterCtx> {
+    CLUSTER.get()
+}
 
 /// One routed expert's SwiGLU weights.
 #[derive(Debug, Clone, Default)]
@@ -428,7 +449,7 @@ fn subcols(w_mat: &[f32], s_len: usize, n_uniq: usize, cols: &[usize]) -> Vec<f3
 /// so it matches `moe` exactly. `provider` must be able to load *this node's*
 /// experts; the peer's `serve_experts` handler computes theirs.
 #[allow(clippy::too_many_arguments)]
-pub fn moe_sharded<P: ExpertProvider, T: Transport>(
+pub fn moe_sharded<P: ExpertProvider, T: Transport + ?Sized>(
     cfg: &Config,
     l: &Layer,
     layer: usize,
@@ -524,6 +545,17 @@ pub fn moe<P: ExpertProvider>(
     with_shared: bool,
     provider: &P,
 ) -> io::Result<()> {
+    // Expert-parallel dispatch: when a multi-node cluster context is installed,
+    // route experts by ownership (local in-process, remote over the transport).
+    // Single node (or unset) falls through to the local path below.
+    if let Some(ctx) = cluster_ctx() {
+        if ctx.sharding.num_nodes() > 1 {
+            return moe_sharded(
+                cfg, l, layer, x, s_len, out, with_shared, provider, &ctx.sharding, &*ctx.transport,
+            );
+        }
+    }
+
     let d = cfg.hidden as usize;
     let e_n = cfg.n_experts as usize;
     let k = (cfg.topk as usize).min(e_n);

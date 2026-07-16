@@ -35,8 +35,8 @@ pub use loader::{ld, qt_load};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
 pub use model::{KvCache, Layer, Model};
 pub use moe::{
-    compute_experts_partial, dense_mlp, moe, moe_sharded, route, Expert, ExpertProvider,
-    ShardsExpertProvider,
+    cluster_ctx, compute_experts_partial, dense_mlp, moe, moe_sharded, route, set_cluster,
+    ClusterCtx, Expert, ExpertProvider, ShardsExpertProvider,
 };
 pub use preload::{default_num_files, preload_parallel, repack, Manifest, PreloadStore};
 pub use quantize::qtensor_from_f32;

@@ -22,6 +22,7 @@ USAGE:
 COMMANDS:
   cluster [seconds]        scan the ConnectX/RoCE fabric for other Sparks  [working]
   serve <snap> [port] [warm-up prompt...]  OpenAI-compatible HTTP server  [working]
+  worker <snap> [port]     expert-shard server for a peer node (multi-node)  [working]
   bench <snap>             throughput benchmark        [pending]
   convert ...              FP8 -> int4 converter       [pending: tools port]
   tokenize <tok.json> <text>   encode/decode round-trip   [working]
@@ -64,6 +65,7 @@ fn main() -> ExitCode {
         "repack" => cmd_repack(&args),
         "backend" => cmd_backend(),
         "cluster" => cmd_cluster(&args),
+        "worker" => cmd_worker(&args),
         "serve" => serve::cmd_serve(&args),
         "bench" | "convert" => {
             eprintln!("coli {cmd}: not yet ported. See PORTING.md for status.");
@@ -317,6 +319,105 @@ fn cmd_cluster(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Port a `worker` binds (and a `serve` peer connects to) for expert exchange.
+fn expert_port() -> u16 {
+    std::env::var("COLI_EXPERT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(48800)
+}
+
+/// Parse `COLI_PEERS="1=host:port,2=host:port"` into a node→address map (the
+/// expert servers of the other nodes).
+fn parse_peers() -> Result<std::collections::HashMap<colibri_cluster::NodeId, std::net::SocketAddr>, String> {
+    use std::net::ToSocketAddrs;
+    let mut map = std::collections::HashMap::new();
+    let s = std::env::var("COLI_PEERS").unwrap_or_default();
+    for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (rank, addr) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("bad COLI_PEERS entry '{entry}' (want rank=host:port)"))?;
+        let rank: u32 = rank.trim().parse().map_err(|_| format!("bad rank in '{entry}'"))?;
+        let sa = addr
+            .trim()
+            .to_socket_addrs()
+            .map_err(|e| format!("resolve '{addr}': {e}"))?
+            .next()
+            .ok_or_else(|| format!("no address for '{addr}'"))?;
+        map.insert(colibri_cluster::NodeId(rank), sa);
+    }
+    Ok(map)
+}
+
+/// `coli worker <snap> [port]` — a headless expert-shard server for a peer node.
+/// Loads the model, then answers `serve`'s expert-exchange requests over TCP
+/// (RoCE Ethernet): for each request it computes `Σ w·expert(x)` over the experts
+/// this node owns and returns the partial MoE sum. `COLI_NODE_RANK`/`COLI_NUM_NODES`
+/// set which shard this node owns; only that shard is ever loaded/cached.
+fn cmd_worker(args: &[String]) -> ExitCode {
+    let snap = match args.get(2) {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("usage: coli worker <snapshot-dir> [port]  (set COLI_NODE_RANK / COLI_NUM_NODES)");
+            return ExitCode::from(2);
+        }
+    };
+    let cluster = colibri_cluster::ClusterConfig::from_env();
+    let port = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(expert_port);
+
+    // Leak the model to 'static so the (process-lifetime) expert server thread can
+    // hold a persistent cache of this node's shard.
+    let model: &'static colibri_engine::Model = match colibri_engine::load_model(&snap) {
+        Ok(m) => Box::leak(Box::new(m)),
+        Err(e) => {
+            eprintln!("coli worker: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let base = colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
+    let provider: &'static colibri_engine::ExpertCache<_> =
+        Box::leak(Box::new(colibri_engine::ExpertCache::new(base, ram_budget())));
+
+    let sharding = cluster.expert_sharding(model.cfg.n_experts as u32);
+    let (lo, hi) = sharding.range_for(cluster.this_node);
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let bound = match colibri_cluster::serve_experts(addr, move |req| {
+        match colibri_engine::compute_experts_partial(
+            provider,
+            req.layer as usize,
+            &req.experts,
+            &req.weights,
+            &req.activations,
+            req.n_tokens,
+            req.hidden,
+        ) {
+            Ok(outputs) => {
+                colibri_cluster::ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
+            }
+            Err(e) => {
+                eprintln!("[worker] expert compute error: {e}");
+                colibri_cluster::ExpertResponse {
+                    outputs: vec![0.0; req.n_tokens * req.hidden],
+                    n_tokens: req.n_tokens,
+                    hidden: req.hidden,
+                }
+            }
+        }
+    }) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("coli worker: bind {addr}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "[worker] rank {} of {} — serving experts {}..{} on {} (TCP/RoCE)",
+        cluster.this_node.0, cluster.num_nodes, lo, hi, bound
+    );
+    // Advertise on the discovery beacon so `cluster` scans see this worker.
+    colibri_cluster::discovery::spawn_beacon(cluster.this_node.0, port);
+    loop {
+        std::thread::park();
+    }
 }
 
 /// Direct parallel preload from the original model (no repack). One thread per

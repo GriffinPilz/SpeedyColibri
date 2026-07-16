@@ -112,6 +112,31 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     let provider = ExpertCache::new(base, crate::ram_budget());
     let model_id = model_id_from(&snap);
 
+    // Multi-node: install the expert-parallel context so moe() splits experts by
+    // ownership — this node computes its own shard, and peers' experts are fetched
+    // from their `worker` servers over TCP/RoCE. Single-node leaves it unset.
+    let cluster = colibri_cluster::ClusterConfig::from_env();
+    if !cluster.is_single_node() {
+        let peers = match crate::parse_peers() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("coli serve: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let sharding = cluster.expert_sharding(model.cfg.n_experts as u32);
+        let (lo, hi) = sharding.range_for(cluster.this_node);
+        let transport = colibri_cluster::TcpTransport::new(cluster.this_node, peers);
+        colibri_engine::set_cluster(colibri_engine::ClusterCtx {
+            sharding,
+            transport: Box::new(transport),
+        });
+        println!(
+            "[serve] expert-parallel: {} nodes, rank {} owns experts {}..{}; peers over TCP/RoCE",
+            cluster.num_nodes, cluster.this_node.0, lo, hi
+        );
+    }
+
     // Served context length (prompt + completion). The model's hard ceiling is
     // `max_position_embeddings`; the served value is COLI_CTX (else a memory-safe
     // default), clamped to that ceiling. Requests are validated against it.

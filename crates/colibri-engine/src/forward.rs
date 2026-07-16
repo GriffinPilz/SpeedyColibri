@@ -30,6 +30,16 @@ static EMBED_US: AtomicU64 = AtomicU64::new(0);
 /// A sub-total of `MOE_US`. Incremented from `moe`.
 pub(crate) static LOAD_US: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic forward-pass counter — one per `forward` call, i.e. per decode token
+/// (prefill is a single step over the whole prompt). Used only to key the optional
+/// expert-routing log so a token's per-layer expert sequence is reconstructable.
+static FWD_STEP: AtomicU64 = AtomicU64::new(0);
+
+/// The current forward step (see [`FWD_STEP`]).
+pub fn current_step() -> u64 {
+    FWD_STEP.load(Ordering::Relaxed)
+}
+
 /// Time `f` into `acc` when profiling is enabled (else just run it).
 #[inline]
 fn timed<T>(acc: &AtomicU64, f: impl FnOnce() -> T) -> T {
@@ -57,6 +67,7 @@ pub fn forward<P: ExpertProvider>(
     let d = cfg.hidden as usize;
     let s = ids.len();
     assert_eq!(hidden_out.len(), s * d);
+    FWD_STEP.fetch_add(1, Ordering::Relaxed);
 
     // token embeddings
     let mut x = vec![0f32; s * d];

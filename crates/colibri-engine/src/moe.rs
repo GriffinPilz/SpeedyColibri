@@ -37,6 +37,67 @@ pub struct ClusterCtx {
 
 static CLUSTER: OnceLock<ClusterCtx> = OnceLock::new();
 
+/// Optional expert-routing log, enabled with `COLI_EXPERT_LOG=<file>` (or
+/// `stderr`). Each routed position writes one line `step layer pos e0 e1 … ek`
+/// (top-K expert ids, best-first). `step` is the forward/decode-token counter, so
+/// the sequence of experts **across layers** within a token (predict layer L+1 from
+/// L) and **across tokens** at the same layer (temporal locality) can both be mined
+/// offline — the raw material for a predictive expert prefetcher.
+fn expert_log() -> Option<&'static std::sync::Mutex<Box<dyn io::Write + Send>>> {
+    static LOG: OnceLock<Option<std::sync::Mutex<Box<dyn io::Write + Send>>>> = OnceLock::new();
+    LOG.get_or_init(|| {
+        use io::Write;
+        let path = std::env::var("COLI_EXPERT_LOG").ok()?;
+        let mut w: Box<dyn io::Write + Send> = if matches!(path.as_str(), "stderr" | "-" | "1") {
+            Box::new(io::stderr())
+        } else {
+            match std::fs::File::create(&path) {
+                Ok(f) => Box::new(std::io::BufWriter::new(f)),
+                Err(e) => {
+                    eprintln!("[expert-log] cannot open {path}: {e}");
+                    return None;
+                }
+            }
+        };
+        let _ = writeln!(w, "# step layer pos experts...  (top-K routed, best-first)");
+        Some(std::sync::Mutex::new(w))
+    })
+    .as_ref()
+}
+
+/// Write the per-position routing lines `step layer pos e0 … ek` to `w`.
+fn write_routing_lines<W: io::Write + ?Sized>(
+    w: &mut W,
+    step: u64,
+    layer: usize,
+    s_len: usize,
+    k: usize,
+    idxs: &[usize],
+) -> io::Result<()> {
+    for s in 0..s_len {
+        write!(w, "{step} {layer} {s}")?;
+        for kk in 0..k {
+            write!(w, " {}", idxs[s * k + kk])?;
+        }
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
+/// Emit one routing line per position when the expert log is enabled (no-op
+/// otherwise). `idxs` is the `[s_len * k]` top-K expert ids from routing.
+fn log_routing(layer: usize, s_len: usize, k: usize, idxs: &[usize]) {
+    let lg = match expert_log() {
+        Some(l) => l,
+        None => return,
+    };
+    let step = crate::forward::current_step();
+    if let Ok(mut w) = lg.lock() {
+        let _ = write_routing_lines(&mut **w, step, layer, s_len, k, idxs);
+        let _ = w.flush(); // opt-in log; keep it durable (the writer is never dropped)
+    }
+}
+
 /// Install the cluster context (idempotent; a second call is ignored).
 pub fn set_cluster(ctx: ClusterCtx) {
     let _ = CLUSTER.set(ctx);
@@ -474,6 +535,7 @@ pub fn moe_sharded<P: ExpertProvider, T: Transport + ?Sized>(
         idxs[s * k..s * k + k].copy_from_slice(&idx);
         ws[s * k..s * k + k].copy_from_slice(&w);
     }
+    log_routing(layer, s_len, k, &idxs);
     for v in out.iter_mut() {
         *v = 0.0;
     }
@@ -571,6 +633,7 @@ pub fn moe<P: ExpertProvider>(
         idxs[s * k..s * k + k].copy_from_slice(&idx);
         ws[s * k..s * k + k].copy_from_slice(&w);
     }
+    log_routing(layer, s_len, k, &idxs);
 
     for v in out.iter_mut() {
         *v = 0.0;
@@ -795,6 +858,14 @@ mod tests {
         for dd in 0..d {
             assert!((with[dd] - without[dd] - sh_out[dd]).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn routing_log_line_format() {
+        // Two positions, k=2: one line per position, `step layer pos e0 e1`.
+        let mut buf = Vec::new();
+        write_routing_lines(&mut buf, 5, 3, 2, 2, &[10, 20, 30, 40]).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "5 3 0 10 20\n5 3 1 30 40\n");
     }
 
     #[test]

@@ -62,9 +62,16 @@ impl ClusterConfig {
         self.num_nodes == 1
     }
 
-    /// Build the expert sharding for this cluster over `n_experts`.
+    /// Build the **contiguous** expert sharding for this cluster over `n_experts`.
     pub fn expert_sharding(&self, n_experts: u32) -> ExpertSharding {
         ExpertSharding::new(self.num_nodes, n_experts)
+    }
+
+    /// Build the **hot-aware** expert sharding from per-expert `weights` (a shared
+    /// usage history summed per expert). Every node must pass identical weights so
+    /// the maps agree — see [`ExpertSharding::balanced`] / `fingerprint`.
+    pub fn expert_sharding_balanced(&self, n_experts: u32, weights: &[u64]) -> ExpertSharding {
+        ExpertSharding::balanced(self.num_nodes, n_experts, weights)
     }
 }
 

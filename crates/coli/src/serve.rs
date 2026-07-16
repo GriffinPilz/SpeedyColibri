@@ -112,12 +112,22 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
     let base = ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
-    let provider = std::sync::Arc::new(ExpertCache::new(base, crate::ram_budget()));
+    let budget = crate::ram_budget();
+    let provider = std::sync::Arc::new(ExpertCache::new(base, budget));
     if let Some(topn) = crate::prefetch_topn() {
         provider.enable_prefetch(topn);
         println!("[serve] speculative next-layer prefetch on (top-{topn}/layer)");
     }
     let model_id = model_id_from(&snap);
+
+    // Pinned hot-store (AUTOPIN) from the persistent usage history: routing is heavily
+    // skewed, so keeping the hot head resident stops it churning through the LRU.
+    // `COLI_PIN_GB=auto` sizes it to the usage curve's knee. The same history feeds the
+    // hot-aware sharding map below.
+    let usage_path =
+        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
+    crate::apply_autopin(&provider, &history, budget);
 
     // Multi-node: install the expert-parallel context so moe() splits experts by
     // ownership — this node computes its own shard, and peers' experts are fetched
@@ -131,16 +141,16 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let sharding = cluster.expert_sharding(model.cfg.n_experts as u32);
-        let (lo, hi) = sharding.range_for(cluster.this_node);
+        let sharding = crate::build_sharding(&cluster, model.cfg.n_experts as u32, &history);
+        let owned = sharding.count_for(cluster.this_node);
         let transport = colibri_cluster::TcpTransport::new(cluster.this_node, peers);
         colibri_engine::set_cluster(colibri_engine::ClusterCtx {
             sharding,
             transport: Box::new(transport),
         });
         println!(
-            "[serve] expert-parallel: {} nodes, rank {} owns experts {}..{}; peers over TCP/RoCE",
-            cluster.num_nodes, cluster.this_node.0, lo, hi
+            "[serve] expert-parallel: {} nodes, rank {} owns {} experts; peers over TCP/RoCE",
+            cluster.num_nodes, cluster.this_node.0, owned
         );
     }
 

@@ -185,19 +185,54 @@ impl<P: ExpertProvider> ExpertCache<P> {
     /// cumulative selection count) until `pin_budget_bytes` is reached. Returns
     /// how many were pinned. Warm-up loads do not count as session usage.
     pub fn warm_pin(&self, history: &UsageHistory, pin_budget_bytes: u64) -> io::Result<usize> {
+        Ok(self.pin_ranked(&history.ranked(), pin_budget_bytes, usize::MAX)?.0)
+    }
+
+    /// Auto-sized AUTOPIN: pin the hot **head** of the usage curve — as many of the
+    /// hottest experts as sit before the coverage curve's knee ([`UsageHistory::knee`])
+    /// — instead of a hand-picked GB budget. Capped at ~80% of `cache_budget_bytes`
+    /// so the cold tail still has room to stream through the LRU (pinning the whole
+    /// cache would leave nothing evictable and thrash every miss). Returns
+    /// `(n_pinned, bytes_pinned, coverage)` where `coverage` is the fraction of
+    /// historical selections the pinned set accounts for.
+    pub fn warm_pin_auto(
+        &self,
+        history: &UsageHistory,
+        cache_budget_bytes: u64,
+    ) -> io::Result<(usize, u64, f64)> {
+        let ranked = history.ranked();
+        let knee = history.knee().min(ranked.len());
+        // Leave headroom for the streaming tail; guard against an unbounded budget.
+        let byte_cap = (cache_budget_bytes / 5).saturating_mul(4); // 80%, overflow-safe
+        let (n, bytes) = self.pin_ranked(&ranked, byte_cap, knee)?;
+        Ok((n, bytes, history.coverage_of_top(n)))
+    }
+
+    /// Pin the first entries of `ranked` (hottest-first) until either `byte_cap`
+    /// bytes or `count_cap` experts is reached, whichever comes first. Always pins
+    /// at least the first entry (if any). Returns `(n_pinned, bytes_pinned)`.
+    fn pin_ranked(
+        &self,
+        ranked: &[(usize, usize)],
+        byte_cap: u64,
+        count_cap: usize,
+    ) -> io::Result<(usize, u64)> {
         let mut bytes = 0u64;
         let mut n = 0usize;
-        for (layer, eid) in history.ranked() {
+        for &(layer, eid) in ranked {
+            if n >= count_cap {
+                break;
+            }
             let ex = self.fetch(layer, eid, false)?; // load resident, not a selection
             let b = ex.bytes();
-            if n > 0 && bytes + b > pin_budget_bytes {
+            if n > 0 && bytes + b > byte_cap {
                 break; // budget reached (the just-loaded one stays unpinned/LRU)
             }
             self.state.lock().unwrap().pinned.insert((layer, eid));
             bytes += b;
             n += 1;
         }
-        Ok(n)
+        Ok((n, bytes))
     }
 
     /// Snapshot this session's expert selections as a [`UsageHistory`], to merge
@@ -635,6 +670,44 @@ mod tests {
         cache.expert(0, 2).unwrap();
         cache.expert(0, 1).unwrap();
         assert_eq!(cache.inner.loads.load(Ordering::Relaxed), before, "pinned reloaded");
+    }
+
+    #[test]
+    fn warm_pin_auto_pins_the_hot_head() {
+        // 4 hot experts then a flat tail: auto should pin ~the head, not the tail,
+        // and report a coverage well above the pinned fraction.
+        let mut h = UsageHistory::new();
+        for e in 0..4 {
+            h.add(0, e, 100);
+        }
+        for e in 4..60 {
+            h.add(0, e, 1);
+        }
+        let cache = ExpertCache::new(counting(), u64::MAX);
+        let (n, bytes, cov) = cache.warm_pin_auto(&h, u64::MAX).unwrap();
+        assert_eq!(cache.pinned_count(), n);
+        assert!((4..=12).contains(&n), "auto pinned {n}, expected the ~4 hot head");
+        assert!(bytes > 0);
+        assert!(cov > 0.8, "coverage {cov} should capture the hot head's traffic");
+        assert_eq!(cache.usage_snapshot().total(), 0, "warm-up isn't session usage");
+    }
+
+    #[test]
+    fn warm_pin_auto_respects_cache_headroom() {
+        // With a tiny cache budget, auto must not pin the whole thing — it caps at
+        // ~80% so the streaming tail keeps room. Budget for 5 experts -> <=4 pinned.
+        let mut h = UsageHistory::new();
+        for e in 0..20 {
+            h.add(0, e, 100 - e as u64); // gently decreasing, knee is late
+        }
+        let one = {
+            let c = ExpertCache::new(counting(), u64::MAX);
+            c.expert(0, 0).unwrap().bytes()
+        };
+        let cache = ExpertCache::new(counting(), one * 5);
+        let (n, bytes, _cov) = cache.warm_pin_auto(&h, one * 5).unwrap();
+        assert!(n <= 4, "pinned {n}, must leave headroom below the 5-expert budget");
+        assert!(bytes <= one * 4);
     }
 
     #[test]

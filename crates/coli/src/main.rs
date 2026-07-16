@@ -209,22 +209,13 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
     }
 
-    // Pinned hot-store warm-up (AUTOPIN): read the persistent usage history and
-    // pin the hottest experts (COLI_PIN_GB budget) so they stay resident.
+    // Pinned hot-store warm-up (AUTOPIN): read the persistent usage history and pin
+    // the hottest experts (COLI_PIN_GB budget, or `auto` to size to the curve's knee)
+    // so they stay resident.
     let usage_path =
         std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
     let mut history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
-    let pin_gb: u64 = std::env::var("COLI_PIN_GB").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    if pin_gb > 0 && !history.is_empty() {
-        match provider.warm_pin(&history, pin_gb << 30) {
-            Ok(n) => println!(
-                "hot-store: pinned {n} experts from usage history ({} entries, {} selections)",
-                history.len(),
-                history.total()
-            ),
-            Err(e) => eprintln!("coli gen: warm_pin: {e}"),
-        }
-    }
+    apply_autopin(&provider, &history, budget);
 
     let mut kv = colibri_engine::KvCache::new(
         model.cfg.n_layers as usize,
@@ -381,13 +372,22 @@ fn cmd_worker(args: &[String]) -> ExitCode {
         }
     };
     let base = colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
-    let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, ram_budget()));
+    let budget = ram_budget();
+    let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
     }
 
-    let sharding = cluster.expert_sharding(model.cfg.n_experts as u32);
-    let (lo, hi) = sharding.range_for(cluster.this_node);
+    // AUTOPIN this node's hot experts before the provider moves into the server
+    // closure. The same history feeds the hot-aware sharding map below, so its
+    // fingerprint must match every other node's — compare the printed values.
+    let usage_path =
+        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
+    apply_autopin(&provider, &history, budget);
+
+    let sharding = build_sharding(&cluster, model.cfg.n_experts as u32, &history);
+    let owned = sharding.count_for(cluster.this_node);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let bound = match colibri_cluster::serve_experts(addr, move |req| {
         match colibri_engine::compute_experts_partial(
@@ -419,8 +419,8 @@ fn cmd_worker(args: &[String]) -> ExitCode {
         }
     };
     println!(
-        "[worker] rank {} of {} — serving experts {}..{} on {} (TCP/RoCE)",
-        cluster.this_node.0, cluster.num_nodes, lo, hi, bound
+        "[worker] rank {} of {} — serving {} experts on {} (TCP/RoCE)",
+        cluster.this_node.0, cluster.num_nodes, owned, bound
     );
     // Advertise on the discovery beacon so `cluster` scans see this worker.
     colibri_cluster::discovery::spawn_beacon(cluster.this_node.0, port);
@@ -813,6 +813,115 @@ fn prefetch_topn() -> Option<usize> {
             Some(std::env::var("COLI_PREFETCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(16))
         }
         Some(v) => Some(v.parse().unwrap_or(16)),
+    }
+}
+
+/// AUTOPIN sizing from `COLI_PIN_GB`: unset/`0` → off; `auto` → size to the knee of
+/// the usage-coverage curve (pin the hot head, stream the tail); a number `N` → pin
+/// up to `N` GB of the hottest experts.
+pub(crate) enum PinMode {
+    Off,
+    Auto,
+    Gb(u64),
+}
+
+pub(crate) fn pin_mode() -> PinMode {
+    match std::env::var("COLI_PIN_GB").ok().as_deref().map(str::trim) {
+        None | Some("") | Some("0") => PinMode::Off,
+        Some(v) if v.eq_ignore_ascii_case("auto") => PinMode::Auto,
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) | Err(_) => PinMode::Off,
+            Ok(n) => PinMode::Gb(n),
+        },
+    }
+}
+
+/// Apply AUTOPIN to `provider` from the persistent usage `history`, honoring
+/// `COLI_PIN_GB` (see [`pin_mode`]). `cache_budget` is the cache's byte budget, used
+/// by the `auto` path to leave streaming headroom. Logs what it pinned. Shared by
+/// `coli gen` and `coli serve`.
+pub(crate) fn apply_autopin<P: colibri_engine::ExpertProvider>(
+    provider: &colibri_engine::ExpertCache<P>,
+    history: &colibri_engine::UsageHistory,
+    cache_budget: u64,
+) {
+    let mode = pin_mode();
+    if matches!(mode, PinMode::Off) {
+        return;
+    }
+    if history.is_empty() {
+        eprintln!(
+            "hot-store: COLI_PIN_GB set but usage history is empty — it builds as you \
+             run; nothing to pin yet"
+        );
+        return;
+    }
+    let gib = (1u64 << 30) as f64;
+    match mode {
+        PinMode::Off => unreachable!(),
+        PinMode::Auto => match provider.warm_pin_auto(history, cache_budget) {
+            Ok((n, bytes, cov)) => println!(
+                "hot-store: AUTOPIN pinned {n} experts ({:.1} GB) at the usage-curve knee \
+                 — {:.0}% of historical routing kept resident",
+                bytes as f64 / gib,
+                cov * 100.0
+            ),
+            Err(e) => eprintln!("coli: warm_pin_auto: {e}"),
+        },
+        PinMode::Gb(gb) => match provider.warm_pin(history, gb << 30) {
+            Ok(n) => println!(
+                "hot-store: pinned {n} experts from usage history ({} entries, {} selections)",
+                history.len(),
+                history.total()
+            ),
+            Err(e) => eprintln!("coli: warm_pin: {e}"),
+        },
+    }
+}
+
+/// Build the expert→node sharding for a multi-node run. `COLI_SHARD=hot` selects the
+/// hot-aware, traffic-balanced map built from the shared usage `history` (spreads the
+/// popular experts across nodes); anything else (or an empty history) uses contiguous
+/// blocks. Logs the map fingerprint and the balance achieved — **all nodes must print
+/// the same fingerprint**, or the activation exchange is misrouting.
+pub(crate) fn build_sharding(
+    cluster: &colibri_cluster::ClusterConfig,
+    n_experts: u32,
+    history: &colibri_engine::UsageHistory,
+) -> colibri_cluster::ExpertSharding {
+    let hot = std::env::var("COLI_SHARD")
+        .ok()
+        .is_some_and(|v| v.eq_ignore_ascii_case("hot"));
+    if hot && !history.is_empty() {
+        let weights = history.expert_weights(n_experts as usize);
+        let sharding = cluster.expert_sharding_balanced(n_experts, &weights);
+        let nw = sharding.node_weights(&weights);
+        let (min, max) = (
+            nw.iter().copied().min().unwrap_or(0),
+            nw.iter().copied().max().unwrap_or(0),
+        );
+        let imbalance = if min > 0 { max as f64 / min as f64 } else { f64::INFINITY };
+        println!(
+            "sharding: hot-aware (traffic-balanced), fingerprint {:#018x} — per-node load \
+             max/min {:.2}x (contiguous would cluster hot experts). Verify this fingerprint \
+             matches on every node.",
+            sharding.fingerprint(),
+            imbalance
+        );
+        sharding
+    } else {
+        let sharding = cluster.expert_sharding(n_experts);
+        if hot {
+            eprintln!(
+                "sharding: COLI_SHARD=hot but usage history is empty — falling back to \
+                 contiguous. Build history with a warm-up run first."
+            );
+        }
+        println!(
+            "sharding: contiguous blocks, fingerprint {:#018x}",
+            sharding.fingerprint()
+        );
+        sharding
     }
 }
 

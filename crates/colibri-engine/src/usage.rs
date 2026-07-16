@@ -51,6 +51,19 @@ impl UsageHistory {
         self.counts.values().sum()
     }
 
+    /// Per-expert selection weight summed across all layers: `w[e] = Σ_layer
+    /// count(layer, e)`, length `n_experts`. Feeds [`ExpertSharding::balanced`] —
+    /// expert ownership is layer-independent, so we balance the aggregate traffic.
+    pub fn expert_weights(&self, n_experts: usize) -> Vec<u64> {
+        let mut w = vec![0u64; n_experts];
+        for (&(_layer, e), &c) in &self.counts {
+            if e < n_experts {
+                w[e] += c;
+            }
+        }
+        w
+    }
+
     /// `(layer, eid)` ranked by count descending; ties broken by `(layer, eid)`
     /// ascending for determinism. This is the pin order (global, all layers
     /// pooled — matching the C `pin_load` ranking).
@@ -59,6 +72,63 @@ impl UsageHistory {
             self.counts.iter().map(|(&k, &c)| (k, c)).collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// Descending selection counts (the `ranked()` order), for coverage/knee math.
+    fn sorted_counts(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.counts.values().copied().collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v
+    }
+
+    /// Fraction of all selections covered by the `n` hottest experts (the pin
+    /// coverage if the top-`n` were pinned). `n == 0` → 0; `n >= len` → 1.
+    pub fn coverage_of_top(&self, n: usize) -> f64 {
+        let total = self.total();
+        if total == 0 || n == 0 {
+            return 0.0;
+        }
+        let covered: u64 = self.sorted_counts().iter().take(n).sum();
+        covered as f64 / total as f64
+    }
+
+    /// The **knee** of the cumulative-coverage curve: how many of the hottest
+    /// experts to pin before returns flatten. Auto-sizing for AUTOPIN — instead of
+    /// a hand-picked `COLI_PIN_GB`, pin exactly the hot head and stream the tail.
+    ///
+    /// The curve `cum[i] = Σ_{j≤i} count[j] / total` (experts hottest-first) is
+    /// concave-increasing, so it has a well-defined elbow. We take the Kneedle
+    /// point: the index of maximum vertical distance above the chord joining the
+    /// first and last points. Returns a **count of experts** (≥1 when non-empty).
+    pub fn knee(&self) -> usize {
+        let counts = self.sorted_counts();
+        let n = counts.len();
+        if n <= 2 {
+            return n;
+        }
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return n;
+        }
+        // Cumulative coverage in [0,1], then farthest point above the endpoints' chord.
+        let inv_total = 1.0 / total as f64;
+        let inv_span = 1.0 / (n - 1) as f64;
+        let mut cum = 0u64;
+        let y0 = counts[0] as f64 * inv_total; // cum[0]
+        let mut best_i = 0usize;
+        let mut best_d = f64::NEG_INFINITY;
+        for (i, &c) in counts.iter().enumerate() {
+            cum += c;
+            let y = cum as f64 * inv_total;
+            let x = i as f64 * inv_span; // 0..1
+            let chord = y0 + x * (1.0 - y0); // line from (0,y0) to (1,1)
+            let d = y - chord;
+            if d > best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        best_i + 1 // count = index + 1
     }
 
     /// Merge another history into this one (summing counts).
@@ -142,6 +212,56 @@ mod tests {
     fn missing_file_is_empty() {
         let h = UsageHistory::load("/no/such/coli_usage").unwrap();
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn coverage_of_top_matches_hand_count() {
+        let mut h = UsageHistory::new();
+        h.add(0, 0, 70);
+        h.add(0, 1, 20);
+        h.add(0, 2, 10); // total 100
+        assert_eq!(h.total(), 100);
+        assert!((h.coverage_of_top(0) - 0.0).abs() < 1e-9);
+        assert!((h.coverage_of_top(1) - 0.70).abs() < 1e-9);
+        assert!((h.coverage_of_top(2) - 0.90).abs() < 1e-9);
+        assert!((h.coverage_of_top(3) - 1.00).abs() < 1e-9);
+        assert!((h.coverage_of_top(99) - 1.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn knee_finds_elbow_of_skewed_curve() {
+        // 5 hot experts (count 100) then a long flat tail (count 1). The elbow of
+        // the cumulative-coverage curve should land right at the head, not the tail.
+        let mut h = UsageHistory::new();
+        for e in 0..5 {
+            h.add(0, e, 100);
+        }
+        for e in 5..200 {
+            h.add(0, e, 1);
+        }
+        let k = h.knee();
+        assert!((5..=15).contains(&k), "knee {k} should sit near the 5-expert head");
+        // Pinning the knee captures the bulk of the traffic.
+        assert!(h.coverage_of_top(k) > 0.7, "knee coverage {}", h.coverage_of_top(k));
+    }
+
+    #[test]
+    fn knee_of_uniform_is_not_degenerate() {
+        // Uniform usage has no elbow; knee must stay in-range and never panic.
+        let mut h = UsageHistory::new();
+        for e in 0..50 {
+            h.add(0, e, 10);
+        }
+        let k = h.knee();
+        assert!((1..=50).contains(&k));
+    }
+
+    #[test]
+    fn knee_tiny_histories() {
+        assert_eq!(UsageHistory::new().knee(), 0);
+        let mut one = UsageHistory::new();
+        one.add(0, 0, 5);
+        assert_eq!(one.knee(), 1);
     }
 
     #[test]

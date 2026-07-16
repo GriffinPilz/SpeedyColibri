@@ -945,6 +945,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn moe_sharded_hot_aware_map_equals_single_node() {
+        // A hot-aware (traffic-balanced) map is only a *different* expert->node
+        // assignment; the math must be unchanged. Weights [100,100,1,1] make LPT place
+        // e0,e2 on node 0 and e1,e3 on node 1 — the opposite of the contiguous split
+        // for the routed pair {2,1}, so the local and remote branches swap sides.
+        // The output must still match single-node exactly.
+        use colibri_cluster::{serve_experts, ExpertResponse, TcpTransport};
+
+        let c = cfg();
+        let d = c.hidden as usize;
+        let inter = c.moe_inter as usize;
+
+        let consts = [-1.0f32, 0.5, 1.0, 0.0]; // top-2 routes to {2, 1}
+        let mut router = vec![0f32; c.n_experts as usize * d];
+        for (e, &cst) in consts.iter().enumerate() {
+            for i in 0..d {
+                router[e * d + i] = cst;
+            }
+        }
+        let mut l = Layer::default();
+        l.router = router;
+        l.router_bias = vec![0.0; c.n_experts as usize];
+        let sh = expert(50, (c.moe_inter * c.n_shared) as usize, d);
+        l.sh_gate = sh.gate.clone();
+        l.sh_up = sh.up.clone();
+        l.sh_down = sh.down.clone();
+
+        let experts: HashMap<(usize, usize), Arc<Expert>> =
+            (0..4).map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d)))).collect();
+        let provider = Arc::new(MapProvider { experts });
+        let x = vec![0.3f32, 0.5, -0.2, 0.7];
+
+        let mut out_single = vec![0f32; d];
+        moe(&c, &l, 0, &x, 1, &mut out_single, true, &*provider).unwrap();
+
+        let hp = provider.clone();
+        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), move |req| {
+            let outputs = compute_experts_partial(
+                &*hp,
+                req.layer as usize,
+                &req.experts,
+                &req.weights,
+                &req.activations,
+                req.n_tokens,
+                req.hidden,
+            )
+            .unwrap();
+            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
+        })
+        .unwrap();
+
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), addr);
+        let transport = TcpTransport::new(NodeId(0), peers);
+
+        let weights = [100u64, 100, 1, 1];
+        let sharding = ExpertSharding::balanced(2, c.n_experts as u32, &weights);
+        assert!(sharding.is_hot_aware());
+        // The hot pair is split across nodes, unlike the contiguous map.
+        assert_ne!(sharding.owner(0), sharding.owner(1), "hot experts must be spread");
+        let contig = ExpertSharding::new(2, c.n_experts as u32);
+        assert_ne!(
+            sharding.fingerprint(),
+            contig.fingerprint(),
+            "test needs a map that differs from contiguous"
+        );
+
+        let mut out_sharded = vec![0f32; d];
+        moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
+            .unwrap();
+
+        for dd in 0..d {
+            assert!(
+                (out_single[dd] - out_sharded[dd]).abs() < 1e-5,
+                "hot-aware mismatch at {dd}: single {} vs sharded {}",
+                out_single[dd],
+                out_sharded[dd]
+            );
+        }
+    }
+
     /// End-to-end: write a real int4 `.weight` + f32 `.qs` shard for one expert,
     /// load it through the coalesced + chunked path (`read_threads=8`), and assert
     /// the resulting `Bytes::Shared` views (a) hold exactly the on-disk bytes and

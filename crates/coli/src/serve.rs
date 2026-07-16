@@ -39,6 +39,15 @@ const DEFAULT_CTX: usize = 32_768;
 /// Tokens generated per warm-up prompt (enough to route a spread of experts).
 const WARMUP_TOKENS: usize = 8;
 
+/// How many copies of the KV cache to reserve for. `KvCache` lazily allocates a
+/// full-size device-side shadow per layer (`model.rs`'s `DeviceKv`) on the GPU decode
+/// path — and on GB10's unified memory that shadow comes out of the *same* pool as
+/// the host copy, so under CUDA the KV genuinely costs twice.
+#[cfg(feature = "cuda")]
+const KV_COPIES: u64 = 2;
+#[cfg(not(feature = "cuda"))]
+const KV_COPIES: u64 = 1;
+
 /// Parse a token count like `32k`, `1m`, or `131072`.
 fn parse_ctx(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
@@ -112,7 +121,34 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
     let model_id = model_id_from(&snap);
-    let budget = crate::ram_budget();
+    // Served context length (prompt + completion). The model's hard ceiling is
+    // `max_position_embeddings`; the served value is COLI_CTX (else a memory-safe
+    // default), clamped to that ceiling. Requests are validated against it.
+    //
+    // Computed *before* the expert-cache budget: the budget has to reserve the KV
+    // this window can allocate, and KV is sized from ctx_len.
+    let model_max = if model.cfg.max_ctx > 0 { model.cfg.max_ctx as usize } else { usize::MAX };
+    let ctx_len = std::env::var("COLI_CTX")
+        .ok()
+        .and_then(|s| parse_ctx(&s))
+        .unwrap_or(DEFAULT_CTX)
+        .clamp(1, model_max);
+
+    // Worst-case KV for the served window — a single full-context request allocates
+    // exactly this, and the expert cache must not have already eaten it.
+    let kv_reserve = (kv_bytes_per_token(&model.cfg) as u64)
+        .saturating_mul(ctx_len as u64)
+        .saturating_mul(KV_COPIES);
+    let budget = crate::ram_budget_reserving(kv_reserve);
+    let gib = (1u64 << 30) as f64;
+    println!(
+        "[serve] expert cache: {:.0} GB budget (reserved {:.1} GB KV for {} ctx{}) \
+         — set COLI_RAM_GB to override",
+        budget as f64 / gib,
+        kv_reserve as f64 / gib,
+        ctx_len,
+        if KV_COPIES > 1 { ", incl. device shadow" } else { "" }
+    );
 
     let usage_path =
         std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
@@ -194,16 +230,6 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // rejected outright by the provider's ownership gate).
     let own_history = crate::owned_history(&history, &sharding, cluster.this_node);
     crate::apply_autopin(&provider, &own_history, budget);
-
-    // Served context length (prompt + completion). The model's hard ceiling is
-    // `max_position_embeddings`; the served value is COLI_CTX (else a memory-safe
-    // default), clamped to that ceiling. Requests are validated against it.
-    let model_max = if model.cfg.max_ctx > 0 { model.cfg.max_ctx as usize } else { usize::MAX };
-    let ctx_len = std::env::var("COLI_CTX")
-        .ok()
-        .and_then(|s| parse_ctx(&s))
-        .unwrap_or(DEFAULT_CTX)
-        .clamp(1, model_max);
 
     // ---- warm-up ----------------------------------------------------------
     for (i, w) in warmups.iter().enumerate() {

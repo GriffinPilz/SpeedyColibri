@@ -934,15 +934,62 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Expert-cache byte budget: `COLI_RAM_GB` if set, else available RAM (Linux),
-/// else unbounded.
-fn ram_budget() -> u64 {
+/// Held back from the expert cache on top of any caller-specific reserve: OS page
+/// cache for the model file, allocator slack, the CUDA context, and the headroom the
+/// kernel needs to not swap.
+///
+/// **Measured, not guessed.** On a 121 GiB Spark serving diverse prompts:
+/// `COLI_RAM_GB=75` runs clean (~24 GiB still available, no swap) at 0.97 tok/s;
+/// `85` drives the box 8.6 GiB into swap and collapses to 0.22 tok/s — ~4x worse
+/// *because* it was given more cache. The old default (all of MemAvailable, no
+/// reserve) is past that cliff by construction: the cache fills its budget and never
+/// gives memory back, so it eventually collides with KV + CUDA + page cache and the
+/// kernel starts paging the expert cache to disk — on an engine whose whole cost is
+/// already disk I/O.
+const WORKING_RESERVE: u64 = 10 << 30;
+
+/// Floor so a small/busy box still gets a usable cache rather than 0 (a 0 budget
+/// evicts every expert immediately and thrashes). Set `COLI_RAM_GB` explicitly if
+/// even this doesn't fit.
+const MIN_BUDGET: u64 = 4 << 30;
+
+/// Expert-cache byte budget, reserving `reserve` bytes the caller knows it will
+/// still allocate (e.g. `serve`'s KV cache) on top of [`WORKING_RESERVE`].
+///
+/// `COLI_RAM_GB` remains an **exact override** — the point of the default is to pick
+/// a safe maximum automatically, and the knob is there to go lower (or higher, if you
+/// know better).
+///
+/// Dense weights are deliberately *not* subtracted: `load_model_with` materializes
+/// them eagerly and every caller budgets *after* the load, so `MemAvailable` has
+/// already excluded them. Subtracting again would double-count ~11 GiB.
+fn ram_budget_reserving(reserve: u64) -> u64 {
     if let Ok(gb) = std::env::var("COLI_RAM_GB") {
         if let Ok(g) = gb.parse::<u64>() {
             return g << 30;
         }
     }
-    colibri_engine::available_ram_bytes().unwrap_or(u64::MAX)
+    match colibri_engine::available_ram_bytes() {
+        Some(avail) => budget_from(avail, reserve),
+        None => u64::MAX, // non-Linux: no /proc/meminfo, stay unbounded
+    }
+}
+
+/// Pure arithmetic behind [`ram_budget_reserving`], split out to be testable.
+///
+/// Saturating on purpose: a plain `avail - reserve - WORKING_RESERVE` underflows on a
+/// small box and wraps to ~16 EiB — an effectively unbounded budget, causing exactly
+/// the OOM this exists to prevent.
+fn budget_from(avail: u64, reserve: u64) -> u64 {
+    avail
+        .saturating_sub(reserve)
+        .saturating_sub(WORKING_RESERVE)
+        .max(MIN_BUDGET)
+}
+
+/// Expert-cache byte budget for callers with nothing extra to reserve.
+fn ram_budget() -> u64 {
+    ram_budget_reserving(0)
 }
 
 /// Speculative-prefetch setting from `COLI_PREFETCH`: unset/`0` → off; `1` → on
@@ -1260,6 +1307,49 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    const GB: u64 = 1 << 30;
+
+    #[test]
+    fn budget_leaves_headroom_below_the_measured_swap_cliff() {
+        // The real case: a 121 GiB Spark, ~99 GiB available once dense is resident,
+        // reserving ~11 GiB of KV for a 32K window (incl. the CUDA device shadow).
+        // Measured on that box: 75 GiB runs clean, 85 GiB swaps 8.6 GiB and costs ~4x.
+        // The default must land in the safe zone without being told.
+        let got = budget_from(99 * GB, 11 * GB) / GB;
+        assert!((70..=80).contains(&got), "picked {got} GB; must sit below the 85 GB cliff");
+    }
+
+    #[test]
+    fn budget_never_underflows_into_an_unbounded_cache() {
+        // The bug this guards: `avail - reserve - WORKING_RESERVE` on a small box
+        // wraps to ~16 EiB — an effectively unlimited budget, i.e. exactly the OOM
+        // the reserve exists to prevent.
+        for (avail, reserve) in [(0, 0), (1 * GB, 0), (8 * GB, 64 * GB), (0, u64::MAX)] {
+            let b = budget_from(avail, reserve);
+            assert!(b <= MIN_BUDGET, "underflowed to {b} bytes for avail={avail} reserve={reserve}");
+        }
+    }
+
+    #[test]
+    fn budget_subtracts_both_reserves() {
+        // 100 - 20 caller reserve - 10 working = 70.
+        assert_eq!(budget_from(100 * GB, 20 * GB), 70 * GB);
+        // A bigger KV window (longer ctx) must shrink the cache one-for-one.
+        assert_eq!(budget_from(100 * GB, 40 * GB), 50 * GB);
+    }
+
+    #[test]
+    fn bigger_context_never_grows_the_cache() {
+        // Monotonic in the reserve — a longer served window can only take from the
+        // cache, never give to it.
+        let mut prev = u64::MAX;
+        for ctx_gb in [0u64, 5, 11, 22, 44] {
+            let b = budget_from(99 * GB, ctx_gb * GB);
+            assert!(b <= prev, "budget grew when ctx grew");
+            prev = b;
+        }
     }
 
     #[test]

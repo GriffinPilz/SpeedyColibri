@@ -158,6 +158,20 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     );
     println!("[serve]   POST /v1/chat/completions   POST /v1/completions   GET /v1/models   GET /health");
 
+    // Scan the ConnectX/RoCE fabric and print the other Sparks we can see, so the
+    // operator can verify the multi-node wiring at startup, then keep beaconing so
+    // peers that start later discover this node too. COLI_DISCOVER_SECS=0 skips.
+    let disc_secs = std::env::var("COLI_DISCOVER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(3.0);
+    if disc_secs > 0.0 {
+        let rank: u32 = std::env::var("COLI_NODE_RANK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let d = colibri_cluster::discover(rank, port, Duration::from_secs_f64(disc_secs));
+        let _ = colibri_cluster::discovery::print_report(&d, &mut std::io::stdout());
+        colibri_cluster::discovery::spawn_beacon(rank, port);
+    }
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => handle(stream, &model, &provider, &tok, &model_id, ctx_len),

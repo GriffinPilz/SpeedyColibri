@@ -125,7 +125,8 @@ HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm -p 8080:808
 | `COLI_MODEL_DIR` | host path to a pre-resolved snapshot → mounted at `/model` | unset |
 | `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budgets (cap on a shared box to avoid the OOM killer) | available RAM / VRAM |
 | `COLI_NUM_NODES` | cluster size (expert-parallel) | `1` |
-| `COLI_NODE_RANK` | this node's rank `0..NUM_NODES` | `0` |
+| `COLI_NODE_RANK` | this node's rank `0..NUM_NODES` (advertised in the discovery beacon) | `0` |
+| `COLI_DISCOVER_SECS` | `serve` startup ConnectX fabric-scan window in seconds (`0` disables) | `3` |
 | `COLI_CACHE_DIR` | writable path for `.coli_kv` / `.coli_usage` (compose) | `./.coli-cache` |
 | `COLI_IMAGE` | image tag used by `run-dgx.sh` | `speedycolibri:latest` |
 | `COLI_DOCKER_ARGS` | extra `docker run` flags injected by `run-dgx.sh` | unset |

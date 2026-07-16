@@ -12,9 +12,11 @@
 //!
 //! See DEPLOYMENT.md for the container and topology details.
 
+pub mod discovery;
 pub mod sharding;
 pub mod transport;
 
+pub use discovery::{connectx_links, discover, ConnectXLink, Discovery, Peer, PeerKind};
 pub use sharding::{ExpertSharding, NodeId};
 pub use transport::{ExpertRequest, ExpertResponse, LocalTransport, Transport, TransportError};
 

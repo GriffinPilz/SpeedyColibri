@@ -71,8 +71,9 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
     HF_HOME=/root/.cache/huggingface
 
 # `hf` CLI for pulling the model snapshot on first run (Ubuntu 24.04 is
-# PEP 668 externally-managed, so it lives in its own venv).
-RUN apt-get update && apt-get install -y --no-install-recommends python3-venv \
+# PEP 668 externally-managed, so it lives in its own venv). `iproute2` gives the
+# `ip` tool that ConnectX discovery reads interface addresses from.
+RUN apt-get update && apt-get install -y --no-install-recommends python3-venv iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/hf \
     && /opt/hf/bin/pip install --no-cache-dir -q huggingface_hub \

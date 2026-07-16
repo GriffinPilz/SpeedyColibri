@@ -22,4 +22,5 @@ colibri-engine = { workspace = true }
 colibri-safetensors = { workspace = true }
 colibri-tokenizer = { workspace = true }
 colibri-json = { workspace = true }
+colibri-cluster = { workspace = true }
 colibri-backend = { workspace = true }

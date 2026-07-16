@@ -76,23 +76,30 @@ vols+=(-v "$host_hf:/root/.cache/huggingface")
 envs=()
 for v in HF_TOKEN COLI_RAM_GB COLI_VRAM_GB COLI_NGEN COLI_PROFILE COLI_TIMING \
          COLI_LOAD_THREADS COLI_GPU_EXPERTS COLI_NO_ZEROCOPY COLI_BUF_POOL \
-         COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP; do
+         COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP \
+         COLI_CTX COLI_DISCOVER_SECS; do
   [[ -n "${!v:-}" ]] && envs+=(-e "$v=${!v}")
 done
 
-# For `serve`, publish the listen port. Port precedence matches the server: a
-# bare integer right after `serve`, else COLI_PORT, else 8080.
+# `serve` and `cluster` need to see the ConnectX/RoCE fabric — the RoCE subnet,
+# the kernel ARP table, and UDP broadcast — which the default bridge namespace
+# hides. Run them with host networking; the listen port is then already on the
+# host (no `-p` needed, and `-p` conflicts with `--network host`). Other commands
+# keep bridge networking and just publish the port.
+net=()
 ports=()
-if [[ "${1:-}" == serve ]]; then
-  port="${COLI_PORT:-8080}"
-  [[ "${2:-}" =~ ^[0-9]+$ ]] && port="$2"
-  ports+=(-p "${port}:${port}")
-  echo "[run-dgx] serving on host port ${port}" >&2
-fi
+case "${1:-}" in
+  serve | cluster)
+    net+=(--network host)
+    port="${COLI_PORT:-8080}"
+    [[ "${2:-}" =~ ^[0-9]+$ ]] && port="$2"
+    [[ "${1:-}" == serve ]] && echo "[run-dgx] host networking; serving on host port ${port}" >&2
+    ;;
+esac
 
 tty=()
 [[ -t 0 && -t 1 ]] && tty=(-it)
 
 # shellcheck disable=SC2086
-exec docker run --rm "${tty[@]}" "${gpu[@]}" "${vols[@]}" "${envs[@]}" "${ports[@]}" \
+exec docker run --rm "${tty[@]}" "${gpu[@]}" "${net[@]}" "${vols[@]}" "${envs[@]}" "${ports[@]}" \
   ${COLI_DOCKER_ARGS:-} "$IMAGE" "$@"

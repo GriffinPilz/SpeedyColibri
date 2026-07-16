@@ -20,6 +20,7 @@ USAGE:
   coli <command> [args]
 
 COMMANDS:
+  cluster [seconds]        scan the ConnectX/RoCE fabric for other Sparks  [working]
   serve <snap> [port] [warm-up prompt...]  OpenAI-compatible HTTP server  [working]
   bench <snap>             throughput benchmark        [pending]
   convert ...              FP8 -> int4 converter       [pending: tools port]
@@ -62,6 +63,7 @@ fn main() -> ExitCode {
         "loadbench" => cmd_loadbench(&args),
         "repack" => cmd_repack(&args),
         "backend" => cmd_backend(),
+        "cluster" => cmd_cluster(&args),
         "serve" => serve::cmd_serve(&args),
         "bench" | "convert" => {
             eprintln!("coli {cmd}: not yet ported. See PORTING.md for status.");
@@ -291,6 +293,29 @@ fn cmd_backend() -> ExitCode {
     }
     #[cfg(not(feature = "cuda"))]
     println!("(built without `cuda` — CPU only; rebuild with --features cuda on a DGX Spark)");
+    ExitCode::SUCCESS
+}
+
+/// `coli cluster [seconds]` — scan the ConnectX/RoCE fabric and print the other
+/// DGX Sparks it can see (local links + peers, whether or not they run colibrì),
+/// for the operator to verify the multi-node wiring. Advertises this node's
+/// `COLI_NODE_RANK` / `COLI_PORT` in its beacon so peers see them too.
+fn cmd_cluster(args: &[String]) -> ExitCode {
+    let window = args
+        .get(2)
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|s| std::time::Duration::from_secs_f64(s.clamp(0.5, 60.0)))
+        .unwrap_or_else(|| std::time::Duration::from_secs(4));
+    let rank: u32 = std::env::var("COLI_NODE_RANK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let port: u16 = std::env::var("COLI_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
+
+    eprintln!("[cluster] scanning the fabric for {:.0}s (UDP :{}) ...", window.as_secs_f64(), colibri_cluster::discovery::DISC_PORT);
+    let d = colibri_cluster::discover(rank, port, window);
+    let mut out = std::io::stdout();
+    if let Err(e) = colibri_cluster::discovery::print_report(&d, &mut out) {
+        eprintln!("coli cluster: {e}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 

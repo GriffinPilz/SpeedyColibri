@@ -31,7 +31,7 @@ ships with unit tests; the C code is the oracle.
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
 | `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache**; DSA/SIMD/speculation deferred |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; **CUDA FFI binding GPU-verified on a DGX Spark** (GB10, sm_121, CUDA 13 — builds/links/inits, GPU matmul smoke test passes); not yet wired into forward; Metal deprioritized |
-| `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
+| `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; **ConnectX/RoCE peer discovery working** (`coli cluster`); RDMA transport stubbed |
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack/**serve** work; interactive chat REPL dropped (server is the interface) |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
 | — | `c/olmoe.c` | ⬜ not started (second model variant) |
@@ -250,6 +250,18 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
    OpenAI-compatible server, web dashboard.
 7. **Multi-node (expert-parallel):** real `num_nodes > 1` sharding + RDMA/RoCE
    transport over ConnectX-7 (GPUDirect); split-model on-disk layout per node.
+   - ✅ **ConnectX/RoCE peer discovery** (`colibri-cluster::discovery`, `coli cluster
+     [seconds]`, and a scan printed at `serve` startup). Enumerates local RoCE links
+     from `/sys/class/infiniband` + `ip`; finds peers two ways — a UDP beacon each
+     node broadcasts (announcing hostname/rank/serve-port) and the kernel ARP table
+     (primed by a subnet sweep), classifying a neighbour as a Spark when its MAC OUI
+     matches a local ConnectX NIC. Verified across two real GB10 Sparks (gx10-42b2 ↔
+     gx10-5a4f on 192.168.100.0/24): each finds the other by hardware and, when both
+     run colibrì, by beacon (rank + serve port). `serve` keeps a background beacon so
+     later-starting nodes still discover it. Container needs `--network host` (bridge
+     hides the fabric) — `run-dgx.sh` sets it for `serve`/`cluster`.
+   - ⬜ next: the RDMA transport itself, then wiring the MoE path to fetch non-local
+     experts through it, and a per-node on-disk expert-shard layout.
 8. **Second model:** `olmoe.c`.
 
 ## Validation strategy

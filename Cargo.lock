@@ -7,6 +7,7 @@ name = "coli"
 version = "0.1.0"
 dependencies = [
  "colibri-backend",
+ "colibri-cluster",
  "colibri-core",
  "colibri-engine",
  "colibri-json",

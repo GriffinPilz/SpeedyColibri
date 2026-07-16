@@ -14,7 +14,7 @@
 //! buffered. Correctness is unaffected. See PORTING.md — tracked as a follow-up
 //! to reintroduce via `libc::posix_fadvise` behind a `cfg(unix)` gate.
 
-use colibri_core::dtype::{bf16_to_f32, f16_to_f32, DType};
+use colibri_core::dtype::{bf16_to_f32, f16_to_f32, f8e4m3_to_f32, f8e5m2_to_f32, DType};
 use colibri_core::SharedBuf;
 use colibri_json::Json;
 use std::collections::HashMap;
@@ -34,6 +34,9 @@ pub struct StTensor {
     pub nbytes: u64,
     pub dtype: DType,
     pub numel: i64,
+    /// full tensor shape from the safetensors header (needed by the converter to
+    /// recover `[O, I]` and the `[⌈O/128⌉, ⌈I/128⌉]` FP8 block-scale grid)
+    pub shape: Vec<i64>,
 }
 
 /// A set of indexed safetensors shards, supporting on-demand reads by name.
@@ -112,7 +115,8 @@ impl Shards {
                     .ok_or_else(|| bad(&path, name, "shape"))?;
                 let a0 = offsets.first().and_then(Json::as_i64).unwrap_or(0);
                 let b0 = offsets.get(1).and_then(Json::as_i64).unwrap_or(0);
-                let numel: i64 = shape.iter().map(|d| d.as_i64().unwrap_or(0)).product();
+                let dims: Vec<i64> = shape.iter().map(|d| d.as_i64().unwrap_or(0)).collect();
+                let numel: i64 = dims.iter().product();
 
                 let idx = s.tensors.len();
                 s.tensors.push(StTensor {
@@ -122,6 +126,7 @@ impl Shards {
                     nbytes: (b0 - a0) as u64,
                     dtype,
                     numel,
+                    shape: dims,
                 });
                 s.index.insert(name.to_string(), idx);
             }
@@ -144,6 +149,18 @@ impl Shards {
     /// Look up a tensor by name.
     pub fn find(&self, name: &str) -> Option<&StTensor> {
         self.index.get(name).map(|&i| &self.tensors[i])
+    }
+
+    /// All indexed tensors, in file/offset discovery order. The `file_idx` field
+    /// groups them by shard — used by the FP8→int4 converter to stream one input
+    /// shard at a time.
+    pub fn tensors(&self) -> &[StTensor] {
+        &self.tensors
+    }
+
+    /// Number of shard files indexed.
+    pub fn num_files(&self) -> usize {
+        self.files.len()
     }
 
     /// Whether a tensor exists — port of `st_has`.
@@ -252,7 +269,7 @@ impl Shards {
         out: &mut [f32],
     ) -> io::Result<()> {
         let t = self.tensor(name)?;
-        let esz = if t.dtype == DType::F32 { 4 } else { 2 } as u64;
+        let esz = t.dtype.elem_size() as u64;
         let boff = t.off + elem_off as u64 * esz;
         let nb = n_elems as u64 * esz;
         let raw = self.pread(t.file_idx, boff, nb as usize)?;
@@ -363,6 +380,16 @@ fn convert_to_f32(dtype: DType, raw: &[u8], out: &mut [f32]) {
             // read_raw. Fall back to byte-as-float to avoid surprises.
             for (o, &b) in out.iter_mut().zip(raw.iter()) {
                 *o = b as f32;
+            }
+        }
+        DType::F8E4M3 => {
+            for (o, &b) in out.iter_mut().zip(raw.iter()) {
+                *o = f8e4m3_to_f32(b);
+            }
+        }
+        DType::F8E5M2 => {
+            for (o, &b) in out.iter_mut().zip(raw.iter()) {
+                *o = f8e5m2_to_f32(b);
             }
         }
     }

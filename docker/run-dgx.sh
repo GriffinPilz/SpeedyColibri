@@ -79,25 +79,36 @@ for v in HF_TOKEN COLI_RAM_GB COLI_VRAM_GB COLI_NGEN COLI_PROFILE COLI_TIMING \
          COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP \
          COLI_CTX COLI_DISCOVER_SECS \
          COLI_PEERS COLI_EXPERT_PORT COLI_SHARD \
-         COLI_PIN_GB COLI_USAGE COLI_PREFETCH COLI_PREFETCH_N COLI_EXPERT_LOG; do
+         COLI_PIN_GB COLI_USAGE COLI_PREFETCH COLI_PREFETCH_N COLI_EXPERT_LOG \
+         COLI_CONVERT_DIR COLI_EBITS COLI_IO_BITS COLI_XBITS COLI_NLAYERS; do
   [[ -n "${!v:-}" ]] && envs+=(-e "$v=${!v}")
 done
+
+# Locate the coli subcommand: the entrypoint accepts an optional leading
+# `hf_TOKEN` and an optional `--model <spec>` before it, so the subcommand is not
+# necessarily $1 (getting this wrong silently skips the network mode for `serve`).
+_i=0
+_a=("$@")
+[[ "${_a[$_i]:-}" == hf_* ]] && _i=$((_i + 1))
+[[ "${_a[$_i]:-}" == "--model" || "${_a[$_i]:-}" == "-m" ]] && _i=$((_i + 2))
+_cmd="${_a[$_i]:-}"
+_next="${_a[$((_i + 1))]:-}"
 
 # `serve`, `worker` and `cluster` need to see the ConnectX/RoCE fabric — the RoCE
 # subnet, the kernel ARP table, and UDP broadcast — which the default bridge
 # namespace hides. `worker` in particular must be reachable by the driver at its
 # RoCE address, which bridge NAT would hide. Run them with host networking; the
 # listen port is then already on the host (no `-p` needed, and `-p` conflicts with
-# `--network host`). Other commands keep bridge networking and just publish the port.
+# `--network host`). Other commands keep bridge networking.
 net=()
 ports=()
-case "${1:-}" in
+case "$_cmd" in
   serve | worker | cluster)
     net+=(--network host)
     port="${COLI_PORT:-8080}"
-    [[ "${1:-}" == worker ]] && port="${COLI_EXPERT_PORT:-48800}" # matches expert_port()
-    [[ "${2:-}" =~ ^[0-9]+$ ]] && port="$2"
-    case "${1:-}" in
+    [[ "$_cmd" == worker ]] && port="${COLI_EXPERT_PORT:-48800}" # matches expert_port()
+    [[ "$_next" =~ ^[0-9]+$ ]] && port="$_next"
+    case "$_cmd" in
       serve) echo "[run-dgx] host networking; serving on host port ${port}" >&2 ;;
       worker) echo "[run-dgx] host networking; expert shard server on host port ${port}" >&2 ;;
     esac

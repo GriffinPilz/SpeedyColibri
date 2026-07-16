@@ -12,6 +12,7 @@
 
 pub mod attention;
 pub mod cache;
+pub mod convert;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;
@@ -20,6 +21,7 @@ pub mod loader;
 pub mod math;
 pub mod model;
 pub mod moe;
+pub mod mtp;
 pub mod preload;
 pub mod quantize;
 pub mod sampling;
@@ -27,17 +29,22 @@ pub mod usage;
 
 pub use attention::{attention, attention_with, AttnCore};
 pub use cache::{available_ram_bytes, capacity, CacheStats, ExpertCache};
+pub use convert::{convert_snapshot, detect_format, ConvertOpts, ConvertStats, SourceFormat};
 pub use usage::UsageHistory;
 pub use colibri_core::Config;
-pub use forward::{forward, generate_greedy, generate_stream, logits};
+pub use forward::{
+    forward, generate_greedy, generate_stream, generate_stream_drafting, layer_forward, logits,
+    DecodeStats,
+};
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
-pub use model::{KvCache, Layer, Model};
+pub use model::{KvCache, Layer, Model, MtpHead, KV_UNSET};
 pub use moe::{
     cluster_ctx, compute_experts_partial, dense_mlp, moe, moe_sharded, route, set_cluster,
     ClusterCtx, Expert, ExpertProvider, ShardsExpertProvider,
 };
+pub use mtp::{absorb as mtp_absorb, draft as mtp_draft};
 pub use preload::{default_num_files, preload_parallel, repack, Manifest, PreloadStore};
 pub use quantize::qtensor_from_f32;
 pub use sampling::{argmax, sample_top_p, SampleConfig};
@@ -101,6 +108,127 @@ pub fn load_model(snap: impl AsRef<Path>) -> Result<Model, EngineError> {
     load_model_with(snap, LoadOptions::default())
 }
 
+/// Load one transformer layer's resident weights: MLA attention plus either the
+/// dense MLP (`sparse == false`) or the MoE router + shared expert
+/// (`sparse == true`). Routed experts are **not** loaded — they stream.
+///
+/// Shared by the main stack and by the MTP head, which is structurally just a
+/// sparse layer at index `n_layers` (C: `mtpL`, always `sparse = 1`).
+fn load_layer(
+    shards: &colibri_safetensors::Shards,
+    cfg: &Config,
+    i: usize,
+    dbits: u32,
+    sparse: bool,
+) -> Result<Layer, EngineError> {
+    let d = cfg.hidden as usize;
+    let h = cfg.n_heads as usize;
+    let p = |s: &str| format!("model.layers.{i}.{s}");
+    let mut l = Layer::default();
+    l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
+    l.post_ln = ld(shards, &p("post_attention_layernorm.weight"))?;
+    // MLA attention projections
+    l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), cfg.q_lora as usize, d, dbits)?;
+    l.q_a_ln = ld(shards, &p("self_attn.q_a_layernorm.weight"))?;
+    l.q_b = qt_load(
+        shards,
+        &p("self_attn.q_b_proj.weight"),
+        h * cfg.qk_head as usize,
+        cfg.q_lora as usize,
+        dbits,
+    )?;
+    l.kv_a = qt_load(
+        shards,
+        &p("self_attn.kv_a_proj_with_mqa.weight"),
+        (cfg.kv_lora + cfg.qk_rope) as usize,
+        d,
+        dbits,
+    )?;
+    l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
+    l.kv_b = qt_load(
+        shards,
+        &p("self_attn.kv_b_proj.weight"),
+        h * (cfg.qk_nope + cfg.v_head) as usize,
+        cfg.kv_lora as usize,
+        dbits,
+    )?;
+    l.o = qt_load(shards, &p("self_attn.o_proj.weight"), d, h * cfg.v_head as usize, dbits)?;
+
+    l.sparse = sparse;
+    if !sparse {
+        // dense MLP
+        let inter = cfg.dense_inter as usize;
+        l.gate_proj = qt_load(shards, &p("mlp.gate_proj.weight"), inter, d, dbits)?;
+        l.up_proj = qt_load(shards, &p("mlp.up_proj.weight"), inter, d, dbits)?;
+        l.down_proj = qt_load(shards, &p("mlp.down_proj.weight"), d, inter, dbits)?;
+    } else {
+        // MoE: router (f32) + shared expert. Routed experts stream on demand.
+        l.router = ld(shards, &p("mlp.gate.weight"))?;
+        l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))?;
+        let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
+        l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?;
+        l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?;
+        l.sh_down = qt_load(shards, &p("mlp.shared_experts.down_proj.weight"), d, s_i, dbits)?;
+    }
+    Ok(l)
+}
+
+/// Load the MTP speculative head at layer index `n_layers`, if the container
+/// ships a **complete** one. Port of the MTP block of `model_init`.
+///
+/// The completeness gate matters: the head's tensors span several shards, so a
+/// partial conversion (or a `--mtp` pass that was interrupted) leaves a subset
+/// behind. The C refuses to enable MTP unless every required tensor is present —
+/// a half-loaded head would draft garbage. `MTP=0` disables it regardless.
+fn load_mtp(
+    shards: &colibri_safetensors::Shards,
+    cfg: &Config,
+    dbits: u32,
+) -> Result<Option<MtpHead>, EngineError> {
+    let i = cfg.n_layers as usize;
+    let last_e = (cfg.n_experts - 1).max(0) as usize;
+    // Same required set as the C, with the last expert index taken from the
+    // config rather than hardcoded at 255. experts.0/experts.{last} are probed
+    // because they live on different shards than the rest of the head.
+    let required = [
+        "eh_proj.weight".to_string(),
+        "enorm.weight".to_string(),
+        "hnorm.weight".to_string(),
+        "shared_head.norm.weight".to_string(),
+        "input_layernorm.weight".to_string(),
+        "post_attention_layernorm.weight".to_string(),
+        "self_attn.q_a_proj.weight".to_string(),
+        "self_attn.q_b_proj.weight".to_string(),
+        "self_attn.kv_a_proj_with_mqa.weight".to_string(),
+        "self_attn.kv_b_proj.weight".to_string(),
+        "self_attn.o_proj.weight".to_string(),
+        "mlp.gate.weight".to_string(),
+        "mlp.shared_experts.gate_proj.weight".to_string(),
+        "mlp.shared_experts.down_proj.weight".to_string(),
+        "mlp.experts.0.gate_proj.weight".to_string(),
+        format!("mlp.experts.{last_e}.down_proj.weight"),
+    ];
+    if !required.iter().all(|s| shards.has(&format!("model.layers.{i}.{s}"))) {
+        return Ok(None);
+    }
+    if std::env::var("MTP").ok().as_deref() == Some("0") {
+        return Ok(None);
+    }
+
+    let d = cfg.hidden as usize;
+    let p = |s: &str| format!("model.layers.{i}.{s}");
+    // The head's block is always sparse (C: `l->sparse = 1`).
+    let layer = load_layer(shards, cfg, i, dbits, true)?;
+    Ok(Some(MtpHead {
+        layer,
+        // [D, 2D]: consumes the concatenated [embed_normed ; hidden_normed].
+        eh_proj: qt_load(shards, &p("eh_proj.weight"), d, 2 * d, dbits)?,
+        enorm: ld(shards, &p("enorm.weight"))?,
+        hnorm: ld(shards, &p("hnorm.weight"))?,
+        mtp_norm: ld(shards, &p("shared_head.norm.weight"))?,
+    }))
+}
+
 /// Load a model snapshot, materializing the **dense** weights (embeddings,
 /// lm_head, final norm, and per-layer attention + dense-MLP / shared-expert +
 /// router). Port of the dense path of `model_init` / `load_weights` in `c/glm.c`.
@@ -150,7 +278,6 @@ pub fn load_model_with(
     }
 
     let d = cfg.hidden as usize;
-    let h = cfg.n_heads as usize;
     let dbits = opts.dbits;
     // embed/lm_head are the I/O boundary — keep them high precision (f32 when
     // dbits >= 8, else dbits), matching the C `io_bits`.
@@ -162,65 +289,13 @@ pub fn load_model_with(
 
     let mut layers = Vec::with_capacity(cfg.n_layers as usize);
     for i in 0..cfg.n_layers as usize {
-        let p = |s: &str| format!("model.layers.{i}.{s}");
-        let mut l = Layer::default();
-        l.in_ln = ld(&shards, &p("input_layernorm.weight"))?;
-        l.post_ln = ld(&shards, &p("post_attention_layernorm.weight"))?;
-        // MLA attention projections
-        l.q_a = qt_load(&shards, &p("self_attn.q_a_proj.weight"), cfg.q_lora as usize, d, dbits)?;
-        l.q_a_ln = ld(&shards, &p("self_attn.q_a_layernorm.weight"))?;
-        l.q_b = qt_load(
-            &shards,
-            &p("self_attn.q_b_proj.weight"),
-            h * cfg.qk_head as usize,
-            cfg.q_lora as usize,
-            dbits,
-        )?;
-        l.kv_a = qt_load(
-            &shards,
-            &p("self_attn.kv_a_proj_with_mqa.weight"),
-            (cfg.kv_lora + cfg.qk_rope) as usize,
-            d,
-            dbits,
-        )?;
-        l.kv_a_ln = ld(&shards, &p("self_attn.kv_a_layernorm.weight"))?;
-        l.kv_b = qt_load(
-            &shards,
-            &p("self_attn.kv_b_proj.weight"),
-            h * (cfg.qk_nope + cfg.v_head) as usize,
-            cfg.kv_lora as usize,
-            dbits,
-        )?;
-        l.o = qt_load(
-            &shards,
-            &p("self_attn.o_proj.weight"),
-            d,
-            h * cfg.v_head as usize,
-            dbits,
-        )?;
-
-        l.sparse = i as i32 >= cfg.first_dense;
-        if !l.sparse {
-            // dense MLP
-            let inter = cfg.dense_inter as usize;
-            l.gate_proj = qt_load(&shards, &p("mlp.gate_proj.weight"), inter, d, dbits)?;
-            l.up_proj = qt_load(&shards, &p("mlp.up_proj.weight"), inter, d, dbits)?;
-            l.down_proj = qt_load(&shards, &p("mlp.down_proj.weight"), d, inter, dbits)?;
-        } else {
-            // MoE: router (f32) + shared expert. Routed experts stream on demand.
-            l.router = ld(&shards, &p("mlp.gate.weight"))?;
-            l.router_bias = ld(&shards, &p("mlp.gate.e_score_correction_bias"))?;
-            let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
-            l.sh_gate = qt_load(&shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?;
-            l.sh_up = qt_load(&shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?;
-            l.sh_down = qt_load(&shards, &p("mlp.shared_experts.down_proj.weight"), d, s_i, dbits)?;
-        }
-        layers.push(l);
+        let sparse = i as i32 >= cfg.first_dense;
+        layers.push(load_layer(&shards, &cfg, i, dbits, sparse)?);
     }
 
     // MTP head lives at the extra layer index n_layers; DSA indexer weights are
     // per-layer `self_attn.indexer.*`.
-    let has_mtp = shards.has(&format!("model.layers.{}.eh_proj.weight", cfg.n_layers));
+    let mtp = load_mtp(&shards, &cfg, dbits)?;
     let has_dsa = (0..cfg.n_layers as usize).any(|i| {
         shards.has(&format!("model.layers.{i}.self_attn.indexer.wq_b.weight"))
     });
@@ -235,7 +310,8 @@ pub fn load_model_with(
         final_norm,
         layers,
         has_dsa,
-        has_mtp,
+        has_mtp: mtp.is_some(),
+        mtp,
     };
     // Dense weights are resident for the model's lifetime → GPU-cacheable.
     model.embed.gpu_eligible = true;

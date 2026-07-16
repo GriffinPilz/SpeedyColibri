@@ -41,6 +41,50 @@ mounts the host's `~/.cache/huggingface`, so the 358 GB download happens at most
 once and is shared with non-container runs), else `hf download
 $COLI_MODEL_REPO` (default `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
 
+### Any model: `--model <repo | url | path>`
+
+Point the container at a model with `--model` (or `$COLI_MODEL_REPO`). It takes an
+HF repo id, an HF URL, or a local path — and the model may be an
+**already-converted colibrì container** *or* a source checkpoint in block-scaled
+**FP8** or modelopt **NVFP4**. A source checkpoint is converted to the int4
+container automatically on first run:
+
+```bash
+# already-converted container (default) — served directly
+docker/run-dgx.sh serve 8080
+
+# an FP8 checkpoint — downloaded, then converted once, then served
+docker/run-dgx.sh --model unsloth/GLM-5.2-FP8 serve 8080
+
+# an NVFP4 checkpoint, given as a URL
+docker/run-dgx.sh --model https://huggingface.co/nvidia/GLM-5.2-NVFP4 serve 8080
+
+# a local checkpoint you already have
+docker/run-dgx.sh --model /data/my-glm-fp8 serve 8080
+```
+
+`coli probe <snap>` decides which path is taken (`container` → serve as-is;
+`fp8`/`nvfp4` → convert first). The conversion is the slow part — **~1h+ and
+~350 GB** for GLM-5.2 — so it is cached under `$COLI_CONVERT_DIR`
+(default `<HF cache>/colibri-int4/<repo-slug>-e<ebits>x<xbits>io<io_bits>`, i.e.
+inside the mounted host cache, so it survives container restarts and is only ever
+done once per model+bit-width). Bit widths come from `COLI_EBITS` (4),
+`COLI_XBITS` (=ebits), `COLI_IO_BITS` (8) and are part of the cache key. You can
+also run the conversion yourself:
+
+```bash
+coli probe   <src-snapshot>              # container | fp8 | nvfp4 | unknown
+coli convert <src-snapshot> <out-snapshot>
+```
+
+Supported source layouts: FP8 with 128×128 `weight_scale_inv` block scales
+(DeepSeek/GLM style), FP8 with a per-tensor `weight_scale` (modelopt), and
+modelopt NVFP4 (`weight_scale` per-16-block + `weight_scale_2` global). NVFP4 in
+**compressed-tensors/llm-compressor** form is *rejected* rather than silently
+mis-scaled — it stores the reciprocal global scale and divides, where modelopt
+multiplies. The DSA indexer and the MTP head are dropped by the conversion, so the
+container loads with `has_dsa=false has_mtp=false` (exact dense attention).
+
 `run-dgx.sh` picks the GPU passthrough that the host supports: CDI
 (`--device nvidia.com/gpu=all`), the nvidia runtime (`--gpus all`), or — on a
 stock shared DGX where neither is configured and you have no root — it binds

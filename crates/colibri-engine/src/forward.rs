@@ -9,7 +9,7 @@
 use crate::attention::attention;
 use crate::linear::{embed_row, matmul_qt};
 use crate::math::rmsnorm;
-use crate::model::{KvCache, Model};
+use crate::model::{KvCache, Layer, Model};
 use crate::moe::{dense_mlp, moe, ExpertProvider};
 use crate::sampling::argmax;
 use std::io;
@@ -40,6 +40,17 @@ pub fn current_step() -> u64 {
     FWD_STEP.load(Ordering::Relaxed)
 }
 
+/// Tokens to speculatively draft per forward via the MTP head: `DRAFT=n`.
+///
+/// **Defaults to 0 (off)** — same as the C's `g_draft`, where speculation is
+/// opt-in because the win is workload- and acceptance-dependent. Capped at 63
+/// (the C's `draft[64]`).
+pub(crate) fn draft_budget() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DRAFT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(63)
+    })
+}
 /// Time `f` into `acc` when profiling is enabled (else just run it).
 #[inline]
 fn timed<T>(acc: &AtomicU64, f: impl FnOnce() -> T) -> T {
@@ -52,9 +63,56 @@ fn timed<T>(acc: &AtomicU64, f: impl FnOnce() -> T) -> T {
     r
 }
 
+/// Run ONE layer over `x[S * hidden]` in place (positions
+/// `pos_base..pos_base+S`), updating `kv[li]`. Port of `layer_forward`.
+///
+/// `nrm`/`tmp` are caller-owned scratch, each `[S * hidden]`, so a hot loop can
+/// reuse them. Shared by the main stack and by the MTP head, which runs its own
+/// block at `li = n_layers`.
+pub fn layer_forward<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    l: &Layer,
+    li: usize,
+    x: &mut [f32],
+    s: usize,
+    pos_base: usize,
+    nrm: &mut [f32],
+    tmp: &mut [f32],
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    // in_ln -> attention -> residual
+    for si in 0..s {
+        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
+    }
+    timed(&ATTN_US, || attention(cfg, l, li, kv, nrm, s, pos_base, tmp));
+    for j in 0..s * d {
+        x[j] += tmp[j];
+    }
+    // post_ln -> MoE/dense -> residual
+    for si in 0..s {
+        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
+    }
+    if l.sparse {
+        timed(&MOE_US, || moe(cfg, l, li, nrm, s, tmp, true, provider))?;
+    } else {
+        timed(&DENSE_US, || dense_mlp(l, nrm, s, tmp));
+    }
+    for j in 0..s * d {
+        x[j] += tmp[j];
+    }
+    Ok(())
+}
+
 /// Run the transformer stack over `ids` (positions `pos_base..pos_base+S`),
 /// updating `kv` and writing the final hidden states `[S * hidden]` to
 /// `hidden_out`. Port of embed + `layers_forward`.
+///
+/// `hidden_out` is the **raw** hidden state — before `model.norm`. That is what
+/// [`logits`] and the MTP head both expect as input (each applies `final_norm`
+/// itself).
 pub fn forward<P: ExpertProvider>(
     model: &Model,
     kv: &mut KvCache,
@@ -79,27 +137,19 @@ pub fn forward<P: ExpertProvider>(
 
     let mut nrm = vec![0f32; s * d];
     let mut tmp = vec![0f32; s * d];
-    for (li, l) in model.layers.iter().enumerate() {
-        // in_ln -> attention -> residual
-        for si in 0..s {
-            rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
-        }
-        timed(&ATTN_US, || attention(cfg, l, li, kv, &nrm, s, pos_base, &mut tmp));
-        for j in 0..s * d {
-            x[j] += tmp[j];
-        }
-        // post_ln -> MoE/dense -> residual
-        for si in 0..s {
-            rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
-        }
-        if l.sparse {
-            timed(&MOE_US, || moe(cfg, l, li, &nrm, s, &mut tmp, true, provider))?;
-        } else {
-            timed(&DENSE_US, || dense_mlp(l, &nrm, s, &mut tmp));
-        }
-        for j in 0..s * d {
-            x[j] += tmp[j];
-        }
+    for li in 0..model.layers.len() {
+        layer_forward(
+            model,
+            kv,
+            provider,
+            &model.layers[li],
+            li,
+            &mut x,
+            s,
+            pos_base,
+            &mut nrm,
+            &mut tmp,
+        )?;
     }
 
     hidden_out.copy_from_slice(&x);
@@ -149,8 +199,46 @@ pub fn generate_stream<P, F>(
     provider: &P,
     prompt: &[i32],
     n_new: usize,
-    mut on_token: F,
+    on_token: F,
 ) -> io::Result<()>
+where
+    P: ExpertProvider,
+    F: FnMut(i32) -> bool,
+{
+    let budget = if model.has_mtp { draft_budget() } else { 0 };
+    generate_stream_drafting(model, kv, provider, prompt, n_new, budget, on_token)?;
+    Ok(())
+}
+
+/// What a decode run did. `forwards < emitted` is exactly the speculation win;
+/// `drafts_accepted / drafts_proposed` is the acceptance rate that decides
+/// whether the head is earning its keep.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeStats {
+    pub emitted: usize,
+    /// main-model forwards actually run
+    pub forwards: u64,
+    pub drafts_proposed: u64,
+    pub drafts_accepted: u64,
+}
+
+/// [`generate_stream`] with an explicit speculation budget: `budget` tokens are
+/// drafted by the MTP head per forward and verified against the main model.
+/// `generate_stream` supplies `DRAFT` for it.
+///
+/// `budget == 0` disables speculation, and the loop then reduces exactly to the
+/// plain one-token-per-forward path — which is the property the
+/// "speculation does not change output" test relies on. Exposed separately
+/// because `DRAFT` is read once per process and so cannot be varied in-process.
+pub fn generate_stream_drafting<P, F>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    prompt: &[i32],
+    n_new: usize,
+    budget: usize,
+    mut on_token: F,
+) -> io::Result<DecodeStats>
 where
     P: ExpertProvider,
     F: FnMut(i32) -> bool,
@@ -186,29 +274,112 @@ where
         l
     };
     let mut pos = s;
+    // Raw hidden at the position that produced `logit` — the MTP head's input.
+    let mut hlast = hidden[(s - 1) * d..s * d].to_vec();
+
+    // Speculation budget for this run. Starts at `DRAFT` (0 = off, matching the
+    // C's `g_draft`) and is zeroed by the auto-off guard below. With `g == 0`
+    // every step below degenerates to exactly the non-speculative loop, which is
+    // what makes `DRAFT=0` byte-identical to `DRAFT=n`.
+    let mut budget = if model.has_mtp { budget } else { 0 };
+    let (mut proposed, mut accepted, mut forwards) = (0u64, 0u64, 0u64);
 
     let mut decode_ms: Vec<f64> = Vec::with_capacity(n_new);
-    for _ in 0..n_new {
+    let mut emitted = 0usize;
+    while emitted < n_new {
         let next = argmax(&logit) as i32;
         let keep_going = on_token(next);
+        emitted += 1;
         if model.cfg.stop_ids.contains(&next) {
             break;
         }
-        if !keep_going {
+        if !keep_going || emitted >= n_new {
             break;
         }
-        let mut h = vec![0f32; d];
+
+        // --- draft ---------------------------------------------------------
+        // Auto-off: drafts that are never accepted are pure overhead (on this
+        // engine, extra expert streaming). The C disables them below 10%
+        // acceptance after 24 proposals; an int4 MTP head lands there.
+        if budget > 0 && proposed >= 24 && accepted * 10 < proposed {
+            eprintln!(
+                "[MTP] {:.0}% acceptance after {proposed} proposals: drafts disabled",
+                100.0 * accepted as f64 / proposed as f64
+            );
+            budget = 0;
+        }
+        let drafts = if budget > 0 {
+            let dr = crate::mtp::draft(model, kv, provider, next, pos, budget, &hlast)?;
+            proposed += dr.len() as u64;
+            dr
+        } else {
+            Vec::new()
+        };
+        // Clamp to what we still owe the caller and to the cache.
+        let mut g = drafts.len().min(n_new - emitted);
+        if pos + g + 2 > kv.max_t {
+            g = (kv.max_t.saturating_sub(pos + 2)).min(g);
+        }
+
+        // --- verify --------------------------------------------------------
+        // One forward over [next, drafts...]: position i's logits reveal the
+        // TRUE token at i+1, which is what each draft is checked against.
+        let mut batch = Vec::with_capacity(1 + g);
+        batch.push(next);
+        batch.extend_from_slice(&drafts[..g]);
+        let sb = batch.len();
+        let mut h_all = vec![0f32; sb * d];
         let t = std::time::Instant::now();
-        forward(model, kv, provider, &[next], pos, &mut h)?;
+        forward(model, kv, provider, &batch, pos, &mut h_all)?;
+        forwards += 1;
         let ms = t.elapsed().as_secs_f64() * 1e3;
         if timing {
             eprintln!("[timing] decode tok {}: {ms:.1} ms ({:.2} tok/s)", pos - s, 1e3 / ms);
         }
         decode_ms.push(ms);
+
         let tl = std::time::Instant::now();
-        logit = logits(model, &h);
+        let los: Vec<Vec<f32>> =
+            (0..sb).map(|i| logits(model, &h_all[i * d..(i + 1) * d])).collect();
         logits_us += tl.elapsed().as_micros() as u64;
-        pos += 1;
+
+        // Accept the longest prefix that matches what the model itself would
+        // have produced — this is why speculation cannot change the output.
+        let mut k = 0usize;
+        let mut done = false;
+        while k < g && emitted < n_new {
+            if argmax(&los[k]) as i32 != drafts[k] {
+                break; // rejected: everything after it is stale too
+            }
+            let keep = on_token(drafts[k]);
+            emitted += 1;
+            k += 1;
+            if model.cfg.stop_ids.contains(&drafts[k - 1]) || !keep {
+                done = true;
+                break;
+            }
+        }
+        accepted += k as u64;
+
+        // Keep the head's KV in sync with the VERIFIED tokens only.
+        if k >= 1 {
+            crate::mtp::absorb(model, kv, provider, &drafts[..k], &h_all, pos)?;
+        }
+        // `hlast` must be the last ACCEPTED position, not the end of the batch:
+        // the KV past `pos + k` is stale and will simply be overwritten.
+        hlast.copy_from_slice(&h_all[k * d..(k + 1) * d]);
+        logit = los[k].clone();
+        pos += 1 + k;
+        if done {
+            break;
+        }
+    }
+    if budget > 0 && proposed > 0 {
+        eprintln!(
+            "[MTP] {accepted}/{proposed} drafts accepted ({:.0}%), {:.2} tok/forward",
+            100.0 * accepted as f64 / proposed as f64,
+            if forwards > 0 { emitted as f64 / forwards as f64 } else { 0.0 }
+        );
     }
     if timing && !decode_ms.is_empty() {
         // Steady state: drop the first half (cold expert-cache misses) and
@@ -237,5 +408,10 @@ where
             logits_us as f64 / 1e3,
         );
     }
-    Ok(())
+    Ok(DecodeStats {
+        emitted,
+        forwards,
+        drafts_proposed: proposed,
+        drafts_accepted: accepted,
+    })
 }

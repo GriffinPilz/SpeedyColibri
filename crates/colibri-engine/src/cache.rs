@@ -17,7 +17,93 @@ use crate::usage::UsageHistory;
 use colibri_core::tier::lfru_score;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+
+/// Online next-layer expert predictor for speculative prefetch (`COLI_PREFETCH`).
+///
+/// As tokens stream past it learns two things: per-layer expert **frequency**, and
+/// the adjacent-layer **transition** `layer L-1 expert → layer L expert`
+/// co-occurrence. Given a layer's routed experts it predicts the *next* layer's
+/// likely experts (transition-scored, frequency-backfilled) so they can be loaded
+/// in the background during this layer's compute. `scripts/expert_prefetch_analysis.py`
+/// measured this "markov+freq" predictor covering ~68% of cache misses at top-16 in
+/// the miss-heavy (working-set > cache) regime — the 1–4 Spark case.
+struct Predictor {
+    topn: usize,
+    freq: HashMap<usize, HashMap<u32, u32>>,
+    trans: HashMap<usize, HashMap<u32, HashMap<u32, u32>>>,
+    last: Option<(usize, Vec<u32>)>,
+}
+
+impl Predictor {
+    fn new(topn: usize) -> Predictor {
+        Predictor { topn, freq: HashMap::new(), trans: HashMap::new(), last: None }
+    }
+
+    /// Record this layer's experts and return the predicted top-N for the *next*
+    /// layer.
+    fn observe_and_predict(&mut self, layer: usize, eids: &[usize]) -> Vec<usize> {
+        let cur: Vec<u32> = eids.iter().map(|&e| e as u32).collect();
+        let f = self.freq.entry(layer).or_default();
+        for &e in &cur {
+            *f.entry(e).or_insert(0) += 1;
+        }
+        if let Some((ll, le)) = self.last.take() {
+            if ll + 1 == layer {
+                let t = self.trans.entry(layer).or_default();
+                for &pe in &le {
+                    let c = t.entry(pe).or_default();
+                    for &e in &cur {
+                        *c.entry(e).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let predicted = self.predict(layer + 1, &cur);
+        self.last = Some((layer, cur));
+        predicted
+    }
+
+    /// Top-N predicted experts for `target` given `from` (the previous layer's
+    /// experts): sum the learned transitions, then backfill by frequency.
+    fn predict(&self, target: usize, from: &[u32]) -> Vec<usize> {
+        let mut score: HashMap<u32, u32> = HashMap::new();
+        if let Some(t) = self.trans.get(&target) {
+            for &e in from {
+                if let Some(c) = t.get(&e) {
+                    for (&ne, &cnt) in c {
+                        *score.entry(ne).or_insert(0) += cnt;
+                    }
+                }
+            }
+        }
+        let mut ranked: Vec<(u32, u32)> = score.into_iter().collect();
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut out: Vec<usize> = Vec::with_capacity(self.topn);
+        for (e, _) in ranked {
+            out.push(e as usize);
+            if out.len() >= self.topn {
+                break;
+            }
+        }
+        if out.len() < self.topn {
+            if let Some(f) = self.freq.get(&target) {
+                let mut fr: Vec<(u32, u32)> = f.iter().map(|(&e, &c)| (e, c)).collect();
+                fr.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                for (e, _) in fr {
+                    let e = e as usize;
+                    if !out.contains(&e) {
+                        out.push(e);
+                        if out.len() >= self.topn {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
 
 /// One cached expert plus its LFRU bookkeeping.
 struct Entry {
@@ -58,6 +144,10 @@ pub struct ExpertCache<P: ExpertProvider> {
     inner: P,
     budget: u64,
     state: Mutex<State>,
+    /// Speculative-prefetch predictor + background-loader channel, present only
+    /// when [`enable_prefetch`](ExpertCache::enable_prefetch) was called.
+    predictor: Mutex<Option<Predictor>>,
+    prefetch_tx: OnceLock<mpsc::SyncSender<(usize, Vec<usize>)>>,
 }
 
 impl<P: ExpertProvider> ExpertCache<P> {
@@ -77,6 +167,8 @@ impl<P: ExpertProvider> ExpertCache<P> {
                 evictions: 0,
                 session_usage: HashMap::new(),
             }),
+            predictor: Mutex::new(None),
+            prefetch_tx: OnceLock::new(),
         }
     }
 
@@ -232,6 +324,34 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
     /// once while protecting itself. Preloads aren't router selections — the compute
     /// loop's `expert` call then hits and records the selection.
     fn prefetch(&self, layer: usize, eids: &[usize]) -> io::Result<()> {
+        // Speculative prefetch: predict the *next* layer's experts from this one and
+        // hand them to the background loader, so they load during this layer's
+        // compute (best-effort — dropped if the loader is behind). Enabled only when
+        // `enable_prefetch` was called; otherwise this is a no-op and we just load.
+        if let Some(tx) = self.prefetch_tx.get() {
+            let predicted = self
+                .predictor
+                .lock()
+                .unwrap()
+                .as_mut()
+                .map(|p| p.observe_and_predict(layer, eids));
+            if let Some(pred) = predicted {
+                if !pred.is_empty() {
+                    let _ = tx.try_send((layer + 1, pred));
+                }
+            }
+        }
+        self.load_batch(layer, eids)
+    }
+}
+
+impl<P: ExpertProvider + Sync> ExpertCache<P> {
+    /// Load `eids` for `layer` into the cache if absent (used by both `prefetch`
+    /// and the background prefetch loader). Loads run **off the cache lock**; the
+    /// batch is inserted under one lock and evicted once while protecting itself.
+    /// Loads aren't router selections — the compute loop's `expert` call then hits
+    /// and records the selection.
+    fn load_batch(&self, layer: usize, eids: &[usize]) -> io::Result<()> {
         let missing: Vec<usize> = {
             let s = self.state.lock().unwrap();
             eids.iter()
@@ -269,6 +389,40 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
         let budget = self.budget;
         s.evict_to_protecting(budget, &batch);
         Ok(())
+    }
+}
+
+impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
+    /// Turn on **speculative prefetch**: from each layer's routed experts, predict
+    /// the next layer's and load them in the background (up to `topn`/layer) during
+    /// this layer's compute, so a predicted expert is already resident when its
+    /// layer runs. Best-effort — it never blocks the forward pass, only loads
+    /// experts that aren't cached, and stops at the byte budget like any other load.
+    ///
+    /// **Off by default, and it should stay off when experts load from the local
+    /// NVMe.** A controlled A/B on a Spark (GLM-5.2 int4, 20 GB cache, miss-heavy
+    /// regime) regressed decode throughput at every degree — 1.01 tok/s off vs 0.99
+    /// (top-2), 0.93 (top-4), 0.82 (top-16) — because (1) speculative loads evict
+    /// working-set experts the model still needs (misses climb from 15k to 37k), and
+    /// (2) the background loader steals bandwidth from demand reads on an
+    /// already-saturated drive (expert-load time rises 29→34 s). Prediction accuracy
+    /// isn't the bottleneck; you can't hide loads behind the drive that *is* the
+    /// bottleneck. This machinery earns its keep only when the prefetch **source** is
+    /// a peer's RAM over RDMA (multispark) rather than local disk — no drive
+    /// contention there — or with a separate staging budget that can't evict the
+    /// working set. Kept opt-in for that. See `scripts/expert_prefetch_analysis.py`.
+    pub fn enable_prefetch(self: &Arc<Self>, topn: usize) {
+        *self.predictor.lock().unwrap() = Some(Predictor::new(topn));
+        let (tx, rx) = mpsc::sync_channel::<(usize, Vec<usize>)>(4);
+        if self.prefetch_tx.set(tx).is_err() {
+            return; // already enabled
+        }
+        let cache = Arc::clone(self);
+        std::thread::spawn(move || {
+            for (layer, eids) in rx {
+                let _ = cache.load_batch(layer, &eids);
+            }
+        });
     }
 }
 
@@ -342,6 +496,31 @@ mod tests {
     use super::*;
     use crate::quantize::qtensor_from_f32;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn predictor_learns_layer_transition() {
+        let mut p = Predictor::new(4);
+        // Teach it twice: at layer 1 expert 10 is followed by expert 20 at layer 2.
+        for _ in 0..2 {
+            p.observe_and_predict(1, &[10]);
+            p.observe_and_predict(2, &[20]);
+        }
+        // Now, seeing expert 10 at layer 1, it should predict 20 for layer 2.
+        let pred = p.observe_and_predict(1, &[10]);
+        assert_eq!(pred.first(), Some(&20), "predicted {pred:?}");
+    }
+
+    #[test]
+    fn predictor_backfills_with_frequency() {
+        let mut p = Predictor::new(3);
+        // No transitions into layer 5 learned, but layer 5 saw expert 7 often.
+        for _ in 0..3 {
+            p.observe_and_predict(5, &[7, 8]);
+        }
+        // Predicting layer 5 from an unknown context falls back to frequency (7, 8).
+        let pred = p.predict(5, &[999]);
+        assert!(pred.contains(&7) && pred.contains(&8), "predicted {pred:?}");
+    }
 
     // A provider that counts how many times it actually loads (i.e. cache misses
     // that reach disk).

@@ -100,6 +100,9 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Leak to 'static so the optional background prefetch loader can hold the cache
+    // (a server owns the model for its whole lifetime).
+    let model: &'static colibri_engine::Model = Box::leak(Box::new(model));
     let tok_path = format!("{snap}/tokenizer.json");
     let tok = match Tokenizer::load(&tok_path) {
         Ok(t) => t,
@@ -109,7 +112,11 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
     let base = ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
-    let provider = ExpertCache::new(base, crate::ram_budget());
+    let provider = std::sync::Arc::new(ExpertCache::new(base, crate::ram_budget()));
+    if let Some(topn) = crate::prefetch_topn() {
+        provider.enable_prefetch(topn);
+        println!("[serve] speculative next-layer prefetch on (top-{topn}/layer)");
+    }
     let model_id = model_id_from(&snap);
 
     // Multi-node: install the expert-parallel context so moe() splits experts by
@@ -154,8 +161,8 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             continue;
         }
         eprintln!("[serve] warm-up {}/{}: {} tokens", i + 1, warmups.len(), ids.len());
-        let mut kv = mk_kv(&model, ids.len() + WARMUP_TOKENS);
-        if let Err(e) = colibri_engine::generate_greedy(&model, &mut kv, &provider, &ids, WARMUP_TOKENS) {
+        let mut kv = mk_kv(model, ids.len() + WARMUP_TOKENS);
+        if let Err(e) = colibri_engine::generate_greedy(model, &mut kv, &*provider, &ids, WARMUP_TOKENS) {
             eprintln!("[serve] warm-up failed: {e}");
         }
     }
@@ -199,7 +206,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
 
     for conn in listener.incoming() {
         match conn {
-            Ok(stream) => handle(stream, &model, &provider, &tok, &model_id, ctx_len),
+            Ok(stream) => handle(stream, model, &*provider, &tok, &model_id, ctx_len),
             Err(e) => eprintln!("[serve] accept: {e}"),
         }
     }

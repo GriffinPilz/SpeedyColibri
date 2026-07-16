@@ -180,6 +180,9 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Leak to 'static so an optional background prefetch loader can hold the cache
+    // (the process owns the model for its lifetime anyway).
+    let model: &'static colibri_engine::Model = Box::leak(Box::new(model));
     let n_new = envbits("COLI_NGEN", 16) as usize;
 
     // COLI_PRELOAD: parallel-load experts into RAM, then serve with no per-token
@@ -189,9 +192,9 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     if let Ok(v) = std::env::var("COLI_PRELOAD") {
         let repacked = std::path::Path::new(&v).join("manifest.json").exists();
         if repacked {
-            return cmd_gen_preload_repacked(&model, &v, &prompt, n_new);
+            return cmd_gen_preload_repacked(model, &v, &prompt, n_new);
         }
-        return cmd_gen_preload_direct(&model, &prompt, n_new);
+        return cmd_gen_preload_direct(model, &prompt, n_new);
     }
 
     // Resident expert cache: experts loaded once stay in RAM until the budget
@@ -200,7 +203,11 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     let base =
         colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
     let budget = ram_budget();
-    let provider = colibri_engine::ExpertCache::new(base, budget);
+    let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
+    if let Some(topn) = prefetch_topn() {
+        provider.enable_prefetch(topn);
+        println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
+    }
 
     // Pinned hot-store warm-up (AUTOPIN): read the persistent usage history and
     // pin the hottest experts (COLI_PIN_GB budget) so they stay resident.
@@ -225,7 +232,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         model.cfg.qk_rope as usize,
         prompt.len() + n_new,
     );
-    match colibri_engine::generate_greedy(&model, &mut kv, &provider, &prompt, n_new) {
+    match colibri_engine::generate_greedy(model, &mut kv, &*provider, &prompt, n_new) {
         Ok(seq) => {
             let cont: Vec<i32> = seq[prompt.len()..].to_vec();
             println!("prompt: {prompt:?}");
@@ -374,15 +381,17 @@ fn cmd_worker(args: &[String]) -> ExitCode {
         }
     };
     let base = colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
-    let provider: &'static colibri_engine::ExpertCache<_> =
-        Box::leak(Box::new(colibri_engine::ExpertCache::new(base, ram_budget())));
+    let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, ram_budget()));
+    if let Some(topn) = prefetch_topn() {
+        provider.enable_prefetch(topn);
+    }
 
     let sharding = cluster.expert_sharding(model.cfg.n_experts as u32);
     let (lo, hi) = sharding.range_for(cluster.this_node);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let bound = match colibri_cluster::serve_experts(addr, move |req| {
         match colibri_engine::compute_experts_partial(
-            provider,
+            &*provider,
             req.layer as usize,
             &req.experts,
             &req.weights,
@@ -788,6 +797,23 @@ fn ram_budget() -> u64 {
         }
     }
     colibri_engine::available_ram_bytes().unwrap_or(u64::MAX)
+}
+
+/// Speculative-prefetch setting from `COLI_PREFETCH`: unset/`0` → off; `1` → on
+/// with `COLI_PREFETCH_N` experts/layer (default 16); a bare number → that many.
+/// Off by default and best left off with local-NVMe experts: a controlled A/B
+/// regressed decode tok/s at every degree (speculative loads evict the working set
+/// and contend for the saturated drive). Retained opt-in for the RDMA case where
+/// the prefetch source is a peer's RAM. See `ExpertCache::enable_prefetch` and
+/// `scripts/expert_prefetch_analysis.py`.
+fn prefetch_topn() -> Option<usize> {
+    match std::env::var("COLI_PREFETCH").ok().as_deref() {
+        None | Some("") | Some("0") => None,
+        Some("1") => {
+            Some(std::env::var("COLI_PREFETCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(16))
+        }
+        Some(v) => Some(v.parse().unwrap_or(16)),
+    }
 }
 
 /// Parse a token count like `256k`, `1m`, or `262144`.

@@ -142,20 +142,41 @@ token's chosen experts to their owner. The dense part (attention, shared expert,
 embeddings — ~10 GB int4) is replicated per node so attention stays local and
 only expert I/O crosses the wire.
 
-Transport target: **RDMA/RoCE over the ConnectX-7 200 GbE link**, ideally with
-GPUDirect RDMA so the Blackwell GPU DMAs activations straight to the wire
-(`colibri-cluster::transport`, `--features rdma`). This is designed but not
-wired — single node comes first.
+Transport: **TCP over the RoCE Ethernet** today (RoCE is Ethernet, so TCP on the
+192.168.100.0/24 fabric already gets the ConnectX-7's 200 GbE). A future
+`RdmaTransport` (verbs + GPUDirect) can drop in behind the same `Transport` trait
+to cut latency; the engine above is unchanged.
 
-To bring up two nodes later:
+### Bring up two nodes (working today)
 
-1. Build the split model layout so each node has its expert shard on local NVMe.
-2. Launch node 0 with `COLI_NUM_NODES=2 COLI_NODE_RANK=0`, node 1 with rank `1`.
-3. Wire `RdmaTransport::connect` (queue pairs + registered MRs over ConnectX).
+Only the exchanged **activations** cross the wire (~24 KB/expert-group per token,
+sent to the owner, weighted partial sum returned) — not expert weights. First,
+**find the peers** (verify the fabric): `docker/run-dgx.sh cluster` on each node.
 
-On real hardware the two Sparks talk over the direct 200 GbE link with host
-networking, not a compose bridge (the disabled `node1` service in the compose
-file is only a placeholder for the topology).
+One node **drives** (HTTP + the forward pass, owning half the experts); the other
+runs a headless **worker** (an expert server for its half). Each node only loads
+and caches *its* shard, so the working set is split across the fabric.
+
+```bash
+# Node 1 (rank 1) — worker for experts 128..256, on the RoCE port:
+COLI_NUM_NODES=2 COLI_NODE_RANK=1 COLI_RAM_GB=85 \
+  coli worker <snap> 48800        # binds 0.0.0.0:48800
+
+# Node 0 (rank 0) — driver: HTTP on :8080, owns 0..128, fetches 128..256 from node 1
+COLI_NUM_NODES=2 COLI_NODE_RANK=0 COLI_RAM_GB=85 \
+  COLI_PEERS="1=192.168.100.10:48800" \
+  coli serve <snap> 8080 "warm up"
+```
+
+Start the worker first (the driver connects to it at startup). `COLI_PEERS` is a
+comma-separated `rank=host:port` map of the other nodes' worker addresses;
+`COLI_EXPERT_PORT` sets the default worker port (48800). Verified on two GB10
+Sparks: output is bit-identical to single-node, and each node's RSS drops to
+~65 GB (half the experts) from ~95 GB.
+
+**Status:** the split-model on-disk layout (each node stores only its shard, not
+the full 358 GB) and the GPUDirect `RdmaTransport` are the remaining optimizations;
+both nodes currently keep the full model on disk but load only their shard.
 
 ## CUDA (Blackwell) backend
 

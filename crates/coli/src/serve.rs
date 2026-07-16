@@ -231,7 +231,10 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("[serve] OpenAI-compatible server on http://{addr}  (model: {model_id})");
+    println!(
+        "[serve] coli {} — OpenAI-compatible server on http://{addr}  (model: {model_id})",
+        crate::version_string()
+    );
     let kv_at_ctx = kv_bytes_per_token(&model.cfg).saturating_mul(ctx_len) as f64 / (1u64 << 30) as f64;
     let model_max_str =
         if model.cfg.max_ctx > 0 { model.cfg.max_ctx.to_string() } else { "unknown".to_string() };

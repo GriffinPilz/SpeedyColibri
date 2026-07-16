@@ -11,9 +11,20 @@ mod serve;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Source revision this binary was built from (see `build.rs`). Printed by `version`
+/// and by the `serve`/`worker` banners: a container image built from stale source
+/// looks identical at runtime otherwise, and on a cluster every node should show the
+/// same value.
+const BUILD_REV: &str = env!("COLI_BUILD_REV");
+
+/// `v0.1.0 (abc1234)` — the identity string for logs and `version`.
+pub(crate) fn version_string() -> String {
+    format!("v{VERSION} ({BUILD_REV})")
+}
+
 fn usage() {
     eprintln!(
-        r#"colibrì (SpeedyColibri, Rust port) v{VERSION}
+        r#"colibrì (SpeedyColibri, Rust port) v{VERSION} ({BUILD_REV})
   tiny engine, immense model
 
 USAGE:
@@ -48,7 +59,7 @@ fn main() -> ExitCode {
 
     match cmd {
         "version" | "--version" | "-V" => {
-            println!("coli {VERSION}");
+            println!("coli {}", version_string());
             ExitCode::SUCCESS
         }
         "help" | "--help" | "-h" => {
@@ -469,8 +480,12 @@ fn cmd_worker(args: &[String]) -> ExitCode {
         }
     };
     println!(
-        "[worker] rank {} of {} — serving {} experts on {} (TCP/RoCE)",
-        cluster.this_node.0, cluster.num_nodes, owned, bound
+        "[worker] coli {} — rank {} of {} — serving {} experts on {} (TCP/RoCE)",
+        version_string(),
+        cluster.this_node.0,
+        cluster.num_nodes,
+        owned,
+        bound
     );
     // Advertise on the discovery beacon so `cluster` scans see this worker.
     colibri_cluster::discovery::spawn_beacon(cluster.this_node.0, port);

@@ -11,8 +11,10 @@
 #   3. download from the Hub — pass an HF token as the first argument (hf_...)
 #      or via HF_TOKEN / HUGGING_FACE_HUB_TOKEN in the environment.
 #
-# Build (on/for aarch64):
-#   docker build -f docker/Dockerfile -t speedycolibri:latest .
+# Build (on/for aarch64) — pass GIT_SHA so the image can report what it was built
+# from (`coli version`); .git is not in the build context:
+#   docker build -f docker/Dockerfile \
+#     --build-arg GIT_SHA=$(git rev-parse --short HEAD) -t speedycolibri:latest .
 # Run on a DGX Spark host (GPU passthrough + HF cache handled for you):
 #   docker/run-dgx.sh [hf_TOKEN] gen 100 200 300
 # Or by hand:
@@ -41,6 +43,15 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /build
 COPY . .
+
+# Source revision stamp. `.dockerignore` excludes `.git`, so the build cannot derive
+# it — pass it in:
+#   docker build --build-arg GIT_SHA=$(git rev-parse --short HEAD) ...
+# It surfaces in `coli version` and the serve/worker banners, so an image built from
+# stale source is visible rather than silently running old code (and two cluster
+# nodes can be compared at a glance). Defaults to `unknown` if not supplied.
+ARG GIT_SHA=unknown
+ENV COLI_GIT_SHA=${GIT_SHA}
 
 # The CUDA (Blackwell) backend is the default. CUDA_ARCH must be an explicit
 # sm_* here — `native` probes a GPU, and there is none during `docker build`.

@@ -5,11 +5,15 @@
 //! the C Makefile's Linux CUDA path. When the feature is off — the default — this
 //! is a no-op, so ordinary (CPU / non-CUDA) builds are unaffected.
 //!
-//! If `nvcc` is not found while the feature IS on, we skip compilation with a
-//! warning rather than aborting, so `cargo check --features cuda` can still
-//! type-check the FFI on a machine without CUDA. A real `cargo build
-//! --features cuda` there will fail at link time (undefined `coli_cuda_*`), as
-//! expected — build on a CUDA host (e.g. the DGX Spark image's `-devel` base).
+//! If `nvcc` is not found while the feature IS on we **fail the build**, naming the
+//! cause. Silently skipping produced a link error (`undefined reference to
+//! coli_cuda_*`) far from its cause — and worse, cargo *caches* build-script results,
+//! so one build in a shell without `nvcc` poisoned every later build even after nvcc
+//! was back on `PATH`. Hence `rerun-if-env-changed=PATH` below: `nvcc` is normally
+//! found through it, so a PATH change must re-run the probe.
+//!
+//! `COLI_ALLOW_NO_NVCC=1` restores the old skip-with-warning, so `cargo check
+//! --features cuda` can still type-check the FFI on a machine without CUDA.
 
 use std::env;
 use std::path::PathBuf;
@@ -30,6 +34,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    // `nvcc` is normally resolved through PATH, and cargo caches this script's
+    // result. Without re-running on a PATH change, one build from a shell that
+    // lacks nvcc (a non-interactive ssh, say) sticks — every later build reuses the
+    // "no CUDA" outcome and fails at link with `undefined reference to coli_cuda_*`.
+    println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=COLI_ALLOW_NO_NVCC");
 
     let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
         env::var("CUDA_HOME")
@@ -43,12 +53,26 @@ fn main() {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !have_nvcc {
-        println!(
-            "cargo:warning=nvcc not found ('{nvcc}'); CUDA backend NOT compiled. \
-             `cargo check --features cuda` still type-checks the FFI, but linking \
-             will fail. Build on a CUDA host or set NVCC / CUDA_HOME."
+        // Escape hatch: type-check the FFI on a machine without CUDA.
+        if env::var_os("COLI_ALLOW_NO_NVCC").is_some() {
+            println!(
+                "cargo:warning=nvcc not found ('{nvcc}') and COLI_ALLOW_NO_NVCC is set: \
+                 CUDA backend NOT compiled. Type-checking only — linking will fail with \
+                 undefined `coli_cuda_*`."
+            );
+            return;
+        }
+        // Fail here, where the cause is known. Skipping would surface as a link error
+        // against `coli_cuda_*` with no hint that nvcc was simply missing.
+        panic!(
+            "the `cuda` feature is enabled but nvcc was not found (tried '{nvcc}').\n\
+             Build on a CUDA host, or point at it explicitly:\n\
+             \x20   NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda \
+             cargo build --release -p coli --features cuda\n\
+             A login shell (`bash -lc`) usually has nvcc on PATH where a plain \
+             non-interactive ssh does not.\n\
+             To type-check the FFI without CUDA, set COLI_ALLOW_NO_NVCC=1."
         );
-        return;
     }
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());

@@ -45,61 +45,131 @@ not compute-bound — which is exactly the problem multi-Spark is meant to solve
 
 ## Quick start (DGX Spark)
 
-The deliverable is an **OpenAI-compatible inference server**. One command builds
-the container on first use, wires up the GPU (even on a stock shared Spark with no
-`--gpus` runtime and no root), fetches the model into your Hugging Face cache if
-needed, and starts serving:
+The deliverable is an **OpenAI-compatible inference server**. Run these four steps
+on the Spark, top to bottom. Everything — the image build, the model download, and
+GPU passthrough (even on a stock shared Spark with no `--gpus` runtime and no root)
+— is handled by `docker/run-dgx.sh`.
+
+> **Prerequisites:** a DGX Spark (GB10) with Docker and the NVIDIA driver ≥ 580
+> (CUDA 13) — both ship with DGX OS. A Hugging Face account/token for the first
+> model download. ~360 GB free disk for the model. No root required.
+
+**Time budget (first run, cold):** ~10 min build + 30–90 min model download +
+~1–2 min server startup. Everything after the first run skips the build and
+download (~1–2 min to a ready server).
+
+### 1. Get the code  ·  ~30 s
 
 ```bash
-# `serve [port] [warm-up prompt...]` — publishes the port and starts the HTTP API.
-# The HF token (first arg, or HF_TOKEN) is only needed for the first, uncached download.
-docker/run-dgx.sh hf_xxxxxxxxxxxxxxxxxxxx serve 8080 "hello, warm up the cache"
-
-# already downloaded (or a public repo)? no token needed:
-COLI_RAM_GB=85 docker/run-dgx.sh serve 8080
+git clone https://github.com/GriffinPilz/SpeedyColibri.git
+cd SpeedyColibri
+# already cloned? update instead:
+# git pull
 ```
 
-Then talk to it like any OpenAI endpoint — streaming works, which matters at
-~1 tok/s:
+### 2. Start the server  ·  first run ~10 min build, then a one-time 30–90 min download
+
+`run-dgx.sh` builds the image if it doesn't exist yet, downloads the model into
+your Hugging Face cache if it isn't there, warms the cache, and starts serving.
 
 ```bash
-# chat, streamed (SSE)
+# First run — pass your HF token so the 358 GB model can download.
+# (~10 min to build the image, then ~30–90 min for the one-time download.)
+COLI_RAM_GB=85 docker/run-dgx.sh hf_xxxxxxxxxxxxxxxxxxxx serve 8080 "warm up the cache"
+
+# Later runs — model already cached, no token needed. Ready in ~1–2 min.
+COLI_RAM_GB=85 docker/run-dgx.sh serve 8080 "warm up the cache"
+```
+
+Wait for this line before sending requests:
+
+```
+[serve] OpenAI-compatible server on http://0.0.0.0:8080  (model: mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp)
+```
+
+**Command shape:** `docker/run-dgx.sh [hf_TOKEN] serve [port] [warm-up prompt...]`
+
+| Argument | Meaning | Default |
+|---|---|---|
+| `hf_TOKEN` | *(optional, first)* Hugging Face token — any arg starting `hf_`. Only needed the first time, to download the model. Equivalent to the `HF_TOKEN` env var. | none (fine once cached) |
+| `serve` | The subcommand: start the HTTP inference server. | — |
+| `port` | *(optional)* TCP port to listen on and publish from the container. | `8080` |
+| `warm-up prompt...` | *(optional)* Text run through one short generation at startup, so the hottest experts are resident before the first real request. Several via `COLI_WARMUP="a\|b"`. | none |
+
+### 3. Query it  ·  first token in a few seconds, then ~1.2 tokens/sec
+
+Any OpenAI client works. Streaming (`"stream": true`) sends tokens as they are
+produced — worth using at ~1 tok/s so output appears live instead of after the
+full ~N/1.2 seconds.
+
+```bash
+# Liveness + what's served (instant)
+curl http://localhost:8080/health
+curl http://localhost:8080/v1/models
+
+# Chat, streamed as Server-Sent Events (a 64-token reply ≈ 50 s at ~1.2 tok/s)
 curl -N http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "glm-5.2", "stream": true, "max_tokens": 64,
+  "stream": true, "max_tokens": 64,
   "messages": [{"role": "user", "content": "Explain MoE routing in one sentence."}]
 }'
 
-# raw completion, non-streamed
+# Raw text completion, returned in one JSON object (waits for all tokens)
 curl http://localhost:8080/v1/completions -H 'Content-Type: application/json' -d '{
   "prompt": "The capital of France is", "max_tokens": 16
 }'
-
-curl http://localhost:8080/v1/models      # what is served
-curl http://localhost:8080/health         # liveness
 ```
 
-**Warm-up prompts** (positional args after the port, and/or `COLI_WARMUP="a|b"`)
-run through a short generation at startup so the hottest experts are already
-resident before the first real request. The **port** is a positional arg after
-`serve`, or `COLI_PORT`, default `8080`.
+**Request fields** (JSON body):
 
-The model resolves in order: a snapshot mounted at `/model`
-(`COLI_MODEL_DIR=<dir> docker/run-dgx.sh ...`) → the Hugging Face cache (the
-launcher mounts the host's `~/.cache/huggingface`, so the 358 GB download happens
-**at most once** and is shared with non-container runs) → `hf download` of
-`$COLI_MODEL_REPO` (default `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
+| Field | Applies to | Meaning | Default |
+|---|---|---|---|
+| `messages` | `/v1/chat/completions` | array of `{"role": "user"\|"assistant"\|"system", "content": "..."}`; assembled with the GLM-5.2 chat template | required |
+| `prompt` | `/v1/completions` | raw text, tokenized and continued verbatim | required |
+| `max_tokens` | both | tokens to generate (capped at 2048) | `128` |
+| `stream` | both | `true` → SSE token stream ending in `data: [DONE]`; `false` → one JSON object | `false` |
+| `model` | both | accepted and echoed; ignored for routing (one model is served) | — |
 
-Full deployment notes — GPU passthrough modes, every environment variable,
-building by hand or with compose — are in **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+### 4. Stop it
+
+`Ctrl-C` in the foreground, or `docker rm -f <container>` (find it with `docker ps`).
+
+---
+
+**How the model is found** — `run-dgx.sh` resolves it in order: a snapshot you
+mount (`COLI_MODEL_DIR=<host-dir> docker/run-dgx.sh serve ...` → `/model`) → the
+Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so the
+358 GB download happens **at most once** and is shared with non-container runs) →
+`hf download` of `$COLI_MODEL_REPO` (default
+`mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
+
+**Environment variables** (all optional; pass as `VAR=value docker/run-dgx.sh ...`):
+
+| Var | Meaning | Default |
+|---|---|---|
+| `HF_TOKEN` | Hugging Face token for the first download (alt. to the `hf_...` arg) | none |
+| `COLI_RAM_GB` | cap the RAM expert cache — set below the box's free RAM so the OOM killer stays away (85 leaves headroom on a 128 GB Spark) | all free RAM |
+| `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
+| `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
+| `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
+| `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
+| `COLI_VRAM_GB` | cap the VRAM expert store | all free VRAM |
+| `COLI_PROFILE` | `1` → print the attention/MoE/expert-load time breakdown | off |
+| `COLI_TIMING` | `1` → print per-token latency + steady-state tok/s | off |
+
+Full deployment notes — GPU passthrough modes, building by hand or with compose,
+the CUDA base image — are in **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 ### Without Docker
 
-The workspace has **no crates.io dependencies** (std + path crates only):
+The workspace has **no crates.io dependencies** (std + path crates only), so a
+direct build needs only the CUDA toolkit and rustup:
 
 ```bash
+# Build (~3–5 min): the CUDA backend compiles c/backend_cuda.cu with nvcc.
 CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
   cargo build --release -p coli --features cuda
 
+# Serve: serve <snapshot-dir> [port] [warm-up prompt...]
 COLI_RAM_GB=85 ./target/release/coli serve /path/to/snapshot 8080 "warm-up prompt"
 ```
 
@@ -111,7 +181,8 @@ feeds the four-token prompt `[100, 200, 300, 400]` and prints the generated ids.
 It's a benchmark/debug driver that bypasses the tokenizer (the server is the
 text-in/text-out path); pass any valid ids (`< 154880`), or none to default to
 `[1]`. `COLI_TIMING=1` and `COLI_PROFILE=1` print per-token latency and the
-attention/MoE/load breakdown.
+attention/MoE/load breakdown; `COLI_NGEN=N` sets how many tokens to generate
+(default 16).
 
 ```bash
 COLI_RAM_GB=85 COLI_TIMING=1 COLI_PROFILE=1 docker/run-dgx.sh gen 100 200 300 400

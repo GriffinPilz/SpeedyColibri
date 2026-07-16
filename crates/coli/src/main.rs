@@ -22,7 +22,8 @@ USAGE:
 COMMANDS:
   serve <snap> [port] [warm-up prompt...]  OpenAI-compatible HTTP server  [working]
   bench <snap>             throughput benchmark        [pending]
-  convert ...              FP8 -> int4 converter       [pending: tools port]
+  convert <src-snap> <out-snap>  FP8/NVFP4 -> int4 container converter  [working]
+  probe <snap>             print snapshot format (container|fp8|nvfp4|unknown)  [working]
   tokenize <tok.json> <text>   encode/decode round-trip   [working]
   config <snap>            print parsed hyperparameters   [working]
   load <snap>              load dense weights, print structure  [working]
@@ -63,7 +64,9 @@ fn main() -> ExitCode {
         "repack" => cmd_repack(&args),
         "backend" => cmd_backend(),
         "serve" => serve::cmd_serve(&args),
-        "bench" | "convert" => {
+        "convert" => cmd_convert(&args),
+        "probe" => cmd_probe(&args),
+        "bench" => {
             eprintln!("coli {cmd}: not yet ported. See PORTING.md for status.");
             ExitCode::from(2)
         }
@@ -104,6 +107,92 @@ fn cmd_tokenize(args: &[String]) -> ExitCode {
     } else {
         println!("round-trip: MISMATCH (expected {text:?})");
         ExitCode::FAILURE
+    }
+}
+
+/// `coli probe <snap>` — print the snapshot's format on stdout, one word:
+/// `container` (already ours — serve directly), `fp8` / `nvfp4` (needs `convert`),
+/// or `unknown`. Scripting hook for the container entrypoint.
+fn cmd_probe(args: &[String]) -> ExitCode {
+    let snap = match args.get(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: coli probe <snapshot-dir>");
+            return ExitCode::from(2);
+        }
+    };
+    match colibri_engine::detect_format(snap) {
+        Ok(f) => {
+            println!("{}", f.as_str());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coli probe: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `coli convert <src-snapshot> <out-snapshot>` — rewrite a block-scaled FP8 or
+/// modelopt-NVFP4 GLM-5.2 snapshot as the colibrì int4/int8 container the engine loads.
+///
+/// Bit-widths default to the shipped container (int4 dense + experts, int8
+/// embeddings/head) and can be overridden via `COLI_EBITS` / `COLI_IO_BITS` /
+/// `COLI_XBITS` / `COLI_NLAYERS`.
+fn cmd_convert(args: &[String]) -> ExitCode {
+    let (indir, outdir) = match (args.get(2), args.get(3)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            eprintln!("usage: coli convert <fp8|nvfp4-snapshot-dir> <output-snapshot-dir>");
+            eprintln!("  env: COLI_EBITS(4) COLI_IO_BITS(8) COLI_XBITS(=ebits) COLI_NLAYERS(78)");
+            return ExitCode::from(2);
+        }
+    };
+    let env_u32 = |k: &str, d: u32| {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let ebits = env_u32("COLI_EBITS", 4);
+    let opts = colibri_engine::ConvertOpts {
+        ebits,
+        io_bits: env_u32("COLI_IO_BITS", 8),
+        xbits: env_u32("COLI_XBITS", ebits),
+        n_layers: env_u32("COLI_NLAYERS", 78) as usize,
+    };
+
+    eprintln!(
+        "[convert] {indir} -> {outdir}  (ebits={} io_bits={} xbits={} n_layers={})",
+        opts.ebits, opts.io_bits, opts.xbits, opts.n_layers
+    );
+    let t0 = std::time::Instant::now();
+    let res = colibri_engine::convert_snapshot(indir, outdir, opts, |fi, n, st| {
+        let secs = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "[convert] shard {:>3}/{n}  quantized={} f32={} skipped={}  out={:.1} GB  {:.0}s",
+            fi + 1,
+            st.tensors_quantized,
+            st.tensors_f32,
+            st.tensors_skipped,
+            st.bytes_out as f64 / 1e9,
+            secs
+        );
+    });
+    match res {
+        Ok(st) => {
+            eprintln!(
+                "[convert] done: {} shards, {} weights quantized, {} f32, {} skipped, {:.1} GB out, {:.0}s",
+                st.shards_written,
+                st.tensors_quantized,
+                st.tensors_f32,
+                st.tensors_skipped,
+                st.bytes_out as f64 / 1e9,
+                t0.elapsed().as_secs_f64()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[convert] error: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -215,12 +304,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         }
     }
 
-    let mut kv = colibri_engine::KvCache::new(
-        model.cfg.n_layers as usize,
-        model.cfg.kv_lora as usize,
-        model.cfg.qk_rope as usize,
-        prompt.len() + n_new,
-    );
+    let mut kv = colibri_engine::KvCache::for_model(&model, prompt.len() + n_new);
     match colibri_engine::generate_greedy(&model, &mut kv, &provider, &prompt, n_new) {
         Ok(seq) => {
             let cont: Vec<i32> = seq[prompt.len()..].to_vec();
@@ -337,12 +421,7 @@ fn finish_gen(
     prompt: &[i32],
     n_new: usize,
 ) -> ExitCode {
-    let mut kv = colibri_engine::KvCache::new(
-        model.cfg.n_layers as usize,
-        model.cfg.kv_lora as usize,
-        model.cfg.qk_rope as usize,
-        prompt.len() + n_new,
-    );
+    let mut kv = colibri_engine::KvCache::for_model(&model, prompt.len() + n_new);
     match colibri_engine::generate_greedy(model, &mut kv, provider, prompt, n_new) {
         Ok(seq) => {
             println!("prompt: {prompt:?}");
@@ -785,12 +864,7 @@ fn cmd_tf(args: &[String]) -> ExitCode {
     let provider =
         colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
     let d = model.cfg.hidden as usize;
-    let mut kv = colibri_engine::KvCache::new(
-        model.cfg.n_layers as usize,
-        model.cfg.kv_lora as usize,
-        model.cfg.qk_rope as usize,
-        ids.len(),
-    );
+    let mut kv = colibri_engine::KvCache::for_model(&model, ids.len());
     let mut hidden = vec![0f32; ids.len() * d];
     if let Err(e) = colibri_engine::forward(&model, &mut kv, &provider, &ids, 0, &mut hidden) {
         eprintln!("coli tf: {e}");

@@ -6,11 +6,23 @@
 //! sparse). Routed experts are streamed, so they are intentionally absent — the
 //! loader must not require them.
 
-use colibri_engine::{load_model_with, LoadOptions};
+use colibri_engine::{load_model_with, KvCache, LoadOptions, KV_UNSET};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// `MTP` is a process-global env var but cargo runs tests in parallel threads —
+/// without this, `mtp_env_zero_disables_head` setting `MTP=0` leaks into any
+/// concurrently-running test that expects the head to load. Every test whose
+/// outcome depends on `MTP` takes this lock.
+static MTP_ENV: Mutex<()> = Mutex::new(());
+
+/// Lock `MTP_ENV`, ignoring poisoning (a panic in one test must not cascade).
+fn mtp_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    MTP_ENV.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // tiny config
 const D: usize = 8; // hidden
@@ -60,34 +72,59 @@ fn config_json() -> String {
     )
 }
 
+/// Every tensor of one transformer layer at index `i`, with element counts.
+/// `sparse` picks MoE (router + shared expert) over the dense MLP.
+fn layer_tensors(i: usize, sparse: bool, t: &mut Vec<(String, usize)>) {
+    let p = |s: &str| format!("model.layers.{i}.{s}");
+    t.push((p("input_layernorm.weight"), D));
+    t.push((p("post_attention_layernorm.weight"), D));
+    t.push((p("self_attn.q_a_proj.weight"), Q_LORA * D));
+    t.push((p("self_attn.q_a_layernorm.weight"), Q_LORA));
+    t.push((p("self_attn.q_b_proj.weight"), H * QK_HEAD * Q_LORA));
+    t.push((p("self_attn.kv_a_proj_with_mqa.weight"), (KV_LORA + QK_ROPE) * D));
+    t.push((p("self_attn.kv_a_layernorm.weight"), KV_LORA));
+    t.push((p("self_attn.kv_b_proj.weight"), H * (QK_NOPE + V_HEAD) * KV_LORA));
+    t.push((p("self_attn.o_proj.weight"), D * H * V_HEAD));
+    if !sparse {
+        t.push((p("mlp.gate_proj.weight"), DENSE_INTER * D));
+        t.push((p("mlp.up_proj.weight"), DENSE_INTER * D));
+        t.push((p("mlp.down_proj.weight"), D * DENSE_INTER));
+    } else {
+        t.push((p("mlp.gate.weight"), E * D));
+        t.push((p("mlp.gate.e_score_correction_bias"), E));
+        t.push((p("mlp.shared_experts.gate_proj.weight"), S_I * D));
+        t.push((p("mlp.shared_experts.up_proj.weight"), S_I * D));
+        t.push((p("mlp.shared_experts.down_proj.weight"), D * S_I));
+    }
+}
+
 /// The full list of dense tensors the loader reads, with element counts.
-fn tensor_list() -> Vec<(String, usize)> {
+/// `with_mtp` appends a complete MTP head at the extra layer index `NL`: the
+/// head's own (always-sparse) block, its `eh_proj`/`enorm`/`hnorm`/
+/// `shared_head.norm`, and its routed experts — the loader's completeness gate
+/// probes `experts.0` and `experts.{E-1}`, and the draft path streams them.
+fn tensor_list(with_mtp: bool) -> Vec<(String, usize)> {
     let mut t: Vec<(String, usize)> = vec![
         ("model.embed_tokens.weight".into(), VOCAB * D),
         ("lm_head.weight".into(), VOCAB * D),
         ("model.norm.weight".into(), D),
     ];
     for i in 0..NL {
+        layer_tensors(i, i >= FIRST_DENSE, &mut t);
+    }
+    if with_mtp {
+        let i = NL; // the MTP head lives at layer index n_layers
+        layer_tensors(i, true, &mut t); // C: mtpL is always sparse
         let p = |s: &str| format!("model.layers.{i}.{s}");
-        t.push((p("input_layernorm.weight"), D));
-        t.push((p("post_attention_layernorm.weight"), D));
-        t.push((p("self_attn.q_a_proj.weight"), Q_LORA * D));
-        t.push((p("self_attn.q_a_layernorm.weight"), Q_LORA));
-        t.push((p("self_attn.q_b_proj.weight"), H * QK_HEAD * Q_LORA));
-        t.push((p("self_attn.kv_a_proj_with_mqa.weight"), (KV_LORA + QK_ROPE) * D));
-        t.push((p("self_attn.kv_a_layernorm.weight"), KV_LORA));
-        t.push((p("self_attn.kv_b_proj.weight"), H * (QK_NOPE + V_HEAD) * KV_LORA));
-        t.push((p("self_attn.o_proj.weight"), D * H * V_HEAD));
-        if i < FIRST_DENSE {
-            t.push((p("mlp.gate_proj.weight"), DENSE_INTER * D));
-            t.push((p("mlp.up_proj.weight"), DENSE_INTER * D));
-            t.push((p("mlp.down_proj.weight"), D * DENSE_INTER));
-        } else {
-            t.push((p("mlp.gate.weight"), E * D));
-            t.push((p("mlp.gate.e_score_correction_bias"), E));
-            t.push((p("mlp.shared_experts.gate_proj.weight"), S_I * D));
-            t.push((p("mlp.shared_experts.up_proj.weight"), S_I * D));
-            t.push((p("mlp.shared_experts.down_proj.weight"), D * S_I));
+        t.push((p("eh_proj.weight"), D * 2 * D)); // [D, 2D]
+        t.push((p("enorm.weight"), D));
+        t.push((p("hnorm.weight"), D));
+        t.push((p("shared_head.norm.weight"), D));
+        // routed experts of the MTP block (streamed; the gate probes 0 and E-1)
+        for e in 0..E {
+            t.push((p(&format!("mlp.experts.{e}.gate_proj.weight")), MOE_INTER * D));
+            t.push((p(&format!("mlp.experts.{e}.up_proj.weight")), MOE_INTER * D));
+            t.push((p(&format!("mlp.experts.{e}.down_proj.weight")), D * MOE_INTER));
         }
     }
     t
@@ -95,7 +132,16 @@ fn tensor_list() -> Vec<(String, usize)> {
 
 /// Write a single-shard safetensors file with all tensors as small f32 values.
 fn write_model(dir: &Path) {
-    let tensors = tensor_list();
+    write_model_with(dir, false)
+}
+
+fn write_model_with(dir: &Path, with_mtp: bool) {
+    write_tensors(dir, &tensor_list(with_mtp))
+}
+
+/// Write an explicit tensor list — lets a test drop a tensor to simulate a
+/// shard-truncated conversion.
+fn write_tensors(dir: &Path, tensors: &[(String, usize)]) {
     let mut header = String::from("{");
     let mut off = 0usize;
     let mut payload: Vec<u8> = Vec::new();
@@ -170,6 +216,111 @@ fn tiny_model_loads_end_to_end() {
     colibri_engine::embed_row(&m.embed, 3, &mut x);
     assert_eq!(x.len(), D);
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A container converted WITH `--mtp` loads the speculative head: the block
+/// itself plus eh_proj `[D, 2D]` and the three norms.
+#[test]
+fn tiny_model_with_mtp_head_loads() {
+    let _env = mtp_env_guard();
+    let dir = temp_dir();
+    std::fs::write(dir.join("config.json"), config_json()).unwrap();
+    write_model_with(&dir, true);
+
+    let m = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load_model");
+
+    assert!(m.has_mtp, "complete MTP tensor set must enable the head");
+    let mtp = m.mtp.as_ref().expect("mtp head loaded");
+    // the head's own block is always sparse (C: mtpL->sparse = 1)
+    assert!(mtp.layer.sparse, "MTP block must be sparse (MoE)");
+    // eh_proj consumes the concatenated [e ; h] -> 2D wide, D out
+    assert_eq!(mtp.eh_proj.o as usize, D);
+    assert_eq!(mtp.eh_proj.i as usize, 2 * D);
+    assert_eq!(mtp.enorm.len(), D);
+    assert_eq!(mtp.hnorm.len(), D);
+    assert_eq!(mtp.mtp_norm.len(), D);
+    // the head's attention loaded like any layer's
+    assert_eq!(mtp.layer.o.o as usize, D);
+    // the main stack is untouched by the extra layer
+    assert_eq!(m.layers.len(), NL);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The head's tensors span several shards, so a partial `--mtp` conversion can
+/// leave a subset behind. A subset must DISABLE the head rather than half-load it
+/// (a half-loaded head would draft garbage).
+#[test]
+fn incomplete_mtp_head_is_ignored() {
+    let dir = temp_dir();
+    std::fs::write(dir.join("config.json"), config_json()).unwrap();
+    // Write the full MTP set, then drop one required tensor (the last expert,
+    // which is exactly what a shard-truncated conversion loses).
+    let dropped = format!("model.layers.{NL}.mlp.experts.{}.down_proj.weight", E - 1);
+    let tensors: Vec<(String, usize)> =
+        tensor_list(true).into_iter().filter(|(n, _)| *n != dropped).collect();
+    write_tensors(&dir, &tensors);
+
+    let m = load_model_with(&dir, LoadOptions::default()).expect("load_model");
+    assert!(!m.has_mtp, "an incomplete MTP set must not enable the head");
+    assert!(m.mtp.is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `MTP=0` disables a present, complete head.
+#[test]
+fn mtp_env_zero_disables_head() {
+    let _env = mtp_env_guard();
+    let dir = temp_dir();
+    std::fs::write(dir.join("config.json"), config_json()).unwrap();
+    write_model_with(&dir, true);
+
+    // SAFETY: single-threaded scope for this env toggle; restored below.
+    std::env::set_var("MTP", "0");
+    let m = load_model_with(&dir, LoadOptions::default()).expect("load_model");
+    std::env::remove_var("MTP");
+
+    assert!(!m.has_mtp, "MTP=0 must disable the head");
+    assert!(m.mtp.is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The MTP head is a real layer at index `n_layers`, so the KV needs an extra
+/// row — and that row starts UNSET, because the head's cache begins at the first
+/// decode position rather than at the start of the prompt.
+#[test]
+fn kv_cache_sizes_for_mtp_head() {
+    let _env = mtp_env_guard();
+    // no MTP: exactly n_layers rows, all starting at 0
+    let dir = temp_dir();
+    std::fs::write(dir.join("config.json"), config_json()).unwrap();
+    write_model(&dir);
+    let plain = load_model_with(&dir, LoadOptions::default()).unwrap();
+    let kv = KvCache::for_model(&plain, 16);
+    assert_eq!(kv.kv_start.len(), NL, "no MTP head -> no extra KV row");
+    assert!(kv.kv_start.iter().all(|&s| s == 0));
+    std::fs::remove_dir_all(&dir).ok();
+
+    // with MTP: one extra row, and it starts UNSET
+    let dir = temp_dir();
+    std::fs::write(dir.join("config.json"), config_json()).unwrap();
+    write_model_with(&dir, true);
+    let m = load_model_with(&dir, LoadOptions::default()).unwrap();
+    let mut kv = KvCache::for_model(&m, 16);
+    assert_eq!(kv.kv_start.len(), NL + 1, "MTP head needs its own KV row");
+    assert!(kv.kv_start[..NL].iter().all(|&s| s == 0), "main stack starts at 0");
+    assert_eq!(kv.kv_start[NL], KV_UNSET, "MTP row starts unset");
+
+    // start_at: the sentinel is > any real position, so the first call wins...
+    kv.start_at(NL, 7);
+    assert_eq!(kv.kv_start[NL], 7);
+    // ...a later position must NOT push the start forward...
+    kv.start_at(NL, 9);
+    assert_eq!(kv.kv_start[NL], 7);
+    // ...but an earlier one does (C: `kv_start[li] > p`).
+    kv.start_at(NL, 3);
+    assert_eq!(kv.kv_start[NL], 3);
     std::fs::remove_dir_all(&dir).ok();
 }
 

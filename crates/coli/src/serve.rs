@@ -168,12 +168,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
 }
 
 fn mk_kv(model: &Model, max_t: usize) -> KvCache {
-    KvCache::new(
-        model.cfg.n_layers as usize,
-        model.cfg.kv_lora as usize,
-        model.cfg.qk_rope as usize,
-        max_t,
-    )
+    KvCache::for_model(model, max_t)
 }
 
 /// Derive a display model id from the snapshot path (the HF repo dir name, or the

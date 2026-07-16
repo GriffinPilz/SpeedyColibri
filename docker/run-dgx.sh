@@ -76,16 +76,27 @@ vols+=(-v "$host_hf:/root/.cache/huggingface")
 envs=()
 for v in HF_TOKEN COLI_RAM_GB COLI_VRAM_GB COLI_NGEN COLI_PROFILE COLI_TIMING \
          COLI_LOAD_THREADS COLI_GPU_EXPERTS COLI_NO_ZEROCOPY COLI_BUF_POOL \
-         COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP; do
+         COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP \
+         COLI_CONVERT_DIR COLI_EBITS COLI_IO_BITS COLI_XBITS COLI_NLAYERS; do
   [[ -n "${!v:-}" ]] && envs+=(-e "$v=${!v}")
 done
+
+# Locate the coli subcommand: the entrypoint accepts an optional leading
+# `hf_TOKEN` and an optional `--model <spec>` before it, so the subcommand is not
+# necessarily $1 (getting this wrong silently skips the port publish for `serve`).
+_i=0
+_a=("$@")
+[[ "${_a[$_i]:-}" == hf_* ]] && _i=$((_i + 1))
+[[ "${_a[$_i]:-}" == "--model" || "${_a[$_i]:-}" == "-m" ]] && _i=$((_i + 2))
+_cmd="${_a[$_i]:-}"
+_next="${_a[$((_i + 1))]:-}"
 
 # For `serve`, publish the listen port. Port precedence matches the server: a
 # bare integer right after `serve`, else COLI_PORT, else 8080.
 ports=()
-if [[ "${1:-}" == serve ]]; then
+if [[ "$_cmd" == serve ]]; then
   port="${COLI_PORT:-8080}"
-  [[ "${2:-}" =~ ^[0-9]+$ ]] && port="$2"
+  [[ "$_next" =~ ^[0-9]+$ ]] && port="$_next"
   ports+=(-p "${port}:${port}")
   echo "[run-dgx] serving on host port ${port}" >&2
 fi

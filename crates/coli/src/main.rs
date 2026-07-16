@@ -42,6 +42,7 @@ COMMANDS:
   load <snap>              load dense weights, print structure  [working]
   gen <snap> [ids...]      greedy-generate from token ids       [working]
   tf <snap> <ids...>       teacher-forcing argmax per position  [working]
+  ppl <snap> <text-file> [n]   perplexity on held-out text (quality yardstick)  [working]
   capacity <snap> [ram_gb] expert residency / RAM planning      [working]
   loadbench <snap> [n] [layer]  decompose warm per-expert load cost  [working]
   repack <snap> <out> [n]  repack experts into n core-sharded binary files [working]
@@ -72,6 +73,7 @@ fn main() -> ExitCode {
         "load" => cmd_load(&args),
         "gen" => cmd_gen(&args),
         "tf" => cmd_tf(&args),
+        "ppl" => cmd_ppl(&args),
         "capacity" => cmd_capacity(&args),
         "loadbench" => cmd_loadbench(&args),
         "repack" => cmd_repack(&args),
@@ -1220,6 +1222,142 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Log-probability the distribution `logits` assigns to token `t`, in nats.
+///
+/// Stable log-softmax: `logit[t] - logsumexp(logits)`, shifted by the max so the
+/// exponentials can't overflow. A naive `ln(exp(l[t]) / sum(exp(l)))` overflows to
+/// inf/NaN on real logits and would silently poison the perplexity.
+fn logprob_of(logits: &[f32], t: usize) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
+    logits[t] - (max + sum_exp.ln())
+}
+
+/// `coli ppl <snap> <text-file> [max_tokens]` — teacher-forcing perplexity over
+/// held-out text.
+///
+/// The quality yardstick this repo otherwise lacks: `VALIDATION.md` proves the port
+/// is token-exact *against the C engine at the same quantization*, which says nothing
+/// about fidelity to the original model. Perplexity does — run the same file through
+/// two builds and the lower number is the better model.
+///
+/// Its reason to exist: choosing quantization by intuition is expensive. `COLI_XBITS
+/// 4->8` (routed experts) doubles the bytes streamed per token and costs ~40%
+/// throughput on this disk-bound engine, while `COLI_EBITS 4->8` (attention + dense +
+/// shared expert — resident, never streamed) costs ~9 GB of RAM and no throughput at
+/// all. Measure which one actually buys the quality before paying for it.
+///
+/// One forward over the whole sequence (prefill), then the mean negative
+/// log-likelihood of each *actual* next token — not the argmax, which only says
+/// whether the top pick matched and is blind to how much probability mass moved.
+/// Honors `COLI_DBITS`/`COLI_EBITS`, which only bite on a full-precision snapshot: a
+/// pre-quantized int4 container is already 4-bit on disk and cannot be un-rounded, so
+/// comparing bit-widths on the real model means converting the FP8 source at each
+/// setting.
+fn cmd_ppl(args: &[String]) -> ExitCode {
+    let (snap, text_path) = match (args.get(2), args.get(3)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            eprintln!("usage: coli ppl <snapshot-dir> <text-file|-> [max_tokens]");
+            eprintln!("  compares quantization quality: lower perplexity is better");
+            return ExitCode::from(2);
+        }
+    };
+    let max_tokens: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(512);
+
+    let text = if text_path == "-" {
+        let mut s = String::new();
+        match std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) {
+            Ok(_) => s,
+            Err(e) => {
+                eprintln!("coli ppl: stdin: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match std::fs::read_to_string(text_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("coli ppl: {text_path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let tok_path = format!("{snap}/tokenizer.json");
+    let tok = match colibri_tokenizer::Tokenizer::load(&tok_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("coli ppl: load tokenizer ({tok_path}): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut ids = tok.encode(&text);
+    ids.truncate(max_tokens);
+    if ids.len() < 2 {
+        eprintln!("coli ppl: need >= 2 tokens (got {}), give it more text", ids.len());
+        return ExitCode::from(2);
+    }
+
+    let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let opts = colibri_engine::LoadOptions {
+        dbits: envbits("COLI_DBITS", 4),
+        ebits: envbits("COLI_EBITS", 4),
+    };
+    let model = match colibri_engine::load_model_with(snap, opts) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("coli ppl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Cache the experts: teacher-forcing a few hundred positions re-touches the same
+    // experts many times, and the uncached provider would re-read each from disk.
+    let base =
+        colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
+    let provider = colibri_engine::ExpertCache::new(base, ram_budget());
+
+    let d = model.cfg.hidden as usize;
+    let mut kv = colibri_engine::KvCache::for_model(&model, ids.len());
+    let mut hidden = vec![0f32; ids.len() * d];
+    eprintln!(
+        "[ppl] {} tokens from {text_path} (dense {} bits, experts {} bits) — one forward...",
+        ids.len(),
+        model.dbits,
+        model.ebits
+    );
+    let t0 = std::time::Instant::now();
+    if let Err(e) = colibri_engine::forward(&model, &mut kv, &provider, &ids, 0, &mut hidden) {
+        eprintln!("coli ppl: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // NLL of the token that actually followed each position.
+    let mut sum = 0f64;
+    let mut top1 = 0usize;
+    let n = ids.len() - 1;
+    for pos in 0..n {
+        let lg = colibri_engine::logits(&model, &hidden[pos * d..(pos + 1) * d]);
+        let target = ids[pos + 1] as usize;
+        if target >= lg.len() {
+            eprintln!("coli ppl: token id {target} out of range for vocab {}", lg.len());
+            return ExitCode::FAILURE;
+        }
+        sum += -logprob_of(&lg, target) as f64;
+        if colibri_engine::argmax(&lg) == target {
+            top1 += 1;
+        }
+    }
+    let nll = sum / n as f64;
+    println!("tokens        : {n}");
+    println!("dense/expert  : {} / {} bits", model.dbits, model.ebits);
+    println!("mean NLL      : {nll:.4} nats/token");
+    println!("perplexity    : {:.3}   <- lower is better", nll.exp());
+    println!("top-1 match   : {:.1}%  ({top1}/{n})", top1 as f64 / n as f64 * 100.0);
+    eprintln!("[ppl] {:.1}s", t0.elapsed().as_secs_f64());
+    ExitCode::SUCCESS
+}
+
 /// `coli tf <snap> <id...>` — teacher-forcing: one forward over the token ids,
 /// print the argmax prediction at each position. Mirrors the C engine's `TF=1`
 /// mode (`forward_all`), for the validation harness. Honors COLI_DBITS/EBITS.
@@ -1310,6 +1448,58 @@ mod tests {
     }
 
     const GB: u64 = 1 << 30;
+
+    #[test]
+    fn logprob_matches_hand_computed_softmax() {
+        // Uniform over 4 -> each has p=0.25 -> ln(0.25).
+        let lg = [1.0f32, 1.0, 1.0, 1.0];
+        for t in 0..4 {
+            assert!((logprob_of(&lg, t) - 0.25f32.ln()).abs() < 1e-6);
+        }
+        // Asymmetric: check against an explicit softmax.
+        let lg = [0.0f32, 1.0, 2.0];
+        let denom: f32 = lg.iter().map(|x| x.exp()).sum();
+        for t in 0..3 {
+            let want = (lg[t].exp() / denom).ln();
+            assert!((logprob_of(&lg, t) - want).abs() < 1e-5, "t={t}");
+        }
+    }
+
+    #[test]
+    fn logprob_is_stable_on_huge_logits() {
+        // The bug this guards: a naive ln(exp(l[t]) / sum(exp(l))) overflows to
+        // inf/NaN here and would silently poison every perplexity we report.
+        let lg = [900.0f32, 901.0, 899.0];
+        for t in 0..3 {
+            let p = logprob_of(&lg, t);
+            assert!(p.is_finite(), "logprob {p} not finite for t={t}");
+            assert!(p <= 0.0, "log-prob must be <= 0, got {p}");
+        }
+        // Shifting all logits by a constant must not change the distribution.
+        let a: Vec<f32> = vec![0.3, -1.2, 4.5, 2.0];
+        let b: Vec<f32> = a.iter().map(|x| x + 500.0).collect();
+        for t in 0..a.len() {
+            assert!((logprob_of(&a, t) - logprob_of(&b, t)).abs() < 1e-4, "not shift-invariant");
+        }
+    }
+
+    #[test]
+    fn logprobs_form_a_distribution() {
+        // exp of the log-probs must sum to 1 — catches a wrong normalizer.
+        let lg = [0.5f32, -2.0, 3.25, 1.0, -0.75];
+        let mass: f32 = (0..lg.len()).map(|t| logprob_of(&lg, t).exp()).sum();
+        assert!((mass - 1.0).abs() < 1e-5, "mass {mass} != 1");
+    }
+
+    #[test]
+    fn confident_prediction_beats_uniform() {
+        // Sanity on the direction: perplexity should fall as the model gets it right.
+        let uniform = [0.0f32; 8];
+        let confident = [10.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert!(logprob_of(&confident, 0) > logprob_of(&uniform, 0));
+        // ...and a confident *wrong* answer is worse than uniform.
+        assert!(logprob_of(&confident, 1) < logprob_of(&uniform, 1));
+    }
 
     #[test]
     fn budget_leaves_headroom_below_the_measured_swap_cliff() {

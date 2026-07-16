@@ -33,6 +33,12 @@ use crate::sharding::NodeId;
 pub struct ExpertRequest {
     /// experts (global ids) the peer should apply, all owned by the target node
     pub experts: Vec<u32>,
+    /// routing weight for each expert in `experts` (per the requester's router).
+    /// The owner returns `sum_e weight[e] * expert_e(x)` so the response is one
+    /// `[n_tokens, hidden]` partial sum regardless of how many experts it owns.
+    /// For the batched (`n_tokens > 1`) case, weights are `[n_tokens * n_experts]`
+    /// row-major (per token, per expert); for `n_tokens == 1` it is just per expert.
+    pub weights: Vec<f32>,
     /// token activations, `[n_tokens * hidden]` row-major f32
     pub activations: Vec<f32>,
     pub n_tokens: usize,
@@ -179,6 +185,7 @@ mod tests {
         let t = LocalTransport;
         let req = ExpertRequest {
             experts: vec![0],
+            weights: vec![1.0],
             activations: vec![0.0; 4],
             n_tokens: 1,
             hidden: 4,

@@ -64,6 +64,11 @@ pub enum TransportError {
     NotConnected,
     /// The RDMA transport is not compiled in (`rdma` feature off).
     RdmaUnavailable,
+    /// The peer's expert→node map differs from ours. Fatal and **not retryable**:
+    /// with disagreeing maps each side ships experts to the node it *thinks* owns
+    /// them, so some experts are computed twice and others never — silently wrong
+    /// output. Refuse the connection instead.
+    FingerprintMismatch { node: u32, local: u64, remote: u64 },
     Io(String),
 }
 
@@ -74,6 +79,13 @@ impl std::fmt::Display for TransportError {
             TransportError::RdmaUnavailable => {
                 write!(f, "transport: RDMA support not compiled in (enable feature `rdma`)")
             }
+            TransportError::FingerprintMismatch { node, local, remote } => write!(
+                f,
+                "transport: node {node} has a different expert sharding map \
+                 (ours {local:#018x}, theirs {remote:#018x}). Every node must build the \
+                 identical map — check that COLI_SHARD and the usage history (.coli_usage) \
+                 match on all nodes. Refusing to run: mismatched maps corrupt results silently."
+            ),
             TransportError::Io(s) => write!(f, "transport io error: {s}"),
         }
     }
@@ -102,6 +114,16 @@ pub trait Transport: Send + Sync {
         node: NodeId,
         req: &ExpertRequest,
     ) -> Result<ExpertResponse, TransportError>;
+
+    /// Handshake with every peer up front and confirm they agree on the expert
+    /// sharding map, so a misconfigured cluster fails at startup rather than
+    /// silently producing wrong tokens. Implementations that carry a fingerprint
+    /// should return [`TransportError::FingerprintMismatch`] on disagreement.
+    ///
+    /// Default: no peers to verify (single-node), so `Ok`.
+    fn verify_peers(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 /// Single-node transport: this process is the whole cluster.

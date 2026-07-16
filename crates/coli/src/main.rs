@@ -388,8 +388,11 @@ fn cmd_worker(args: &[String]) -> ExitCode {
 
     let sharding = build_sharding(&cluster, model.cfg.n_experts as u32, &history);
     let owned = sharding.count_for(cluster.this_node);
+    // Peers must present this exact fingerprint on connect, or they're refused before
+    // any activation is computed — disagreeing maps corrupt results silently.
+    let fingerprint = sharding.fingerprint();
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    let bound = match colibri_cluster::serve_experts(addr, move |req| {
+    let bound = match colibri_cluster::serve_experts(addr, fingerprint, move |req| {
         match colibri_engine::compute_experts_partial(
             &*provider,
             req.layer as usize,

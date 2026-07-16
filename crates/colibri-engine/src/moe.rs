@@ -909,9 +909,12 @@ mod tests {
         let mut out_single = vec![0f32; d];
         moe(&c, &l, 0, &x, 1, &mut out_single, true, &*provider).unwrap();
 
+        // Both sides share one map, so the connect-time handshake agrees.
+        let sharding = ExpertSharding::new(2, c.n_experts as u32);
+
         // Node 1's expert server (loopback TCP), handler = compute_experts_partial.
         let hp = provider.clone();
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), move |req| {
+        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
             let outputs = compute_experts_partial(
                 &*hp,
                 req.layer as usize,
@@ -928,8 +931,7 @@ mod tests {
 
         let mut peers = HashMap::new();
         peers.insert(NodeId(1), addr);
-        let transport = TcpTransport::new(NodeId(0), peers);
-        let sharding = ExpertSharding::new(2, c.n_experts as u32);
+        let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
 
         let mut out_sharded = vec![0f32; d];
         moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
@@ -981,8 +983,12 @@ mod tests {
         let mut out_single = vec![0f32; d];
         moe(&c, &l, 0, &x, 1, &mut out_single, true, &*provider).unwrap();
 
+        let weights = [100u64, 100, 1, 1];
+        let sharding = ExpertSharding::balanced(2, c.n_experts as u32, &weights);
+        assert!(sharding.is_hot_aware());
+
         let hp = provider.clone();
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), move |req| {
+        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
             let outputs = compute_experts_partial(
                 &*hp,
                 req.layer as usize,
@@ -999,11 +1005,7 @@ mod tests {
 
         let mut peers = HashMap::new();
         peers.insert(NodeId(1), addr);
-        let transport = TcpTransport::new(NodeId(0), peers);
-
-        let weights = [100u64, 100, 1, 1];
-        let sharding = ExpertSharding::balanced(2, c.n_experts as u32, &weights);
-        assert!(sharding.is_hot_aware());
+        let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
         // The hot pair is split across nodes, unlike the contiguous map.
         assert_ne!(sharding.owner(0), sharding.owner(1), "hot experts must be spread");
         let contig = ExpertSharding::new(2, c.n_experts as u32);

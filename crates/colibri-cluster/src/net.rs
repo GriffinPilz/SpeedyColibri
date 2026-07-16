@@ -22,12 +22,17 @@ use std::sync::{Arc, Mutex};
 
 const REQ_MAGIC: u32 = 0x4352_4551; // "CREQ"
 const RSP_MAGIC: u32 = 0x4352_5350; // "CRSP"
+const HELLO_MAGIC: u32 = 0x4348_454c; // "CHEL" — connect-time sharding handshake
+const HACK_MAGIC: u32 = 0x4348_4143; // "CHAC" — handshake ack
 /// Reject frames larger than this (guards against a bad length prefix -> OOM).
 const MAX_FRAME: usize = 1 << 30; // 1 GiB
 
 // ---- wire encode/decode ----------------------------------------------------
 
 fn put_u32(b: &mut Vec<u8>, v: u32) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+fn put_u64(b: &mut Vec<u8>, v: u64) {
     b.extend_from_slice(&v.to_le_bytes());
 }
 fn put_f32s(b: &mut Vec<u8>, v: &[f32]) {
@@ -48,6 +53,12 @@ impl<'a> Cur<'a> {
         self.i = e;
         Some(v)
     }
+    fn u64(&mut self) -> Option<u64> {
+        let e = self.i + 8;
+        let v = u64::from_le_bytes(self.b.get(self.i..e)?.try_into().ok()?);
+        self.i = e;
+        Some(v)
+    }
     fn f32s(&mut self, n: usize) -> Option<Vec<f32>> {
         let e = self.i + n * 4;
         let s = self.b.get(self.i..e)?;
@@ -60,6 +71,47 @@ impl<'a> Cur<'a> {
         self.i = e;
         Some(s.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
     }
+}
+
+/// Encode the connect-time hello: who we are and the fingerprint of our expert
+/// sharding map. Sent as the first frame on every new connection, before any
+/// activations, so a disagreeing peer is rejected before it can corrupt results.
+pub fn encode_hello(node: NodeId, fingerprint: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(16);
+    put_u32(&mut b, HELLO_MAGIC);
+    put_u32(&mut b, node.0);
+    put_u64(&mut b, fingerprint);
+    b
+}
+
+/// Decode a hello → `(peer node, peer fingerprint)`.
+pub fn decode_hello(b: &[u8]) -> Option<(NodeId, u64)> {
+    let mut c = Cur { b, i: 0 };
+    if c.u32()? != HELLO_MAGIC {
+        return None;
+    }
+    let node = NodeId(c.u32()?);
+    Some((node, c.u64()?))
+}
+
+/// Encode the hello ack: whether the peer accepted us, plus its own fingerprint
+/// (so a rejected client can report both sides of the mismatch).
+pub fn encode_hello_ack(ok: bool, fingerprint: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(16);
+    put_u32(&mut b, HACK_MAGIC);
+    put_u32(&mut b, ok as u32);
+    put_u64(&mut b, fingerprint);
+    b
+}
+
+/// Decode a hello ack → `(accepted, responder fingerprint)`.
+pub fn decode_hello_ack(b: &[u8]) -> Option<(bool, u64)> {
+    let mut c = Cur { b, i: 0 };
+    if c.u32()? != HACK_MAGIC {
+        return None;
+    }
+    let ok = c.u32()? != 0;
+    Some((ok, c.u64()?))
 }
 
 /// Encode a request payload (without the length prefix).
@@ -144,7 +196,12 @@ fn read_frame(s: &mut impl Read) -> io::Result<Vec<u8>> {
 /// engine, which owns the resident expert weights). Spawns an accept loop on its
 /// own thread and a thread per connection; returns immediately with the listener's
 /// bound address so the caller can advertise it.
-pub fn serve_experts<F>(listen: SocketAddr, handler: F) -> io::Result<SocketAddr>
+///
+/// `fingerprint` is this node's [`ExpertSharding::fingerprint`](crate::ExpertSharding::fingerprint).
+/// Every connection must open with a matching hello or it is refused before a single
+/// activation is read — see [`serve_conn`]-level docs and
+/// [`TransportError::FingerprintMismatch`](crate::TransportError::FingerprintMismatch).
+pub fn serve_experts<F>(listen: SocketAddr, fingerprint: u64, handler: F) -> io::Result<SocketAddr>
 where
     F: Fn(&ExpertRequest) -> ExpertResponse + Send + Sync + 'static,
 {
@@ -157,7 +214,7 @@ where
                 Ok(stream) => {
                     let h = handler.clone();
                     std::thread::spawn(move || {
-                        let _ = serve_conn(stream, &*h);
+                        let _ = serve_conn(stream, fingerprint, &*h);
                     });
                 }
                 Err(_) => continue,
@@ -167,11 +224,40 @@ where
     Ok(addr)
 }
 
-fn serve_conn<F>(mut stream: TcpStream, handler: &F) -> io::Result<()>
+/// One connection: a mandatory sharding handshake, then request/response until EOF.
+///
+/// The first frame **must** be a hello whose fingerprint equals ours. A mismatch
+/// means the peer built a different expert→node map, which would silently corrupt
+/// results (experts computed twice or not at all), so we ack the rejection — telling
+/// the peer our fingerprint so it can report both sides — and drop the connection
+/// without ever calling the handler.
+fn serve_conn<F>(mut stream: TcpStream, fingerprint: u64, handler: &F) -> io::Result<()>
 where
     F: Fn(&ExpertRequest) -> ExpertResponse,
 {
     let _ = stream.set_nodelay(true);
+
+    let hello = read_frame(&mut stream)?;
+    let (peer, peer_fp) = match decode_hello(&hello) {
+        Some(h) => h,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected a sharding hello as the first frame",
+            ))
+        }
+    };
+    if peer_fp != fingerprint {
+        let _ = write_frame(&mut stream, &encode_hello_ack(false, fingerprint));
+        eprintln!(
+            "[expert-server] REFUSED node {}: sharding fingerprint {:#018x} != ours {:#018x}. \
+             All nodes must build the identical expert map (check COLI_SHARD and .coli_usage).",
+            peer.0, peer_fp, fingerprint
+        );
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "sharding fingerprint mismatch"));
+    }
+    write_frame(&mut stream, &encode_hello_ack(true, fingerprint))?;
+
     loop {
         let frame = read_frame(&mut stream)?; // Err on clean EOF ends the loop
         let req = match decode_request(&frame) {
@@ -186,18 +272,45 @@ where
 // ---- client ----------------------------------------------------------------
 
 /// TCP client transport: reaches each peer node at a known socket address, with a
-/// pooled connection per peer (reconnected on error).
+/// pooled connection per peer (reconnected on error). Every connection opens with a
+/// sharding handshake, so a peer with a different expert map is refused before any
+/// activations are sent.
 pub struct TcpTransport {
     this: NodeId,
     peers: HashMap<NodeId, SocketAddr>,
+    /// Our [`ExpertSharding::fingerprint`](crate::ExpertSharding::fingerprint), sent
+    /// in the hello and checked against the peer's.
+    fingerprint: u64,
     conns: Mutex<HashMap<NodeId, TcpStream>>,
 }
 
 impl TcpTransport {
     /// `this` is our node id; `peers` maps every *other* node to its
-    /// `serve_experts` address.
-    pub fn new(this: NodeId, peers: HashMap<NodeId, SocketAddr>) -> TcpTransport {
-        TcpTransport { this, peers, conns: Mutex::new(HashMap::new()) }
+    /// `serve_experts` address; `fingerprint` is our expert-sharding map hash, which
+    /// every peer must match.
+    pub fn new(this: NodeId, peers: HashMap<NodeId, SocketAddr>, fingerprint: u64) -> TcpTransport {
+        TcpTransport { this, peers, fingerprint, conns: Mutex::new(HashMap::new()) }
+    }
+
+    /// Open a connection to `node` and complete the sharding handshake. A refused
+    /// hello surfaces as [`TransportError::FingerprintMismatch`], which callers must
+    /// treat as fatal — the peer disagrees about who owns which expert.
+    fn connect_and_hello(&self, node: NodeId, addr: SocketAddr) -> Result<TcpStream, TransportError> {
+        let mut s = TcpStream::connect(addr).map_err(|e| TransportError::Io(e.to_string()))?;
+        let _ = s.set_nodelay(true);
+        write_frame(&mut s, &encode_hello(self.this, self.fingerprint))
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let ack = read_frame(&mut s).map_err(|e| TransportError::Io(e.to_string()))?;
+        let (ok, peer_fp) =
+            decode_hello_ack(&ack).ok_or_else(|| TransportError::Io("bad handshake ack".into()))?;
+        if !ok {
+            return Err(TransportError::FingerprintMismatch {
+                node: node.0,
+                local: self.fingerprint,
+                remote: peer_fp,
+            });
+        }
+        Ok(s)
     }
 }
 
@@ -208,6 +321,24 @@ impl Transport for TcpTransport {
 
     fn this_node(&self) -> NodeId {
         self.this
+    }
+
+    /// Connect to every peer and complete the handshake now, so a cluster whose nodes
+    /// disagree about the expert map dies at startup instead of mid-generation. Also
+    /// surfaces unreachable peers — start the workers before the driver.
+    fn verify_peers(&self) -> Result<(), TransportError> {
+        let mut targets: Vec<(NodeId, SocketAddr)> =
+            self.peers.iter().map(|(&n, &a)| (n, a)).collect();
+        targets.sort_by_key(|(n, _)| n.0); // deterministic error order
+        let mut conns = self.conns.lock().unwrap();
+        for (node, addr) in targets {
+            if conns.contains_key(&node) {
+                continue;
+            }
+            let s = self.connect_and_hello(node, addr)?;
+            conns.insert(node, s);
+        }
+        Ok(())
     }
 
     fn exchange(&self, node: NodeId, req: &ExpertRequest) -> Result<ExpertResponse, TransportError> {
@@ -221,9 +352,21 @@ impl Transport for TcpTransport {
         let mut conns = self.conns.lock().unwrap();
         for attempt in 0..2 {
             if !conns.contains_key(&node) {
-                let s = TcpStream::connect(addr).map_err(|e| TransportError::Io(e.to_string()))?;
-                let _ = s.set_nodelay(true);
-                conns.insert(node, s);
+                match self.connect_and_hello(node, addr) {
+                    Ok(s) => {
+                        conns.insert(node, s);
+                    }
+                    // A map disagreement is fatal, not transient: never retry it and
+                    // never fall through to sending activations to a peer that would
+                    // compute the wrong experts.
+                    Err(e @ TransportError::FingerprintMismatch { .. }) => return Err(e),
+                    Err(e) => {
+                        if attempt == 1 {
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                }
             }
             let stream = conns.get_mut(&node).unwrap();
             let r = write_frame(stream, &payload).and_then(|_| read_frame(stream));
@@ -278,19 +421,39 @@ mod tests {
     }
 
     #[test]
-    fn tcp_exchange_end_to_end() {
-        // Server doubles the activations and reports the expert count in outputs[0];
-        // the client should get exactly that back over a real TCP socket.
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), |req| {
+    fn hello_roundtrip() {
+        let b = encode_hello(NodeId(3), 0xdead_beef_cafe_f00d);
+        assert_eq!(decode_hello(&b).unwrap(), (NodeId(3), 0xdead_beef_cafe_f00d));
+        let a = encode_hello_ack(true, 0x1234_5678_9abc_def0);
+        assert_eq!(decode_hello_ack(&a).unwrap(), (true, 0x1234_5678_9abc_def0));
+        let r = encode_hello_ack(false, 7);
+        assert_eq!(decode_hello_ack(&r).unwrap(), (false, 7));
+        // Cross-decoding must fail on the magic, not silently succeed.
+        assert!(decode_hello(&a).is_none());
+        assert!(decode_hello_ack(&b).is_none());
+        assert!(decode_hello(&[1, 2, 3]).is_none());
+    }
+
+    const FP: u64 = 0xa5a5_1234_5678_9abc;
+
+    fn doubling_server(fingerprint: u64) -> SocketAddr {
+        serve_experts("127.0.0.1:0".parse().unwrap(), fingerprint, |req| {
             let mut outputs: Vec<f32> = req.activations.iter().map(|x| x * 2.0).collect();
             outputs[0] = req.experts.len() as f32;
             ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn tcp_exchange_end_to_end() {
+        // Server doubles the activations and reports the expert count in outputs[0];
+        // the client should get exactly that back over a real TCP socket.
+        let addr = doubling_server(FP);
 
         let mut peers = HashMap::new();
         peers.insert(NodeId(1), addr);
-        let t = TcpTransport::new(NodeId(0), peers);
+        let t = TcpTransport::new(NodeId(0), peers, FP);
         assert!(t.is_local(NodeId(0)));
         assert!(!t.is_local(NodeId(1)));
 
@@ -301,15 +464,81 @@ mod tests {
         assert_eq!(resp.outputs[0], 3.0); // 3 experts
         assert_eq!(resp.outputs[1], req.activations[1] * 2.0);
 
-        // A second exchange reuses the pooled connection.
+        // A second exchange reuses the pooled connection (handshake not repeated).
         let resp2 = t.exchange(NodeId(1), &req).unwrap();
         assert_eq!(resp2.outputs[0], 3.0);
     }
 
     #[test]
+    fn matching_fingerprints_verify() {
+        let addr = doubling_server(FP);
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), addr);
+        let t = TcpTransport::new(NodeId(0), peers, FP);
+        t.verify_peers().expect("identical maps must verify");
+    }
+
+    #[test]
+    fn mismatched_fingerprint_is_refused_not_retried() {
+        // The peer built a different expert map. verify_peers must fail at startup
+        // with both fingerprints, and exchange must refuse rather than send
+        // activations to a node that would compute the wrong experts.
+        let addr = doubling_server(FP);
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), addr);
+        let wrong = FP ^ 0xffff;
+        let t = TcpTransport::new(NodeId(0), peers, wrong);
+
+        match t.verify_peers().unwrap_err() {
+            TransportError::FingerprintMismatch { node, local, remote } => {
+                assert_eq!(node, 1);
+                assert_eq!(local, wrong);
+                assert_eq!(remote, FP);
+            }
+            e => panic!("expected FingerprintMismatch, got {e:?}"),
+        }
+
+        // And the data path refuses too — no silent wrong answer.
+        assert!(matches!(
+            t.exchange(NodeId(1), &sample_req()).unwrap_err(),
+            TransportError::FingerprintMismatch { .. }
+        ));
+        // The error message must name the cause so an operator can act on it.
+        let msg = t.exchange(NodeId(1), &sample_req()).unwrap_err().to_string();
+        assert!(msg.contains("different expert sharding map"), "unhelpful: {msg}");
+    }
+
+    #[test]
+    fn server_rejects_request_sent_without_hello() {
+        // A client that skips the handshake must not get expert compute: the server
+        // requires a hello as the very first frame.
+        let addr = doubling_server(FP);
+        let mut s = TcpStream::connect(addr).unwrap();
+        write_frame(&mut s, &encode_request(&sample_req())).unwrap();
+        // The server closes the connection instead of answering.
+        assert!(read_frame(&mut s).is_err(), "server answered an un-handshaked request");
+    }
+
+    #[test]
+    fn verify_peers_reports_unreachable_peer() {
+        // Nothing is listening here; startup verification should surface it rather
+        // than defer the failure to the first token.
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), "127.0.0.1:1".parse::<SocketAddr>().unwrap());
+        let t = TcpTransport::new(NodeId(0), peers, FP);
+        assert!(matches!(t.verify_peers().unwrap_err(), TransportError::Io(_)));
+    }
+
+    #[test]
     fn exchange_unknown_peer_errors() {
-        let t = TcpTransport::new(NodeId(0), HashMap::new());
+        let t = TcpTransport::new(NodeId(0), HashMap::new(), FP);
         let e = t.exchange(NodeId(5), &sample_req()).unwrap_err();
         assert!(matches!(e, TransportError::Io(_)));
+    }
+
+    #[test]
+    fn local_transport_verify_is_noop() {
+        // Single node: nothing to agree with.
+        assert!(crate::LocalTransport.verify_peers().is_ok());
     }
 }

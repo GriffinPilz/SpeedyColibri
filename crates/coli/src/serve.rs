@@ -120,18 +120,16 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     }
     let model_id = model_id_from(&snap);
 
-    // Pinned hot-store (AUTOPIN) from the persistent usage history: routing is heavily
-    // skewed, so keeping the hot head resident stops it churning through the LRU.
-    // `COLI_PIN_GB=auto` sizes it to the usage curve's knee. The same history feeds the
-    // hot-aware sharding map below.
     let usage_path =
         std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
     let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
-    crate::apply_autopin(&provider, &history, budget);
 
     // Multi-node: install the expert-parallel context so moe() splits experts by
     // ownership — this node computes its own shard, and peers' experts are fetched
     // from their `worker` servers over TCP/RoCE. Single-node leaves it unset.
+    //
+    // Done *before* the AUTOPIN warm-up below: verification is seconds and pinning can
+    // be minutes, so a misconfigured cluster should fail before paying for the warm-up.
     let cluster = colibri_cluster::ClusterConfig::from_env();
     if !cluster.is_single_node() {
         let peers = match crate::parse_peers() {
@@ -143,16 +141,36 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         };
         let sharding = crate::build_sharding(&cluster, model.cfg.n_experts as u32, &history);
         let owned = sharding.count_for(cluster.this_node);
-        let transport = colibri_cluster::TcpTransport::new(cluster.this_node, peers);
+        let transport =
+            colibri_cluster::TcpTransport::new(cluster.this_node, peers, sharding.fingerprint());
+
+        // Handshake with every worker up front: if any disagrees about the expert map
+        // (or isn't up yet), fail here rather than silently mis-routing experts once
+        // tokens start flowing.
+        use colibri_cluster::Transport as _;
+        if let Err(e) = transport.verify_peers() {
+            eprintln!("coli serve: cluster verification failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "[serve] expert-parallel: {} nodes, rank {} owns {} experts; \
+             all peers agreed on sharding {:#018x}",
+            cluster.num_nodes,
+            cluster.this_node.0,
+            owned,
+            sharding.fingerprint()
+        );
         colibri_engine::set_cluster(colibri_engine::ClusterCtx {
             sharding,
             transport: Box::new(transport),
         });
-        println!(
-            "[serve] expert-parallel: {} nodes, rank {} owns {} experts; peers over TCP/RoCE",
-            cluster.num_nodes, cluster.this_node.0, owned
-        );
     }
+
+    // Pinned hot-store (AUTOPIN) from the persistent usage history: routing is heavily
+    // skewed, so keeping the hot head resident stops it churning through the LRU.
+    // `COLI_PIN_GB=auto` sizes it to the usage curve's knee. Can take minutes (it reads
+    // every pinned expert), so it runs only once the cluster is known-good.
+    crate::apply_autopin(&provider, &history, budget);
 
     // Served context length (prompt + completion). The model's hard ceiling is
     // `max_position_embeddings`; the served value is COLI_CTX (else a memory-safe

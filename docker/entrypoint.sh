@@ -83,8 +83,9 @@ resolve_model() {
 
 cmd="${1:-help}"
 case "$cmd" in
-  # snapshot-taking commands: inject the resolved model dir as their 1st arg
-  config | load | gen | tf | capacity | loadbench | repack | serve | bench)
+  # snapshot-taking commands: inject the resolved model dir as their 1st arg.
+  # (`cluster` only scans the fabric — it takes no snapshot, so it is not here.)
+  config | load | gen | tf | capacity | loadbench | repack | serve | worker | bench)
     shift
     snap=$(resolve_model)
     echo "[coli] model: $snap" >&2

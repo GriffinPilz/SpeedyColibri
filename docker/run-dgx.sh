@@ -77,23 +77,30 @@ envs=()
 for v in HF_TOKEN COLI_RAM_GB COLI_VRAM_GB COLI_NGEN COLI_PROFILE COLI_TIMING \
          COLI_LOAD_THREADS COLI_GPU_EXPERTS COLI_NO_ZEROCOPY COLI_BUF_POOL \
          COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP \
-         COLI_CTX COLI_DISCOVER_SECS; do
+         COLI_CTX COLI_DISCOVER_SECS \
+         COLI_PEERS COLI_EXPERT_PORT COLI_SHARD \
+         COLI_PIN_GB COLI_USAGE COLI_PREFETCH COLI_PREFETCH_N COLI_EXPERT_LOG; do
   [[ -n "${!v:-}" ]] && envs+=(-e "$v=${!v}")
 done
 
-# `serve` and `cluster` need to see the ConnectX/RoCE fabric — the RoCE subnet,
-# the kernel ARP table, and UDP broadcast — which the default bridge namespace
-# hides. Run them with host networking; the listen port is then already on the
-# host (no `-p` needed, and `-p` conflicts with `--network host`). Other commands
-# keep bridge networking and just publish the port.
+# `serve`, `worker` and `cluster` need to see the ConnectX/RoCE fabric — the RoCE
+# subnet, the kernel ARP table, and UDP broadcast — which the default bridge
+# namespace hides. `worker` in particular must be reachable by the driver at its
+# RoCE address, which bridge NAT would hide. Run them with host networking; the
+# listen port is then already on the host (no `-p` needed, and `-p` conflicts with
+# `--network host`). Other commands keep bridge networking and just publish the port.
 net=()
 ports=()
 case "${1:-}" in
-  serve | cluster)
+  serve | worker | cluster)
     net+=(--network host)
     port="${COLI_PORT:-8080}"
+    [[ "${1:-}" == worker ]] && port="${COLI_EXPERT_PORT:-48800}" # matches expert_port()
     [[ "${2:-}" =~ ^[0-9]+$ ]] && port="$2"
-    [[ "${1:-}" == serve ]] && echo "[run-dgx] host networking; serving on host port ${port}" >&2
+    case "${1:-}" in
+      serve) echo "[run-dgx] host networking; serving on host port ${port}" >&2 ;;
+      worker) echo "[run-dgx] host networking; expert shard server on host port ${port}" >&2 ;;
+    esac
     ;;
 esac
 

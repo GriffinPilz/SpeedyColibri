@@ -324,6 +324,41 @@ fn expert_port() -> u16 {
     std::env::var("COLI_EXPERT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(48800)
 }
 
+/// Peer addresses for every *other* rank in the cluster, validated.
+///
+/// A multi-node run needs an address for every rank but our own. Missing entries are
+/// fatal: with an empty/partial peer map the startup handshake has nothing to talk to,
+/// so it "verifies" vacuously and the failure only surfaces on the first token as
+/// `no address for node N`. Catch it here instead.
+pub(crate) fn cluster_peers(
+    cluster: &colibri_cluster::ClusterConfig,
+) -> Result<std::collections::HashMap<colibri_cluster::NodeId, std::net::SocketAddr>, String> {
+    let peers = parse_peers()?;
+    let missing = missing_peer_ranks(cluster.num_nodes, cluster.this_node, &peers);
+    if !missing.is_empty() {
+        return Err(format!(
+            "COLI_NUM_NODES={} but COLI_PEERS has no address for rank(s) {missing:?}. \
+             Every other node needs one: COLI_PEERS=\"<rank>=<host:port>,...\" \
+             (e.g. COLI_PEERS=\"1=192.168.100.10:48800\").",
+            cluster.num_nodes
+        ));
+    }
+    Ok(peers)
+}
+
+/// Ranks other than `this` with no configured address. Non-empty ⇒ the cluster is
+/// misconfigured and must not start.
+fn missing_peer_ranks(
+    num_nodes: u32,
+    this: colibri_cluster::NodeId,
+    peers: &std::collections::HashMap<colibri_cluster::NodeId, std::net::SocketAddr>,
+) -> Vec<u32> {
+    (0..num_nodes)
+        .filter(|&r| colibri_cluster::NodeId(r) != this)
+        .filter(|&r| !peers.contains_key(&colibri_cluster::NodeId(r)))
+        .collect()
+}
+
 /// Parse `COLI_PEERS="1=host:port,2=host:port"` into a node→address map (the
 /// expert servers of the other nodes).
 fn parse_peers() -> Result<std::collections::HashMap<colibri_cluster::NodeId, std::net::SocketAddr>, String> {
@@ -1095,5 +1130,46 @@ fn cmd_config(args: &[String]) -> ExitCode {
             eprintln!("coli config: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use colibri_cluster::NodeId;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn single_node_needs_no_peers() {
+        assert!(missing_peer_ranks(1, NodeId(0), &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn multi_node_without_peers_is_missing_all_others() {
+        // The regression this guards: COLI_NUM_NODES=2 with an empty COLI_PEERS used
+        // to sail through startup verification (nothing to verify) and only fail on
+        // the first token with "no address for node 1".
+        assert_eq!(missing_peer_ranks(2, NodeId(0), &HashMap::new()), vec![1]);
+        assert_eq!(missing_peer_ranks(4, NodeId(2), &HashMap::new()), vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn complete_peer_set_is_accepted() {
+        let mut p = HashMap::new();
+        p.insert(NodeId(1), addr("192.168.100.10:48800"));
+        assert!(missing_peer_ranks(2, NodeId(0), &p).is_empty());
+    }
+
+    #[test]
+    fn partial_peer_set_reports_only_the_gaps() {
+        let mut p = HashMap::new();
+        p.insert(NodeId(1), addr("192.168.100.10:48800"));
+        p.insert(NodeId(3), addr("192.168.100.12:48800"));
+        assert_eq!(missing_peer_ranks(4, NodeId(0), &p), vec![2]);
     }
 }

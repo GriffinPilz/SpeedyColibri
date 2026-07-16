@@ -132,13 +132,14 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // be minutes, so a misconfigured cluster should fail before paying for the warm-up.
     let cluster = colibri_cluster::ClusterConfig::from_env();
     if !cluster.is_single_node() {
-        let peers = match crate::parse_peers() {
+        let peers = match crate::cluster_peers(&cluster) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("coli serve: {e}");
                 return ExitCode::FAILURE;
             }
         };
+        let n_peers = peers.len();
         let sharding = crate::build_sharding(&cluster, model.cfg.n_experts as u32, &history);
         let owned = sharding.count_for(cluster.this_node);
         let transport =
@@ -154,10 +155,11 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         }
         println!(
             "[serve] expert-parallel: {} nodes, rank {} owns {} experts; \
-             all peers agreed on sharding {:#018x}",
+             {} peer(s) agreed on sharding {:#018x}",
             cluster.num_nodes,
             cluster.this_node.0,
             owned,
+            n_peers,
             sharding.fingerprint()
         );
         colibri_engine::set_cluster(colibri_engine::ClusterCtx {

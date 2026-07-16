@@ -334,12 +334,20 @@ pub fn load_expert(
 
 impl ExpertProvider for ShardsExpertProvider<'_> {
     fn expert(&self, layer: usize, eid: usize) -> io::Result<Arc<Expert>> {
-        // Expert-parallel ownership: local experts load from disk; non-local ones
-        // would be fetched over the RDMA transport (not wired — single node now).
+        // Expert-parallel ownership, enforced at the *load* layer. `moe_sharded`
+        // already dispatches non-local experts to their owner over the transport and
+        // never asks us for one, so reaching this is a bug (bad routing, or a node
+        // built a different map). Erring is the point: without it we would silently
+        // load a peer's expert from disk — right answer, wasted I/O, hidden bug.
+        // Single-node providers use `ExpertSharding::single`, so everything is local.
         if !self.sharding.is_local(self.this_node, eid as u32) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("expert {eid} owned by another node; RDMA transport not wired"),
+                format!(
+                    "expert {eid} (layer {layer}) is owned by another node, not {}; \
+                     it should have been dispatched over the transport",
+                    self.this_node.0
+                ),
             ));
         }
         Ok(Arc::new(load_expert(
@@ -899,6 +907,62 @@ mod tests {
         let mut buf = Vec::new();
         write_routing_lines(&mut buf, 5, 3, 2, 2, &[10, 20, 30, 40]).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "5 3 0 10 20\n5 3 1 30 40\n");
+    }
+
+    #[test]
+    fn provider_refuses_experts_owned_by_another_node() {
+        // Ownership is enforced at the *load* layer, not only at dispatch. Asking for
+        // a peer's expert must fail loudly — otherwise a routing bug quietly streams
+        // it off this node's disk: right answer, wasted I/O, invisible bug.
+        use std::io::Write;
+        let dir = {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+            let p = std::path::PathBuf::from(base).join(format!(
+                "colibri-own-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        };
+        // Minimal valid safetensors so `Shards::open` succeeds; the ownership gate
+        // returns before any tensor is touched.
+        let hdr = br#"{"dummy":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut f = std::fs::File::create(dir.join("m.safetensors")).unwrap();
+        f.write_all(&(hdr.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(hdr).unwrap();
+        f.write_all(&0f32.to_le_bytes()).unwrap();
+        drop(f);
+
+        let shards = Shards::open(&dir).unwrap();
+        let c = cfg(); // 4 routed experts
+        // 2 nodes over 4 experts: node 0 owns {0,1}, node 1 owns {2,3}.
+        let sharding = ExpertSharding::new(2, c.n_experts as u32);
+        let p = ShardsExpertProvider::with_sharding(&shards, &c, 4, sharding, NodeId(0));
+
+        for peer_expert in [2usize, 3] {
+            let e = p.expert(0, peer_expert).unwrap_err();
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::Unsupported,
+                "expert {peer_expert} belongs to node 1 and must be refused"
+            );
+            assert!(e.to_string().contains("owned by another node"), "unhelpful: {e}");
+        }
+
+        // A locally-owned expert gets *past* the gate and fails for an unrelated
+        // reason (this fixture has no expert data) — proving the gate discriminates
+        // by ownership rather than rejecting everything.
+        let local = p.expert(0, 0).unwrap_err();
+        assert_ne!(local.kind(), io::ErrorKind::Unsupported, "local expert must pass the gate");
+
+        // A single-node provider owns everything: no expert is ever refused.
+        let solo = ShardsExpertProvider::new(&shards, &c, 4);
+        for e in 0..c.n_experts as usize {
+            assert_ne!(solo.expert(0, e).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -111,26 +111,43 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let base = ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
-    let budget = crate::ram_budget();
-    let provider = std::sync::Arc::new(ExpertCache::new(base, budget));
-    if let Some(topn) = crate::prefetch_topn() {
-        provider.enable_prefetch(topn);
-        println!("[serve] speculative next-layer prefetch on (top-{topn}/layer)");
-    }
     let model_id = model_id_from(&snap);
+    let budget = crate::ram_budget();
 
     let usage_path =
         std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
     let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
 
+    // The expert->node map comes first: it gates what this node may load (below), and
+    // a cluster that disagrees about it must fail before we pay for the AUTOPIN
+    // warm-up (verification is seconds, pinning can be minutes). Single-node collapses
+    // to "everything is local".
+    let cluster = colibri_cluster::ClusterConfig::from_env();
+    let sharding = if cluster.is_single_node() {
+        colibri_cluster::ExpertSharding::single(model.cfg.n_experts as u32)
+    } else {
+        crate::build_sharding(&cluster, model.cfg.n_experts as u32, &history)
+    };
+
+    // Ownership is enforced at the load layer too, not just at dispatch: the provider
+    // refuses experts this node doesn't own, so a routing bug fails loudly instead of
+    // silently streaming a peer's expert off disk.
+    let base = ShardsExpertProvider::with_sharding(
+        &model.shards,
+        &model.cfg,
+        model.ebits as u32,
+        sharding.clone(),
+        cluster.this_node,
+    );
+    let provider = std::sync::Arc::new(ExpertCache::new(base, budget));
+    if let Some(topn) = crate::prefetch_topn() {
+        provider.enable_prefetch(topn);
+        println!("[serve] speculative next-layer prefetch on (top-{topn}/layer)");
+    }
+
     // Multi-node: install the expert-parallel context so moe() splits experts by
     // ownership — this node computes its own shard, and peers' experts are fetched
     // from their `worker` servers over TCP/RoCE. Single-node leaves it unset.
-    //
-    // Done *before* the AUTOPIN warm-up below: verification is seconds and pinning can
-    // be minutes, so a misconfigured cluster should fail before paying for the warm-up.
-    let cluster = colibri_cluster::ClusterConfig::from_env();
     if !cluster.is_single_node() {
         let peers = match crate::cluster_peers(&cluster) {
             Ok(p) => p,
@@ -140,7 +157,6 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             }
         };
         let n_peers = peers.len();
-        let sharding = crate::build_sharding(&cluster, model.cfg.n_experts as u32, &history);
         let owned = sharding.count_for(cluster.this_node);
         let transport =
             colibri_cluster::TcpTransport::new(cluster.this_node, peers, sharding.fingerprint());
@@ -163,7 +179,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             sharding.fingerprint()
         );
         colibri_engine::set_cluster(colibri_engine::ClusterCtx {
-            sharding,
+            sharding: sharding.clone(),
             transport: Box::new(transport),
         });
     }
@@ -172,7 +188,12 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // skewed, so keeping the hot head resident stops it churning through the LRU.
     // `COLI_PIN_GB=auto` sizes it to the usage curve's knee. Can take minutes (it reads
     // every pinned expert), so it runs only once the cluster is known-good.
-    crate::apply_autopin(&provider, &history, budget);
+    //
+    // Restricted to the experts we own: every node reads the same history, so an
+    // unfiltered pin would spend this node's cache on a peer's shard (and now be
+    // rejected outright by the provider's ownership gate).
+    let own_history = crate::owned_history(&history, &sharding, cluster.this_node);
+    crate::apply_autopin(&provider, &own_history, budget);
 
     // Served context length (prompt + completion). The model's hard ceiling is
     // `max_position_embeddings`; the served value is COLI_CTX (else a memory-safe

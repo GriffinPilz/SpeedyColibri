@@ -406,23 +406,35 @@ fn cmd_worker(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let base = colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
+    // The map comes first: it decides which experts this node may load. The same
+    // history feeds it, so its fingerprint must match every other node's — the
+    // driver's handshake enforces that, and the printed values let you eyeball it.
+    let usage_path =
+        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
+    let sharding = build_sharding(&cluster, model.cfg.n_experts as u32, &history);
+    let owned = sharding.count_for(cluster.this_node);
+
+    // Ownership enforced at the load layer: the driver should only ever send us
+    // experts we own, so a request for someone else's is a bug worth surfacing
+    // rather than quietly serving from disk.
+    let base = colibri_engine::ShardsExpertProvider::with_sharding(
+        &model.shards,
+        &model.cfg,
+        model.ebits as u32,
+        sharding.clone(),
+        cluster.this_node,
+    );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
     }
 
-    // AUTOPIN this node's hot experts before the provider moves into the server
-    // closure. The same history feeds the hot-aware sharding map below, so its
-    // fingerprint must match every other node's — compare the printed values.
-    let usage_path =
-        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
-    let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
-    apply_autopin(&provider, &history, budget);
-
-    let sharding = build_sharding(&cluster, model.cfg.n_experts as u32, &history);
-    let owned = sharding.count_for(cluster.this_node);
+    // AUTOPIN our shard's hot experts, before the provider moves into the server
+    // closure. Filtered to what we own — the history covers the whole cluster.
+    let own_history = owned_history(&history, &sharding, cluster.this_node);
+    apply_autopin(&provider, &own_history, budget);
     // Peers must present this exact fingerprint on connect, or they're refused before
     // any activation is computed — disagreeing maps corrupt results silently.
     let fingerprint = sharding.fingerprint();
@@ -915,6 +927,21 @@ pub(crate) fn apply_autopin<P: colibri_engine::ExpertProvider>(
             Err(e) => eprintln!("coli: warm_pin: {e}"),
         },
     }
+}
+
+/// The usage history restricted to the experts `this_node` owns.
+///
+/// Every node loads the *same* history — the hot-aware map is derived from it, so it
+/// has to be identical — but each only ever computes its own shard. Pinning from the
+/// unfiltered history would spend this node's cache on experts it is never asked for
+/// (up to half of it on 2 nodes), and the provider's ownership gate rejects them
+/// outright. Single-node owns everything, so this is a no-op there.
+pub(crate) fn owned_history(
+    history: &colibri_engine::UsageHistory,
+    sharding: &colibri_cluster::ExpertSharding,
+    this_node: colibri_cluster::NodeId,
+) -> colibri_engine::UsageHistory {
+    history.filter_experts(|eid| sharding.is_local(this_node, eid as u32))
 }
 
 /// Build the expert→node sharding for a multi-node run. `COLI_SHARD=hot` selects the

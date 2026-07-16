@@ -131,6 +131,24 @@ impl UsageHistory {
         best_i + 1 // count = index + 1
     }
 
+    /// A copy keeping only the entries whose **expert id** passes `keep`.
+    ///
+    /// Expert ownership is layer-independent, so this restricts an AUTOPIN candidate
+    /// set to the experts a node actually computes. On a sharded cluster every node
+    /// reads the *same* usage history (it has to — the hot-aware map is derived from
+    /// it), but each only ever computes its own shard; pinning an expert this node is
+    /// never asked for would just burn its cache on a peer's work.
+    pub fn filter_experts(&self, keep: impl Fn(usize) -> bool) -> UsageHistory {
+        UsageHistory {
+            counts: self
+                .counts
+                .iter()
+                .filter(|(&(_layer, e), _)| keep(e))
+                .map(|(&k, &v)| (k, v))
+                .collect(),
+        }
+    }
+
     /// Merge another history into this one (summing counts).
     pub fn merge(&mut self, other: &UsageHistory) {
         for (&(l, e), &c) in &other.counts {
@@ -262,6 +280,49 @@ mod tests {
         let mut one = UsageHistory::new();
         one.add(0, 0, 5);
         assert_eq!(one.knee(), 1);
+    }
+
+    #[test]
+    fn filter_experts_keeps_only_owned() {
+        // A cluster-wide history: node 0 owns even experts, node 1 odd. Each node's
+        // pin candidates must be its own shard only — otherwise it burns cache on a
+        // peer's experts (and the provider's ownership gate rejects them anyway).
+        let mut h = UsageHistory::new();
+        h.add(0, 0, 10); // even -> node 0
+        h.add(0, 1, 99); // odd  -> node 1 (hottest overall)
+        h.add(5, 2, 7); // even -> node 0
+        h.add(5, 3, 50); // odd  -> node 1
+
+        let n0 = h.filter_experts(|e| e % 2 == 0);
+        assert_eq!(n0.len(), 2);
+        assert_eq!(n0.get(0, 0), 10);
+        assert_eq!(n0.get(5, 2), 7);
+        assert_eq!(n0.get(0, 1), 0, "peer's expert must not survive the filter");
+        assert_eq!(n0.total(), 17);
+        // The globally hottest expert (0,1) belongs to the peer, so node 0's ranking
+        // must not lead with it.
+        assert_eq!(n0.ranked().first().copied(), Some((0, 0)));
+
+        let n1 = h.filter_experts(|e| e % 2 == 1);
+        assert_eq!(n1.len(), 2);
+        assert_eq!(n1.ranked().first().copied(), Some((0, 1)));
+        assert_eq!(n1.total(), 149);
+
+        // The two shards partition the original history exactly.
+        assert_eq!(n0.total() + n1.total(), h.total());
+        assert_eq!(n0.len() + n1.len(), h.len());
+    }
+
+    #[test]
+    fn filter_experts_keep_all_is_identity() {
+        let mut h = UsageHistory::new();
+        h.add(1, 4, 3);
+        h.add(2, 9, 8);
+        let all = h.filter_experts(|_| true);
+        assert_eq!(all.len(), h.len());
+        assert_eq!(all.total(), h.total());
+        let none = h.filter_experts(|_| false);
+        assert!(none.is_empty());
     }
 
     #[test]

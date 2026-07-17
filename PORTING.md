@@ -32,7 +32,7 @@ ships with unit tests that encode the reference behavior.
 | `colibri-tokenizer` | `c/tok.h`, `c/tok_unicode.h` | ✅ ported + tested |
 | `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 **NEON int4·f32 / int8·f32 dots (5.4× vs scalar)** wired into `matmul_qt`; int2 + IDOT int8-activation path pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
-| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache**; DSA/SIMD/speculation deferred |
+| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache + DSA sparse attention**; SIMD/speculation deferred |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; **CUDA FFI binding GPU-verified on a DGX Spark** (GB10, sm_121, CUDA 13 — builds/links/inits, GPU matmul smoke test passes); not yet wired into forward; Metal deprioritized |
 | `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; **ConnectX/RoCE peer discovery working** (`coli cluster`); RDMA transport stubbed |
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack/**serve** work; interactive chat REPL dropped (server is the interface) |
@@ -68,7 +68,10 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
    - ✅ MLA attention (`attention.rs`) with compressed KV-cache (`KvCache`) — both
      the reconstruction reference and the DeepSeek weight-absorption decode core;
      tested that the two agree, and that batched prefill == step-by-step decode.
-     (DSA sparse-indexer top-k selection still ⬜ — this is the dense path.)
+     ✅ **DSA sparse-indexer top-k selection ported** (`dsa.rs`): lightning-indexer
+     scoring + top-k + sparse attention, wired into `attention_with` for FULL
+     indexer layers. Unit-tested incl. the select-all==dense invariant. SHARED-layer
+     selection-reuse ⬜ (runs dense); end-to-end needs the --indexer weights.
    - ✅ MoE block (`moe.rs`): sigmoid router + bias top-K (noaux_tc), SwiGLU
      experts, shared expert; experts streamed via an `ExpertProvider` whose
      `ShardsExpertProvider` checks `colibri-cluster` ownership (single-node local

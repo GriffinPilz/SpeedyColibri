@@ -440,11 +440,33 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         return cmd_gen_preload_direct(model, &prompt, n_new);
     }
 
-    // Resident expert cache: experts loaded once stay in RAM until the budget
-    // forces an eviction (see `coli capacity`). Budget from COLI_RAM_GB, else
-    // available RAM, else unbounded.
-    let base =
-        colibri_engine::ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
+    // Usage history first — both the hot-aware sharding and AUTOPIN read it.
+    let usage_path =
+        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let mut history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
+
+    // Cluster-aware expert sharding. Single-node keeps every expert local; multi-node
+    // splits experts by owner so `moe()` computes this node's shard and dispatches the
+    // rest to their owners over the transport. Wiring this into `gen` (not just
+    // `serve`) is what makes the token-identity oracle — `coli gen <snap> 100 200 300`
+    // — runnable across nodes, which is the RDMA-A correctness gate.
+    let cluster = colibri_cluster::ClusterConfig::from_env();
+    let sharding = if cluster.is_single_node() {
+        colibri_cluster::ExpertSharding::single(model.cfg.n_experts as u32)
+    } else {
+        build_sharding(&cluster, model.cfg.n_experts as u32, &history)
+    };
+
+    // Resident expert cache, restricted to this node's shard (the provider refuses a
+    // non-owned expert, so a routing bug fails loudly instead of streaming a peer's
+    // expert off disk). Budget from COLI_RAM_GB, else the auto cap.
+    let base = colibri_engine::ShardsExpertProvider::with_sharding(
+        &model.shards,
+        &model.cfg,
+        model.ebits as u32,
+        sharding.clone(),
+        cluster.this_node,
+    );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
     if let Some(topn) = prefetch_topn() {
@@ -452,13 +474,42 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
     }
 
-    // Pinned hot-store warm-up (AUTOPIN): read the persistent usage history and pin
-    // the hottest experts (COLI_PIN_GB budget, or `auto` to size to the curve's knee)
-    // so they stay resident.
-    let usage_path =
-        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
-    let mut history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
-    apply_autopin(&provider, &history, budget);
+    // Multi-node: install the expert-parallel context so `moe()` dispatches non-local
+    // experts over TCP/RoCE. verify_peers() handshakes every worker up front, so a
+    // mismatched sharding map or a peer that isn't up fails here rather than
+    // mid-generation. Single-node leaves the context unset (everything local).
+    if !cluster.is_single_node() {
+        let peers = match cluster_peers(&cluster) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("coli gen: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let owned = sharding.count_for(cluster.this_node);
+        let transport =
+            colibri_cluster::TcpTransport::new(cluster.this_node, peers, sharding.fingerprint());
+        use colibri_cluster::Transport as _;
+        if let Err(e) = transport.verify_peers() {
+            eprintln!("coli gen: cluster verification failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "[gen] expert-parallel: {} nodes, rank {} owns {} experts, sharding {:#018x}",
+            cluster.num_nodes,
+            cluster.this_node.0,
+            owned,
+            sharding.fingerprint()
+        );
+        colibri_engine::set_cluster(colibri_engine::ClusterCtx {
+            sharding: sharding.clone(),
+            transport: Box::new(transport),
+        });
+    }
+
+    // AUTOPIN the hottest experts, restricted to this node's shard in a cluster.
+    let own_history = owned_history(&history, &sharding, cluster.this_node);
+    apply_autopin(&provider, &own_history, budget);
 
     // `for_model` sizes the KV for the MTP head too (rows = n_layers + has_mtp);
     // hand-rolling `KvCache::new(n_layers, ..)` would under-allocate on an MTP model.

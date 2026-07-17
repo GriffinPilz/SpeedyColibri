@@ -13,6 +13,7 @@
 pub mod attention;
 pub mod cache;
 pub mod convert;
+pub mod dsa;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;

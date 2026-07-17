@@ -14,8 +14,12 @@
 //!     fast path.
 //!
 //! They are algebraically identical; a test asserts they agree numerically.
-//! DSA sparse-indexer selection (long-context top-k) is not yet ported — this is
-//! the dense path, exact for context ≤ `index_topk`.
+//!
+//! DSA sparse attention: `attention_with` takes an optional per-query selection (the
+//! DSA lightning indexer's top-k, computed in [`crate::dsa`]). The reconstruct core
+//! then attends only to the selected cached positions. `sel == None` is dense, and
+//! selecting *all* positions reproduces the dense output exactly (tested) — so DSA is
+//! a no-op for context ≤ `index_topk` and a strict speedup above it.
 
 use crate::linear::{matmul_qt, qt_addrow, qt_matvec_rows};
 use crate::math::{rmsnorm_inplace, rope_interleave, softmax};
@@ -43,10 +47,12 @@ pub fn attention(
     pos_base: usize,
     out: &mut [f32],
 ) {
-    attention_with(cfg, l, layer, kv, x, s_len, pos_base, out, AttnCore::Reconstruct);
+    attention_with(cfg, l, layer, kv, x, s_len, pos_base, out, AttnCore::Reconstruct, None);
 }
 
-/// As [`attention`], but selecting the core explicitly.
+/// As [`attention`], but selecting the core explicitly and optionally restricting each
+/// query to a DSA sparse selection (`sel[s]` = the cached positions query `s` attends
+/// to). `sel == None` (or an empty per-query list) is dense — full causal attention.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_with(
     cfg: &Config,
@@ -58,6 +64,7 @@ pub fn attention_with(
     pos_base: usize,
     out: &mut [f32],
     core: AttnCore,
+    sel: Option<&[Vec<u32>]>,
 ) {
     let h = cfg.n_heads as usize;
     let qh = cfg.qk_head as usize;
@@ -107,8 +114,10 @@ pub fn attention_with(
     let mut ctx = vec![0f32; s_len * h * vh];
 
     // GPU weight-absorption attention core for resident kv_b (falls back to CPU).
+    // DSA sparse selection has no GPU kernel yet — fall back to the CPU reconstruct
+    // core when a selection is active (this is the long-context prefill path).
     #[cfg(feature = "cuda")]
-    let ran_gpu = {
+    let ran_gpu = sel.is_none() && {
         let tk = pos_base + s_len;
         if s_len == 1 && st0 == 0 && crate::gpu::available() && l.kv_b.gpu_eligible {
             // Decode: persistent device KV — append the new row, read on device.
@@ -143,8 +152,10 @@ pub fn attention_with(
     if !ran_gpu {
         match core {
             AttnCore::Reconstruct => {
-                reconstruct_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx);
+                reconstruct_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx, sel);
             }
+            // Absorb is the S==1 decode core; DSA sparsifies the long-context prefill
+            // (reconstruct), so a selection is not applied here.
             AttnCore::Absorb => {
                 absorb_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx);
             }
@@ -168,6 +179,7 @@ fn reconstruct_core(
     pos_base: usize,
     st0: usize,
     ctx: &mut [f32],
+    sel: Option<&[Vec<u32>]>,
 ) {
     let h = cfg.n_heads as usize;
     let qh = cfg.qk_head as usize;
@@ -186,12 +198,22 @@ fn reconstruct_core(
 
     for s in 0..s_len {
         let pos = pos_base + s;
+        let nt = pos + 1 - st0;
+        // The cached positions (as `jj = t - st0`) this query attends to. DSA sparse
+        // attention restricts to the indexer's selection; dense (None, or an empty
+        // selection = the DSA no-op) attends to all — and the two must agree when the
+        // selection is all positions (the `is_dense` invariant, tested below).
+        let jjs: Vec<usize> = match sel {
+            Some(sels) if !sels[s].is_empty() => {
+                sels[s].iter().map(|&t| t as usize - st0).collect()
+            }
+            _ => (0..nt).collect(),
+        };
         for hh in 0..h {
             let qbase = s * h * qh + hh * qh;
             let (qnope, qrope) = q[qbase..qbase + qh].split_at(qk_nope);
-            let nt = pos + 1 - st0;
-            let mut sc = vec![0f32; nt];
-            for (jj, sc_jj) in sc.iter_mut().enumerate() {
+            let mut sc = vec![0f32; jjs.len()];
+            for (k, &jj) in jjs.iter().enumerate() {
                 let t = st0 + jj;
                 let kn_off = (t - st0) * kvb_dim + hh * head_kv;
                 let kn = &kvb_all[kn_off..kn_off + qk_nope];
@@ -203,12 +225,12 @@ fn reconstruct_core(
                 for d in 0..r {
                     a += qrope[d] * kr[d];
                 }
-                *sc_jj = a * scale;
+                sc[k] = a * scale;
             }
             softmax(&mut sc);
             let cx = &mut ctx[(s * h + hh) * vh..(s * h + hh) * vh + vh];
-            for (jj, &a) in sc.iter().enumerate() {
-                let t = st0 + jj;
+            for (k, &a) in sc.iter().enumerate() {
+                let t = st0 + jjs[k];
                 let vv_off = (t - st0) * kvb_dim + hh * head_kv + qk_nope;
                 let vv = &kvb_all[vv_off..vv_off + vh];
                 for d in 0..vh {
@@ -433,14 +455,67 @@ mod tests {
         let mut out_recon = vec![0f32; s_len * d];
         let mut out_absorb = vec![0f32; s_len * d];
 
-        attention_with(&c, &l, 0, &mut kv_a, &x, s_len, 0, &mut out_recon, AttnCore::Reconstruct);
-        attention_with(&c, &l, 0, &mut kv_b, &x, s_len, 0, &mut out_absorb, AttnCore::Absorb);
+        attention_with(&c, &l, 0, &mut kv_a, &x, s_len, 0, &mut out_recon, AttnCore::Reconstruct, None);
+        attention_with(&c, &l, 0, &mut kv_b, &x, s_len, 0, &mut out_absorb, AttnCore::Absorb, None);
 
         for (a, b) in out_recon.iter().zip(&out_absorb) {
             assert!((a - b).abs() < 1e-4, "reconstruct {a} vs absorb {b}");
         }
         // sanity: not all zero
         assert!(out_recon.iter().any(|v| v.abs() > 1e-6));
+    }
+
+    #[test]
+    fn dsa_select_all_equals_dense() {
+        // THE DSA correctness gate (the C's DSA_FORCE): selecting *every* cached
+        // position must reproduce the exact dense attention output — proving the sparse
+        // core is a faithful restriction of full attention, not a different computation.
+        let c = cfg();
+        let l = make_layer(&c);
+        let d = c.hidden as usize;
+        let s_len = 4;
+        let x = vecf(s_len * d, 9);
+
+        let mut kv_dense = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut kv_sparse = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut out_dense = vec![0f32; s_len * d];
+        let mut out_sparse = vec![0f32; s_len * d];
+
+        // sel[s] = every causal position 0..=s (pos_base=0): exactly the dense set.
+        let sel: Vec<Vec<u32>> = (0..s_len).map(|s| (0..=s as u32).collect()).collect();
+
+        attention_with(&c, &l, 0, &mut kv_dense, &x, s_len, 0, &mut out_dense, AttnCore::Reconstruct, None);
+        attention_with(&c, &l, 0, &mut kv_sparse, &x, s_len, 0, &mut out_sparse, AttnCore::Reconstruct, Some(&sel));
+
+        for (a, b) in out_dense.iter().zip(&out_sparse) {
+            assert!((a - b).abs() < 1e-6, "dense {a} vs select-all {b}");
+        }
+        assert!(out_dense.iter().any(|v| v.abs() > 1e-6));
+    }
+
+    #[test]
+    fn dsa_subset_changes_output() {
+        // A strict subset must differ from dense — otherwise the sparse path isn't
+        // actually sparsifying. Query s attends only to position 0 here; for s>0 that
+        // drops keys it would otherwise see, so the output must change.
+        let c = cfg();
+        let l = make_layer(&c);
+        let d = c.hidden as usize;
+        let s_len = 4;
+        let x = vecf(s_len * d, 9);
+
+        let mut kv_d = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut kv_s = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut out_d = vec![0f32; s_len * d];
+        let mut out_s = vec![0f32; s_len * d];
+
+        let sel: Vec<Vec<u32>> = (0..s_len).map(|_| vec![0u32]).collect(); // attend only to pos 0
+
+        attention_with(&c, &l, 0, &mut kv_d, &x, s_len, 0, &mut out_d, AttnCore::Reconstruct, None);
+        attention_with(&c, &l, 0, &mut kv_s, &x, s_len, 0, &mut out_s, AttnCore::Reconstruct, Some(&sel));
+
+        let differ = out_d.iter().zip(&out_s).any(|(a, b)| (a - b).abs() > 1e-5);
+        assert!(differ, "a strict subset selection must change the attention output");
     }
 
     #[test]
@@ -456,8 +531,8 @@ mod tests {
         let mut kv2 = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 4);
         let mut o1 = vec![0f32; d];
         let mut o2 = vec![0f32; d];
-        attention_with(&c, &l, 0, &mut kv1, &x, 1, 0, &mut o1, AttnCore::Reconstruct);
-        attention_with(&c, &l, 0, &mut kv2, &x, 1, 0, &mut o2, AttnCore::Absorb);
+        attention_with(&c, &l, 0, &mut kv1, &x, 1, 0, &mut o1, AttnCore::Reconstruct, None);
+        attention_with(&c, &l, 0, &mut kv2, &x, 1, 0, &mut o2, AttnCore::Absorb, None);
         for (a, b) in o1.iter().zip(&o2) {
             assert!((a - b).abs() < 1e-4);
         }

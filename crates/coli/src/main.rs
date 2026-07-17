@@ -940,19 +940,45 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Held back from the expert cache on top of any caller-specific reserve: OS page
-/// cache for the model file, allocator slack, the CUDA context, and the headroom the
-/// kernel needs to not swap.
+/// Held back from the expert cache on top of any caller-specific reserve: allocator
+/// slack, the CUDA context, and short-lived working set.
 ///
-/// **Measured, not guessed.** On a 121 GiB Spark serving diverse prompts:
-/// `COLI_RAM_GB=75` runs clean (~24 GiB still available, no swap) at 0.97 tok/s;
-/// `85` drives the box 8.6 GiB into swap and collapses to 0.22 tok/s — ~4x worse
-/// *because* it was given more cache. The old default (all of MemAvailable, no
-/// reserve) is past that cliff by construction: the cache fills its budget and never
-/// gives memory back, so it eventually collides with KV + CUDA + page cache and the
-/// kernel starts paging the expert cache to disk — on an engine whose whole cost is
-/// already disk I/O.
+/// This alone is **not** what keeps the box out of swap — see [`CACHE_CAP_DIVISOR`],
+/// which is the real guard. Subtracting a constant from `MemAvailable` cannot express
+/// "don't take so much that the kernel pages you out", because `MemAvailable` counts
+/// the page cache as free: on a 121 GiB Spark it reads ~99 GiB once dense weights are
+/// resident, so any small constant still yields a budget far past the cliff.
 const WORKING_RESERVE: u64 = 10 << 30;
+
+/// The expert cache is capped at `MemTotal / CACHE_CAP_DIVISOR`.
+///
+/// **Measured on a 121 GiB Spark, 8/4 model (~19 GiB resident), 12 diverse prompts,
+/// counterbalanced order** (each config run at mirrored positions so a drift cannot
+/// masquerade as a config effect — every earlier ascending-order sweep here was
+/// uninterpretable for exactly that reason):
+///
+/// | `COLI_RAM_GB` | RSS   | swap  | tok/s |
+/// |---------------|-------|-------|-------|
+/// | 20            | 39 GB | 0     | 0.46  |
+/// | 40            | 57 GB | 0     | 0.45  |
+/// | 55            | 74 GB | 0     | 0.44  |
+/// | 70            | 89 GB | 15 GB | 0.38  |
+/// | 87 (old auto) | 95 GB | 15 GB | 0.11  |
+///
+/// Two facts set the rule. **The plateau is flat**: 20 GiB serves as fast as 55, so
+/// a bigger cache buys nothing on diverse traffic — routed experts are barely reused
+/// across unrelated prompts, so the hit rate stays near zero whatever the size.
+/// **The cliff is a wall**: RSS tracks `budget + resident`, and once that crowds out
+/// the page cache the kernel pages out the very cache we just filled, on an engine
+/// whose whole cost is already disk I/O.
+///
+/// So the ceiling is chosen for margin, not throughput — there is no throughput to
+/// win. `/3` lands at ~40 GiB here: mid-plateau, ~15 GiB clear of the last known-good
+/// point and ~30 clear of the cliff. That margin absorbs what this table does not
+/// cover — longer contexts, other tenants, larger resident footprints. Repeated or
+/// shared-prefix traffic *does* reuse experts and would prefer a larger cache; `/3`
+/// leaves room for that without approaching the wall.
+const CACHE_CAP_DIVISOR: u64 = 3;
 
 /// Floor so a small/busy box still gets a usable cache rather than 0 (a 0 budget
 /// evicts every expert immediately and thrashes). Set `COLI_RAM_GB` explicitly if
@@ -972,25 +998,51 @@ const MIN_BUDGET: u64 = 4 << 30;
 fn ram_budget_reserving(reserve: u64) -> u64 {
     if let Ok(gb) = std::env::var("COLI_RAM_GB") {
         if let Ok(g) = gb.parse::<u64>() {
-            return g << 30;
+            let asked = g << 30;
+            // Exact override, but say so when it's past the measured cliff: 70 GiB on a
+            // 121 GiB box swaps 15 GiB and costs ~20%, 85 costs ~4x. Silently obeying a
+            // number that guarantees thrash is how the old default hurt people.
+            if let Some(cap) = colibri_engine::total_ram_bytes().map(|t| t / CACHE_CAP_DIVISOR) {
+                if asked > cap {
+                    eprintln!(
+                        "[warn] COLI_RAM_GB={g} exceeds the safe cache ceiling of {} GB \
+                         (MemTotal/{CACHE_CAP_DIVISOR}); measured: budgets past ~55 GB on a \
+                         121 GB box swap and lose throughput. Using {g} GB as asked.",
+                        cap >> 30
+                    );
+                }
+            }
+            return asked;
         }
     }
     match colibri_engine::available_ram_bytes() {
-        Some(avail) => budget_from(avail, reserve),
+        Some(avail) => budget_from(avail, reserve, colibri_engine::total_ram_bytes()),
         None => u64::MAX, // non-Linux: no /proc/meminfo, stay unbounded
     }
 }
 
 /// Pure arithmetic behind [`ram_budget_reserving`], split out to be testable.
 ///
+/// Two independent guards, because they fail in different directions:
+/// - subtracting the reserves keeps a *busy* box from overcommitting what's left;
+/// - the [`CACHE_CAP_DIVISOR`] cap keeps an *idle* box from taking memory the kernel
+///   needs for page cache. This is the one that matters in practice: on an idle Spark
+///   `MemAvailable` reads ~99 GiB and the subtraction alone yields 87 GiB — measured
+///   at 0.11 tok/s against 0.46 at 40 GiB.
+///
 /// Saturating on purpose: a plain `avail - reserve - WORKING_RESERVE` underflows on a
 /// small box and wraps to ~16 EiB — an effectively unbounded budget, causing exactly
 /// the OOM this exists to prevent.
-fn budget_from(avail: u64, reserve: u64) -> u64 {
-    avail
+fn budget_from(avail: u64, reserve: u64, total: Option<u64>) -> u64 {
+    let by_avail = avail
         .saturating_sub(reserve)
-        .saturating_sub(WORKING_RESERVE)
-        .max(MIN_BUDGET)
+        .saturating_sub(WORKING_RESERVE);
+    // `total` is None only off-Linux, where there's no /proc/meminfo to cap against.
+    let capped = match total {
+        Some(t) => by_avail.min(t / CACHE_CAP_DIVISOR),
+        None => by_avail,
+    };
+    capped.max(MIN_BUDGET)
 }
 
 /// Expert-cache byte budget for callers with nothing extra to reserve.
@@ -1535,14 +1587,35 @@ mod tests {
         assert!(logprob_of(&confident, 1) < logprob_of(&uniform, 1));
     }
 
+    /// The Spark this was all measured on: 121 GiB total, ~99 GiB `MemAvailable` once
+    /// the 8/4 dense weights are resident.
+    const SPARK_TOTAL: u64 = 121 * GB;
+    const SPARK_AVAIL: u64 = 99 * GB;
+
     #[test]
-    fn budget_leaves_headroom_below_the_measured_swap_cliff() {
-        // The real case: a 121 GiB Spark, ~99 GiB available once dense is resident,
-        // reserving ~11 GiB of KV for a 32K window (incl. the CUDA device shadow).
-        // Measured on that box: 75 GiB runs clean, 85 GiB swaps 8.6 GiB and costs ~4x.
-        // The default must land in the safe zone without being told.
-        let got = budget_from(99 * GB, 11 * GB) / GB;
-        assert!((70..=80).contains(&got), "picked {got} GB; must sit below the 85 GB cliff");
+    fn budget_stays_on_the_measured_plateau() {
+        // This test previously asserted 70..=80 GB and PASSED — encoding the 4/4 model's
+        // cliff. The 8/4 model made it wrong: measured counterbalanced on the box, 70 GB
+        // swaps 15 GiB at 0.38 tok/s and the old auto-pick of 87 GB manages 0.11, against
+        // 0.46 at 40. Throughput is flat from 20..55, so the target is the plateau with
+        // margin, not the highest number that fits.
+        let got = budget_from(SPARK_AVAIL, 1 * GB, Some(SPARK_TOTAL)) / GB;
+        assert!(
+            (20..=55).contains(&got),
+            "picked {got} GB; must land on the measured 20-55 GB plateau, clear of the \
+             cliff between 55 and 70"
+        );
+    }
+
+    #[test]
+    fn idle_box_does_not_get_a_cliff_sized_budget() {
+        // The regression that shipped: on an idle box MemAvailable counts page cache as
+        // free, so the reserves alone pick 87 GB — past the cliff, 4x slower. The cap is
+        // what actually prevents this; the subtraction never could.
+        let no_cap = SPARK_AVAIL.saturating_sub(1 * GB).saturating_sub(WORKING_RESERVE) / GB;
+        assert!(no_cap > 70, "premise: reserves alone pick {no_cap} GB, past the cliff");
+        let with_cap = budget_from(SPARK_AVAIL, 1 * GB, Some(SPARK_TOTAL)) / GB;
+        assert!(with_cap < 70, "cap failed to pull {with_cap} GB back below the cliff");
     }
 
     #[test]
@@ -1551,17 +1624,39 @@ mod tests {
         // wraps to ~16 EiB — an effectively unlimited budget, i.e. exactly the OOM
         // the reserve exists to prevent.
         for (avail, reserve) in [(0, 0), (1 * GB, 0), (8 * GB, 64 * GB), (0, u64::MAX)] {
-            let b = budget_from(avail, reserve);
+            let b = budget_from(avail, reserve, Some(SPARK_TOTAL));
             assert!(b <= MIN_BUDGET, "underflowed to {b} bytes for avail={avail} reserve={reserve}");
         }
     }
 
     #[test]
     fn budget_subtracts_both_reserves() {
+        // With the cap out of the way (huge total), the reserves still bind exactly:
         // 100 - 20 caller reserve - 10 working = 70.
-        assert_eq!(budget_from(100 * GB, 20 * GB), 70 * GB);
+        let uncapped = Some(u64::MAX);
+        assert_eq!(budget_from(100 * GB, 20 * GB, uncapped), 70 * GB);
         // A bigger KV window (longer ctx) must shrink the cache one-for-one.
-        assert_eq!(budget_from(100 * GB, 40 * GB), 50 * GB);
+        assert_eq!(budget_from(100 * GB, 40 * GB, uncapped), 50 * GB);
+    }
+
+    #[test]
+    fn cap_scales_with_the_machine_not_a_constant() {
+        // A fixed reserve can't work across machine sizes: the same 10 GiB that is
+        // reasonable on a 32 GiB box is meaningless on a 512 GiB one. The ceiling has
+        // to track MemTotal.
+        for total_gb in [32u64, 121, 512] {
+            let total = total_gb * GB;
+            // Idle: MemAvailable ~= total, so only the cap can bind.
+            let b = budget_from(total, 0, Some(total)) / GB;
+            assert_eq!(b, total_gb / CACHE_CAP_DIVISOR, "cap did not track a {total_gb} GB box");
+        }
+    }
+
+    #[test]
+    fn missing_meminfo_total_still_bounded_by_reserves() {
+        // Off-Linux there's no MemTotal to cap against; the reserves must still apply
+        // rather than silently going unbounded.
+        assert_eq!(budget_from(100 * GB, 20 * GB, None), 70 * GB);
     }
 
     #[test]
@@ -1570,7 +1665,7 @@ mod tests {
         // cache, never give to it.
         let mut prev = u64::MAX;
         for ctx_gb in [0u64, 5, 11, 22, 44] {
-            let b = budget_from(99 * GB, ctx_gb * GB);
+            let b = budget_from(SPARK_AVAIL, ctx_gb * GB, Some(SPARK_TOTAL));
             assert!(b <= prev, "budget grew when ctx grew");
             prev = b;
         }

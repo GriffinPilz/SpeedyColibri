@@ -28,7 +28,7 @@ pub mod sampling;
 pub mod usage;
 
 pub use attention::{attention, attention_with, AttnCore};
-pub use cache::{available_ram_bytes, capacity, CacheStats, ExpertCache};
+pub use cache::{available_ram_bytes, capacity, total_ram_bytes, CacheStats, ExpertCache};
 pub use convert::{convert_snapshot, detect_format, ConvertOpts, ConvertStats, SourceFormat};
 pub use usage::UsageHistory;
 pub use colibri_core::Config;

@@ -516,9 +516,23 @@ pub mod capacity {
 /// Linux (the DGX Spark target); returns `None` elsewhere (e.g. macOS dev boxes),
 /// where the caller should fall back to an explicit budget.
 pub fn available_ram_bytes() -> Option<u64> {
+    meminfo_field("MemAvailable:")
+}
+
+/// Total RAM in bytes, best-effort (`/proc/meminfo` `MemTotal`).
+///
+/// Distinct from [`available_ram_bytes`] on purpose: `MemAvailable` counts reclaimable
+/// page cache as free, so budgeting from it hands the expert cache memory the kernel
+/// is *already using* to cache the model file — and the cache then pages itself out.
+/// The safe ceiling scales with the size of the machine, which only `MemTotal` knows.
+pub fn total_ram_bytes() -> Option<u64> {
+    meminfo_field("MemTotal:")
+}
+
+fn meminfo_field(key: &str) -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+        if let Some(rest) = line.strip_prefix(key) {
             let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * 1024);
         }

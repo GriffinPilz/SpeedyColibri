@@ -299,7 +299,7 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         (Some(a), Some(b)) => (a, b),
         _ => {
             eprintln!("usage: coli convert <fp8|nvfp4-snapshot-dir> <output-snapshot-dir>");
-            eprintln!("  env: COLI_EBITS(8) COLI_IO_BITS(8) COLI_XBITS(4) COLI_NLAYERS(78)");
+            eprintln!("  env: COLI_EBITS(8) COLI_IO_BITS(8) COLI_XBITS(4) COLI_NLAYERS(78) COLI_KEEP_INDEXER(0)");
             return ExitCode::from(2);
         }
     };
@@ -315,6 +315,9 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         io_bits: env_u32("COLI_IO_BITS", 8),
         xbits: env_u32("COLI_XBITS", 4),
         n_layers: env_u32("COLI_NLAYERS", 78) as usize,
+        // COLI_KEEP_INDEXER=1 keeps the DSA lightning-indexer weights so the container
+        // can run DSA sparse attention (dropped by default, matching the reference).
+        keep_indexer: env_u32("COLI_KEEP_INDEXER", 0) != 0,
     };
 
     eprintln!(

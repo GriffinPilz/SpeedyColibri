@@ -8,11 +8,16 @@
 //! `name.qs` `F32` tensor of per-row scales — exactly what [`crate::loader::qt_load`]
 //! reads. Norms, the MoE router, biases, and embeddings-passthrough stay `F32`.
 //!
-//! What is dropped (matching the reference): the DSA lightning indexer
+//! What is dropped by default (matching the reference): the DSA lightning indexer
 //! (`self_attn.indexer.*`) and the MTP head (layer `n_layers`,
 //! `eh_proj`/`enorm`/`hnorm`/`shared_head`). The engine then auto-detects
 //! `has_dsa = false` / `has_mtp = false` from the absent tensors, so attention is
-//! exact dense MLA. Add those back later with dedicated passes if wanted.
+//! exact dense MLA.
+//!
+//! Set `ConvertOpts::keep_indexer` (`COLI_KEEP_INDEXER=1`) to retain the indexer
+//! weights instead — the wk/wq_b/weights_proj matrices quantize at `ebits`, k_norm
+//! stays f32 — so the resulting container has `has_dsa = true` and runs DSA sparse
+//! attention above `index_topk` context. The MTP head is still dropped.
 //!
 //! The quantizer math is the shared, C-exact [`crate::quantize`] code, so a
 //! converted weight is byte-identical to a runtime-quantized one.
@@ -72,11 +77,16 @@ pub struct ConvertOpts {
     pub xbits: u32,
     /// number of transformer layers; layer index `>= n_layers` is the MTP head
     pub n_layers: usize,
+    /// keep the DSA lightning-indexer weights (`self_attn.indexer.*`) instead of
+    /// dropping them — required to run DSA sparse attention. `--indexer`. The wk/wq_b/
+    /// weights_proj matrices quantize at `ebits`; k_norm stays f32. Adds ~index-head
+    /// weights per layer (small vs the experts).
+    pub keep_indexer: bool,
 }
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78 }
+        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false }
     }
 }
 
@@ -108,9 +118,10 @@ fn layer_idx(name: &str) -> i64 {
     -1
 }
 
-/// Tensor classification — faithful port of `classify(name, n_layers)` on the
-/// default path (no `keep_mtp`/`keep_idx`).
-fn classify(name: &str, n_layers: usize) -> Kind {
+/// Tensor classification — port of `classify(name, n_layers)`. `keep_idx` mirrors the
+/// reference's `--indexer` pass: retain the DSA lightning-indexer weights instead of
+/// dropping them.
+fn classify(name: &str, n_layers: usize, keep_idx: bool) -> Kind {
     // scale sidecars are consumed with their weight
     if name.ends_with("_scale_inv") {
         return Kind::Skip;
@@ -125,14 +136,16 @@ fn classify(name: &str, n_layers: usize) -> Kind {
     if li >= 0 && li as usize >= n_layers {
         return Kind::Skip; // MTP head lives at layer index n_layers
     }
-    for k in [
-        "indexer",
-        "indexers_proj",
-        "eh_proj",
-        "enorm",
-        "hnorm",
-        "shared_head",
-    ] {
+    // DSA lightning indexer (`self_attn.indexer.{wk,wq_b,weights_proj,k_norm}`). Dropped
+    // by default; kept when `keep_idx` so the container can run DSA — the wk/wq_b/
+    // weights_proj matrices quantize as resident (`Q`), k_norm stays f32.
+    if name.contains(".indexer.") {
+        if !keep_idx {
+            return Kind::Skip;
+        }
+        return if name.contains("k_norm") { Kind::F32 } else { Kind::Q };
+    }
+    for k in ["indexers_proj", "eh_proj", "enorm", "hnorm", "shared_head"] {
         if name.contains(k) {
             return Kind::Skip;
         }
@@ -574,7 +587,7 @@ pub fn quant_error(
         .tensors()
         .iter()
         .map(|t| t.name.as_str())
-        .filter(|n| classify(n, n_layers) == want)
+        .filter(|n| classify(n, n_layers, false) == want)
         .collect();
     names.sort_unstable();
 
@@ -727,7 +740,7 @@ pub fn convert_snapshot(
         let mut codes: Vec<OutTensor> = Vec::new();
         let mut floats: Vec<OutTensor> = Vec::new();
         for &name in names {
-            match classify(name, opts.n_layers) {
+            match classify(name, opts.n_layers, opts.keep_indexer) {
                 Kind::Skip => {
                     stats.tensors_skipped += 1;
                 }
@@ -1183,44 +1196,61 @@ mod tests {
 
     #[test]
     fn classify_rules() {
-        assert_eq!(classify("model.embed_tokens.weight", 78), Kind::Io);
-        assert_eq!(classify("lm_head.weight", 78), Kind::Io);
-        assert_eq!(classify("model.norm.weight", 78), Kind::F32);
+        assert_eq!(classify("model.embed_tokens.weight", 78, false), Kind::Io);
+        assert_eq!(classify("lm_head.weight", 78, false), Kind::Io);
+        assert_eq!(classify("model.norm.weight", 78, false), Kind::F32);
         assert_eq!(
-            classify("model.layers.3.input_layernorm.weight", 78),
+            classify("model.layers.3.input_layernorm.weight", 78, false),
             Kind::F32
         );
-        assert_eq!(classify("model.layers.3.mlp.gate.weight", 78), Kind::F32); // router
+        assert_eq!(classify("model.layers.3.mlp.gate.weight", 78, false), Kind::F32); // router
         assert_eq!(
-            classify("model.layers.3.mlp.gate.e_score_correction_bias", 78),
+            classify("model.layers.3.mlp.gate.e_score_correction_bias", 78, false),
             Kind::F32
         );
         assert_eq!(
-            classify("model.layers.3.mlp.experts.7.gate_proj.weight", 78),
+            classify("model.layers.3.mlp.experts.7.gate_proj.weight", 78, false),
             Kind::X
         );
         assert_eq!(
-            classify("model.layers.0.mlp.gate_proj.weight", 78),
+            classify("model.layers.0.mlp.gate_proj.weight", 78, false),
             Kind::Q // dense MLP (layer < first MoE)
         );
         assert_eq!(
-            classify("model.layers.5.self_attn.kv_b_proj.weight", 78),
+            classify("model.layers.5.self_attn.kv_b_proj.weight", 78, false),
             Kind::Q
         );
         // dropped classes
         assert_eq!(
-            classify("model.layers.3.mlp.experts.7.gate_proj.weight_scale_inv", 78),
+            classify("model.layers.3.mlp.experts.7.gate_proj.weight_scale_inv", 78, false),
             Kind::Skip
         );
         assert_eq!(
-            classify("model.layers.0.self_attn.indexer.wk.weight", 78),
+            classify("model.layers.0.self_attn.indexer.wk.weight", 78, false),
             Kind::Skip
         );
-        assert_eq!(classify("model.layers.78.eh_proj.weight", 78), Kind::Skip);
+        assert_eq!(classify("model.layers.78.eh_proj.weight", 78, false), Kind::Skip);
         assert_eq!(
-            classify("model.layers.78.mlp.experts.0.gate_proj.weight", 78),
+            classify("model.layers.78.mlp.experts.0.gate_proj.weight", 78, false),
             Kind::Skip // MTP layer
         );
+    }
+
+    #[test]
+    fn keep_indexer_retains_the_dsa_weights() {
+        // With keep_idx: wk/wq_b/weights_proj quantize (Q), k_norm stays f32; and the
+        // FP8 scale sidecar is still consumed. Default (false) drops them all.
+        let n = "model.layers.0.self_attn.indexer";
+        assert_eq!(classify(&format!("{n}.wk.weight"), 78, true), Kind::Q);
+        assert_eq!(classify(&format!("{n}.wq_b.weight"), 78, true), Kind::Q);
+        assert_eq!(classify(&format!("{n}.weights_proj.weight"), 78, true), Kind::Q);
+        assert_eq!(classify(&format!("{n}.k_norm.weight"), 78, true), Kind::F32);
+        assert_eq!(classify(&format!("{n}.k_norm.bias"), 78, true), Kind::F32);
+        assert_eq!(classify(&format!("{n}.wk.weight_scale_inv"), 78, true), Kind::Skip);
+        // Default path still drops them.
+        assert_eq!(classify(&format!("{n}.wk.weight"), 78, false), Kind::Skip);
+        // keep_idx does NOT resurrect MTP-head tensors.
+        assert_eq!(classify("model.layers.3.eh_proj.weight", 78, true), Kind::Skip);
     }
 
     /// Write a minimal FP8 shard: one `[2,2]` F8_E4M3 weight + its `[1,1]`
@@ -1268,7 +1298,7 @@ mod tests {
         drop(f);
 
         let outdir = tmp();
-        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78 };
+        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false };
         let stats = convert_snapshot(&indir, &outdir, opts, |_, _, _| {}).unwrap();
         assert_eq!(stats.tensors_quantized, 1); // o_proj
         assert_eq!(stats.tensors_f32, 1); // norm

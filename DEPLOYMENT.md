@@ -224,7 +224,7 @@ both nodes currently keep the full model on disk but load only their shard.
 
 ## CUDA (Blackwell) backend
 
-`colibri-backend` binds the reference CUDA kernels (`c/backend_cuda.cu`) over FFI.
+`colibri-backend` binds the CUDA kernels (`crates/colibri-backend/cuda/backend_cuda.cu`) over FFI.
 It is **off by default**; enable it on a CUDA host:
 
 ```bash

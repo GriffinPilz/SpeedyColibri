@@ -1,6 +1,6 @@
 //! Build script for the CUDA backend.
 //!
-//! When the `cuda` feature is enabled, compile the reference `c/backend_cuda.cu`
+//! When the `cuda` feature is enabled, compile the crate's `cuda/backend_cuda.cu`
 //! with `nvcc` into a static lib and link it (plus `cudart` + `stdc++`), mirroring
 //! the C Makefile's Linux CUDA path. When the feature is off — the default — this
 //! is a no-op, so ordinary (CPU / non-CUDA) builds are unaffected.
@@ -73,9 +73,10 @@ fn main() {
     }
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    // crates/colibri-backend -> repo root c/
-    let cu = manifest.join("../../c/backend_cuda.cu");
-    let hdr = manifest.join("../../c/backend_cuda.h");
+    // CUDA kernel source lives in the crate (`cuda/`). It is the live GPU backend,
+    // not part of the ported-away C reference engine — no Rust equivalent exists.
+    let cu = manifest.join("cuda/backend_cuda.cu");
+    let hdr = manifest.join("cuda/backend_cuda.h");
     println!("cargo:rerun-if-changed={}", cu.display());
     println!("cargo:rerun-if-changed={}", hdr.display());
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");

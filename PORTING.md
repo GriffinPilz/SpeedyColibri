@@ -1,9 +1,12 @@
 # colibrì → Rust port status (SpeedyColibri)
 
-This repository is being converted from the original C engine (`c/`) to Rust.
-The Rust workspace lives at the repo root (`Cargo.toml` + `crates/`); the C
-sources stay in the tree as the reference implementation until each module is
-fully ported and validated.
+This repository was converted from the original C engine to Rust. The Rust
+workspace lives at the repo root (`Cargo.toml` + `crates/`) and is now the engine;
+the C reference sources have been removed from the tree. The one exception is the
+CUDA kernel source (`crates/colibri-backend/cuda/backend_cuda.{cu,h}`), which is the
+live GPU backend compiled via FFI — it has no Rust equivalent. The "Ports (C
+source)" column below is retained as **provenance** — where each crate's logic came
+from — not as a pointer to in-tree files.
 
 **Goal:** a full 1:1 rewrite of the whole engine (CPU forward pass, kernels,
 grammar, tokenizer, backends, tools) that runs GLM-5.2 token-exact against the
@@ -17,7 +20,7 @@ Blackwell, aarch64 + CUDA), single node first, designed to split across nodes
 
 **Approach:** bottom-up. Leaf modules first (no dependencies, easy to validate),
 then the forward pass, then the GPU backends and tooling. Every ported module
-ships with unit tests; the C code is the oracle.
+ships with unit tests that encode the reference behavior.
 
 ## Workspace layout
 
@@ -99,7 +102,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      expert LRU cache) and the deferred pieces (DSA, speculation, CUDA).
 4. **CUDA (Blackwell) backend:** primary GPU tier for DGX Spark.
    - ✅ FFI binding (`colibri-backend/src/cuda.rs` + `build.rs`): compiles
-     `c/backend_cuda.cu` with nvcc (`--features cuda`, `CUDA_ARCH=native`/`sm_121`),
+     `crates/colibri-backend/cuda/backend_cuda.cu` with nvcc (`--features cuda`, auto-detected `CUDA_ARCH`),
      links `cudart`+`stdc++`; safe wrappers for init/mem_info/tensor_upload/matmul/
      expert_mlp/lifecycle; `CudaBackend::probe()` (init-based); `coli backend`.
      **GPU-VERIFIED on a DGX Spark** (GB10, sm_121, CUDA 13.0): builds+links, inits
@@ -266,15 +269,16 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 87 tests currently pass.
-- **C-vs-Rust harness (`scripts/validate_c_vs_rust.py`, see [VALIDATION.md](VALIDATION.md)):**
-  runs both engines on the same tiny synthetic model (real GLM architecture, no
-  torch / no 370 GB model) and diffs greedy generation + teacher-forcing at f32
-  and int4. **Currently PASSES** — byte-exact at f32, token-exact at int4, on
-  both modes. The C engine is forced onto the exact CPU path
-  (`IDOT=0 ABSORB=0 DRAFT=0`). Since the C engine is itself token-exact vs a
-  `transformers` oracle, this transitively validates the Rust dense path.
-- Not yet covered by the harness: DSA indexer, MTP speculation, CUDA (unported).
+- Unit + integration tests per crate encode the reference behavior (the C engine's
+  semantics are the spec). The tiny synthetic-model integration tests
+  (`colibri-engine/tests/forward_tiny.rs`, `load_tiny_model.rs`) exercise the full
+  forward pass + greedy decode on real GLM architecture without the 370 GB model.
+- The C reference engine and the C-vs-Rust oracle harness (`validate_c_vs_rust.py`,
+  `VALIDATION.md`) have been **removed** — the port is the engine now, and the tests
+  above carry correctness forward. The C engine was historically token-exact vs a
+  `transformers` oracle, which is the behavior those tests encode.
+- CUDA is verified separately on a CUDA host: GPU-vs-CPU tokens match within f32
+  epsilon (`colibri-engine/tests/forward_tiny.rs` under `--features cuda`).
 
 ## Notes
 

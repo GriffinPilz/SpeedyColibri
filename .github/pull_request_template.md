@@ -4,8 +4,8 @@ Describe the problem and the smallest change that solves it.
 
 ## Validation
 
-- [ ] `make -C c check`
-- [ ] CUDA changes were tested with `make -C c cuda-test` (if applicable)
+- [ ] `cargo test --workspace` passes
+- [ ] CUDA changes built + tested on a CUDA host (`cargo test -p colibri-backend --features cuda`)
 - [ ] Performance claims include hardware, commands, and repeatable measurements
 
 ## Compatibility

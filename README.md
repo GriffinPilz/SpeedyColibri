@@ -15,9 +15,9 @@ the GB10 Grace-Blackwell superchip, with the whole hot path on the GPU.
 > makes this work — treating VRAM, RAM, and disk as one managed memory hierarchy;
 > streaming a 744B model's routed experts on demand while keeping the dense part
 > resident at int4; the faithful, quality-preserving GLM-5.2 forward pass — is
-> theirs. This repository is a Rust rewrite of that engine: the C sources in
-> [`c/`](c/) remain in-tree as the **reference oracle**, and the port is validated
-> **token-exact** against them ([VALIDATION.md](VALIDATION.md)). None of this would
+> theirs. This repository is a Rust rewrite of that engine — now the engine in its
+> own right; the original C sources have been retired from the tree, and correctness
+> is carried by the port's own test suite. None of this would
 > be possible without JustVugg's original work. **Thank you.** If you want the
 > mature, portable, multi-platform engine, start there — colibrì is the real thing;
 > SpeedyColibri is one deployment target taken deep.
@@ -175,7 +175,7 @@ The workspace has **no crates.io dependencies** (std + path crates only), so a
 direct build needs only the CUDA toolkit and rustup:
 
 ```bash
-# Build (~3–5 min): the CUDA backend compiles c/backend_cuda.cu with nvcc.
+# Build (~3–5 min): the CUDA backend compiles crates/colibri-backend/cuda/backend_cuda.cu with nvcc.
 # NVCC and CUDA_HOME are set explicitly because a non-interactive shell often lacks
 # nvcc on PATH (a login shell, `bash -lc`, usually has it). If nvcc is missing the
 # build now fails immediately and says so, instead of dying later at link time with
@@ -358,14 +358,13 @@ lever is still expert residency, i.e. more nodes.
 
 ```
 crates/          the Rust workspace (core, safetensors, tokenizer, kernels,
-                 engine, backend, cluster, and the `coli` binary)
-c/               the original colibrì C engine — kept as the validation oracle;
-                 c/backend_cuda.{cu,h} are compiled by the Rust CUDA backend
+                 engine, backend, cluster, and the `coli` binary). The CUDA
+                 kernels live in crates/colibri-backend/cuda/backend_cuda.{cu,h},
+                 compiled by that crate's build script.
 docker/          Dockerfile, entrypoint, and run-dgx.sh (the one-command launch)
-scripts/         validate_c_vs_rust.py (the oracle harness) + codegen helpers
-PORTING.md       per-module C→Rust status and milestone order
+scripts/         benchmark + codegen helpers
+PORTING.md       per-module port history and milestone order
 DEPLOYMENT.md    DGX Spark deployment guide
-VALIDATION.md    how the port is checked token-exact against the C engine
 ```
 
 ## Credits & license

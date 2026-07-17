@@ -52,11 +52,19 @@ the wire — that's what makes the wire traffic cheap and the SSD scaling real.
 
 ### Wave 1 — start both now
 
-- [ ] **RDMA-A · Expert-parallel over TCP** — branch off `multispark`. Critical path,
-      highest value/risk. (Prompt: "Expert-parallel data-flow over TCP".)
-      - Gate: 2-node run (42b2+5a4f, experts `eid%2`) == single-node tokens.
-      - Record: per-node cache misses (~½ each → ~2× aggregate SSD BW), tok/s vs 1-node,
-        wire bytes/token.
+- [x] **RDMA-A · Expert-parallel over TCP** — CORRECTNESS GATE PASSED (2026-07-17).
+      The whole path was already coded (TcpTransport, moe_sharded, serve wiring); the
+      only gap was that `set_cluster` lived only in `serve`, so `coli gen` — the token
+      oracle — couldn't run multi-node. Fixed in `aec9c52`.
+      - ✅ Gate: 42b2 (rank 0, experts 0-127) + 5a4f (rank 1, experts 128-255),
+        contiguous-block sharding (fingerprint `0xa8ec43a8dc6fb35c` agreed on both),
+        `coli gen <int4-snap> 100 200 300` == single-node, all 16 tokens:
+        `[198,82,198,82,200,82,198,82,198,82,198,82,198,82,198,82]`. Real wire
+        (TcpTransport over the 192.168.100.0/24 RoCE fabric), not LocalTransport.
+      - [ ] **Still to record** (performance, not correctness): tok/s 2-node vs 1-node,
+        per-node cache misses (expect ~½ each → ~2× aggregate SSD BW), wire bytes/token.
+      - Note: ran on the int4 `mateogrgic` model (both nodes have it; 5a4f can't fit the
+        356 GB 8/4 container in its 114 GB free). Correctness is model-independent.
 - [ ] **GDS-1 · Feasibility probe** — separate worktree, ~1 h spike, no engine changes.
       (Prompt: "GDS Feasibility probe".)
       - Gate/output: is real GDS available (not cuFile compat mode)? Does it offload CPU

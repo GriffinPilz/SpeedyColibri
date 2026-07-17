@@ -153,26 +153,30 @@ fn cmd_probe(args: &[String]) -> ExitCode {
 /// `coli convert <src-snapshot> <out-snapshot>` — rewrite a block-scaled FP8 or
 /// modelopt-NVFP4 GLM-5.2 snapshot as the colibrì int4/int8 container the engine loads.
 ///
-/// Bit-widths default to the shipped container (int4 dense + experts, int8
-/// embeddings/head) and can be overridden via `COLI_EBITS` / `COLI_IO_BITS` /
-/// `COLI_XBITS` / `COLI_NLAYERS`.
+/// Bit-widths default to the measured sweet spot — **8-bit resident, 4-bit experts**
+/// (`ebits=8 xbits=4 io_bits=8`): 7.9x better perplexity than all-int4 (6.189 vs
+/// 48.665) for ~33% throughput. Override via `COLI_EBITS` / `COLI_IO_BITS` /
+/// `COLI_XBITS` / `COLI_NLAYERS`; see `ConvertOpts`.
 fn cmd_convert(args: &[String]) -> ExitCode {
     let (indir, outdir) = match (args.get(2), args.get(3)) {
         (Some(a), Some(b)) => (a, b),
         _ => {
             eprintln!("usage: coli convert <fp8|nvfp4-snapshot-dir> <output-snapshot-dir>");
-            eprintln!("  env: COLI_EBITS(4) COLI_IO_BITS(8) COLI_XBITS(=ebits) COLI_NLAYERS(78)");
+            eprintln!("  env: COLI_EBITS(8) COLI_IO_BITS(8) COLI_XBITS(4) COLI_NLAYERS(78)");
             return ExitCode::from(2);
         }
     };
     let env_u32 = |k: &str, d: u32| {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     };
-    let ebits = env_u32("COLI_EBITS", 4);
+    // NB: xbits does NOT default to ebits. It used to (mirroring the reference
+    // converter), which would make the new `ebits=8` default silently mean 8/8 —
+    // the config that doubles bytes-per-token and costs ~40% throughput for
+    // quality that fixing attention already recovers.
     let opts = colibri_engine::ConvertOpts {
-        ebits,
+        ebits: env_u32("COLI_EBITS", 8),
         io_bits: env_u32("COLI_IO_BITS", 8),
-        xbits: env_u32("COLI_XBITS", ebits),
+        xbits: env_u32("COLI_XBITS", 4),
         n_layers: env_u32("COLI_NLAYERS", 78) as usize,
     };
 

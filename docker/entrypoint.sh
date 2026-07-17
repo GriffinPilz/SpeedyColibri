@@ -150,7 +150,7 @@ ensure_container() {
   # different COLI_EBITS/COLI_XBITS doesn't silently reuse the wrong container.
   slug="${COLI_MODEL_REPO//\//--}"
   slug="${slug//[^A-Za-z0-9._-]/_}"
-  dest="${COLI_CONVERT_DIR}/${slug}-e${COLI_EBITS:-4}x${COLI_XBITS:-${COLI_EBITS:-4}}io${COLI_IO_BITS:-8}"
+  dest="${COLI_CONVERT_DIR}/${slug}-e${COLI_EBITS:-8}x${COLI_XBITS:-4}io${COLI_IO_BITS:-8}"
 
   if [[ -f "$dest/.convert-complete" ]]; then
     echo "[coli] using cached int4 container: $dest" >&2

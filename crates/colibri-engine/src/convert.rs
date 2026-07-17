@@ -37,8 +37,23 @@ const E2M1: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
-/// Bit-widths for each tensor class. Defaults mirror the reference converter's
-/// non-`--mtp` invocation: int4 dense + experts, int8 embeddings/head.
+/// Bit-widths for each tensor class.
+///
+/// **Defaults are 8-bit resident / 4-bit experts (`8/4`), measured.** The reference
+/// converter defaults everything to int4; on GLM-5.2 that wrecks the model. Same
+/// source (unsloth/GLM-5.2-FP8), same converter, only `ebits` changed:
+///
+/// | | perplexity | top-1 | tok/s |
+/// |---|---|---|---|
+/// | `4/4` (reference default) | 48.665 | 32.1% | 0.52 |
+/// | `8/4` (ours)              |  6.189 | 57.9% | 0.35 |
+///
+/// 7.9x the quality for a third of the throughput — perplexity 48.7 means the model
+/// was effectively guessing among ~49 tokens; 6.2 is a healthy frontier-model number.
+/// The damage is in the *resident* path, not the experts: attention + dense + shared
+/// expert are only 2.5% of the parameters but 42% of what every token touches, and
+/// they cross all 78 layers. `xbits` (the streamed experts) stays at 4 — 8-bit there
+/// doubles the bytes per token for whatever quality is left once attention is fixed.
 #[derive(Debug, Clone, Copy)]
 pub struct ConvertOpts {
     /// bits for resident weights (attention, dense MLP, shared expert) — `--ebits`
@@ -53,7 +68,7 @@ pub struct ConvertOpts {
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78 }
+        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78 }
     }
 }
 
@@ -551,6 +566,31 @@ pub fn convert_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_8bit_resident_4bit_experts() {
+        // Measured on unsloth/GLM-5.2-FP8, same converter, only ebits changed:
+        //   4/4  perplexity 48.665  top-1 32.1%  0.52 tok/s
+        //   8/4  perplexity  6.189  top-1 57.9%  0.35 tok/s
+        // 8-bit resident is worth 7.9x the quality for ~a third of the throughput.
+        let d = ConvertOpts::default();
+        assert_eq!(d.ebits, 8, "resident weights (attention/dense/shared) must default to 8-bit");
+        assert_eq!(d.xbits, 4, "streamed experts must stay 4-bit");
+        assert_eq!(d.io_bits, 8);
+    }
+
+    #[test]
+    fn expert_bits_are_independent_of_resident_bits() {
+        // The trap: xbits used to default to ebits (mirroring the reference
+        // converter). With ebits now 8 that would silently produce 8/8 — doubling
+        // the bytes streamed per token for ~40% throughput, to recover quality that
+        // fixing attention already recovers. They must move independently.
+        let d = ConvertOpts::default();
+        assert_ne!(d.xbits, d.ebits, "xbits must not track ebits");
+        let hi = ConvertOpts { ebits: 16, ..Default::default() };
+        assert_eq!(hi.xbits, 4, "raising ebits must not drag the experts up with it");
+    }
     use super::*;
     use std::path::PathBuf;
 

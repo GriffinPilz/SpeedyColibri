@@ -151,6 +151,24 @@ the wire — that's what makes the wire traffic cheap and the SSD scaling real.
 Single-node optimizations that attack the same long-context wall as multi-node, but
 independently. Kept here so they aren't lost; not gated on the RDMA/GDS waves.
 
+- [x] **MTP speculative decoding — MEASURED NET LOSS, do not re-try (2026-07-17).**
+      MTP is already wired (`generate_stream` → `generate_stream_drafting`, gated by
+      `DRAFT=n`, off by default). Enabling it made decode *slower*, not faster, on the
+      int4-with-int8-mtp model:
+      | workload | DRAFT=0 | DRAFT=8 | int8-head acceptance |
+      |---|---|---|---|
+      | varied text | 0.586 | 0.436 | 4–10% (auto-disabled) |
+      | natural prose | 0.481 | 0.420 | 0% (auto-disabled) |
+      **Why it can't win here — architectural, not a weak head:** speculative decoding
+      trades more work/forward for fewer forwards. That's a win when COMPUTE-bound (the
+      K-wide verification is ~free on the GPU). This engine is LOAD-bound — a forward's
+      cost is streaming ~11 GB of experts from disk, and verifying K+1 positions routes
+      K+1 sets of experts, so it streams *more* per forward. Unless acceptance is very
+      high it's a net loss, and the int8 head lands at 0–10%. The auto-off guard
+      correctly disables it. Speculative decoding is the wrong class of optimization for
+      a disk-streaming MoE; keep `DRAFT=0`. What this engine wants is *less* compute per
+      forward (DSA), not more.
+
 - [ ] **Sliding-window attention (SWA)** — bound each token's attention to the last W
       positions so prefill attention drops from O(n²) to O(n·W). Goal: **more speed at
       long context with minimal-to-no quality loss.**

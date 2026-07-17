@@ -112,6 +112,86 @@ pub fn is_dense(nk: usize, index_topk: usize) -> bool {
     nk <= index_topk
 }
 
+/// The per-layer lightning-indexer weights (a FULL indexer layer; SHARED layers reuse
+/// the previous FULL layer's selection). Tensor names in the checkpoint:
+/// `self_attn.indexer.{wk, k_norm, wq_b, weights_proj}`.
+pub struct IndexerWeights<'a> {
+    /// key projection `hidden -> index_hd` (`indexer.wk`)
+    pub wk: &'a colibri_core::quant::QTensor,
+    /// key LayerNorm weight + bias (`indexer.k_norm`), eps 1e-6
+    pub knorm_w: &'a [f32],
+    pub knorm_b: &'a [f32],
+    /// query projection `q_lora -> nh*index_hd` (`indexer.wq_b`)
+    pub wq: &'a colibri_core::quant::QTensor,
+    /// per-head weight projection `hidden -> nh` (`indexer.weights_proj`)
+    pub wp: &'a colibri_core::quant::QTensor,
+}
+
+/// Run the lightning indexer over a prefill batch and return, per query, the cached
+/// positions the main attention should attend to (empty = dense no-op). Port of the
+/// `idx_type[layer]` FULL block in `glm.c`, for `pos_base .. pos_base+s_len` with the
+/// cache starting at 0 (the long-context prefill case DSA targets).
+///
+/// For each new token the indexer key is `rope(layernorm(x·wk), pos)` — RoPE on the
+/// first `qk_rope` dims only, exactly as the C. For each query the indexer query is
+/// `rope(q_lora·wq)` per head and the head weights are `x·wp`; positions are scored
+/// with [`indexer_score`] and [`select_topk`] picks the top `index_topk`.
+#[allow(clippy::too_many_arguments)]
+pub fn indexer_forward(
+    w: &IndexerWeights,
+    x: &[f32],       // [s_len, hidden]
+    q_lora: &[f32],  // [s_len, q_lora_dim]  (the q_a-normed query, `QR` in the C)
+    s_len: usize,
+    nh: usize,
+    index_hd: usize,
+    index_topk: usize,
+    qk_rope: usize,
+    theta: f32,
+    pos_base: usize,
+) -> Vec<Vec<u32>> {
+    use crate::linear::matmul_qt;
+    use crate::math::{layernorm, rope_interleave};
+
+    let q_lora_dim = w.wq.i as usize;
+    let hidden = w.wk.i as usize;
+    let rope = qk_rope.min(index_hd);
+
+    // 1) indexer keys for the new tokens: k[s] = rope(layernorm(x[s]·wk), pos).
+    let mut keys = vec![0f32; s_len * index_hd];
+    matmul_qt(&mut keys, x, w.wk, s_len);
+    for s in 0..s_len {
+        let pos = pos_base + s;
+        let k = &mut keys[s * index_hd..(s + 1) * index_hd];
+        layernorm(k, w.knorm_w, w.knorm_b, 1e-6);
+        rope_interleave(&mut k[..rope], pos, rope, theta);
+    }
+
+    // 2) per query: indexer query + head weights, score every causal key, select.
+    let mut sel = vec![Vec::new(); s_len];
+    for s in 0..s_len {
+        let pos = pos_base + s;
+        let nk = pos + 1; // causal, cache starts at 0
+        if is_dense(nk, index_topk) {
+            continue; // no-op: attention attends to all (empty selection)
+        }
+        let mut qi = vec![0f32; nh * index_hd];
+        matmul_qt(&mut qi, &q_lora[s * q_lora_dim..(s + 1) * q_lora_dim], w.wq, 1);
+        for h in 0..nh {
+            rope_interleave(&mut qi[h * index_hd..h * index_hd + rope], pos, rope, theta);
+        }
+        let mut hw = vec![0f32; nh];
+        matmul_qt(&mut hw, &x[s * hidden..(s + 1) * hidden], w.wp, 1);
+
+        let mut scores = vec![0f32; nk];
+        for (t, sc) in scores.iter_mut().enumerate() {
+            let kt = &keys[t * index_hd..(t + 1) * index_hd];
+            *sc = indexer_score(&qi, kt, &hw, nh, index_hd);
+        }
+        sel[s] = select_topk(&scores, index_topk);
+    }
+    sel
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +249,46 @@ mod tests {
         let scores = [1.0; 10];
         let sel = select_topk(&scores, 3);
         assert_eq!(sel, vec![0, 1, 2]);
+    }
+
+    fn vecf(n: usize, seed: u64) -> Vec<f32> {
+        // deterministic pseudo-random in [-1, 1), no rng dependency
+        (0..n)
+            .map(|i| {
+                let z = (i as u64).wrapping_mul(2654435761).wrapping_add(seed.wrapping_mul(40503));
+                ((z % 2000) as f32 / 1000.0) - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn indexer_forward_selects_and_respects_dense() {
+        use crate::quantize::qtensor_from_f32;
+        let (hidden, index_hd, nh, q_lora_dim) = (8usize, 4usize, 2usize, 6usize);
+        let (index_topk, qk_rope, s_len) = (2usize, 2usize, 4usize);
+        // f32 (bits=16) synthetic weights → exact matmul.
+        let wk = qtensor_from_f32(&vecf(index_hd * hidden, 1), index_hd, hidden, 16);
+        let wq = qtensor_from_f32(&vecf(nh * index_hd * q_lora_dim, 2), nh * index_hd, q_lora_dim, 16);
+        let wp = qtensor_from_f32(&vecf(nh * hidden, 3), nh, hidden, 16);
+        let knw = vec![1.0f32; index_hd];
+        let knb = vec![0.0f32; index_hd];
+        let w = IndexerWeights { wk: &wk, knorm_w: &knw, knorm_b: &knb, wq: &wq, wp: &wp };
+        let x = vecf(s_len * hidden, 7);
+        let ql = vecf(s_len * q_lora_dim, 8);
+
+        let sel = indexer_forward(&w, &x, &ql, s_len, nh, index_hd, index_topk, qk_rope, 10000.0, 0);
+
+        // queries 0,1 have nk=1,2 <= index_topk=2 → dense no-op (empty selection).
+        assert!(sel[0].is_empty() && sel[1].is_empty(), "context <= index_topk must be dense");
+        // queries 2,3 have nk=3,4 > 2 → keep = min(nk, index_topk) = 2 positions.
+        assert_eq!(sel[2].len(), 2);
+        assert_eq!(sel[3].len(), 2);
+        // every selected position is a valid causal index, ascending.
+        for (s, sl) in sel.iter().enumerate() {
+            assert!(sl.windows(2).all(|w| w[0] < w[1]), "selection must be ascending");
+            for &t in sl {
+                assert!((t as usize) <= s, "selected pos {t} not causal for query {s}");
+            }
+        }
     }
 }

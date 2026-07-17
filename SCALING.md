@@ -14,8 +14,10 @@ K3-class) is a streaming problem. Scale it two ways, over ConnectX-7 (200 GbE Ro
    *its own* NVMe, so read bandwidth scales ~linearly with nodes (the single-drive
    ~10.5 GB/s ceiling stops being the cap).
 
-GDS (cuFile) is the per-node refinement: DMA storage→memory to **free the CPU cores**
-the read path currently pegs, so they're available for the RDMA transport.
+GDS (cuFile) was to be the per-node refinement: DMA storage→memory to free the CPU
+cores the read path pegs, for the RDMA transport. **GDS-1 came back NO-GO** — GB10's
+unified memory makes it inapplicable (see Wave 1). The *goal* — offload read-path CPU
+— stays; pursue it via async I/O (io_uring), not GDS.
 
 Data-flow rule (non-negotiable): **move activations to experts, not weights.** A
 remote expert gets the tiny activation rows (~tens of KB); the owner computes the FFN
@@ -65,10 +67,21 @@ the wire — that's what makes the wire traffic cheap and the SSD scaling real.
         per-node cache misses (expect ~½ each → ~2× aggregate SSD BW), wire bytes/token.
       - Note: ran on the int4 `mateogrgic` model (both nodes have it; 5a4f can't fit the
         356 GB 8/4 container in its 114 GB free). Correctness is model-independent.
-- [ ] **GDS-1 · Feasibility probe** — separate worktree, ~1 h spike, no engine changes.
-      (Prompt: "GDS Feasibility probe".)
-      - Gate/output: is real GDS available (not cuFile compat mode)? Does it offload CPU
-        vs chunked pread? Clear **GO / NO-GO**. NO-GO cancels Wave-2/3 GDS tasks.
+- [x] **GDS-1 · Feasibility probe** — **NO-GO** (2026-07-17). Cancels GDS-2 + GDS-3.
+      `gdscheck -p` on the GB10 Spark (GDS 1.15.1.6, libcufile 2.12, aarch64):
+      every storage backend `Unsupported` (NVMe, NVMe P2PDMA, NVMeOF, all FS),
+      `use_compat_mode : true`, nvidia-fs module not loaded (loading it needs root we
+      don't have on the shared box). So cuFile would run in compat mode = POSIX read +
+      CPU bounce = zero DMA offload, the exact thing this gate rejects.
+      - **Root cause is architectural, not a missing module:** GB10 is unified coherent
+        memory. The engine already reads NVMe→host RAM and the GPU reads that RAM
+        *zero-copy* (no cudaMemcpy). GDS's value is DMA NVMe→**VRAM** to skip the host
+        bounce on a *discrete* GPU; there is no separate VRAM here to bounce to, so
+        `NVMe P2PDMA: Unsupported` is the platform correctly saying GDS's model doesn't
+        apply. Even with root + nvidia-fs it would not help the way it does on PCIe.
+      - **The underlying goal survives GDS** — free the CPU cores the read path pegs so
+        they can drive the RDMA transport. Pursue via async I/O (io_uring) instead;
+        tracked in the backlog, NOT as a GDS task.
 
 ### Wave 2 — after Wave-1 gates are green
 
@@ -78,14 +91,14 @@ the wire — that's what makes the wire traffic cheap and the SSD scaling real.
         the engine (RoCE bring-up: GID index, RoCEv2, PFC/MTU — budget time here).
       - Gate: RDMA tokens == TCP tokens == single-node. A/B vs TCP: round-trip latency,
         tok/s, driver CPU%.
-- [ ] **GDS-2 · cuFile FFI + registered read** — only if GDS-1 = GO. Independent crate,
+- [~] **GDS-2 · cuFile FFI + registered read** — CANCELLED (GDS-1 = NO-GO). Independent crate,
       overlaps RDMA-B. (Prompt: "cuFile FFI + registered-buffer read".)
       - Gate: GDS read byte-identical to `read_raw_shared`; `--features gds` off = build
         + 87 tests unchanged.
 
 ### Wave 3 — last (measured in the multi-node context on purpose)
 
-- [ ] **GDS-3 · Wire GDS into expert load + benchmark** — after RDMA-A exists so the
+- [~] **GDS-3 · Wire GDS into expert load + benchmark** — CANCELLED (GDS-1 = NO-GO). Kept for context. Was: after RDMA-A exists so the
       CPU-offload value is measurable where it matters. (Prompt: "Wire GDS + benchmark".)
       - Gate: tokens match (unconstrained + `COLI_RAM_GB=25`). A/B `COLI_GDS=1` vs `0`:
         preload GB/s, decode load time, **driver CPU% during load** (the real win).
@@ -121,7 +134,11 @@ the wire — that's what makes the wire traffic cheap and the SSD scaling real.
 
 ## Decision log / open questions
 
-- [ ] GDS GO/NO-GO (from GDS-1) — record the CPU + GB/s numbers and the decision.
+- [x] GDS GO/NO-GO (from GDS-1) — **NO-GO** (2026-07-17). No CPU/GB-s numbers taken:
+      gdscheck reports compat-mode-only (every backend Unsupported, nvidia-fs unloaded,
+      no root), so there was no real-GDS path to benchmark. Root cause is GB10's unified
+      memory — the GPU already reads host RAM zero-copy, so GDS's NVMe->VRAM DMA has no
+      VRAM bounce to eliminate. GDS-2/3 cancelled. Read-path CPU offload -> io_uring backlog.
 - [ ] Transport lib for RDMA-B: raw libibverbs+rdma_cm FFI (dependency-light) vs UCX
       (simpler, adds dep). Default to raw verbs unless bring-up proves too costly.
 - [ ] EP topology: rank-0-drives + peers-as-expert-servers (v1) — revisit symmetric

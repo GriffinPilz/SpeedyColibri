@@ -6,10 +6,72 @@
 //! against the ported crates.
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod serve;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Set by the SIGINT/SIGTERM handler; polled by the long-running server loops
+/// (`serve`'s accept loop, `worker`'s park loop) so they stop instead of hanging.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// True once a shutdown signal has been received.
+pub(crate) fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+/// Signal handler. First signal → request graceful shutdown; a second (impatient
+/// operator, or a graceful stop that's wedged mid-request) → immediate `_exit`.
+///
+/// Async-signal-safe: an atomic swap and `_exit` are the only operations, both on the
+/// POSIX allowlist. `std::process::exit` is NOT safe here — it runs atexit hooks that
+/// can deadlock if the signal interrupted an allocation — so the hard path uses
+/// `_exit`, which the kernel guarantees is safe from a handler.
+#[cfg(unix)]
+extern "C" fn on_shutdown_signal(_sig: libc::c_int) {
+    if SHUTDOWN.swap(true, Ordering::SeqCst) {
+        unsafe { libc::_exit(130) };
+    }
+}
+
+/// Install SIGINT/SIGTERM handlers so the long-running servers stop cleanly.
+///
+/// This is also what makes shutdown work **as PID 1 in a container**: the kernel
+/// discards a signal sent to PID 1 unless PID 1 has installed a handler for it, so
+/// without this `docker stop` (SIGTERM) and Ctrl-C (SIGINT) are ignored, the server
+/// loop blocks forever, and the terminal never returns — the reported bug. The
+/// entrypoint `exec`s `coli`, so `coli` really is PID 1.
+///
+/// No `SA_RESTART`: a signal landing during a blocking syscall should return `EINTR`
+/// so the loop wakes and checks [`shutdown_requested`], rather than silently resuming.
+#[cfg(unix)]
+pub(crate) fn install_shutdown_handlers() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_shutdown_signal as extern "C" fn(libc::c_int) as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn install_shutdown_handlers() {}
+
+/// Exit on shutdown, skipping the Drop of the model / expert cache / CUDA context.
+///
+/// Measured on the box (`COLI_DISCOVER_SECS=0`, so no startup-scan confound): the loop
+/// notices the signal in ~50ms, then exit takes ~2s. That ~2s is the **kernel**
+/// reclaiming this ~60 GB process's mappings (resident weights + 40 GB expert cache +
+/// KV + device shadow); it is NOT userspace atexit — `libc::_exit(0)` was measured no
+/// faster (2.6s vs 2.0s, within noise) — so there is nothing to skip by going lower
+/// than `process::exit`. Drop *is* worth skipping (redundant explicit frees on a dying
+/// process), which is the one thing this does. ~2s sits well inside docker's 10s grace.
+pub(crate) fn shutdown_exit() -> ! {
+    std::process::exit(0)
+}
 
 /// Source revision this binary was built from (see `build.rs`). Printed by `version`
 /// and by the `serve`/`worker` banners: a container image built from stale source
@@ -656,9 +718,16 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     );
     // Advertise on the discovery beacon so `cluster` scans see this worker.
     colibri_cluster::discovery::spawn_beacon(cluster.this_node.0, port);
-    loop {
-        std::thread::park();
+    // serve_experts runs the accept loop on its own thread; this thread just waits for
+    // a shutdown signal. Handle SIGINT/SIGTERM (as PID 1 under Docker the kernel
+    // ignores them without a handler) and poll instead of parking forever, so
+    // `docker stop` / Ctrl-C actually return the terminal.
+    install_shutdown_handlers();
+    while !shutdown_requested() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
+    eprintln!("[worker] shutdown signal received — stopping");
+    shutdown_exit()
 }
 
 /// Direct parallel preload from the original model (no repack). One thread per
@@ -1612,6 +1681,24 @@ mod tests {
     }
 
     const GB: u64 = 1 << 30;
+
+    // The ONLY test that touches the process-global signal state — kept single so it
+    // cannot race another test between the reset and the raise. A raise while SHUTDOWN
+    // is already true takes the `_exit` path and would kill the test runner; the reset
+    // + single raise keeps this on the first-signal (flag-only) path.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_requests_shutdown_without_exiting() {
+        SHUTDOWN.store(false, Ordering::SeqCst);
+        install_shutdown_handlers();
+        assert!(!shutdown_requested(), "flag should start clear");
+        // raise() runs the handler synchronously before returning. If the handler had
+        // taken the _exit path this process would die and the run would fail as a
+        // crash — so reaching the assert at all is half the test.
+        unsafe { libc::raise(libc::SIGTERM) };
+        assert!(shutdown_requested(), "SIGTERM must set the shutdown flag");
+        SHUTDOWN.store(false, Ordering::SeqCst); // leave clean for any later code
+    }
 
     #[test]
     fn logprob_matches_hand_computed_softmax() {

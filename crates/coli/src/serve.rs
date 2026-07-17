@@ -266,6 +266,13 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Handle SIGINT/SIGTERM so the server (often PID 1 under Docker) stops on Ctrl-C or
+    // `docker stop` instead of hanging until SIGKILL. Nonblocking accept + a poll of
+    // the shutdown flag is what lets the blocking loop below actually notice it.
+    crate::install_shutdown_handlers();
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("[serve] warning: set_nonblocking failed ({e}); Ctrl-C may be slow");
+    }
     println!(
         "[serve] coli {} — OpenAI-compatible server on http://{addr}  (model: {model_id})",
         crate::version_string()
@@ -293,13 +300,30 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         colibri_cluster::discovery::spawn_beacon(rank, port);
     }
 
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => handle(stream, model, &*provider, &tok, &model_id, ctx_len),
+    while !crate::shutdown_requested() {
+        match listener.accept() {
+            // handle() does blocking, timeout-bounded reads; the listener is
+            // nonblocking but the accepted socket must not be, or reads spin.
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                handle(stream, model, &*provider, &tok, &model_id, ctx_len);
+            }
+            // No pending connection: nap briefly, then re-check SHUTDOWN. 100 ms of
+            // accept latency is nothing next to a multi-second generation, and it
+            // bounds how long Ctrl-C takes to be noticed.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // EINTR from the signal itself: loop and let the SHUTDOWN check handle it.
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => eprintln!("[serve] accept: {e}"),
         }
     }
-    ExitCode::SUCCESS
+    println!("[serve] shutdown signal received — stopping");
+    // Loop noticed the signal in ~50ms (measured); shutdown_exit then skips Drop. The
+    // remaining ~2s is the kernel reclaiming this ~60 GB process, unavoidable and well
+    // inside docker's grace — see shutdown_exit's docs.
+    crate::shutdown_exit()
 }
 
 fn mk_kv(model: &Model, max_t: usize) -> KvCache {

@@ -24,3 +24,6 @@ colibri-tokenizer = { workspace = true }
 colibri-json = { workspace = true }
 colibri-cluster = { workspace = true }
 colibri-backend = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

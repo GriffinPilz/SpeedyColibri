@@ -120,3 +120,30 @@ the wire — that's what makes the wire traffic cheap and the SSD scaling real.
       driving later if it helps.
 - [ ] GDS buffer ownership: copy-out to `Arc<[u8]>` vs a `Bytes::Registered` pooled
       variant (decide in GDS-2 from the probe's registration-cost numbers).
+
+## Backlog — orthogonal speedups (not in the wave plan)
+
+Single-node optimizations that attack the same long-context wall as multi-node, but
+independently. Kept here so they aren't lost; not gated on the RDMA/GDS waves.
+
+- [ ] **Sliding-window attention (SWA)** — bound each token's attention to the last W
+      positions so prefill attention drops from O(n²) to O(n·W). Goal: **more speed at
+      long context with minimal-to-no quality loss.**
+      - *Motivation (measured 2026-07-17, single node, 8/4):* prefill dominates long
+        context — 512 in → 202 s, 2048 in → 618 s — and decode degrades with context
+        (0.58 → 0.45 tok/s from 512 → 2048) because each step attends over the whole
+        KV. Both are the attention span growing; SWA caps it.
+      - *Quality risk is real:* GLM-5.2's checkpoint config has **no** window param —
+        it was trained with **full** attention, so SWA is an added approximation, not a
+        native mode. It may hurt quality; this is why it's a *test*, not a change.
+      - *Quality gate (hard):* `coli ppl` must stay at the 8/4 baseline — perplexity
+        ≈ 6.189, top-1 ≈ 57.9%. Sweep W (e.g. 1k/2k/4k/8k) and take the smallest W that
+        does not regress ppl. If no W both speeds up and holds quality → negative
+        result, record it and drop.
+      - *Measure:* prefill (TTFT) and decode tok/s at 2k/8k/32k input, SWA on vs off,
+        plus ppl on vs off. Same harness as the long-context record
+        (`scripts` + `coli ppl`). Report speedup **and** ppl delta together — a speedup
+        that moved ppl is not a win.
+      - *Also worth a look:* attention-sink / StreamingLLM variants (keep the first few
+        tokens + a sliding window) often hold quality far better than a plain window on
+        a full-attention-trained model — cheap to try once the window path exists.

@@ -111,6 +111,43 @@ pub fn attention_with(
     }
 
     let st0 = kv.kv_start[layer];
+
+    // DSA lightning indexer: on a FULL indexer layer, once the context exceeds
+    // `index_topk`, select the top-k keys per query and attend only to those. Needs
+    // the full context in cache (st0 == 0 — the long-context prefill DSA targets) and
+    // the layer's indexer weights. An explicit `sel` (tests), a missing indexer, a
+    // SHARED layer, or a short context all leave attention dense. `x`/`qr` are the same
+    // inputs the C's indexer uses.
+    let dsa_selection: Option<Vec<Vec<u32>>> = if sel.is_none()
+        && st0 == 0
+        && l.ix_wk.is_some()
+        && cfg.idx_type.get(layer).copied().unwrap_or(false)
+        && pos_base + s_len > cfg.index_topk as usize
+    {
+        let iw = crate::dsa::IndexerWeights {
+            wk: l.ix_wk.as_ref().unwrap(),
+            knorm_w: &l.ix_knorm_w,
+            knorm_b: &l.ix_knorm_b,
+            wq: l.ix_wq.as_ref().unwrap(),
+            wp: l.ix_wp.as_ref().unwrap(),
+        };
+        Some(crate::dsa::indexer_forward(
+            &iw,
+            x,
+            &qr,
+            s_len,
+            cfg.index_nh as usize,
+            cfg.index_hd as usize,
+            cfg.index_topk as usize,
+            r,
+            theta,
+            pos_base,
+        ))
+    } else {
+        None
+    };
+    let sel = sel.or(dsa_selection.as_deref());
+
     let mut ctx = vec![0f32; s_len * h * vh];
 
     // GPU weight-absorption attention core for resident kv_b (falls back to CPU).

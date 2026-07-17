@@ -158,6 +158,19 @@ fn load_layer(
     )?;
     l.o = qt_load(shards, &p("self_attn.o_proj.weight"), d, h * cfg.v_head as usize, dbits)?;
 
+    // DSA lightning indexer — present only when the checkpoint was converted with the
+    // indexer weights (`--indexer`). Load per layer that carries them; a model without
+    // these tensors leaves the fields `None` and attention runs dense. Names/dims match
+    // the C loader (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`).
+    if cfg.index_hd > 0 && cfg.index_nh > 0 && shards.has(&p("self_attn.indexer.wq_b.weight")) {
+        let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
+        l.ix_wq = Some(qt_load(shards, &p("self_attn.indexer.wq_b.weight"), nh * hd, cfg.q_lora as usize, dbits)?);
+        l.ix_wk = Some(qt_load(shards, &p("self_attn.indexer.wk.weight"), hd, d, dbits)?);
+        l.ix_wp = Some(qt_load(shards, &p("self_attn.indexer.weights_proj.weight"), nh, d, dbits)?);
+        l.ix_knorm_w = ld(shards, &p("self_attn.indexer.k_norm.weight"))?;
+        l.ix_knorm_b = ld(shards, &p("self_attn.indexer.k_norm.bias"))?;
+    }
+
     l.sparse = sparse;
     if !sparse {
         // dense MLP

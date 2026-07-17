@@ -39,6 +39,15 @@ pub struct Layer {
     pub sh_gate: QTensor,
     pub sh_up: QTensor,
     pub sh_down: QTensor,
+
+    // DSA lightning indexer (present only on FULL indexer layers, i.e. when the
+    // checkpoint was converted with the indexer weights). `None`/empty → no DSA on
+    // this layer, so attention runs the dense path. See `crate::dsa`.
+    pub ix_wk: Option<QTensor>,     // key proj: hidden -> index_hd
+    pub ix_wq: Option<QTensor>,     // query proj: q_lora -> index_nh*index_hd
+    pub ix_wp: Option<QTensor>,     // per-head weight proj: hidden -> index_nh
+    pub ix_knorm_w: Vec<f32>,       // key LayerNorm weight (eps 1e-6)
+    pub ix_knorm_b: Vec<f32>,       // key LayerNorm bias
 }
 
 /// The MTP (multi-token prediction) speculative head — port of the `mtpL` /

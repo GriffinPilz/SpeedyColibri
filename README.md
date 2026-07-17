@@ -97,18 +97,20 @@ Wait for this line before sending requests:
 | `port` | *(optional)* TCP port to listen on and publish from the container. | `8080` |
 | `warm-up prompt...` | *(optional)* Text run through one short generation at startup, so the hottest experts are resident before the first real request. Several via `COLI_WARMUP="a\|b"`. | none |
 
-### 3. Query it  ·  first token in a few seconds, then ~1.2 tokens/sec
+### 3. Query it  ·  ~0.5 tok/s single-node decode (see the record for current numbers)
 
 Any OpenAI client works. Streaming (`"stream": true`) sends tokens as they are
-produced — worth using at ~1 tok/s so output appears live instead of after the
-full ~N/1.2 seconds.
+produced — worth using at sub-1 tok/s so output appears live instead of after the
+whole completion. Current measured throughput and long-context prefill costs are in
+the [Performance & quality record](#performance--quality-record); a short prompt's
+first token lands in a few seconds, but a long prompt pays a large prefill first.
 
 ```bash
 # Liveness + what's served (instant)
 curl http://localhost:8080/health
 curl http://localhost:8080/v1/models
 
-# Chat, streamed as Server-Sent Events (a 64-token reply ≈ 50 s at ~1.2 tok/s)
+# Chat, streamed as Server-Sent Events (a 64-token reply ≈ 2+ min at ~0.5 tok/s)
 curl -N http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "stream": true, "max_tokens": 64,
   "messages": [{"role": "user", "content": "Explain MoE routing in one sentence."}]
@@ -202,20 +204,14 @@ COLI_RAM_GB=85 COLI_TIMING=1 COLI_PROFILE=1 docker/run-dgx.sh gen 100 200 300 40
 
 ## Where it stands
 
-Running the real 358 GB model on **one** DGX Spark (GB10), int4 experts, 85 GB
-expert cache — honest, disk-streaming-bound numbers:
-
-| | |
-|---|---|
-| Decode (steady state) | **~1.2 tok/s** mean, ~1.5 best |
-| Prefill (8-token prompt) | ~18 s (one-time cold expert load) |
-| Correctness | GPU tokens **byte-identical** to the CPU path |
-| Resident footprint | ~10 GB dense + capped expert cache; no OOM |
-
-The bottleneck is **loading**, not math: every token streams ~180 fresh experts
-(~3.4 GB) from disk, and the model is far larger than RAM, so experts can't all
-stay resident and load can't overlap the per-layer-sequential routing. On this
-single node, decode ≈ load + compute.
+Running the real 358 GB model on **one** DGX Spark (GB10). The bottleneck is
+**loading**, not math: every token streams ~180 fresh experts (~3.4 GB) from disk,
+and the model is far larger than RAM, so experts can't all stay resident and load
+can't overlap the per-layer-sequential routing. On this single node, decode ≈ load +
+compute. For the current, measured throughput and quality numbers see the
+[Performance & quality record](#performance--quality-record) below — they supersede
+every tok/s figure that used to live here (those came from a repeated-single-prompt
+benchmark that read ~1.5–2× high, on the pre-8/4 model).
 
 What's landed to push on that wall:
 
@@ -229,6 +225,60 @@ What's landed to push on that wall:
 
 Per-module port status and the milestone order live in **[PORTING.md](PORTING.md)**.
 
+## Performance & quality record
+
+A living, measured record of throughput and quality per node size — **starting →
+current** — so progress (and regressions) stay visible. Update `current` as it
+changes; leave `starting` fixed so the trajectory reads at a glance.
+
+**Read the conditions, not just the digits** — they move the number more than any
+optimization does:
+- A *repeated-single-prompt* benchmark reads ~1.5–2× higher than *diverse* prompts,
+  because the expert cache hits on the repeat. All numbers here use 12 diverse prompts.
+- A RAM budget past the swap cliff collapses throughput ~4× (measured: 87 GB → 0.11,
+  40 GB → 0.46). All current numbers use the auto budget (`MemTotal/3` ≈ 41 GB/node).
+- Output is **bit-identical** across node counts, so **quality is node-independent** —
+  it's tracked once, not per size.
+
+Config: GLM-5.2 744B MoE, **8/4** (int8 resident / int4 experts), GB10 Grace-Blackwell,
+greedy decode. Last updated **2026-07-17**.
+
+### Quality (model-level, all node sizes)
+
+| | perplexity ↓ | top-1 ↑ | when |
+|---|---|---|---|
+| starting — int4 resident (reference 4/4) | 48.665 | 32.1% | baseline |
+| **current — int8 resident (shipped 8/4)** | **6.189** | **57.9%** | 2026-07-17 |
+
+int4 attention was wrecking the model; int8 resident recovers it for +~7 GB RAM. The
+routed experts stay int4 in both. Perplexity from `coli ppl`; lower is better.
+
+### Throughput — decode, diverse prompts, short context
+
+| nodes | starting tok/s | current tok/s | how measured |
+|---|---|---|---|
+| 1 | 0.46 | **0.46** | counterbalanced, n ≥ 6, auto budget |
+| 2 | — | *not yet measured on 8/4* | prior repeated-prompt runs read ~1.95, but on the old model and inflated — not comparable; re-measure with RDMA-A |
+
+The single-node number is flat from a 20 GB to a 55 GB cache (diverse traffic barely
+reuses experts), so cache size is not a throughput lever here — headroom and avoiding
+swap are.
+
+### Long context — single node, 8/4, varied input (in progress)
+
+| input tokens | prefill (time to first token) | decode at that context |
+|---|---|---|
+| 512 | 202 s | 0.58 tok/s |
+| 2048 | 618 s | 0.45 tok/s |
+| 32k (target-adjacent) | ~2.5 h *(extrapolated, unmeasured)* | lower |
+| 64k (bare-minimum target) | ~5 h *(extrapolated, unmeasured)* | lower |
+
+Prefill is ~linear (~0.27 s/token + ~63 s fixed) and dominates at long context, which
+is why 64k single-node is impractical on time (memory fits fine, no swap). This is the
+case for the multi-node work below: sharding experts cuts per-node prefill streaming.
+The 32k/64k rows are **extrapolations from the two measured points**, not measurements
+— they will be replaced with real numbers or struck out.
+
 ## Multi-Spark (expert-parallel)
 
 **Working, and it's the single biggest win available.** The 256 experts/layer are
@@ -237,10 +287,15 @@ answers its peers over the ConnectX/RoCE fabric. The dense part (attention, shar
 expert, embeddings) is replicated per node, so only expert activations cross the wire
 (~24 KB each way, not expert weights).
 
+> ⚠️ **These 2-Spark numbers are superseded and not comparable to the record above.**
+> They were taken with a *repeated single prompt* (which reads ~1.5–2× high because the
+> cache hits on the repeat) on the pre-8/4 model. They are kept only because they are
+> the sole 2-node data that exists; the shape (2-node ≈ 2× 1-node, from residency not
+> compute) is believed to hold, but the magnitudes must be re-measured with diverse
+> prompts on 8/4 (RDMA-A). Treat as illustrative, not current.
+
 Measured on two DGX Sparks, 32-token greedy decode, 6 consecutive repeats against a
-warm server. **Both rows use a 40 GB expert cache per node** so the comparison is
-like-for-like — that is why the 1-Spark row is below the ~1.2 tok/s quoted in
-[Where it stands](#where-it-stands), which uses an 85 GB cache:
+warm server, **40 GB expert cache per node**:
 
 | | cold (1st run) | warm (converged) |
 |---|---|---|

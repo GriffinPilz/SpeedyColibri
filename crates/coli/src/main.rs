@@ -1015,8 +1015,10 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Held back from the expert cache on top of any caller-specific reserve: allocator
-/// slack, the CUDA context, and short-lived working set.
+/// Held back from the expert cache on top of any caller-specific reserve: the CUDA
+/// context and its workspaces, expert read buffers, activations and HTTP scratch, and
+/// allocator slack. Mirrors the VRAM-side reserve in `colibri_engine::gpu::ffn_budget`
+/// — on the Spark's unified pool both draw from the same ~121 GB.
 ///
 /// This alone is **not** what keeps the box out of swap — see [`CACHE_CAP_DIVISOR`],
 /// which is the real guard. Subtracting a constant from `MemAvailable` cannot express

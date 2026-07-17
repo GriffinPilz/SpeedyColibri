@@ -141,14 +141,23 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         .saturating_mul(KV_COPIES);
     let budget = crate::ram_budget_reserving(kv_reserve);
     let gib = (1u64 << 30) as f64;
-    println!(
-        "[serve] expert cache: {:.0} GB budget (reserved {:.1} GB KV for {} ctx{}) \
-         — set COLI_RAM_GB to override",
-        budget as f64 / gib,
-        kv_reserve as f64 / gib,
-        ctx_len,
-        if KV_COPIES > 1 { ", incl. device shadow" } else { "" }
-    );
+    if budget == u64::MAX {
+        // No /proc/meminfo (non-Linux dev box): the budget is unbounded, and printing
+        // it as a number renders "17179869184 GB". Say what actually happened.
+        println!(
+            "[serve] expert cache: unbounded (no MemAvailable to budget from) \
+             — set COLI_RAM_GB to cap it"
+        );
+    } else {
+        println!(
+            "[serve] expert cache: {:.0} GB budget (reserved {:.1} GB KV for {} ctx{}) \
+             — set COLI_RAM_GB to override",
+            budget as f64 / gib,
+            kv_reserve as f64 / gib,
+            ctx_len,
+            if KV_COPIES > 1 { ", incl. device shadow" } else { "" }
+        );
+    }
 
     let usage_path =
         std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));

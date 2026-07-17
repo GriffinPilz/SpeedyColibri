@@ -56,8 +56,14 @@ ENV COLI_GIT_SHA=${GIT_SHA}
 # The CUDA (Blackwell) backend is the default. CUDA_ARCH must be an explicit
 # sm_* here — `native` probes a GPU, and there is none during `docker build`.
 # CPU-only image: --build-arg CUDA_FEATURE=0.
+#
+# `sm_121a`, not `sm_121`: the `a` (architecture-specific) target is where NVIDIA
+# exposes GB10's block-scaled tensor-core instructions. ptxas rejects NVFP4's
+# `mma.sync...kind::mxf4nvf4.block_scale` on plain `sm_121` and accepts it on
+# `sm_121a` (measured on the box). Both target compute 12.1 only, so this costs no
+# device coverage.
 ARG CUDA_FEATURE=1
-ARG CUDA_ARCH=sm_121
+ARG CUDA_ARCH=sm_121a
 ENV CUDA_HOME=/usr/local/cuda
 RUN if [ "$CUDA_FEATURE" = "1" ]; then \
         CUDA_ARCH="$CUDA_ARCH" cargo build --release -p coli --features cuda; \

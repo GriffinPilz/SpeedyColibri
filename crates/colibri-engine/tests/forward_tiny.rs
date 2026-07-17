@@ -3,6 +3,24 @@
 //! without a reference model, but we assert the whole pipeline wires up: it runs
 //! without panicking, produces in-range tokens and finite logits, and is
 //! deterministic.
+//!
+//! # KNOWN FLAKE — run these serially under `--features cuda`
+//!
+//! ```text
+//! cargo test --release --features cuda -- --test-threads=1
+//! ```
+//!
+//! With cargo's default parallelism these tests fail nondeterministically on a CUDA
+//! build — measured on GB10 at 0, 3, 4 and 5 failures across repeated runs of the
+//! *same* binary. Serial passes 3/3; CPU-only passes in parallel. So it is GPU state
+//! shared across concurrently-running tests, not a temp-dir collision and not the
+//! `-arch` target (sm_121 and sm_121a flake identically).
+//!
+//! The root cause is NOT diagnosed. Candidates, unverified: the global `BUF_POOL`
+//! recycling buffer addresses while `gpu.rs` keys its device-tensor cache by pointer
+//! (`try_matmul_qt`), or CUDA context init racing. Do not read a green parallel run
+//! as evidence of a fix — one arch was observed passing 6/6 once and failing 5/6 two
+//! runs later.
 
 use colibri_engine::{
     forward, generate_greedy, load_model_with, logits, preload_parallel, repack, ExpertProvider,

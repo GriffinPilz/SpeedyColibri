@@ -1274,7 +1274,26 @@ mod tests {
             let mut y_ref = vec![0f32; o];
             matmul_qt(&mut y_loaded, &x, loaded, 1);
             matmul_qt(&mut y_ref, &x, &reference, 1);
-            assert_eq!(y_loaded, y_ref);
+            // Not assert_eq!. Under `--features cuda` these two deliberately take
+            // different kernels: `load_expert` marks the expert gpu_eligible, so
+            // `loaded` runs on the GPU, while `reference` gets gpu_eligible=false from
+            // Default and stays on the CPU. They accumulate in different orders and
+            // land ~1e-7 apart in relative terms — f32 epsilon, not a math error.
+            // Demanding bit-identity made `cargo test --features cuda` fail on the
+            // only platform that ships CUDA, which hid every other CUDA regression
+            // behind a permanently red suite.
+            //
+            // 1e-5 still catches what this test is for: a mis-decoded int4 nibble or a
+            // dropped offset-binary bias moves a value by ~8*scale, i.e. orders of
+            // magnitude, not epsilons.
+            for (k, (&a, &b)) in y_loaded.iter().zip(&y_ref).enumerate() {
+                let tol = 1e-5 * a.abs().max(b.abs()).max(1.0);
+                assert!(
+                    (a - b).abs() <= tol,
+                    "row {k}: loaded {a} vs reference {b} (diff {}, tol {tol})",
+                    (a - b).abs()
+                );
+            }
         };
         check(&ex.gate, &gate_q4, &gate_s, moe_inter, hidden);
         check(&ex.up, &up_q4, &up_s, moe_inter, hidden);

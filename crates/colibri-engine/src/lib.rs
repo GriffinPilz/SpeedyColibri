@@ -29,7 +29,10 @@ pub mod usage;
 
 pub use attention::{attention, attention_with, AttnCore};
 pub use cache::{available_ram_bytes, capacity, total_ram_bytes, CacheStats, ExpertCache};
-pub use convert::{convert_snapshot, detect_format, ConvertOpts, ConvertStats, SourceFormat};
+pub use convert::{
+    convert_snapshot, detect_format, quant_error, ConvertOpts, ConvertStats, Scheme,
+    SourceFormat, TensorErr,
+};
 pub use usage::UsageHistory;
 pub use colibri_core::Config;
 pub use forward::{

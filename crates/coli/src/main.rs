@@ -37,6 +37,7 @@ COMMANDS:
   bench <snap>             throughput benchmark        [pending]
   convert <src-snap> <out-snap>  FP8/NVFP4 -> int4 container converter  [working]
   probe <snap>             print snapshot format (container|fp8|nvfp4|unknown)  [working]
+  qerr <src-snap> [bits] [n] [experts|resident]  requant error vs the FP8 source  [working]
   tokenize <tok.json> <text>   encode/decode round-trip   [working]
   config <snap>            print parsed hyperparameters   [working]
   load <snap>              load dense weights, print structure  [working]
@@ -83,6 +84,7 @@ fn main() -> ExitCode {
         "serve" => serve::cmd_serve(&args),
         "convert" => cmd_convert(&args),
         "probe" => cmd_probe(&args),
+        "qerr" => cmd_qerr(&args),
         "bench" => {
             eprintln!("coli {cmd}: not yet ported. See PORTING.md for status.");
             ExitCode::from(2)
@@ -150,6 +152,79 @@ fn cmd_probe(args: &[String]) -> ExitCode {
     }
 }
 
+/// `coli qerr <src-snapshot> [bits] [n]` — what re-quantizing the source at `bits`
+/// costs, per resident tensor, measured against the checkpoint's own values.
+///
+/// The converter reads block-scaled FP8 and re-quantizes with its own per-row scales;
+/// a native path would pass the source bytes through untouched. This scores what that
+/// round trip costs. Reads a strided sample of tensors; no conversion, no GPU.
+///
+/// Reports weight-reconstruction error only — not perplexity, not throughput. A lower
+/// number here does not imply a better model or a faster one.
+fn cmd_qerr(args: &[String]) -> ExitCode {
+    let snap = match args.get(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: coli qerr <src-snapshot> [bits=8] [n=8]");
+            return ExitCode::from(2);
+        }
+    };
+    let scheme = match args.get(3).map(|s| s.as_str()) {
+        Some("nvfp4") => colibri_engine::Scheme::Nvfp4,
+        Some(s) => match s.parse::<u32>() {
+            Ok(b) => colibri_engine::Scheme::Int(b),
+            Err(_) => {
+                eprintln!("coli qerr: bits must be a number or `nvfp4`, got {s:?}");
+                return ExitCode::from(2);
+            }
+        },
+        None => colibri_engine::Scheme::Int(8),
+    };
+    let label = match scheme {
+        colibri_engine::Scheme::Nvfp4 => "nvfp4 (e2m1 + ue4m3/16)".to_string(),
+        colibri_engine::Scheme::Int(b) => format!("{b}-bit per-row int"),
+    };
+    let limit: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let experts = matches!(args.get(5).map(|s| s.as_str()), Some("experts" | "x"));
+    let n_layers = std::env::var("COLI_NLAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(78usize);
+    let pop = if experts { "routed experts" } else { "resident" };
+
+    match colibri_engine::quant_error(snap, scheme, n_layers, limit, experts) {
+        Ok(errs) if errs.is_empty() => {
+            eprintln!("coli qerr: no {pop} 2-D weights found in {snap}");
+            ExitCode::FAILURE
+        }
+        Ok(errs) => {
+            println!("requant error, {label} vs the source's own values [{pop}]");
+            println!("{:>9} {:>9} {:>8}  tensor", "rms_rel", "max_rel", "snr_dB");
+            let mut worst = 0f64;
+            let mut sum = 0f64;
+            for e in &errs {
+                println!(
+                    "{:>9.5} {:>9.3} {:>8.1}  {} [{}x{}]",
+                    e.rms_rel, e.max_rel, e.snr_db, e.name, e.o, e.i
+                );
+                worst = worst.max(e.rms_rel);
+                sum += e.rms_rel;
+            }
+            println!(
+                "\nmean rms_rel {:.5} over {} tensors; worst {:.5}",
+                sum / errs.len() as f64,
+                errs.len(),
+                worst
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coli qerr: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `coli convert <src-snapshot> <out-snapshot>` — rewrite a block-scaled FP8 or
 /// modelopt-NVFP4 GLM-5.2 snapshot as the colibrì int4/int8 container the engine loads.
 ///
@@ -171,8 +246,8 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     };
     // NB: xbits does NOT default to ebits. It used to (mirroring the reference
     // converter), which would make the new `ebits=8` default silently mean 8/8 —
-    // the config that doubles bytes-per-token and costs ~40% throughput for
-    // quality that fixing attention already recovers.
+    // doubling bytes-per-token and needing a 0.74 TB container that does not fit on
+    // the box, for quality that fixing attention already recovers.
     let opts = colibri_engine::ConvertOpts {
         ebits: env_u32("COLI_EBITS", 8),
         io_bits: env_u32("COLI_IO_BITS", 8),
@@ -1313,11 +1388,12 @@ fn logprob_of(logits: &[f32], t: usize) -> f32 {
 /// about fidelity to the original model. Perplexity does — run the same file through
 /// two builds and the lower number is the better model.
 ///
-/// Its reason to exist: choosing quantization by intuition is expensive. `COLI_XBITS
-/// 4->8` (routed experts) doubles the bytes streamed per token and costs ~40%
-/// throughput on this disk-bound engine, while `COLI_EBITS 4->8` (attention + dense +
-/// shared expert — resident, never streamed) costs ~9 GB of RAM and no throughput at
-/// all. Measure which one actually buys the quality before paying for it.
+/// Its reason to exist: choosing quantization by intuition is expensive. `COLI_EBITS
+/// 4->8` (attention + dense + shared expert — resident, never streamed) is worth 7.9x
+/// the perplexity for ~9 GB of RAM. `COLI_XBITS 4->8` (routed experts) doubles the
+/// bytes streamed per token; its cost has **not** been measured, because an 8-bit-
+/// expert container needs 0.74 TB and does not fit on the box. Measure which one
+/// actually buys the quality before paying for it.
 ///
 /// One forward over the whole sequence (prefill), then the mean negative
 /// log-likelihood of each *actual* next token — not the argmax, which only says

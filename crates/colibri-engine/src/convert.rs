@@ -17,8 +17,9 @@
 //! The quantizer math is the shared, C-exact [`crate::quantize`] code, so a
 //! converted weight is byte-identical to a runtime-quantized one.
 
-use crate::quantize::{pack_int2, pack_int4, quantize_rows};
+use crate::quantize::{pack_int2, pack_int4, qtensor_from_f32, quantize_rows};
 use colibri_core::dtype::DType;
+use colibri_core::quant::QTensor;
 use colibri_safetensors::Shards;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -43,17 +44,24 @@ const E2M1: [f32; 16] = [
 /// converter defaults everything to int4; on GLM-5.2 that wrecks the model. Same
 /// source (unsloth/GLM-5.2-FP8), same converter, only `ebits` changed:
 ///
-/// | | perplexity | top-1 | tok/s |
-/// |---|---|---|---|
-/// | `4/4` (reference default) | 48.665 | 32.1% | 0.52 |
-/// | `8/4` (ours)              |  6.189 | 57.9% | 0.35 |
+/// | | perplexity | top-1 |
+/// |---|---|---|
+/// | `4/4` (reference default) | 48.665 | 32.1% |
+/// | `8/4` (ours)              |  6.189 | 57.9% |
 ///
-/// 7.9x the quality for a third of the throughput — perplexity 48.7 means the model
-/// was effectively guessing among ~49 tokens; 6.2 is a healthy frontier-model number.
-/// The damage is in the *resident* path, not the experts: attention + dense + shared
-/// expert are only 2.5% of the parameters but 42% of what every token touches, and
-/// they cross all 78 layers. `xbits` (the streamed experts) stays at 4 — 8-bit there
-/// doubles the bytes per token for whatever quality is left once attention is fixed.
+/// 7.9x the quality — perplexity 48.7 means the model was effectively guessing among
+/// ~49 tokens; 6.2 is a healthy frontier-model number. The damage is in the *resident*
+/// path, not the experts: attention + dense + shared expert are only 2.5% of the
+/// parameters but 42% of what every token touches, and they cross all 78 layers.
+///
+/// **The throughput cost of 8/4 is unresolved.** A 4/4-vs-8/4 comparison at
+/// `COLI_RAM_GB=60` read 0.52 vs 0.35 tok/s, but that is confounded: 8/4 carries ~9 GB
+/// more resident, and the swap cliff was later measured between RSS 74 (clean) and 89
+/// (15 GB swap). At a 60 GB budget 4/4 lands near RSS 70 and 8/4 near 79 — so that
+/// number may be measuring swap rather than bit width. Do not quote it.
+///
+/// `xbits` (the streamed experts) stays at 4. What 8-bit experts would cost has never
+/// been measured: the container needs 0.74 TB and does not fit on the box.
 #[derive(Debug, Clone, Copy)]
 pub struct ConvertOpts {
     /// bits for resident weights (attention, dense MLP, shared expert) — `--ebits`
@@ -393,6 +401,231 @@ fn write_shard(path: &Path, tensors: &[OutTensor]) -> io::Result<()> {
 
 /// What kind of snapshot a directory holds, keyed on the distinctive scale
 /// sidecar each format carries.
+/// What re-quantizing one source tensor at some bit width costs, measured against
+/// the checkpoint's own values.
+#[derive(Debug, Clone)]
+pub struct TensorErr {
+    pub name: String,
+    pub o: usize,
+    pub i: usize,
+    /// RMS(error) / RMS(reference) — scale-free, so tensors are comparable.
+    pub rms_rel: f64,
+    /// Largest single-weight absolute error, relative to the tensor's RMS.
+    pub max_rel: f64,
+    /// Signal-to-noise of the round trip, dB. Higher is better; +6 dB ≈ 1 extra bit.
+    pub snr_db: f64,
+}
+
+/// Which quantization scheme to score in [`quant_error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// What we ship: per-row linear int-N with one f32 scale per output row.
+    Int(u32),
+    /// NVFP4: e2m1 data, one ue4m3 scale per 16 inputs, plus a per-tensor f32 scale.
+    /// Simulated numerically here — no kernel, no container change.
+    Nvfp4,
+}
+
+/// The eight magnitudes e2m1 can represent (1 sign, 2 exponent, 1 mantissa bit).
+const E2M1_LEVELS: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+/// NVFP4 scales one ue4m3 factor per this many inputs (vs int4's one per 6144-wide row).
+const NVFP4_BLOCK: usize = 16;
+/// Largest finite ue4m3 scale (e=15,m=6; m=7 is NaN in the `fn` variant).
+const UE4M3_MAX: f32 = 448.0;
+
+fn e2m1_round(v: f32) -> f32 {
+    let a = v.abs();
+    let mut best = 0f32;
+    let mut bd = f32::INFINITY;
+    for &c in &E2M1_LEVELS {
+        let d = (a - c).abs();
+        if d < bd {
+            bd = d;
+            best = c;
+        }
+    }
+    if v.is_sign_negative() {
+        -best
+    } else {
+        best
+    }
+}
+
+/// Round a positive scale to the nearest representable unsigned e4m3 value.
+fn ue4m3_round(v: f32) -> f32 {
+    if !(v > 0.0) {
+        return 0.0;
+    }
+    let mut best = 0f32;
+    let mut bd = f32::INFINITY;
+    let mut consider = |c: f32| {
+        let d = (v - c).abs();
+        if d < bd {
+            bd = d;
+            best = c;
+        }
+    };
+    for m in 0..8 {
+        consider(2f32.powi(-6) * (m as f32 / 8.0)); // subnormals
+    }
+    for e in 1..16 {
+        for m in 0..8 {
+            if e == 15 && m == 7 {
+                continue; // NaN
+            }
+            consider(2f32.powi(e - 7) * (1.0 + m as f32 / 8.0));
+        }
+    }
+    best
+}
+
+/// Reconstruct what NVFP4 would actually represent, using the standard two-level
+/// recipe: a per-tensor f32 scale brings block scales into ue4m3's range, then each
+/// 16-input block gets its own ue4m3 scale and the values become e2m1 codes.
+///
+/// Simulating rather than implementing means the format's accuracy can be scored
+/// before committing to block-scaled MMA kernels and a container change. NVFP4 is
+/// ~0.56 bytes/weight against int4's 0.5 (e2m1 plus one ue4m3 per 16 inputs) — what
+/// that byte difference costs in throughput is NOT measured here and should not be
+/// inferred from it.
+fn quantize_nvfp4_sim(w: &[f32], o: usize, i: usize) -> Vec<f32> {
+    let amax = w.iter().fold(0f32, |m, &v| m.max(v.abs()));
+    let global = (amax / (E2M1_LEVELS[7] * UE4M3_MAX)).max(f32::MIN_POSITIVE);
+    let mut out = vec![0f32; o * i];
+    for r in 0..o {
+        let mut c = 0;
+        while c < i {
+            let end = (c + NVFP4_BLOCK).min(i);
+            let blk = &w[r * i + c..r * i + end];
+            let bmax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let sf = ue4m3_round(bmax / E2M1_LEVELS[7] / global);
+            let eff = sf * global;
+            for (k, &v) in blk.iter().enumerate() {
+                out[r * i + c + k] = if eff > 0.0 { e2m1_round(v / eff) * eff } else { 0.0 };
+            }
+            c = end;
+        }
+    }
+    out
+}
+
+/// Reconstruct the f32 values a [`QTensor`] actually represents — the inverse of
+/// [`qtensor_from_f32`], i.e. what the kernels will really multiply.
+fn dequantize_qtensor(t: &QTensor) -> Vec<f32> {
+    let (o, i) = (t.o as usize, t.i as usize);
+    let mut out = vec![0f32; o * i];
+    match t.fmt_code {
+        0 => out.copy_from_slice(&t.qf),
+        1 => {
+            for r in 0..o {
+                for c in 0..i {
+                    out[r * i + c] = t.q8[r * i + c] as f32 * t.s[r];
+                }
+            }
+        }
+        2 => {
+            // int4 is offset-binary on disk: stored v+8, so decode as nibble-8.
+            let rb = (i + 1) / 2;
+            let q = t.q4.as_slice();
+            for r in 0..o {
+                for c in 0..i {
+                    let byte = q[r * rb + (c >> 1)];
+                    let nib = if c & 1 == 1 { byte >> 4 } else { byte & 0x0F } as i32;
+                    out[r * i + c] = (nib - 8) as f32 * t.s[r];
+                }
+            }
+        }
+        _ => {} // int2 unused for resident weights; leave zeroed rather than lie
+    }
+    out
+}
+
+/// Error of re-quantizing the source's own weights under `scheme`, per tensor.
+///
+/// **Why this exists.** The converter reads block-scaled FP8 (e4m3 + 128x128 scales),
+/// dequantizes to f32, then re-quantizes with our own per-row scales. Native FP8
+/// compute would instead pass the checkpoint's bytes through untouched — worth
+/// building only if that round trip is actually losing something. This measures the
+/// loss directly, with no kernels and no conversion.
+///
+/// **Scope.** This reports weight-reconstruction error and nothing else. It does not
+/// measure perplexity, throughput, or bytes moved per token, and none of those follow
+/// from it: a scheme with lower error may be slower, larger, or no better end-to-end.
+/// Treat the numbers as one input to that question, not the answer.
+///
+/// `experts` selects which population to report:
+/// - `false` → resident weights ([`Kind::Q`]): attention/dense/shared. 2.5% of params,
+///   but measured to matter enormously — int4 there put perplexity at 48.665, int8 at
+///   6.189.
+/// - `true` → routed experts ([`Kind::X`]): 97.5% of params and 58% of the weights a
+///   token touches, held at int4 throughout. Their error has never been measured in
+///   perplexity terms, because an 8-bit-expert container needs 0.74 TB and does not
+///   fit on the box. This probe reaches them without converting anything.
+pub fn quant_error(
+    indir: impl AsRef<Path>,
+    scheme: Scheme,
+    n_layers: usize,
+    limit: usize,
+    experts: bool,
+) -> io::Result<Vec<TensorErr>> {
+    let want = if experts { Kind::X } else { Kind::Q };
+    let shards = Shards::open(indir.as_ref())?;
+    let mut names: Vec<&str> = shards
+        .tensors()
+        .iter()
+        .map(|t| t.name.as_str())
+        .filter(|n| classify(n, n_layers) == want)
+        .collect();
+    names.sort_unstable();
+
+    // Stride the sample across the whole population instead of taking the first N.
+    // Sorted names cluster by layer, so first-N collapses onto layer 0 — which for
+    // resident weights means *no attention tensors at all*, exactly where the error
+    // is worst, and layer 0 is a dense layer rather than one of the 75 MoE ones. A
+    // first-N sample silently answers a different question than the one asked.
+    let stride = (names.len() / limit.max(1)).max(1);
+    let names: Vec<&str> = names.into_iter().step_by(stride).take(limit).collect();
+
+    let mut out = Vec::new();
+    for name in names {
+        let (w, shape) = dequant(&shards, name)?;
+        if shape.len() != 2 {
+            continue;
+        }
+        let (o, i) = (shape[0] as usize, shape[1] as usize);
+        let approx = match scheme {
+            Scheme::Int(bits) => dequantize_qtensor(&qtensor_from_f32(&w, o, i, bits)),
+            Scheme::Nvfp4 => quantize_nvfp4_sim(&w, o, i),
+        };
+
+        let mut sq_ref = 0f64;
+        let mut sq_err = 0f64;
+        let mut max_abs = 0f64;
+        for (&r, &a) in w.iter().zip(&approx) {
+            let e = (r - a) as f64;
+            sq_ref += (r as f64) * (r as f64);
+            sq_err += e * e;
+            max_abs = max_abs.max(e.abs());
+        }
+        let n = w.len() as f64;
+        let rms_ref = (sq_ref / n).sqrt();
+        let rms_err = (sq_err / n).sqrt();
+        out.push(TensorErr {
+            name: name.to_string(),
+            o,
+            i,
+            rms_rel: if rms_ref > 0.0 { rms_err / rms_ref } else { 0.0 },
+            max_rel: if rms_ref > 0.0 { max_abs / rms_ref } else { 0.0 },
+            snr_db: if rms_err > 0.0 && rms_ref > 0.0 {
+                20.0 * (rms_ref / rms_err).log10()
+            } else {
+                f64::INFINITY
+            },
+        });
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
     /// already a colibrì container (`name` U8 codes + `name.qs` scales) — serve directly
@@ -568,12 +801,113 @@ pub fn convert_snapshot(
 mod tests {
     use super::*;
 
+    /// The metric must react to a loss it is *told* is there, in the right direction
+    /// and roughly the right size — otherwise a near-zero reading off the real
+    /// checkpoint is unreadable: "no headroom" and "broken probe" look identical.
+    #[test]
+    fn quant_error_metric_tracks_bit_width() {
+        // A row whose values span three orders of magnitude — the case per-row linear
+        // int8 handles worst and e4m3's exponent handles well. If the probe can't see
+        // a difference here it can't see one anywhere.
+        let o = 4usize;
+        let i = 256usize;
+        let mut w = vec![0f32; o * i];
+        for r in 0..o {
+            for c in 0..i {
+                let mag = 10f32.powi(-(c as i32 % 3));
+                w[r * i + c] = mag * if (r + c) % 2 == 0 { 1.0 } else { -1.0 };
+            }
+        }
+        let err = |bits: u32| -> f64 {
+            let approx = dequantize_qtensor(&qtensor_from_f32(&w, o, i, bits));
+            let (mut sr, mut se) = (0f64, 0f64);
+            for (&r, &a) in w.iter().zip(&approx) {
+                sr += (r as f64) * (r as f64);
+                se += ((r - a) as f64) * ((r - a) as f64);
+            }
+            (se / sr).sqrt()
+        };
+        let (e16, e8, e4) = (err(16), err(8), err(4));
+        assert!(e16 < 1e-9, "f32 round trip must be exact, got {e16}");
+        assert!(e8 < e4, "int8 ({e8}) must beat int4 ({e4})");
+        assert!(e8 > 1e-6, "int8 on a wide-dynamic-range row should show real error, got {e8}");
+        // ~6 dB per bit: 4 extra bits should buy well over an order of magnitude.
+        assert!(e4 / e8 > 5.0, "int4/int8 error ratio only {:.2}", e4 / e8);
+    }
+
+    #[test]
+    fn e2m1_and_ue4m3_round_to_their_real_grids() {
+        // Exactly-representable values must survive untouched, or the simulator is
+        // measuring its own rounding bug rather than the format.
+        for &v in &E2M1_LEVELS {
+            assert_eq!(e2m1_round(v), v, "e2m1 level {v} not preserved");
+            assert_eq!(e2m1_round(-v), -v, "e2m1 level -{v} not preserved");
+        }
+        // 5.0 is an exact tie between 4.0 (code 6) and 6.0 (code 7); ties-to-even
+        // picks the even code, i.e. 4.0. Asserted because a tie is where a rounding
+        // implementation silently drifts from the hardware's.
+        assert_eq!(e2m1_round(5.0), 4.0, "tie 4/6 must resolve to the even code");
+        assert_eq!(e2m1_round(100.0), 6.0, "saturates at the max magnitude");
+        assert_eq!(e2m1_round(0.2), 0.0, "below half the first step -> 0");
+        // ue4m3: powers of two and the documented max are exact.
+        for e in -6..=8 {
+            let p = 2f32.powi(e);
+            assert_eq!(ue4m3_round(p), p, "ue4m3 power of two {p} not preserved");
+        }
+        assert_eq!(ue4m3_round(UE4M3_MAX), UE4M3_MAX);
+        assert!(ue4m3_round(1e30) <= UE4M3_MAX, "must not invent a scale past the max");
+    }
+
+    #[test]
+    fn nvfp4_beats_per_row_int4_when_dynamic_range_is_wide() {
+        // The whole premise of block scaling: one scale per row is hostage to that
+        // row's largest value, so small values quantize to nothing. Per-16 scales
+        // track the local magnitude instead. If this doesn't show up here, NVFP4 has
+        // no mechanism to help the experts and the measurement below means nothing.
+        let (o, i) = (2usize, 512usize);
+        let mut w = vec![0f32; o * i];
+        for r in 0..o {
+            for c in 0..i {
+                // magnitude sweeps across four decades along the row
+                let mag = 10f32.powi(-((c / 128) as i32));
+                w[r * i + c] = mag * if c % 3 == 0 { -1.0 } else { 1.0 };
+            }
+        }
+        let rel = |approx: &[f32]| -> f64 {
+            let (mut sr, mut se) = (0f64, 0f64);
+            for (&r, &a) in w.iter().zip(approx) {
+                sr += (r as f64) * (r as f64);
+                se += ((r - a) as f64) * ((r - a) as f64);
+            }
+            (se / sr).sqrt()
+        };
+        let int4 = rel(&dequantize_qtensor(&qtensor_from_f32(&w, o, i, 4)));
+        let nvfp4 = rel(&quantize_nvfp4_sim(&w, o, i));
+        assert!(nvfp4 < int4, "nvfp4 {nvfp4:.4} should beat per-row int4 {int4:.4}");
+        assert!(nvfp4 < int4 / 2.0, "expected a large win, got {int4:.4} -> {nvfp4:.4}");
+    }
+
+    #[test]
+    fn nvfp4_sim_is_not_secretly_lossless() {
+        // A simulator that returns its input would make NVFP4 look perfect. e2m1 has
+        // eight levels; random data must show real error.
+        let (o, i) = (2usize, 256usize);
+        let w: Vec<f32> = (0..o * i)
+            .map(|k| ((k * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let approx = quantize_nvfp4_sim(&w, o, i);
+        let diff = w.iter().zip(&approx).filter(|(a, b)| a != b).count();
+        assert!(diff > w.len() / 4, "only {diff}/{} values changed — sim is a no-op?", w.len());
+    }
+
     #[test]
     fn default_is_8bit_resident_4bit_experts() {
         // Measured on unsloth/GLM-5.2-FP8, same converter, only ebits changed:
-        //   4/4  perplexity 48.665  top-1 32.1%  0.52 tok/s
-        //   8/4  perplexity  6.189  top-1 57.9%  0.35 tok/s
-        // 8-bit resident is worth 7.9x the quality for ~a third of the throughput.
+        //   4/4  perplexity 48.665  top-1 32.1%
+        //   8/4  perplexity  6.189  top-1 57.9%
+        // 8-bit resident is worth 7.9x the quality. Its throughput cost is unresolved
+        // and deliberately not asserted here — see ConvertOpts' docs for why the
+        // 0.52-vs-0.35 reading is confounded by the swap cliff.
         let d = ConvertOpts::default();
         assert_eq!(d.ebits, 8, "resident weights (attention/dense/shared) must default to 8-bit");
         assert_eq!(d.xbits, 4, "streamed experts must stay 4-bit");
@@ -583,9 +917,10 @@ mod tests {
     #[test]
     fn expert_bits_are_independent_of_resident_bits() {
         // The trap: xbits used to default to ebits (mirroring the reference
-        // converter). With ebits now 8 that would silently produce 8/8 — doubling
-        // the bytes streamed per token for ~40% throughput, to recover quality that
-        // fixing attention already recovers. They must move independently.
+        // converter). With ebits now 8 that would silently produce 8/8 — doubling the
+        // bytes streamed per token and needing a 0.74 TB container that does not fit,
+        // to recover quality that fixing attention already recovers. They must move
+        // independently.
         let d = ConvertOpts::default();
         assert_ne!(d.xbits, d.ebits, "xbits must not track ebits");
         let hi = ConvertOpts { ebits: 16, ..Default::default() };

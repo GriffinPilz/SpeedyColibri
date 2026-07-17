@@ -1222,6 +1222,22 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Bits per weight actually stored in a loaded tensor, from its container format
+/// (`fmt_code`: 0 = f32, 1 = int8, 2 = packed int4).
+///
+/// `model.dbits`/`model.ebits` are the **LoadOptions** the caller asked for, which
+/// only bite when quantizing a full-precision snapshot at load. For a pre-quantized
+/// container the bits are fixed on disk and those fields are just the env defaults —
+/// reporting them made `ppl` claim "4 / 4 bits" while measuring an 8-bit container.
+fn tensor_bits(t: &colibri_core::QTensor) -> &'static str {
+    match t.fmt_code {
+        0 => "f32",
+        1 => "int8",
+        2 => "int4",
+        _ => "?",
+    }
+}
+
 /// Log-probability the distribution `logits` assigns to token `t`, in nats.
 ///
 /// Stable log-softmax: `logit[t] - logsumexp(logits)`, shifted by the max so the
@@ -1320,11 +1336,25 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
     let d = model.cfg.hidden as usize;
     let mut kv = colibri_engine::KvCache::for_model(&model, ids.len());
     let mut hidden = vec![0f32; ids.len() * d];
+    // Report what the container actually holds, per class — `ebits` governs the
+    // resident path, `xbits` the streamed experts, and they differ independently.
+    let resident_fmt = model
+        .layers
+        .iter()
+        .find(|l| l.sparse)
+        .map(|l| tensor_bits(&l.sh_gate))
+        .unwrap_or("?");
+    let expert_fmt = colibri_engine::ExpertProvider::expert(
+        &provider,
+        model.layers.iter().position(|l| l.sparse).unwrap_or(0),
+        0,
+    )
+    .map(|e| tensor_bits(&e.gate))
+    .unwrap_or("?");
     eprintln!(
-        "[ppl] {} tokens from {text_path} (dense {} bits, experts {} bits) — one forward...",
-        ids.len(),
-        model.dbits,
-        model.ebits
+        "[ppl] {} tokens from {text_path} (resident {resident_fmt}, experts {expert_fmt}) \
+         — one forward...",
+        ids.len()
     );
     let t0 = std::time::Instant::now();
     if let Err(e) = colibri_engine::forward(&model, &mut kv, &provider, &ids, 0, &mut hidden) {
@@ -1350,7 +1380,7 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
     }
     let nll = sum / n as f64;
     println!("tokens        : {n}");
-    println!("dense/expert  : {} / {} bits", model.dbits, model.ebits);
+    println!("resident/expert: {resident_fmt} / {expert_fmt}   (as stored in the container)");
     println!("mean NLL      : {nll:.4} nats/token");
     println!("perplexity    : {:.3}   <- lower is better", nll.exp());
     println!("top-1 match   : {:.1}%  ({top1}/{n})", top1 as f64 / n as f64 * 100.0);

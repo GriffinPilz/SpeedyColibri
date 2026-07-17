@@ -76,10 +76,10 @@ your Hugging Face cache if it isn't there, warms the cache, and starts serving.
 ```bash
 # First run — pass your HF token so the 358 GB model can download.
 # (~10 min to build the image, then ~30–90 min for the one-time download.)
-COLI_RAM_GB=85 docker/run-dgx.sh hf_xxxxxxxxxxxxxxxxxxxx serve 8080 "warm up the cache"
+docker/run-dgx.sh hf_xxxxxxxxxxxxxxxxxxxx serve 8080 "warm up the cache"
 
 # Later runs — model already cached, no token needed. Ready in ~1–2 min.
-COLI_RAM_GB=85 docker/run-dgx.sh serve 8080 "warm up the cache"
+docker/run-dgx.sh serve 8080 "warm up the cache"
 ```
 
 Wait for this line before sending requests:
@@ -150,7 +150,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | Var | Meaning | Default |
 |---|---|---|
 | `HF_TOKEN` | Hugging Face token for the first download (alt. to the `hf_...` arg) | none |
-| `COLI_RAM_GB` | cap the RAM expert cache — set below the box's free RAM so the OOM killer stays away (85 leaves headroom on a 128 GB Spark) | all free RAM |
+| `COLI_RAM_GB` | expert-cache budget override. **The default is already safe — you rarely need this.** Setting it *higher* than the default hurts: measured on a 121 GB Spark, 85 drives the box into swap at ~0.11 tok/s vs ~0.46 at the default. | auto: `MemTotal/3` (~41 GB on a Spark) |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
 | `COLI_CTX` | served context length (prompt + completion), e.g. `64k`; bounded by the model max (1M) and by RAM (~175 KB/token of KV) | `32768` |
@@ -184,7 +184,7 @@ NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
   cargo build --release -p coli --features cuda
 
 # Serve: serve <snapshot-dir> [port] [warm-up prompt...]
-COLI_RAM_GB=85 ./target/release/coli serve /path/to/snapshot 8080 "warm-up prompt"
+./target/release/coli serve /path/to/snapshot 8080 "warm-up prompt"
 ```
 
 ### Low-level: `gen` (forward-pass smoke test)
@@ -199,7 +199,7 @@ attention/MoE/load breakdown; `COLI_NGEN=N` sets how many tokens to generate
 (default 16).
 
 ```bash
-COLI_RAM_GB=85 COLI_TIMING=1 COLI_PROFILE=1 docker/run-dgx.sh gen 100 200 300 400
+COLI_TIMING=1 COLI_PROFILE=1 docker/run-dgx.sh gen 100 200 300 400
 ```
 
 ## Where it stands

@@ -115,7 +115,7 @@ Generation is served **one request at a time** — a single GPU streaming a 744B
 model runs one forward pass anyway, so connections are handled sequentially.
 
 ```bash
-COLI_RAM_GB=85 docker/run-dgx.sh serve 8080 "warm up the expert cache"
+docker/run-dgx.sh serve 8080 "warm up the expert cache"
 curl -N localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -147,7 +147,7 @@ to probe).
 ```bash
 docker run --rm -it --gpus all -p 8080:8080 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -e HF_TOKEN -e COLI_RAM_GB=85 \
+  -e HF_TOKEN \
   speedycolibri:latest serve 8080
 ```
 
@@ -167,7 +167,7 @@ HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm -p 8080:808
 | `COLI_CTX` | `serve` context length (prompt + completion), e.g. `64k`. Clamped to the model max (`max_position_embeddings`, 1M for GLM-5.2). KV is ~175 KB/token (~5.6 GB at 32K, ~22 GB at 128K), so raise it within your RAM budget. Requests over the limit get a `context_length_exceeded` 400. | `32768` |
 | `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
 | `COLI_MODEL_DIR` | host path to a pre-resolved snapshot → mounted at `/model` | unset |
-| `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budgets (cap on a shared box to avoid the OOM killer) | available RAM / VRAM |
+| `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budget overrides. The RAM default auto-caps at `MemTotal/3` and is safe; overriding *higher* is measured to swap and lose throughput (85 → ~0.11 tok/s vs ~0.46 at default on a 121 GB Spark). | auto: `MemTotal/3` RAM |
 | `COLI_NUM_NODES` | cluster size (expert-parallel) | `1` |
 | `COLI_NODE_RANK` | this node's rank `0..NUM_NODES` (advertised in the discovery beacon) | `0` |
 | `COLI_DISCOVER_SECS` | `serve` startup ConnectX fabric-scan window in seconds (`0` disables) | `3` |
@@ -203,11 +203,11 @@ and caches *its* shard, so the working set is split across the fabric.
 
 ```bash
 # Node 1 (rank 1) — worker for experts 128..256, on the RoCE port:
-COLI_NUM_NODES=2 COLI_NODE_RANK=1 COLI_RAM_GB=85 \
+COLI_NUM_NODES=2 COLI_NODE_RANK=1 \
   coli worker <snap> 48800        # binds 0.0.0.0:48800
 
 # Node 0 (rank 0) — driver: HTTP on :8080, owns 0..128, fetches 128..256 from node 1
-COLI_NUM_NODES=2 COLI_NODE_RANK=0 COLI_RAM_GB=85 \
+COLI_NUM_NODES=2 COLI_NODE_RANK=0 \
   COLI_PEERS="1=192.168.100.10:48800" \
   coli serve <snap> 8080 "warm up"
 ```

@@ -35,15 +35,29 @@ pub enum AttnCore {
     Absorb,
 }
 
-/// DSA sparse attention. **Off by default** (`COLI_DSA=1` enables): measured
-/// net-*slower* than dense today because a live selection forces the whole
-/// attention onto the CPU `reconstruct_core` (no GPU sparse-attention kernel yet),
-/// which loses to GPU dense even though sparse does less work — dense 320 s vs DSA
-/// >1800 s over a 2600-tok prefill. The indexer + shared-layer reuse are correct
-/// and ready; DSA becomes a win once the reconstruct core has a GPU kernel.
+/// DSA sparse attention. **On by default** (`COLI_DSA=0` disables): the GPU sparse
+/// kernel (`attention_absorb_sparse`) makes it a strict prefill win at long context —
+/// measured at 8192 tok, 2721 s vs dense 3933 s (1.45×, −31%), with attention alone
+/// ~1.55× (dense attn is O(n²), sparse ~O(n·topk), so the gap widens with context).
+/// Only fires for single-shot prefill (`pos_base == 0`) at or above `dsa_min_prefill()`
+/// tokens; decode stays dense (disk-bound anyway), and short prefills stay dense to
+/// skip the ~index_topk break-even band (at 3072 tok sparse ≈ dense).
 fn dsa_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_DSA").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| std::env::var("COLI_DSA").ok().as_deref() != Some("0"))
+}
+
+/// Minimum prefill length (new tokens) at which DSA activates. Default 4096 — above the
+/// 2048–~3500 break-even band, where GPU-sparse is a clear win and grows with context.
+/// Override with `COLI_DSA_MIN` (e.g. `=2048` to fire as soon as it's correct).
+fn dsa_min_prefill() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_DSA_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096)
+    })
 }
 
 /// `COLI_DSA_CPU=1` forces the CPU `reconstruct_core` even when DSA is on, bypassing
@@ -151,6 +165,7 @@ pub fn attention_with(
         && l.ix_wk.is_some()
         && cfg.idx_type.get(layer).copied().unwrap_or(false)
         && pos_base + s_len > cfg.index_topk as usize
+        && pos_base + s_len >= dsa_min_prefill()
         && dsa_enabled()
     {
         let iw = crate::dsa::IndexerWeights {
@@ -716,11 +731,14 @@ mod tests {
         // `layer_forward` does — carry a full layer's returned selection to the
         // shared layers after it.
         use crate::quantize::qtensor_from_f32;
-        // DSA is off by default (CPU-bound, net-slower than dense); force it on for
-        // this test. Only this test reaches `dsa_enabled()` — the condition checks
-        // `ix_wk.is_some()` first and no other test builds an indexer layer — so the
-        // OnceLock isn't cached off by a sibling test.
+        // DSA is on by default now, but the min-prefill gate (4096) would keep it dense
+        // for this tiny `s_len=4` fixture, so drop the threshold to 2 (> index_topk).
+        // Setting COLI_DSA explicitly too keeps the test independent of the default.
+        // Only this test reaches `dsa_enabled()`/`dsa_min_prefill()` — the condition
+        // checks `ix_wk.is_some()` first and no other test builds an indexer layer — so
+        // their OnceLocks aren't cached wrong by a sibling test.
         std::env::set_var("COLI_DSA", "1");
+        std::env::set_var("COLI_DSA_MIN", "2");
         let json = colibri_json::Json::parse(
             r#"{"hidden_size":6,"num_hidden_layers":1,"num_attention_heads":2,
                 "n_routed_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":4,

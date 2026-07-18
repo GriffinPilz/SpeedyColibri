@@ -464,6 +464,90 @@ mod tests {
     // GPU vs CPU MLA absorb core at GLM dims (H=64, kv_lora=512) over a 2048-token
     // context. `cargo test -p colibri-engine --features cuda --release -- --ignored
     // --nocapture bench_attention`
+    // The DSA correctness gate: the GPU sparse kernel must reproduce the CPU
+    // reconstruct_core for the *same* per-query selection (they are the same math in
+    // different fp order — absorb vs reconstruct). Compares `ctx` directly rather than
+    // end-to-end tokens, which are too sensitive to fp order under heavy sparsity.
+    // Run: `cargo test -p colibri-engine --features cuda --release -- --ignored
+    // dsa_sparse_gpu_matches_cpu --nocapture`
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn dsa_sparse_gpu_matches_cpu_reconstruct() {
+        if !crate::gpu::available() {
+            eprintln!("skip: no CUDA device");
+            return;
+        }
+        // GLM attention dims — real sizes so the kernel path is representative.
+        let json = colibri_json::Json::parse(
+            r#"{"hidden_size":6144,"num_hidden_layers":1,"num_attention_heads":64,
+                "n_routed_experts":256,"num_experts_per_tok":8,"moe_intermediate_size":2048,
+                "intermediate_size":12288,"first_k_dense_replace":0,"q_lora_rank":2048,
+                "kv_lora_rank":512,"qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
+                "n_shared_experts":1,"vocab_size":2000,"n_group":1,"topk_group":1,
+                "rms_norm_eps":1e-5,"routed_scaling_factor":1.0,
+                "rope_parameters":{"rope_theta":10000.0},"eos_token_id":[1],
+                "index_topk":4,"index_n_heads":0,"index_head_dim":0}"#,
+        )
+        .unwrap();
+        let cfg = Config::from_json(&json).unwrap();
+        let (h, qk_nope, r, vh, kvl) = (64usize, 128usize, 64usize, 128usize, 512usize);
+        let kvb_dim = h * (qk_nope + vh);
+        let wf: Vec<f32> = (0..kvb_dim * kvl).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
+        let mut kv_b = qtensor_from_f32(&wf, kvb_dim, kvl, 4); // int4, like production
+        kv_b.gpu_eligible = true;
+        let mut l = Layer::default();
+        l.kv_b = kv_b;
+
+        // Single-shot prefill: s_len queries, context == s_len (all positions new).
+        let s_len = 12usize;
+        let t = s_len;
+        let index_topk = 4usize;
+        let mut kv = KvCache::new(1, kvl, r, t);
+        for pos in 0..t {
+            for (i, x) in kv.latent_row_mut(0, pos).iter_mut().enumerate() {
+                *x = (((pos * 7 + i) % 17) as f32 - 8.0) * 0.02;
+            }
+            for (i, x) in kv.krot_row_mut(0, pos).iter_mut().enumerate() {
+                *x = (((pos * 5 + i) % 11) as f32 - 5.0) * 0.02;
+            }
+        }
+        let q: Vec<f32> =
+            (0..s_len * h * (qk_nope + r)).map(|k| ((k % 7) as f32 - 3.0) * 0.01).collect();
+        let latent = kv.latent_rows(0, 0, t).to_vec();
+        let rope = kv.krot_rows(0, 0, t).to_vec();
+        let scale = cfg.attn_scale;
+
+        // A DSA-shaped selection: dense (empty) while nk <= index_topk, else the last
+        // `index_topk` causal positions — a genuine strict subset for later queries.
+        let sel: Vec<Vec<u32>> = (0..s_len)
+            .map(|s| {
+                let nk = s + 1;
+                if nk <= index_topk {
+                    Vec::new()
+                } else {
+                    ((nk - index_topk) as u32..nk as u32).collect()
+                }
+            })
+            .collect();
+
+        let mut ctx_gpu = vec![0f32; s_len * h * vh];
+        let ok = crate::gpu::try_attention_absorb_sparse(
+            &l.kv_b, &mut ctx_gpu, &q, &latent, &rope, &sel, index_topk, s_len, h, qk_nope, r, vh,
+            kvl, t, scale,
+        );
+        assert!(ok, "GPU sparse kernel must run when a device is present");
+
+        let mut ctx_cpu = vec![0f32; s_len * h * vh];
+        reconstruct_core(&cfg, &l, 0, &kv, &q, s_len, 0, 0, &mut ctx_cpu, Some(&sel));
+
+        let maxerr =
+            ctx_gpu.iter().zip(&ctx_cpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("dsa sparse GPU vs CPU reconstruct: maxerr = {maxerr:.2e}");
+        assert!(ctx_cpu.iter().any(|v| v.abs() > 1e-6), "output must be non-trivial");
+        assert!(maxerr < 5e-3, "GPU sparse must match CPU reconstruct; maxerr={maxerr:.3e}");
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]

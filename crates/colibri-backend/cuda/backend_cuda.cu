@@ -353,6 +353,46 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* DSA sparse prefill attention. Identical to attention_absorb_batch_kernel except
+ * each query attends only to its indexer selection instead of all `nt` causal
+ * positions: `sel_idx[s*maxsel + j]` (j < sel_cnt[s]) are the chosen cache rows.
+ * An empty selection (sel_cnt[s] <= 0) is the is_dense case — attend causally to
+ * 0..nt, which is guaranteed <= maxsel there (is_dense holds only when nk <=
+ * index_topk = maxsel), so `scores[]` sized to maxsel is always sufficient. */
+__global__ static void attention_absorb_sparse_kernel(float *ctx,const float *q,
+        const float *latent,const float *rope,const void *weights,const float *wscale,
+        const int *sel_idx,const int *sel_cnt,int maxsel,
+        int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
+    if(s>=S||nt<1)return;
+    int cnt=sel_cnt[s],dense=(cnt<=0),n=dense?nt:cnt;
+    const int *sidx=sel_idx+(size_t)s*maxsel;
+    extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+maxsel;
+    const float *qs=q+((size_t)s*H+h)*(Q+R);
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
+        a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
+          (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+    __syncthreads();
+    for(int j=tid;j<n;j+=blockDim.x){int t=dense?j:sidx[j];float a=0;
+        const float *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+        for(int k=0;k<K;k++)a+=qa[k]*lt[k];for(int d=0;d<R;d++)a+=qs[Q+d]*rt[d];scores[j]=a*scale;}
+    __syncthreads();
+    float local=-3.402823466e+38F;for(int j=tid;j<n;j+=blockDim.x)local=fmaxf(local,scores[j]);
+    red[tid]=local;__syncthreads();
+    for(int m=blockDim.x>>1;m;m>>=1){if(tid<m)red[tid]=fmaxf(red[tid],red[tid+m]);__syncthreads();}
+    float mx=red[0];local=0;for(int j=tid;j<n;j+=blockDim.x){float e=expf(scores[j]-mx);scores[j]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int m=blockDim.x>>1;m;m>>=1){if(tid<m)red[tid]+=red[tid+m];__syncthreads();}
+    float inv=1.f/red[0];for(int j=tid;j<n;j+=blockDim.x)scores[j]*=inv;
+    __syncthreads();
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int j=0;j<n;j++){int t=dense?j:sidx[j];
+        a+=scores[j]*latent[(size_t)t*K+k];}cl[k]=a;}
+    __syncthreads();
+    for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
+        ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+}
+
 /* ---- Flash-attention decode absorb (S=1): T-parallel with online softmax ----
  * The per-head kernel above serializes the whole context in one block (64 blocks
  * for H=64 → low parallelism on the GB10). Flash splits the key dimension across

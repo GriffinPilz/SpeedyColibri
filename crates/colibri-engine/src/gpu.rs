@@ -330,6 +330,76 @@ pub fn try_attention_absorb(
     ok
 }
 
+/// DSA sparse attention on the GPU — the [`try_attention_absorb`] twin that attends
+/// only to each query's indexer selection. `sel[q]` holds the query's chosen cache
+/// positions (relative to the latent's first row; the DSA path runs at `st0 == 0`, so
+/// these are the absolute positions). An empty `sel[q]` is the is_dense case. Falls
+/// back (returns false) when the GPU is unavailable, so the caller uses the CPU
+/// `reconstruct_core`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_absorb_sparse(
+    kv_b: &QTensor,
+    ctx: &mut [f32],
+    q: &[f32],
+    latent: &[f32],
+    rope: &[f32],
+    sel: &[Vec<u32>],
+    index_topk: usize,
+    s: usize,
+    h: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    v_head: usize,
+    kv_lora: usize,
+    t: usize,
+    scale: f32,
+) -> bool {
+    if !available() || !kv_b.gpu_eligible || sel.len() != s || index_topk == 0 {
+        return false;
+    }
+    let Some(handle) = upload_ffn(kv_b, &[]) else {
+        return false;
+    };
+    // Flatten into fixed-stride [s, maxsel] indices + per-query counts. A query with an
+    // empty selection keeps count 0 → the kernel attends causally (is_dense).
+    let maxsel = index_topk;
+    let mut sel_idx = vec![0i32; s * maxsel];
+    let mut sel_cnt = vec![0i32; s];
+    for (qi, positions) in sel.iter().enumerate() {
+        let n = positions.len().min(maxsel);
+        sel_cnt[qi] = n as i32;
+        for (j, &p) in positions.iter().take(maxsel).enumerate() {
+            sel_idx[qi * maxsel + j] = p as i32;
+        }
+    }
+    // SAFETY: handle resident; ctx/q/latent/rope sized by the dims; sel_idx has
+    // s*maxsel ints and sel_cnt has s ints (allocated just above).
+    let ok = unsafe {
+        cuda::attention_absorb_sparse_raw(
+            handle,
+            ctx.as_mut_ptr(),
+            q.as_ptr(),
+            latent.as_ptr(),
+            rope.as_ptr(),
+            sel_idx.as_ptr(),
+            sel_cnt.as_ptr(),
+            maxsel as i32,
+            s as i32,
+            h as i32,
+            qk_nope as i32,
+            qk_rope as i32,
+            v_head as i32,
+            kv_lora as i32,
+            t as i32,
+            scale,
+        )
+    };
+    if ok {
+        GPU_ATTN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 fn weight_ptr(w: &QTensor) -> *const c_void {
     match w.fmt_code {
         0 => w.qf.as_ptr() as *const c_void,

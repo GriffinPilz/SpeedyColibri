@@ -90,6 +90,25 @@ extern "C" {
         t: c_int,
         scale: f32,
     ) -> c_int;
+    // DSA sparse prefill absorb: each query attends only to its indexer selection.
+    fn coli_cuda_attention_absorb_sparse(
+        kv_b: *mut ColiCudaTensor,
+        ctx: *mut f32,
+        q: *const f32,
+        latent: *const f32,
+        rope: *const f32,
+        sel_idx: *const c_int,
+        sel_cnt: *const c_int,
+        maxsel: c_int,
+        s: c_int,
+        h: c_int,
+        q_nope: c_int,
+        r: c_int,
+        v: c_int,
+        k: c_int,
+        t: c_int,
+        scale: f32,
+    ) -> c_int;
     // Single-token (S=1) absorb with DEVICE latent/rope (the persistent-KV path).
     #[allow(clippy::too_many_arguments)]
     fn coli_cuda_attention_absorb_kvdev(
@@ -382,6 +401,39 @@ pub unsafe fn attention_absorb_batch_raw(
 ) -> bool {
     coli_cuda_attention_absorb_batch(kv_b, ctx, q, latent, rope, s, h, q_nope, r, v, k, t, scale)
         != 0
+}
+
+/// DSA sparse MLA attention: like [`attention_absorb_batch_raw`] but each query
+/// attends only to its indexer selection. `sel_idx` is `[S, maxsel]` (row s = the
+/// query's chosen cache rows, relative to the latent's first row), `sel_cnt` is `[S]`
+/// (count per query; `<= 0` = the is_dense case → attend causally). Twin of the CPU
+/// `reconstruct_core` sparse path.
+///
+/// # Safety
+/// `kv_b` resident; `ctx`/`q`/`latent`/`rope` sized per the dims; `sel_idx` has
+/// `s*maxsel` ints and `sel_cnt` has `s` ints.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn attention_absorb_sparse_raw(
+    kv_b: *mut ColiCudaTensor,
+    ctx: *mut f32,
+    q: *const f32,
+    latent: *const f32,
+    rope: *const f32,
+    sel_idx: *const i32,
+    sel_cnt: *const i32,
+    maxsel: i32,
+    s: i32,
+    h: i32,
+    q_nope: i32,
+    r: i32,
+    v: i32,
+    k: i32,
+    t: i32,
+    scale: f32,
+) -> bool {
+    coli_cuda_attention_absorb_sparse(
+        kv_b, ctx, q, latent, rope, sel_idx, sel_cnt, maxsel, s, h, q_nope, r, v, k, t, scale,
+    ) != 0
 }
 
 /// Single-token MLA absorb reading the KV cache from **device** memory (the

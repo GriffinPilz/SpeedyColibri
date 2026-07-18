@@ -35,6 +35,13 @@ pub enum AttnCore {
     Absorb,
 }
 
+/// DSA sparse attention is on by default; `COLI_DSA=0` forces dense attention on
+/// every layer — the A/B baseline and a kill switch.
+fn dsa_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_DSA").ok().as_deref() != Some("0"))
+}
+
 /// MLA attention over `S` new tokens `x[S, hidden]` beginning at `pos_base`,
 /// writing `out[S, hidden]`. Uses the reconstruction core.
 pub fn attention(
@@ -123,6 +130,7 @@ pub fn attention_with(
     // SHARED layer, or a short context all leave attention dense. `x`/`qr` are the same
     // inputs the C's indexer uses.
     let dsa_selection: Option<Vec<Vec<u32>>> = if sel.is_none()
+        && dsa_enabled()
         && st0 == 0
         && l.ix_wk.is_some()
         && cfg.idx_type.get(layer).copied().unwrap_or(false)

@@ -137,13 +137,17 @@ pub fn attention_with(
     let st0 = kv.kv_start[layer];
 
     // DSA lightning indexer: on a FULL indexer layer, once the context exceeds
-    // `index_topk`, select the top-k keys per query and attend only to those. Needs
-    // the full context in cache (st0 == 0 — the long-context prefill DSA targets) and
-    // the layer's indexer weights. An explicit `sel` (tests), a missing indexer, a
-    // SHARED layer, or a short context all leave attention dense. `x`/`qr` are the same
-    // inputs the C's indexer uses.
+    // `index_topk`, select the top-k keys per query and attend only to those. Gated to
+    // **single-shot prefill** (`pos_base == 0`, so every cached position is one of the
+    // `s_len` new tokens the indexer computes keys for). Decode (`pos_base > 0`) has no
+    // keys for prior positions, so it stays dense — DSA targets long-context prefill,
+    // and decode is disk-bound anyway. `st0 == 0` alone was wrong: kv_start stays 0
+    // during decode, so it let DSA fire there and the indexer indexed past its keys.
+    // An explicit `sel` (tests), a missing indexer, a SHARED layer, or a short context
+    // all leave attention dense.
     let dsa_selection: Option<Vec<Vec<u32>>> = if sel.is_none()
         && st0 == 0
+        && pos_base == 0
         && l.ix_wk.is_some()
         && cfg.idx_type.get(layer).copied().unwrap_or(false)
         && pos_base + s_len > cfg.index_topk as usize

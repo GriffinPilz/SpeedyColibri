@@ -53,6 +53,10 @@ pub fn attention(
 /// As [`attention`], but selecting the core explicitly and optionally restricting each
 /// query to a DSA sparse selection (`sel[s]` = the cached positions query `s` attends
 /// to). `sel == None` (or an empty per-query list) is dense — full causal attention.
+///
+/// Returns the DSA selection this call *computed* — `Some` only on a FULL indexer
+/// layer with DSA active, `None` otherwise — so the forward loop can carry it to the
+/// following SHARED layers (which reuse it instead of falling back to dense).
 #[allow(clippy::too_many_arguments)]
 pub fn attention_with(
     cfg: &Config,
@@ -65,7 +69,7 @@ pub fn attention_with(
     out: &mut [f32],
     core: AttnCore,
     sel: Option<&[Vec<u32>]>,
-) {
+) -> Option<Vec<Vec<u32>>> {
     let h = cfg.n_heads as usize;
     let qh = cfg.qk_head as usize;
     let qk_nope = cfg.qk_nope as usize;
@@ -201,6 +205,11 @@ pub fn attention_with(
 
     // ---- 4) output projection ----------------------------------------------
     matmul_qt(out, &ctx, &l.o, s_len);
+
+    // Hand the caller the selection computed here (Some only on a FULL indexer layer
+    // with DSA active) so it can be reused by the following SHARED layers instead of
+    // them falling back to dense O(n²) attention.
+    dsa_selection
 }
 
 /// Reconstruction core: rebuild k_nope/value for all cached tokens via one kv_b
@@ -553,6 +562,63 @@ mod tests {
 
         let differ = out_d.iter().zip(&out_s).any(|(a, b)| (a - b).abs() > 1e-5);
         assert!(differ, "a strict subset selection must change the attention output");
+    }
+
+    #[test]
+    fn dsa_full_layer_returns_selection_and_reuse_reproduces_it() {
+        // The contract the SHARED-layer reuse relies on: a FULL indexer layer
+        // (sel == None, indexer present, context > index_topk) COMPUTES and RETURNS
+        // its selection; feeding that same selection back reproduces the identical
+        // sparse output and does NOT recompute (returns None). That is exactly what
+        // `layer_forward` does — carry a full layer's returned selection to the
+        // shared layers after it.
+        use crate::quantize::qtensor_from_f32;
+        let json = colibri_json::Json::parse(
+            r#"{"hidden_size":6,"num_hidden_layers":1,"num_attention_heads":2,
+                "n_routed_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":4,
+                "intermediate_size":6,"first_k_dense_replace":0,"q_lora_rank":4,
+                "kv_lora_rank":4,"qk_nope_head_dim":3,"qk_rope_head_dim":2,"v_head_dim":3,
+                "n_shared_experts":1,"vocab_size":10,"n_group":1,"topk_group":1,
+                "rms_norm_eps":1e-5,"routed_scaling_factor":1.0,
+                "rope_parameters":{"rope_theta":10000.0},"eos_token_id":[9],
+                "index_topk":2,"index_n_heads":2,"index_head_dim":4,
+                "indexer_types":["full"]}"#,
+        )
+        .unwrap();
+        let c = Config::from_json(&json).unwrap();
+        assert_eq!(c.idx_type, vec![true], "one FULL indexer layer");
+
+        let mut l = make_layer(&c);
+        let (hidden, ihd, nh, ql) =
+            (c.hidden as usize, c.index_hd as usize, c.index_nh as usize, c.q_lora as usize);
+        l.ix_wk = Some(qtensor_from_f32(&vecf(ihd * hidden, 1), ihd, hidden, 16));
+        l.ix_wq = Some(qtensor_from_f32(&vecf(nh * ihd * ql, 2), nh * ihd, ql, 16));
+        l.ix_wp = Some(qtensor_from_f32(&vecf(nh * hidden, 3), nh, hidden, 16));
+        l.ix_knorm_w = vec![1.0; ihd];
+        l.ix_knorm_b = vec![0.0; ihd];
+
+        let d = hidden;
+        let s_len = 4; // > index_topk (2) → DSA active
+        let x = vecf(s_len * d, 9);
+
+        // FULL layer: no incoming selection → it computes one and returns it.
+        let mut kv1 = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut o1 = vec![0f32; s_len * d];
+        let sel = attention_with(&c, &l, 0, &mut kv1, &x, s_len, 0, &mut o1, AttnCore::Reconstruct, None)
+            .expect("a FULL indexer layer must compute+return a selection past index_topk");
+        // It is a genuine sparse restriction: the last query keeps at most index_topk keys.
+        assert!(sel[s_len - 1].len() <= c.index_topk as usize && !sel[s_len - 1].is_empty());
+
+        // SHARED layer: reuse the carried selection → must NOT recompute, and must
+        // reproduce the full layer's sparse output byte-for-byte.
+        let mut kv2 = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut o2 = vec![0f32; s_len * d];
+        let reused =
+            attention_with(&c, &l, 0, &mut kv2, &x, s_len, 0, &mut o2, AttnCore::Reconstruct, Some(&sel));
+        assert!(reused.is_none(), "a supplied selection must not be recomputed");
+        for (a, b) in o1.iter().zip(&o2) {
+            assert!((a - b).abs() < 1e-6, "reused selection must reproduce the sparse output: {a} vs {b}");
+        }
     }
 
     #[test]

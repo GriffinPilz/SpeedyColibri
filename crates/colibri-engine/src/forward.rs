@@ -6,7 +6,7 @@
 //! layers) → residual add. Then a final RMSNorm and the `lm_head` produce
 //! logits, and greedy decoding feeds the argmax back in one token at a time.
 
-use crate::attention::attention;
+use crate::attention::{attention_with, AttnCore};
 use crate::linear::{embed_row, matmul_qt};
 use crate::math::rmsnorm;
 use crate::model::{KvCache, Layer, Model};
@@ -80,6 +80,7 @@ pub fn layer_forward<P: ExpertProvider>(
     pos_base: usize,
     nrm: &mut [f32],
     tmp: &mut [f32],
+    dsa_sel: &mut Option<Vec<Vec<u32>>>,
 ) -> io::Result<()> {
     let cfg = &model.cfg;
     let d = cfg.hidden as usize;
@@ -87,7 +88,19 @@ pub fn layer_forward<P: ExpertProvider>(
     for si in 0..s {
         rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
     }
-    timed(&ATTN_US, || attention(cfg, l, li, kv, nrm, s, pos_base, tmp));
+    // DSA selection sharing: a FULL indexer layer (idx_type == true) computes its own
+    // top-k selection; SHARED layers (false) reuse the most recent FULL layer's — the
+    // `indexer_types` pattern. Without this the 57 shared layers fell back to dense
+    // O(n²) attention, forfeiting most of DSA's long-context speedup. `attention_with`
+    // returns the selection it computed so we can carry it forward across the stack.
+    let is_full = cfg.idx_type.get(li).copied().unwrap_or(false);
+    let reused = if is_full { None } else { dsa_sel.as_deref() };
+    let computed = timed(&ATTN_US, || {
+        attention_with(cfg, l, li, kv, nrm, s, pos_base, tmp, AttnCore::Reconstruct, reused)
+    });
+    if is_full {
+        *dsa_sel = computed;
+    }
     for j in 0..s * d {
         x[j] += tmp[j];
     }
@@ -137,6 +150,10 @@ pub fn forward<P: ExpertProvider>(
 
     let mut nrm = vec![0f32; s * d];
     let mut tmp = vec![0f32; s * d];
+    // Carries the current DSA selection from each FULL indexer layer to the SHARED
+    // layers that follow it. Fresh per forward pass; stays None when DSA is inactive
+    // (short context or decode), so those layers run dense as before.
+    let mut dsa_sel: Option<Vec<Vec<u32>>> = None;
     for li in 0..model.layers.len() {
         layer_forward(
             model,
@@ -149,6 +166,7 @@ pub fn forward<P: ExpertProvider>(
             pos_base,
             &mut nrm,
             &mut tmp,
+            &mut dsa_sel,
         )?;
     }
 

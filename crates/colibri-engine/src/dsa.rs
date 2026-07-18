@@ -167,28 +167,44 @@ pub fn indexer_forward(
     }
 
     // 2) per query: indexer query + head weights, score every causal key, select.
+    // This is the DSA hot loop — O(s_len · nk · nh · hd). It is embarrassingly
+    // parallel (each query writes only its own `sel[s]` and reads shared keys/x/
+    // q_lora), so split it across cores. Serial, it single-threads the whole indexer
+    // while the rest of the engine is on the GPU, which made DSA net-*slower* than
+    // dense despite the sparse-attention savings.
     let mut sel = vec![Vec::new(); s_len];
-    for s in 0..s_len {
-        let pos = pos_base + s;
-        let nk = pos + 1; // causal, cache starts at 0
-        if is_dense(nk, index_topk) {
-            continue; // no-op: attention attends to all (empty selection)
-        }
-        let mut qi = vec![0f32; nh * index_hd];
-        matmul_qt(&mut qi, &q_lora[s * q_lora_dim..(s + 1) * q_lora_dim], w.wq, 1);
-        for h in 0..nh {
-            rope_interleave(&mut qi[h * index_hd..h * index_hd + rope], pos, rope, theta);
-        }
-        let mut hw = vec![0f32; nh];
-        matmul_qt(&mut hw, &x[s * hidden..(s + 1) * hidden], w.wp, 1);
+    let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let chunk = s_len.div_ceil(nthreads).max(1);
+    let keys = &keys;
+    std::thread::scope(|scope| {
+        for (ci, sel_chunk) in sel.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (j, out) in sel_chunk.iter_mut().enumerate() {
+                    let s = base + j;
+                    let pos = pos_base + s;
+                    let nk = pos + 1; // causal, cache starts at 0
+                    if is_dense(nk, index_topk) {
+                        continue; // no-op: attention attends to all (empty selection)
+                    }
+                    let mut qi = vec![0f32; nh * index_hd];
+                    matmul_qt(&mut qi, &q_lora[s * q_lora_dim..(s + 1) * q_lora_dim], w.wq, 1);
+                    for h in 0..nh {
+                        rope_interleave(&mut qi[h * index_hd..h * index_hd + rope], pos, rope, theta);
+                    }
+                    let mut hw = vec![0f32; nh];
+                    matmul_qt(&mut hw, &x[s * hidden..(s + 1) * hidden], w.wp, 1);
 
-        let mut scores = vec![0f32; nk];
-        for (t, sc) in scores.iter_mut().enumerate() {
-            let kt = &keys[t * index_hd..(t + 1) * index_hd];
-            *sc = indexer_score(&qi, kt, &hw, nh, index_hd);
+                    let mut scores = vec![0f32; nk];
+                    for (t, sc) in scores.iter_mut().enumerate() {
+                        let kt = &keys[t * index_hd..(t + 1) * index_hd];
+                        *sc = indexer_score(&qi, kt, &hw, nh, index_hd);
+                    }
+                    *out = select_topk(&scores, index_topk);
+                }
+            });
         }
-        sel[s] = select_topk(&scores, index_topk);
-    }
+    });
     sel
 }
 

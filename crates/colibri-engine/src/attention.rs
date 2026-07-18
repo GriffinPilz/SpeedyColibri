@@ -35,11 +35,15 @@ pub enum AttnCore {
     Absorb,
 }
 
-/// DSA sparse attention is on by default; `COLI_DSA=0` forces dense attention on
-/// every layer — the A/B baseline and a kill switch.
+/// DSA sparse attention. **Off by default** (`COLI_DSA=1` enables): measured
+/// net-*slower* than dense today because a live selection forces the whole
+/// attention onto the CPU `reconstruct_core` (no GPU sparse-attention kernel yet),
+/// which loses to GPU dense even though sparse does less work — dense 320 s vs DSA
+/// >1800 s over a 2600-tok prefill. The indexer + shared-layer reuse are correct
+/// and ready; DSA becomes a win once the reconstruct core has a GPU kernel.
 fn dsa_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_DSA").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| std::env::var("COLI_DSA").ok().as_deref() == Some("1"))
 }
 
 /// MLA attention over `S` new tokens `x[S, hidden]` beginning at `pos_base`,
@@ -130,11 +134,11 @@ pub fn attention_with(
     // SHARED layer, or a short context all leave attention dense. `x`/`qr` are the same
     // inputs the C's indexer uses.
     let dsa_selection: Option<Vec<Vec<u32>>> = if sel.is_none()
-        && dsa_enabled()
         && st0 == 0
         && l.ix_wk.is_some()
         && cfg.idx_type.get(layer).copied().unwrap_or(false)
         && pos_base + s_len > cfg.index_topk as usize
+        && dsa_enabled()
     {
         let iw = crate::dsa::IndexerWeights {
             wk: l.ix_wk.as_ref().unwrap(),
@@ -581,6 +585,11 @@ mod tests {
         // `layer_forward` does — carry a full layer's returned selection to the
         // shared layers after it.
         use crate::quantize::qtensor_from_f32;
+        // DSA is off by default (CPU-bound, net-slower than dense); force it on for
+        // this test. Only this test reaches `dsa_enabled()` — the condition checks
+        // `ix_wk.is_some()` first and no other test builds an indexer layer — so the
+        // OnceLock isn't cached off by a sibling test.
+        std::env::set_var("COLI_DSA", "1");
         let json = colibri_json::Json::parse(
             r#"{"hidden_size":6,"num_hidden_layers":1,"num_attention_heads":2,
                 "n_routed_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":4,

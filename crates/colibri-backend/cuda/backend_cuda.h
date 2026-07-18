@@ -95,6 +95,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,fl
                                      int H,int Q,int R,int V,int K,int T,
                                      float attention_scale);
 
+/* DSA sparse prefill attention: like the batch variant but each query attends only
+ * to its indexer selection. sel_idx is [S, maxsel] int (row s holds the chosen
+ * cache positions), sel_cnt is [S] int (count per query; <=0 means dense/is_dense).
+ * maxsel must be index_topk. */
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_sparse(ColiCudaTensor *kv_b,float *ctx,const float *q,
+                                     const float *latent,const float *rope,
+                                     const int *sel_idx,const int *sel_cnt,int maxsel,int S,
+                                     int H,int Q,int R,int V,int K,int T,
+                                     float attention_scale);
+
 /* Same attention batch followed immediately by resident o_proj on the same
  * device.  Only the final [S,D] tensor crosses back to the host. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,

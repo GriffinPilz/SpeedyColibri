@@ -29,6 +29,7 @@ typedef struct {
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
+    void *asel,*acnt; size_t asel_cap,acnt_cap;  /* DSA sparse-attention selection */
     float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
@@ -519,6 +520,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
+        if(ctx->asel)cudaFree(ctx->asel);if(ctx->acnt)cudaFree(ctx->acnt);
         for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
@@ -527,10 +529,12 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
+        ctx->asel=ctx->acnt=nullptr;
         ctx->host_x=ctx->host_y=nullptr;ctx->stream=nullptr;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
+        ctx->asel_cap=ctx->acnt_cap=0;
         ctx->host_x_cap=ctx->host_y_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
@@ -887,6 +891,53 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
         const float *latent,const float *rope,int S,int H,int Q,int R,int V,int K,int T,
         float scale){
     return attention_absorb_batch_run(w,nullptr,ctx,q,latent,rope,S,H,Q,R,V,K,T,scale);
+}
+
+/* DSA sparse prefill attention. Mirrors attention_absorb_batch_run but uploads the
+ * per-query indexer selection (`sel_idx` is [S, maxsel] int, `sel_cnt` is [S] int)
+ * and dispatches attention_absorb_sparse_kernel. `maxsel` must be `index_topk` (the
+ * kernel's is_dense fallback relies on dense queries having nt <= maxsel). Larger T
+ * than the dense path is fine — shared memory is sized to maxsel, not T. */
+static int attention_absorb_sparse_run(ColiCudaTensor *w,ColiCudaTensor *proj,float *out,
+        const float *q,const float *latent,const float *rope,
+        const int *sel_idx,const int *sel_cnt,int maxsel,
+        int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if(!w||!out||!q||!latent||!rope||!sel_idx||!sel_cnt||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
+       T<S||T>65536||maxsel<1||maxsel>T||w->I!=K||w->O!=H*(Q+V))return 0;
+    if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
+    size_t rb=(size_t)T*R*sizeof(float),cb=(size_t)S*H*V*sizeof(float);
+    size_t sib=(size_t)S*maxsel*sizeof(int),scb=(size_t)S*sizeof(int);
+    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||
+       !reserve(&dc->ar,&dc->ar_cap,rb)||!reserve(&dc->ac,&dc->ac_cap,cb)||
+       !reserve_bytes(&dc->asel,&dc->asel_cap,sib)||!reserve_bytes(&dc->acnt,&dc->acnt_cap,scb))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"sparse attn q upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"sparse attn latent upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"sparse attn rope upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->asel,sel_idx,sib,cudaMemcpyHostToDevice,dc->stream),"sparse attn sel upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->acnt,sel_cnt,scb,cudaMemcpyHostToDevice,dc->stream),"sparse attn cnt upload"))return 0;
+    size_t shared=(size_t)(2*K+maxsel+ATTN_TPB)*sizeof(float);
+    attention_absorb_sparse_kernel<<<dim3(H,S),ATTN_TPB,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,
+        dc->ar,w->weights,w->scales,(const int*)dc->asel,(const int*)dc->acnt,maxsel,w->fmt,S,H,Q,R,V,K,T,scale);
+    if(!cuda_ok(cudaGetLastError(),"sparse attn launch"))return 0;
+    const float *src=dc->ac;size_t ob=cb;
+    if(proj){
+        ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
+        quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
+            proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I),proj->wrapped);
+        if(!cuda_ok(cudaGetLastError(),"sparse attn o_proj launch"))return 0;src=dc->y;
+    }
+    if(!cuda_ok(cudaMemcpyAsync(out,src,ob,cudaMemcpyDeviceToHost,dc->stream),
+                               proj?"sparse attn projected output download":"sparse attn context download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"sparse attn synchronize"))return 0;
+    return 1;
+}
+
+extern "C" int coli_cuda_attention_absorb_sparse(ColiCudaTensor *w,float *ctx,const float *q,
+        const float *latent,const float *rope,const int *sel_idx,const int *sel_cnt,int maxsel,
+        int S,int H,int Q,int R,int V,int K,int T,float scale){
+    return attention_absorb_sparse_run(w,nullptr,ctx,q,latent,rope,sel_idx,sel_cnt,maxsel,S,H,Q,R,V,K,T,scale);
 }
 
 extern "C" int coli_cuda_attention_project_batch(ColiCudaTensor *w,ColiCudaTensor *proj,

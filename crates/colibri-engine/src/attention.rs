@@ -46,6 +46,15 @@ fn dsa_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_DSA").ok().as_deref() == Some("1"))
 }
 
+/// `COLI_DSA_CPU=1` forces the CPU `reconstruct_core` even when DSA is on, bypassing
+/// the GPU sparse kernel — the correctness A/B (GPU-sparse must match CPU-sparse for
+/// the same selection) and a fallback switch.
+#[cfg(feature = "cuda")]
+fn force_cpu_dsa() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_DSA_CPU").ok().as_deref() == Some("1"))
+}
+
 /// MLA attention over `S` new tokens `x[S, hidden]` beginning at `pos_base`,
 /// writing `out[S, hidden]`. Uses the reconstruction core.
 pub fn attention(
@@ -167,36 +176,70 @@ pub fn attention_with(
     let mut ctx = vec![0f32; s_len * h * vh];
 
     // GPU weight-absorption attention core for resident kv_b (falls back to CPU).
-    // DSA sparse selection has no GPU kernel yet — fall back to the CPU reconstruct
-    // core when a selection is active (this is the long-context prefill path).
+    // A DSA selection (long-context prefill) uses the sparse kernel; dense uses the
+    // batch/decode kernels. Anything the GPU declines falls to the CPU cores below.
     #[cfg(feature = "cuda")]
-    let ran_gpu = sel.is_none() && {
+    let ran_gpu = {
         let tk = pos_base + s_len;
-        if s_len == 1 && st0 == 0 && crate::gpu::available() && l.kv_b.gpu_eligible {
-            // Decode: persistent device KV — append the new row, read on device.
-            match kv.sync_device(layer, pos_base, tk) {
-                Some((lat_dev, rope_dev)) => crate::gpu::try_attention_absorb_kvdev(
-                    &l.kv_b, &mut ctx, &q, lat_dev, rope_dev, h, qk_nope, r, vh, kvl, tk, cfg.attn_scale,
-                ),
-                None => false,
+        match sel {
+            // DSA sparse prefill: reconstruct core restricted to the indexer selection.
+            // DSA runs at st0 == 0 (so the selection's positions are latent-relative);
+            // the Absorb decode core never carries a selection.
+            Some(sels)
+                if matches!(core, AttnCore::Reconstruct)
+                    && st0 == 0
+                    && !force_cpu_dsa()
+                    && crate::gpu::available()
+                    && l.kv_b.gpu_eligible =>
+            {
+                crate::gpu::try_attention_absorb_sparse(
+                    &l.kv_b,
+                    &mut ctx,
+                    &q,
+                    kv.latent_rows(layer, st0, tk),
+                    kv.krot_rows(layer, st0, tk),
+                    sels,
+                    cfg.index_topk as usize,
+                    s_len,
+                    h,
+                    qk_nope,
+                    r,
+                    vh,
+                    kvl,
+                    tk - st0,
+                    cfg.attn_scale,
+                )
             }
-        } else {
-            // Prefill (S>1) or st0>0: one-time host upload of the cache slice.
-            crate::gpu::try_attention_absorb(
-                &l.kv_b,
-                &mut ctx,
-                &q,
-                kv.latent_rows(layer, st0, tk),
-                kv.krot_rows(layer, st0, tk),
-                s_len,
-                h,
-                qk_nope,
-                r,
-                vh,
-                kvl,
-                tk - st0,
-                cfg.attn_scale,
-            )
+            // Selection active but GPU ineligible (or Absorb core) → CPU reconstruct.
+            Some(_) => false,
+            None if s_len == 1 && st0 == 0 && crate::gpu::available() && l.kv_b.gpu_eligible => {
+                // Decode: persistent device KV — append the new row, read on device.
+                match kv.sync_device(layer, pos_base, tk) {
+                    Some((lat_dev, rope_dev)) => crate::gpu::try_attention_absorb_kvdev(
+                        &l.kv_b, &mut ctx, &q, lat_dev, rope_dev, h, qk_nope, r, vh, kvl, tk, cfg.attn_scale,
+                    ),
+                    None => false,
+                }
+            }
+            None if crate::gpu::available() && l.kv_b.gpu_eligible => {
+                // Prefill (S>1) or st0>0: one-time host upload of the cache slice.
+                crate::gpu::try_attention_absorb(
+                    &l.kv_b,
+                    &mut ctx,
+                    &q,
+                    kv.latent_rows(layer, st0, tk),
+                    kv.krot_rows(layer, st0, tk),
+                    s_len,
+                    h,
+                    qk_nope,
+                    r,
+                    vh,
+                    kvl,
+                    tk - st0,
+                    cfg.attn_scale,
+                )
+            }
+            None => false,
         }
     };
     #[cfg(not(feature = "cuda"))]

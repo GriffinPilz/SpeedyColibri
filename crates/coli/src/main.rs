@@ -1052,6 +1052,23 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
         full[i] = report(&format!("full load_expert (T={t})"), t0.elapsed().as_secs_f64(), total_bytes);
     }
 
+    // 2b. Pooled batch: all experts through one continuously-streaming worker set
+    //     (the COLI_READER_POOL path) vs the per-expert spawn/join above. Same
+    //     work (full Experts, scales + QTensor), so this isolates the loader shape.
+    {
+        let eids: Vec<usize> = (0..n_experts).collect();
+        let t0 = std::time::Instant::now();
+        let exps =
+            colibri_engine::moe::load_experts_batch(&shards, hidden, moe_inter, 4, layer, &eids, threads)
+                .expect("load_experts_batch");
+        std::hint::black_box(&exps);
+        report(
+            &format!("pooled batch load (T={threads})"),
+            t0.elapsed().as_secs_f64(),
+            total_bytes,
+        );
+    }
+
     // 3+4. Coalesced read only (fresh alloc + read; no scales, no QTensor).
     let mut read = [0f64; 2];
     for (i, t) in [threads, 1].into_iter().enumerate() {

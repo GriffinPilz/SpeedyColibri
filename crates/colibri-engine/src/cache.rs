@@ -398,14 +398,24 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
             return Ok(());
         }
 
-        // Load off the cache lock; each read chunks itself across cores.
-        let mut loaded: Vec<(usize, Arc<Expert>)> = Vec::with_capacity(missing.len());
-        for &e in &missing {
-            // Best-effort: a load error surfaces when the compute loop calls `expert`.
-            if let Ok(ex) = self.inner.expert(layer, e) {
-                loaded.push((e, ex));
+        // Load off the cache lock. The provider pools the whole batch through one
+        // continuously-streaming reader by default (COLI_READER_POOL=0 disables);
+        // on any batch error fall back to best-effort per-expert loads (a failure
+        // otherwise surfaces when the compute loop calls `expert`).
+        let loaded: Vec<(usize, Arc<Expert>)> = match self.inner.experts_batch(layer, &missing) {
+            Ok(exps) if exps.len() == missing.len() => {
+                missing.iter().copied().zip(exps).collect()
             }
-        }
+            _ => {
+                let mut v = Vec::with_capacity(missing.len());
+                for &e in &missing {
+                    if let Ok(ex) = self.inner.expert(layer, e) {
+                        v.push((e, ex));
+                    }
+                }
+                v
+            }
+        };
 
         // Serial bookkeeping: insert the batch, then a single protected eviction.
         let batch: HashSet<(usize, usize)> = missing.iter().map(|&e| (layer, e)).collect();

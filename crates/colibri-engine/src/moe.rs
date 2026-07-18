@@ -148,6 +148,14 @@ pub trait ExpertProvider {
     fn prefetch(&self, _layer: usize, _eids: &[usize]) -> io::Result<()> {
         Ok(())
     }
+
+    /// Load several experts for `layer` at once, in `eids` order. Providers backed
+    /// by local disk can pool the reads through one continuously-streaming worker
+    /// set (see [`load_experts_batch`]) instead of a per-expert spawn/join; the
+    /// default just loads each through [`ExpertProvider::expert`].
+    fn experts_batch(&self, layer: usize, eids: &[usize]) -> io::Result<Vec<Arc<Expert>>> {
+        eids.iter().map(|&e| self.expert(layer, e)).collect()
+    }
 }
 
 /// Loads experts from local safetensors shards, honoring `colibri-cluster`
@@ -287,31 +295,7 @@ pub fn load_expert(
         // The read is chunked across `read_threads` cores so a single miss saturates
         // the disk. Scales are tiny and elsewhere; keep them as small per-tensor reads.
         let ws = shards.read_raw_shared(&[&gate_w, &up_w, &down_w], read_threads)?;
-        let mk = |o: usize, i: usize, w: &(std::sync::Arc<colibri_core::SharedBuf>, usize, usize), sname: String| -> io::Result<QTensor> {
-            let (buf, off, len) = w;
-            let fmt = if *len == o * i {
-                1
-            } else if *len == o * i.div_ceil(2) {
-                2
-            } else {
-                3
-            };
-            let mut s = vec![0f32; o];
-            shards.read_f32(&sname, &mut s)?;
-            let mut t = QTensor { fmt_code: fmt, o: o as i32, i: i as i32, s, ..Default::default() };
-            if fmt == 1 {
-                // int8 goes in q8 (signed) — a copy; experts are int4 so this is rare.
-                t.q8 = buf[*off..*off + *len].iter().map(|&b| b as i8).collect();
-            } else {
-                t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
-            }
-            Ok(t)
-        };
-        Expert {
-            gate: mk(moe_inter, hidden, &ws[0], format!("{gate_w}.qs"))?,
-            up: mk(moe_inter, hidden, &ws[1], format!("{up_w}.qs"))?,
-            down: mk(hidden, moe_inter, &ws[2], format!("{down_w}.qs"))?,
-        }
+        expert_from_views(shards, hidden, moe_inter, layer, eid, &ws)?
     } else {
         // Full-tensor (runtime-quantized) path — the tiny oracle model.
         Expert {
@@ -330,6 +314,113 @@ pub fn load_expert(
         ex.mark_gpu_eligible();
     }
     Ok(ex)
+}
+
+/// Build an `Expert` from three raw weight views (`gate,up,down`, each as returned
+/// by [`Shards::read_raw_shared`]/`read_raw_shared_batched`), reading the tiny
+/// per-weight scales separately. Shared by the single-expert and batched loaders.
+fn expert_from_views(
+    shards: &Shards,
+    hidden: usize,
+    moe_inter: usize,
+    layer: usize,
+    eid: usize,
+    views: &[(Arc<colibri_core::SharedBuf>, usize, usize)],
+) -> io::Result<Expert> {
+    let mk = |o: usize,
+              i: usize,
+              w: &(Arc<colibri_core::SharedBuf>, usize, usize),
+              sname: String|
+     -> io::Result<QTensor> {
+        let (buf, off, len) = w;
+        let fmt = if *len == o * i {
+            1
+        } else if *len == o * i.div_ceil(2) {
+            2
+        } else {
+            3
+        };
+        let mut s = vec![0f32; o];
+        shards.read_f32(&sname, &mut s)?;
+        let mut t = QTensor { fmt_code: fmt, o: o as i32, i: i as i32, s, ..Default::default() };
+        if fmt == 1 {
+            // int8 goes in q8 (signed) — a copy; experts are int4 so this is rare.
+            t.q8 = buf[*off..*off + *len].iter().map(|&b| b as i8).collect();
+        } else {
+            t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+        }
+        Ok(t)
+    };
+    let wn = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight.qs");
+    Ok(Expert {
+        gate: mk(moe_inter, hidden, &views[0], wn("gate_proj"))?,
+        up: mk(moe_inter, hidden, &views[1], wn("up_proj"))?,
+        down: mk(hidden, moe_inter, &views[2], wn("down_proj"))?,
+    })
+}
+
+/// Pool a whole layer's expert reads through one continuously-streaming worker
+/// set instead of the per-expert spawn/join in [`load_expert`]. **On by default**;
+/// set `COLI_READER_POOL=0` to fall back to the per-expert path. Measured on the
+/// GB10 (PCIe-4-x4 NVMe): +19.6% decode tok/s in the miss-heavy regime with
+/// byte-identical output, and 2.0× warm load bandwidth (9.27 → 18.58 GB/s). The
+/// per-expert spawn/join barrier — paid ~18 times per expert — was the bottleneck.
+fn reader_pool_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_READER_POOL").ok().as_deref() != Some("0"))
+}
+
+/// Load several routed experts through the pooled batched reader — one worker set
+/// drains every expert's sub-chunk reads, so the NVMe streams continuously rather
+/// than stalling at a per-expert barrier. Falls back to per-expert loads for the
+/// full-tensor (oracle) path. Returns experts in `eids` order.
+pub fn load_experts_batch(
+    shards: &Shards,
+    hidden: usize,
+    moe_inter: usize,
+    ebits: u32,
+    layer: usize,
+    eids: &[usize],
+    read_threads: usize,
+) -> io::Result<Vec<Expert>> {
+    if eids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The pooled path applies only to the pre-quantized container (contiguous
+    // gate|up|down + sidecar scales). Detect via the first expert's scales tensor.
+    let probe = format!(
+        "model.layers.{layer}.mlp.experts.{}.gate_proj.weight.qs",
+        eids[0]
+    );
+    if !shards.has(&probe) {
+        return eids
+            .iter()
+            .map(|&e| load_expert(shards, hidden, moe_inter, ebits, layer, e, read_threads))
+            .collect();
+    }
+    // One [gate,up,down] name group per expert; keep the owned strings alive so
+    // the borrowed &str slices handed to the reader stay valid.
+    let names: Vec<[String; 3]> = eids
+        .iter()
+        .map(|&eid| {
+            let wn = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
+            [wn("gate_proj"), wn("up_proj"), wn("down_proj")]
+        })
+        .collect();
+    let groups: Vec<[&str; 3]> =
+        names.iter().map(|g| [g[0].as_str(), g[1].as_str(), g[2].as_str()]).collect();
+    let group_refs: Vec<&[&str]> = groups.iter().map(|g| &g[..]).collect();
+    let views = shards.read_raw_shared_batched(&group_refs, read_threads)?;
+
+    let mut out = Vec::with_capacity(eids.len());
+    for (gi, &eid) in eids.iter().enumerate() {
+        let mut ex = expert_from_views(shards, hidden, moe_inter, layer, eid, &views[gi])?;
+        if gpu_experts_enabled() {
+            ex.mark_gpu_eligible();
+        }
+        out.push(ex);
+    }
+    Ok(out)
 }
 
 impl ExpertProvider for ShardsExpertProvider<'_> {
@@ -359,6 +450,37 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
             eid,
             self.read_threads,
         )?))
+    }
+
+    fn experts_batch(&self, layer: usize, eids: &[usize]) -> io::Result<Vec<Arc<Expert>>> {
+        // Same ownership guard as `expert`: a non-local expert should have been
+        // dispatched over the transport and never reach this local provider.
+        for &eid in eids {
+            if !self.sharding.is_local(self.this_node, eid as u32) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "expert {eid} (layer {layer}) is owned by another node, not {}; \
+                         it should have been dispatched over the transport",
+                        self.this_node.0
+                    ),
+                ));
+            }
+        }
+        if reader_pool_enabled() {
+            let exps = load_experts_batch(
+                self.shards,
+                self.hidden,
+                self.moe_inter,
+                self.ebits,
+                layer,
+                eids,
+                self.read_threads,
+            )?;
+            Ok(exps.into_iter().map(Arc::new).collect())
+        } else {
+            eids.iter().map(|&e| self.expert(layer, e)).collect()
+        }
     }
 }
 

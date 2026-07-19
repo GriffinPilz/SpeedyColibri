@@ -318,11 +318,14 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // COLI_KEEP_INDEXER=1 keeps the DSA lightning-indexer weights so the container
         // can run DSA sparse attention (dropped by default, matching the reference).
         keep_indexer: env_u32("COLI_KEEP_INDEXER", 0) != 0,
+        // COLI_XFP8=1 emits routed experts as per-row e4m3 fp8 (8-bit) instead of xbits
+        // int — preserves the source FP8 precision for the tiled FP8 expert kernel.
+        xfp8: env_u32("COLI_XFP8", 0) != 0,
     };
 
     eprintln!(
-        "[convert] {indir} -> {outdir}  (ebits={} io_bits={} xbits={} n_layers={})",
-        opts.ebits, opts.io_bits, opts.xbits, opts.n_layers
+        "[convert] {indir} -> {outdir}  (ebits={} io_bits={} xbits={} xfp8={} n_layers={})",
+        opts.ebits, opts.io_bits, opts.xbits, opts.xfp8, opts.n_layers
     );
     let t0 = std::time::Instant::now();
     let res = colibri_engine::convert_snapshot(indir, outdir, opts, |fi, n, st| {

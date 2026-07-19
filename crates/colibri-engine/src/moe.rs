@@ -379,13 +379,21 @@ fn expert_from_views(
         } else {
             t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
         }
-        if fmt == 2 && expert_fp8_enabled() {
-            // Convert int4 (offset-binary) experts to e4m3 fp8 for the tiled tensor-core
-            // path. Same per-row scales; e4m3 represents the int4 values −8..7 exactly,
-            // so this is lossless vs the int4 weights (true bf16→e4m3 is a separate
-            // quality task). Doubles the in-RAM expert size (0.5→1 B/weight).
-            t.q4 = Bytes::Owned(int4_to_e4m3(&buf[*off..*off + *len], o, i));
-            t.fmt_code = 4;
+        if expert_fp8_enabled() {
+            if fmt == 2 {
+                // int4 snapshot → convert to e4m3 at load (scaffolding for a non-fp8
+                // container). Same per-row scales; e4m3 represents int4 −8..7 exactly,
+                // so it is lossless vs the int4 weights. Doubles in-RAM size.
+                t.q4 = Bytes::Owned(int4_to_e4m3(&buf[*off..*off + *len], o, i));
+                t.fmt_code = 4;
+            } else if fmt == 1 {
+                // e4m3 snapshot (COLI_XFP8 container): the bytes are already e4m3 —
+                // 1 B/weight, indistinguishable by length from int8. Use them directly,
+                // no conversion. Routed experts are never genuinely int8.
+                t.q8 = Vec::new();
+                t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+                t.fmt_code = 4;
+            }
         }
         Ok(t)
     };

@@ -82,11 +82,15 @@ pub struct ConvertOpts {
     /// weights_proj matrices quantize at `ebits`; k_norm stays f32. Adds ~index-head
     /// weights per layer (small vs the experts).
     pub keep_indexer: bool,
+    /// emit routed experts as per-row-scaled e4m3 fp8 (1 byte/weight) instead of
+    /// `xbits`-bit int — `--xfp8`. Preserves the source FP8's 8-bit weight precision
+    /// (vs int4's 4) at 2× the streamed bytes; consumed by the tiled FP8 expert kernel.
+    pub xfp8: bool,
 }
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false }
+        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false }
     }
 }
 
@@ -377,6 +381,73 @@ fn quantize(name: &str, w: &[f32], o: usize, i: usize, bits: u32) -> (OutTensor,
         name: format!("{name}.qs"),
         dtype: "F32",
         shape: vec![scale.len() as i64],
+        bytes: f32_bytes(&scale),
+    };
+    (codes_t, scale_t)
+}
+
+/// Encode f32 → e4m3 fp8 (OCP: 1 sign, 4 exp bias-7, 3 mantissa; no infinity; max
+/// normal ±448; round-to-nearest on the mantissa). The caller pre-scales into range,
+/// so saturation is a safety net. NaN/0 → signed zero.
+fn float_to_e4m3(x: f32) -> u8 {
+    let sign: u8 = if x.is_sign_negative() { 0x80 } else { 0x00 };
+    let a = x.abs();
+    if !(a > 0.0) {
+        return sign;
+    }
+    if a >= 448.0 {
+        return sign | 0x7E; // saturate to max normal (e=15, m=6 = 448)
+    }
+    let e = a.log2().floor() as i32; // unbiased exponent: 2^e <= a < 2^(e+1)
+    if e < -6 {
+        // subnormal: value = m/8 · 2^-6, so m = a · 2^6 · 8 = a · 512. Round-to-even
+        // matches the hardware fp8 encoder (__nv_cvt_float_to_fp8).
+        let m = (a * 512.0).round_ties_even() as i32;
+        if m >= 8 {
+            return sign | 0x08; // rounded up into the smallest normal (2^-6)
+        }
+        return sign | (m.max(0) as u8);
+    }
+    // normal: value = (1 + m/8) · 2^e
+    let mut m = ((a * 2f32.powi(-e) - 1.0) * 8.0).round_ties_even() as i32;
+    let mut eb = e + 7;
+    if m >= 8 {
+        m = 0;
+        eb += 1; // mantissa carried into the next binade
+    }
+    if eb >= 15 && m > 6 {
+        return sign | 0x7E; // e=15,m=7 is NaN → saturate to 448
+    }
+    sign | ((eb as u8) << 3) | (m as u8 & 0x07)
+}
+
+/// Per-row absmax e4m3 quantization for routed experts: scale = max|w|/448 per row so
+/// the row fits e4m3's range, store e4m3(w/scale) codes + the f32 scale. Same output
+/// layout as [`quantize`] (U8 codes + `{name}.qs` F32 scales) but 8-bit fp precision
+/// (1 byte/weight) instead of int4 — preserves the source FP8's precision.
+fn quantize_e4m3(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, OutTensor) {
+    let mut codes = vec![0u8; o * i];
+    let mut scale = vec![0f32; o];
+    for r in 0..o {
+        let row = &w[r * i..(r + 1) * i];
+        let amax = row.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let s = if amax > 0.0 { amax / 448.0 } else { 1.0 };
+        let inv = 1.0 / s;
+        for c in 0..i {
+            codes[r * i + c] = float_to_e4m3(row[c] * inv);
+        }
+        scale[r] = s;
+    }
+    let codes_t = OutTensor {
+        name: name.to_string(),
+        dtype: "U8",
+        shape: vec![(o * i) as i64],
+        bytes: codes,
+    };
+    let scale_t = OutTensor {
+        name: format!("{name}.qs"),
+        dtype: "F32",
+        shape: vec![o as i64],
         bytes: f32_bytes(&scale),
     };
     (codes_t, scale_t)
@@ -776,7 +847,11 @@ pub fn convert_snapshot(
                         _ => opts.ebits,
                     };
                     let (o, i) = (shape[0] as usize, shape[1] as usize);
-                    let (codes_t, scale_t) = quantize(name, &w, o, i, bits);
+                    let (codes_t, scale_t) = if matches!(kind, Kind::X) && opts.xfp8 {
+                        quantize_e4m3(name, &w, o, i)
+                    } else {
+                        quantize(name, &w, o, i, bits)
+                    };
                     codes.push(codes_t);
                     floats.push(scale_t);
                     stats.tensors_quantized += 1;
@@ -813,6 +888,24 @@ pub fn convert_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `float_to_e4m3` must match the hardware fp8 encoder (`__nv_cvt_float_to_fp8`,
+    /// __NV_SATFINITE, __NV_E4M3) — reference bytes generated on the GB10. A wrong
+    /// encoder silently degrades every converted expert weight.
+    #[test]
+    fn float_to_e4m3_matches_hardware() {
+        let cases: &[(f32, u8)] = &[
+            (0.0, 0x00), (0.1, 0x1D), (0.5, 0x30), (1.0, 0x38), (1.5, 0x3C),
+            (2.0, 0x40), (3.14159, 0x45), (7.0, 0x4E), (15.5, 0x58), (100.0, 0x6C),
+            (448.0, 0x7E), (500.0, 0x7E), (-1.0, 0xB8), (-0.5, 0xB0), (-256.0, 0xF8),
+            (0.015625, 0x08), (0.0078125, 0x04), (0.001, 0x01), (2.5, 0x42),
+            (0.3, 0x2A), (0.017, 0x09), (255.9, 0x78),
+        ];
+        for &(x, want) in cases {
+            let got = float_to_e4m3(x);
+            assert_eq!(got, want, "e4m3({x}) = 0x{got:02X}, want 0x{want:02X}");
+        }
+    }
 
     /// The metric must react to a loss it is *told* is there, in the right direction
     /// and roughly the right size — otherwise a near-zero reading off the real
@@ -1298,7 +1391,7 @@ mod tests {
         drop(f);
 
         let outdir = tmp();
-        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false };
+        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false };
         let stats = convert_snapshot(&indir, &outdir, opts, |_, _, _| {}).unwrap();
         assert_eq!(stats.tensors_quantized, 1); // o_proj
         assert_eq!(stats.tensors_f32, 1); // norm

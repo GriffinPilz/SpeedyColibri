@@ -698,20 +698,36 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         }
     }
 
+    let prof = crate::forward::profile_on();
     for (e, rows, rw) in &per_expert {
         let nr = rows.len();
+        let ex = provider.expert(layer, *e)?; // cache hit (prefetched); not timed here
         let mut xg = vec![0f32; nr * d];
+        let t0 = std::time::Instant::now();
         for (r, &t) in rows.iter().enumerate() {
             xg[r * d..(r + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
         }
-        let ex = provider.expert(layer, *e)?;
+        if prof {
+            crate::forward::GATHER_US
+                .fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut hh = vec![0f32; nr * d];
+        let t1 = std::time::Instant::now();
         ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
+        if prof {
+            crate::forward::GPUFFN_US
+                .fetch_add(t1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let t2 = std::time::Instant::now();
         for (r, &t) in rows.iter().enumerate() {
             let wgt = rw[r];
             for dd in 0..d {
                 out[t * d + dd] += wgt * hh[r * d + dd];
             }
+        }
+        if prof {
+            crate::forward::SCATTER_US
+                .fetch_add(t2.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
     Ok(out)
@@ -736,6 +752,20 @@ fn subcols(w_mat: &[f32], s_len: usize, n_uniq: usize, cols: &[usize]) -> Vec<f3
 /// (`sharding.num_nodes() == 1`) every expert is local and no `exchange` happens,
 /// so it matches `moe` exactly. `provider` must be able to load *this node's*
 /// experts; the peer's `serve_experts` handler computes theirs.
+/// Router projection `logits[s,e] = x[s,d] @ router[e,d]^T`. Runs on the GPU (full
+/// f32, no quality change) when CUDA is available — a single-threaded CPU `matmul_f32`
+/// here was ~40% of moe-compute at long context — falling back to CPU otherwise.
+#[inline]
+fn router_matmul(logits: &mut [f32], x: &[f32], router: &[f32], s_len: usize, d: usize, e_n: usize) {
+    #[cfg(feature = "cuda")]
+    {
+        if crate::gpu::try_matmul_f32(logits, x, router, s_len, d, e_n) {
+            return;
+        }
+    }
+    matmul_f32(logits, x, router, s_len, d, e_n);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn moe_sharded<P: ExpertProvider, T: Transport + ?Sized>(
     cfg: &Config,
@@ -754,7 +784,7 @@ pub fn moe_sharded<P: ExpertProvider, T: Transport + ?Sized>(
     let k = (cfg.topk as usize).min(e_n);
 
     let mut logits = vec![0f32; s_len * e_n];
-    matmul_f32(&mut logits, x, &l.router, s_len, d, e_n);
+    router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
     let mut idxs = vec![0usize; s_len * k];
     let mut ws = vec![0f32; s_len * k];
     for s in 0..s_len {
@@ -851,7 +881,12 @@ pub fn moe<P: ExpertProvider>(
 
     // ---- router (f32) + top-K per position --------------------------------
     let mut logits = vec![0f32; s_len * e_n];
-    matmul_f32(&mut logits, x, &l.router, s_len, d, e_n);
+    let _rt = std::time::Instant::now();
+    router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
+    if crate::forward::profile_on() {
+        crate::forward::ROUTER_US
+            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let mut idxs = vec![0usize; s_len * k];
     let mut ws = vec![0f32; s_len * k];
@@ -876,10 +911,15 @@ pub fn moe<P: ExpertProvider>(
 
     // ---- shared expert (weight 1.0, all positions) ------------------------
     if with_shared {
+        let _st = std::time::Instant::now();
         let mut sh = vec![0f32; s_len * d];
         ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
         for (o, &s) in out.iter_mut().zip(sh.iter()) {
             *o += s;
+        }
+        if crate::forward::profile_on() {
+            crate::forward::SHARED_US
+                .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

@@ -29,6 +29,16 @@ static EMBED_US: AtomicU64 = AtomicU64::new(0);
 /// Time spent fetching experts through the provider (disk→RAM on a cache miss).
 /// A sub-total of `MOE_US`. Incremented from `moe`.
 pub(crate) static LOAD_US: AtomicU64 = AtomicU64::new(0);
+/// Sub-totals of `MOE_US` (compute side, excludes LOAD_US): CPU row-gather into the
+/// per-expert activation buffer, the GPU FFN call incl. sync/transfers, and the
+/// weighted scatter back into the output. Incremented from `compute_experts_partial`.
+pub(crate) static GATHER_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GPUFFN_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SCATTER_US: AtomicU64 = AtomicU64::new(0);
+/// Sub-totals of `MOE_US` outside the routed-expert loop: the CPU router projection
+/// (`matmul_f32`) and the shared-expert FFN. Incremented from `moe`.
+pub(crate) static ROUTER_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SHARED_US: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic forward-pass counter — one per `forward` call, i.e. per decode token
 /// (prefill is a single step over the whole prompt). Used only to key the optional
@@ -424,6 +434,14 @@ where
             ms(&DENSE_US),
             ms(&EMBED_US),
             logits_us as f64 / 1e3,
+        );
+        eprintln!(
+            "[profile] moe-compute breakdown: router {:.0} ms | gather {:.0} ms | gpu-ffn(+sync) {:.0} ms | scatter {:.0} ms | shared {:.0} ms",
+            ms(&ROUTER_US),
+            ms(&GATHER_US),
+            ms(&GPUFFN_US),
+            ms(&SCATTER_US),
+            ms(&SHARED_US),
         );
     }
     Ok(DecodeStats {

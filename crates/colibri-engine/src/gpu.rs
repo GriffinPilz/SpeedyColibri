@@ -678,6 +678,44 @@ pub fn try_matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) -> bool {
     })
 }
 
+/// Dense f32 matmul `y[s,o] = x[s,i] @ w[o,i]^T` on the GPU, full f32 precision.
+/// For the MoE router projection: a single-threaded CPU `matmul_f32` there was
+/// measured at ~40% of moe-compute (~248 s @4096 tok) while the GPU sat idle. The
+/// router weight is numerically sensitive so it stays f32 (fmt=0 — no scales). The
+/// weight is resident-cached by its pointer, so it uploads once. Returns false to
+/// fall back to the CPU path when CUDA is unavailable.
+pub fn try_matmul_f32(y: &mut [f32], x: &[f32], w: &[f32], s: usize, i: usize, o: usize) -> bool {
+    if !available() || w.len() != o * i {
+        return false;
+    }
+    let key = w.as_ptr() as usize;
+    RESIDENT.with(|r| {
+        let mut map = r.borrow_mut();
+        let slot = map.entry(key).or_insert(std::ptr::null_mut());
+        // SAFETY: y sized [s,o], x sized [s,i] by the caller; w is [o,i] f32 and
+        // outlives the resident tensor (a model weight). fmt=0 ⇒ scales unused, so
+        // a null scales pointer is valid (see coli_cuda_tensor_upload / quant_matmul).
+        let ok = unsafe {
+            cuda::matmul_raw(
+                slot,
+                y.as_mut_ptr(),
+                x.as_ptr(),
+                w.as_ptr() as *const c_void,
+                std::ptr::null(),
+                0,
+                s as i32,
+                i as i32,
+                o as i32,
+                0,
+            )
+        };
+        if ok {
+            GPU_MATMULS.with(|c| c.set(c.get() + 1));
+        }
+        ok
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

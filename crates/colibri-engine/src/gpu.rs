@@ -524,6 +524,108 @@ pub fn try_expert_ffn(
     ok
 }
 
+/// `COLI_EXPERT_GROUP=1` batches a layer's routed experts through the grouped async
+/// kernel (one H2D/D2H per ≤64-expert chunk) instead of a synchronous call per expert
+/// — attacks the per-expert round-trip that dominates moe-compute.
+pub fn expert_group_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() == Some("1"))
+}
+
+/// Batched routed-expert FFN. `active` is one `(expert, its token rows, its per-row
+/// weights)` per active expert. Gathers all rows into one buffer (grouped by expert),
+/// wraps each expert zero-copy, computes them in ≤64-expert grouped calls (one H2D/D2H
+/// each), then scatters the weighted results into `out` `[n_tokens, d]`. Returns false
+/// — leaving `out` untouched — if unavailable/ineligible, so the caller falls back
+/// per-expert. FP8-only for now (the grouped kernel's e4m3 branch).
+pub fn try_expert_group(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if active.is_empty() {
+        return true; // nothing routed — `out` unchanged
+    }
+    if !active.iter().all(|(ex, _, _)| {
+        ex.gate.gpu_eligible && ex.gate.fmt_code == 4 && ex.up.fmt_code == 4 && ex.down.fmt_code == 4
+    }) {
+        return false;
+    }
+    let total: usize = active.iter().map(|(_, r, _)| r.len()).sum();
+    // Gather activations, rows grouped by expert; remember each global row's dest token+weight.
+    let mut x_all = vec![0f32; total * d];
+    let mut token_of = vec![0usize; total];
+    let mut weight_of = vec![0f32; total];
+    let mut g = 0usize;
+    for (_, rows, rw) in active {
+        for (r, &t) in rows.iter().enumerate() {
+            x_all[g * d..(g + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
+            token_of[g] = t;
+            weight_of[g] = rw[r];
+            g += 1;
+        }
+    }
+    let mut y_all = vec![0f32; total * d];
+    // Grouped calls in chunks of ≤64 experts (the C-side GroupDesc cap).
+    let mut row_off = 0usize;
+    let mut ci = 0usize;
+    while ci < active.len() {
+        let c1 = (ci + 64).min(active.len());
+        let (mut gs, mut us, mut ds, mut rows_i) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut keep = Vec::new(); // hold descriptors alive across the synchronous call
+        let mut chunk_rows = 0usize;
+        for (ex, rows, _) in &active[ci..c1] {
+            let (Some(gt), Some(ut), Some(dt)) =
+                (wrap_fresh(&ex.gate), wrap_fresh(&ex.up), wrap_fresh(&ex.down))
+            else {
+                return false;
+            };
+            gs.push(gt.as_raw());
+            us.push(ut.as_raw());
+            ds.push(dt.as_raw());
+            keep.push(gt);
+            keep.push(ut);
+            keep.push(dt);
+            rows_i.push(rows.len() as i32);
+            chunk_rows += rows.len();
+        }
+        let off = row_off * d;
+        // SAFETY: gs/us/ds stay resident until `keep` drops (after the synchronous
+        // group call); the x/y sub-slices hold chunk_rows*d floats each.
+        let ok = unsafe {
+            cuda::expert_group_raw(
+                &gs,
+                &us,
+                &ds,
+                &rows_i,
+                y_all[off..off + chunk_rows * d].as_mut_ptr(),
+                x_all[off..off + chunk_rows * d].as_ptr(),
+            )
+        };
+        drop(keep);
+        if !ok {
+            return false;
+        }
+        row_off += chunk_rows;
+        ci = c1;
+    }
+    // Scatter weighted results into the destination tokens.
+    for gg in 0..total {
+        let (t, wgt) = (token_of[gg], weight_of[gg]);
+        let ys = &y_all[gg * d..(gg + 1) * d];
+        let os = &mut out[t * d..(t + 1) * d];
+        for dd in 0..d {
+            os[dd] += wgt * ys[dd];
+        }
+    }
+    true
+}
+
 /// Try to run `y[S,O] = x[S,I] @ W^T` on the GPU. Returns `true` if it ran there;
 /// `false` (do it on the CPU) when CUDA is unavailable or `w` isn't eligible.
 pub fn try_matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) -> bool {

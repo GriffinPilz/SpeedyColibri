@@ -82,6 +82,15 @@ extern "C" {
         x: *const f32,
         s: c_int,
     ) -> c_int;
+    fn coli_cuda_expert_group(
+        gates: *const *mut ColiCudaTensor,
+        ups: *const *mut ColiCudaTensor,
+        downs: *const *mut ColiCudaTensor,
+        rows: *const c_int,
+        count: c_int,
+        y: *mut f32,
+        x: *const f32,
+    ) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn coli_cuda_attention_absorb_batch(
         kv_b: *mut ColiCudaTensor,
@@ -399,6 +408,37 @@ pub unsafe fn expert_mlp_fp8_raw(
     s: i32,
 ) -> bool {
     coli_cuda_expert_mlp_fp8(gate, up, down, y, x, s) != 0
+}
+
+/// Batched fused expert FFN: all `count` (≤64) experts computed with ONE H2D + ONE
+/// D2H and async kernels on the stream — pays the upload/download round-trip once for
+/// the whole group instead of once per expert. `x`/`y` hold `sum(rows)` consecutive
+/// `[I]`/`[O]` rows in expert order; `rows[c]` is expert `c`'s row count.
+///
+/// # Safety
+/// The three slices are `count`-long arrays of resident handles on one device; `x`/`y`
+/// hold `sum(rows)*I` / `sum(rows)*O` floats. Handles must outlive the call.
+pub unsafe fn expert_group_raw(
+    gates: &[*mut ColiCudaTensor],
+    ups: &[*mut ColiCudaTensor],
+    downs: &[*mut ColiCudaTensor],
+    rows: &[i32],
+    y: *mut f32,
+    x: *const f32,
+) -> bool {
+    let count = gates.len();
+    if count == 0 || ups.len() != count || downs.len() != count || rows.len() != count {
+        return false;
+    }
+    coli_cuda_expert_group(
+        gates.as_ptr(),
+        ups.as_ptr(),
+        downs.as_ptr(),
+        rows.as_ptr(),
+        count as c_int,
+        y,
+        x,
+    ) != 0
 }
 
 /// Causal MLA weight-absorption attention on the GPU: computes `ctx[S, H*V]` from

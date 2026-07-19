@@ -818,7 +818,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1;
+    int all_s4=1, all_fp8=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -826,6 +826,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
                  g->fmt,u->fmt,d->fmt,rows[c],total,g->wrapped};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+        all_fp8&=g->fmt==4&&u->fmt==4&&d->fmt==4;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
@@ -865,6 +866,25 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
+    }else if(all_fp8&&ctx->compute_major>=7){
+        /* FP8 (e4m3) tiled Tensor Core, one launch trio per expert on the stream —
+         * the whole group shares ONE H2D + ONE D2H, so the per-expert synchronous
+         * upload/download round-trip (which dominates moe-compute) is paid once for
+         * the layer instead of once per expert. */
+        int off8=0;
+        for(int c=0;c<count;c++){
+            int r=rows[c];
+            float *g8=ctx->gate+(size_t)off8*I,*u8=ctx->up+(size_t)off8*I;
+            float *x8=ctx->x+(size_t)off8*D,*y8=ctx->y+(size_t)off8*D;
+            dim3 hg8((unsigned)((I+63)/64),(unsigned)((r+15)/16));
+            dim3 og8((unsigned)((D+63)/64),(unsigned)((r+15)/16));
+            fp8a16_gate_up<<<hg8,256,0,ctx->stream>>>(g8,u8,x8,
+                (const uint8_t*)host[c].g,(const uint8_t*)host[c].u,host[c].gs,host[c].us,r,D,I);
+            silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g8,u8,(size_t)r*I);
+            fp8a16_matmul<<<og8,128,0,ctx->stream>>>(y8,g8,
+                (const uint8_t*)host[c].d,host[c].ds,r,I,D);
+            off8+=r;
+        }
     }else if(all_s4&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
              atoi(getenv("COLI_CUDA_TC_W4A16"))){
         /* W4A16 Tensor Core per gruppo: attivazioni fp16 per tile (lossless al

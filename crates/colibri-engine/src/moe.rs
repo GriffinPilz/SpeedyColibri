@@ -667,8 +667,9 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         provider.prefetch(layer, &eids)?;
     }
 
+    // Per-expert row lists: the tokens routing to each expert, with their weights.
+    let mut per_expert: Vec<(usize, Vec<usize>, Vec<f32>)> = Vec::new();
     for (ei, &e) in eids.iter().enumerate() {
-        // Rows (tokens) that route to this expert, with their weights.
         let mut rows = Vec::new();
         let mut rw = Vec::new();
         for t in 0..n_tokens {
@@ -678,15 +679,32 @@ pub fn compute_experts_partial<P: ExpertProvider>(
                 rw.push(w);
             }
         }
-        if rows.is_empty() {
-            continue;
+        if !rows.is_empty() {
+            per_expert.push((e, rows, rw));
         }
+    }
+
+    // Batched grouped path (`COLI_EXPERT_GROUP`): one H2D/D2H per ≤64-expert chunk
+    // instead of a synchronous upload/kernel/download per expert — the per-expert
+    // round-trip is what dominates moe-compute. Falls through per-expert if it can't run.
+    #[cfg(feature = "cuda")]
+    if crate::gpu::expert_group_enabled() {
+        let mut active = Vec::with_capacity(per_expert.len());
+        for (e, rows, rw) in &per_expert {
+            active.push((provider.expert(layer, *e)?, rows.clone(), rw.clone()));
+        }
+        if crate::gpu::try_expert_group(&active, activations, d, &mut out) {
+            return Ok(out);
+        }
+    }
+
+    for (e, rows, rw) in &per_expert {
         let nr = rows.len();
         let mut xg = vec![0f32; nr * d];
         for (r, &t) in rows.iter().enumerate() {
             xg[r * d..(r + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
         }
-        let ex = provider.expert(layer, e)?;
+        let ex = provider.expert(layer, *e)?;
         let mut hh = vec![0f32; nr * d];
         ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
         for (r, &t) in rows.iter().enumerate() {

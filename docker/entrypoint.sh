@@ -50,6 +50,11 @@ fi
 # Where auto-converted int4 containers are cached. Defaults under the HF cache so
 # a mounted host cache persists conversions across container runs.
 : "${COLI_CONVERT_DIR:=${HF_HOME:-/root/.cache/huggingface}/colibri-int4}"
+# Multispark ports: rank 0 serves per-node shards on COLI_SHARD_PORT for peers to
+# pull; peers then run a `coli worker` expert server on COLI_EXPERT_PORT that the
+# rank-0 driver reaches for the runtime activation exchange.
+: "${COLI_SHARD_PORT:=48900}"
+: "${COLI_EXPERT_PORT:=48800}"
 
 # Accept an HF URL as well as a bare repo id: strip scheme/host and any
 # /tree/<rev> or trailing slash, leaving `org/name`.
@@ -66,11 +71,9 @@ if [[ "$COLI_MODEL_REPO" != /* ]]; then
   COLI_MODEL_REPO="$(normalize_repo "$COLI_MODEL_REPO")"
 fi
 
-if [[ "${COLI_NUM_NODES}" != "1" ]]; then
-  echo "[cluster] node ${COLI_NODE_RANK}/${COLI_NUM_NODES} (expert-parallel)" >&2
-  # NOTE: multi-node transport (RDMA/RoCE over ConnectX-7) is not wired yet —
-  # single-node is the current target. See DEPLOYMENT.md.
-fi
+# The multispark bootstrap (which calls resolve_model/ensure_container) runs after
+# those functions are defined, just before the command dispatch below.
+RESOLVED_SNAP=""
 
 # Locate (or fetch) the model snapshot. Prints the snapshot dir on stdout.
 resolve_model() {
@@ -171,15 +174,85 @@ ensure_container() {
   echo "$dest"
 }
 
+# Block until TCP `host:port` accepts a connection (or `timeout` seconds elapse).
+# Uses bash's /dev/tcp so it needs no extra tooling in the image.
+wait_for_tcp() {
+  local host="$1" port="$2" timeout="${3:-3600}" waited=0
+  until (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; do
+    exec 3>&- 2>/dev/null || true
+    waited=$((waited + 5))
+    if [[ $waited -ge $timeout ]]; then return 1; fi
+    sleep 5
+  done
+  exec 3>&- 2>/dev/null || true
+  return 0
+}
+
+# ---- Multispark bootstrap (expert-parallel over TCP/RoCE) --------------------
+# Rank 0 owns the model: it downloads + converts once, serves each peer its expert
+# shard (coli shard-serve), waits for the peers' workers, then runs the driver
+# command on the full snapshot. Every other rank downloads NOTHING — it pulls only
+# its shard from rank 0 and becomes a `coli worker`. This is the "main spark hands
+# each peer its experts" design; peers never touch the Hub and load from local NVMe.
+if [[ "${COLI_NUM_NODES}" != "1" ]]; then
+  echo "[cluster] node ${COLI_NODE_RANK}/${COLI_NUM_NODES} (expert-parallel over TCP/RoCE)" >&2
+
+  if [[ "${COLI_NODE_RANK}" != "0" ]]; then
+    # ---- peer: pull our shard from rank 0, then serve our experts as a worker ----
+    if [[ -z "${COLI_MAIN_ADDR:-}" ]]; then
+      echo "[cluster] rank ${COLI_NODE_RANK} needs COLI_MAIN_ADDR=<rank-0 host> to pull its shard" >&2
+      exit 2
+    fi
+    shard_dir="${COLI_CONVERT_DIR}/shard-r${COLI_NODE_RANK}of${COLI_NUM_NODES}"
+    if [[ -f "$shard_dir/.shard-complete" ]]; then
+      echo "[cluster] rank ${COLI_NODE_RANK}: reusing cached shard $shard_dir" >&2
+    else
+      echo "[cluster] rank ${COLI_NODE_RANK}: waiting for rank-0 shard-serve at ${COLI_MAIN_ADDR}:${COLI_SHARD_PORT} ..." >&2
+      wait_for_tcp "${COLI_MAIN_ADDR}" "${COLI_SHARD_PORT}" 7200 \
+        || { echo "[cluster] rank-0 shard-serve never came up" >&2; exit 1; }
+      rm -rf "$shard_dir"; mkdir -p "$shard_dir"
+      coli shard-pull "$shard_dir" "${COLI_MAIN_ADDR}:${COLI_SHARD_PORT}" \
+        --nodes "${COLI_NUM_NODES}" --rank "${COLI_NODE_RANK}" >&2
+      touch "$shard_dir/.shard-complete"
+    fi
+    echo "[cluster] rank ${COLI_NODE_RANK}: starting expert worker on $shard_dir :${COLI_EXPERT_PORT}" >&2
+    exec coli worker "$shard_dir" "${COLI_EXPERT_PORT}"
+  fi
+
+  # ---- rank 0: resolve + convert, serve shards, wait for peers, then drive ----
+  RESOLVED_SNAP=$(resolve_model)
+  echo "[coli] model: $RESOLVED_SNAP" >&2
+  RESOLVED_SNAP=$(ensure_container "$RESOLVED_SNAP")
+  echo "[cluster] rank 0: serving expert shards on :${COLI_SHARD_PORT} for peers to pull" >&2
+  coli shard-serve "$RESOLVED_SNAP" "${COLI_SHARD_PORT}" >&2 &
+  # Peers pull their shard then bind their worker port; wait for each before the
+  # driver's startup handshake (COLI_PEERS lists their worker addresses).
+  IFS=',' read -ra _peers <<< "${COLI_PEERS:-}"
+  for entry in "${_peers[@]}"; do
+    [[ -z "$entry" ]] && continue
+    addr="${entry#*=}"; host="${addr%:*}"; port="${addr##*:}"
+    echo "[cluster] rank 0: waiting for peer worker ${host}:${port} ..." >&2
+    wait_for_tcp "$host" "$port" 7200 \
+      || { echo "[cluster] peer ${host}:${port} never came up" >&2; exit 1; }
+  done
+  echo "[cluster] rank 0: all peers ready — starting driver" >&2
+fi
+
 cmd="${1:-help}"
 case "$cmd" in
   # snapshot-taking commands: inject the loadable model dir as their 1st arg.
   # (`cluster` only scans the fabric — it takes no snapshot, so it is not here.)
   config | load | gen | tf | capacity | loadbench | repack | serve | worker | bench)
     shift
-    snap=$(resolve_model)
-    echo "[coli] model: $snap" >&2
-    snap=$(ensure_container "$snap")
+    # Rank 0 of a multi-node run already resolved + converted the snapshot (and is
+    # serving shards); single-node resolves here.
+    if [[ -n "$RESOLVED_SNAP" ]]; then
+      snap="$RESOLVED_SNAP"
+    else
+      snap=$(resolve_model)
+      echo "[coli] model: $snap" >&2
+      snap=$(ensure_container "$snap")
+    fi
     echo "[coli] loading: $snap" >&2
     exec coli "$cmd" "$snap" "$@"
     ;;

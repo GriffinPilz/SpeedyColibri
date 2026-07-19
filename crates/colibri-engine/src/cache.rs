@@ -359,25 +359,48 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
     /// once while protecting itself. Preloads aren't router selections — the compute
     /// loop's `expert` call then hits and records the selection.
     fn prefetch(&self, layer: usize, eids: &[usize]) -> io::Result<()> {
-        // Speculative prefetch: predict the *next* layer's experts from this one and
-        // hand them to the background loader, so they load during this layer's
-        // compute (best-effort — dropped if the loader is behind). Enabled only when
-        // `enable_prefetch` was called; otherwise this is a no-op and we just load.
+        // Hand the *next* layer's experts to the background loader so they stream in
+        // during this layer's compute. Two source modes:
+        //   - PREFILL prefetch-ahead (COLI_PREFETCH_AHEAD): every layer routes to ~all
+        //     experts, so queue exactly this layer's (large) set for layer+1 — an exact,
+        //     not predicted, next-layer working set. The pipeline primes on layer 1 and
+        //     every later load_batch is a cache hit, so the disk-load never sits on the
+        //     critical path (it overlaps the GPU-bound attention + moe compute, when the
+        //     NVMe is otherwise idle). Gated to the prefill regime by `eids.len()` so
+        //     decode — where speculative loads evict the working set and steal demand
+        //     bandwidth (measured net-negative) — is untouched.
+        //   - Otherwise the learned predictor (decode / miss-heavy regime), if enabled.
         if let Some(tx) = self.prefetch_tx.get() {
-            let predicted = self
-                .predictor
-                .lock()
-                .unwrap()
-                .as_mut()
-                .map(|p| p.observe_and_predict(layer, eids));
-            if let Some(pred) = predicted {
-                if !pred.is_empty() {
-                    let _ = tx.try_send((layer + 1, pred));
+            if prefetch_ahead_enabled() && eids.len() >= PREFETCH_AHEAD_MIN {
+                let _ = tx.try_send((layer + 1, eids.to_vec()));
+            } else {
+                let predicted = self
+                    .predictor
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .map(|p| p.observe_and_predict(layer, eids));
+                if let Some(pred) = predicted {
+                    if !pred.is_empty() {
+                        let _ = tx.try_send((layer + 1, pred));
+                    }
                 }
             }
         }
         self.load_batch(layer, eids)
     }
+}
+
+/// Minimum routed-expert count for the prefill prefetch-ahead to fire — separates
+/// prefill (routes to ~all `n_experts`) from decode (top-k per token, ~8).
+const PREFETCH_AHEAD_MIN: usize = 64;
+
+/// `COLI_PREFETCH_AHEAD=1` — during prefill, unconditionally background-load the next
+/// layer's experts (they overlap the current layer's GPU compute). Off by default;
+/// decode is never affected (gated by [`PREFETCH_AHEAD_MIN`]).
+fn prefetch_ahead_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_PREFETCH_AHEAD").ok().as_deref() == Some("1"))
 }
 
 impl<P: ExpertProvider + Sync> ExpertCache<P> {

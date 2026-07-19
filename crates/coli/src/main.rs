@@ -1658,8 +1658,12 @@ fn ram_budget() -> u64 {
 /// the prefetch source is a peer's RAM. See `ExpertCache::enable_prefetch` and
 /// `scripts/expert_prefetch_analysis.py`.
 fn prefetch_topn() -> Option<usize> {
+    // The prefill prefetch-ahead reuses the same background loader thread + channel
+    // (it bypasses the predictor), so it must enable the loader even when COLI_PREFETCH
+    // is off. `Some(0)` wires the loader with a no-op predictor.
+    let ahead = std::env::var("COLI_PREFETCH_AHEAD").ok().as_deref() == Some("1");
     match std::env::var("COLI_PREFETCH").ok().as_deref() {
-        None | Some("") | Some("0") => None,
+        None | Some("") | Some("0") => ahead.then_some(0),
         Some("1") => {
             Some(std::env::var("COLI_PREFETCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(16))
         }

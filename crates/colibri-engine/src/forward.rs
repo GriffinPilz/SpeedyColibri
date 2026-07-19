@@ -39,6 +39,14 @@ pub(crate) static SCATTER_US: AtomicU64 = AtomicU64::new(0);
 /// (`matmul_f32`) and the shared-expert FFN. Incremented from `moe`.
 pub(crate) static ROUTER_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHARED_US: AtomicU64 = AtomicU64::new(0);
+/// Sub-totals of `ATTN_US`: q/kv projections, RoPE + latent-cache write, the DSA
+/// lightning indexer, the attention core (sparse/dense), and the output projection.
+/// Incremented from `attention_with`.
+pub(crate) static ATTN_PROJ_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ATTN_ROPE_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ATTN_INDEX_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ATTN_CORE_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ATTN_OPROJ_US: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic forward-pass counter — one per `forward` call, i.e. per decode token
 /// (prefill is a single step over the whole prompt). Used only to key the optional
@@ -442,6 +450,14 @@ where
             ms(&GPUFFN_US),
             ms(&SCATTER_US),
             ms(&SHARED_US),
+        );
+        eprintln!(
+            "[profile] attn breakdown: proj {:.0} ms | rope+cache {:.0} ms | dsa-indexer {:.0} ms | core {:.0} ms | o-proj {:.0} ms",
+            ms(&ATTN_PROJ_US),
+            ms(&ATTN_ROPE_US),
+            ms(&ATTN_INDEX_US),
+            ms(&ATTN_CORE_US),
+            ms(&ATTN_OPROJ_US),
         );
     }
     Ok(DecodeStats {

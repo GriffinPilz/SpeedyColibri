@@ -26,6 +26,15 @@ use crate::math::{rmsnorm_inplace, rope_interleave, softmax};
 use crate::model::{KvCache, Layer};
 use colibri_core::Config;
 
+/// Add `t.elapsed()` to `acc` when `COLI_PROFILE` is on (else near-free). Backs the
+/// per-phase attention breakdown.
+#[inline]
+fn atime(acc: &std::sync::atomic::AtomicU64, t: std::time::Instant) {
+    if crate::forward::profile_on() {
+        acc.fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Which attention core to use. Both give the same result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttnCore {
@@ -116,6 +125,7 @@ pub fn attention_with(
     let theta = cfg.theta;
 
     // ---- 1) projections (batched over all S rows; exact kernel) ------------
+    let _tp = std::time::Instant::now();
     let mut qr = vec![0f32; s_len * ql];
     matmul_qt(&mut qr, x, &l.q_a, s_len);
     for s in 0..s_len {
@@ -125,8 +135,10 @@ pub fn attention_with(
     matmul_qt(&mut q, &qr, &l.q_b, s_len);
     let mut comp = vec![0f32; s_len * cw];
     matmul_qt(&mut comp, x, &l.kv_a, s_len);
+    atime(&crate::forward::ATTN_PROJ_US, _tp);
 
     // ---- 2) RoPE the query rope halves; write the compressed cache ---------
+    let _tr = std::time::Instant::now();
     for s in 0..s_len {
         let pos = pos_base + s;
         for hh in 0..h {
@@ -148,8 +160,11 @@ pub fn attention_with(
         }
     }
 
+    atime(&crate::forward::ATTN_ROPE_US, _tr);
+
     let st0 = kv.kv_start[layer];
 
+    let _ti = std::time::Instant::now();
     // DSA lightning indexer: on a FULL indexer layer, once the context exceeds
     // `index_topk`, select the top-k keys per query and attend only to those. Gated to
     // **single-shot prefill** (`pos_base == 0`, so every cached position is one of the
@@ -190,10 +205,12 @@ pub fn attention_with(
     } else {
         None
     };
+    atime(&crate::forward::ATTN_INDEX_US, _ti);
     let sel = sel.or(dsa_selection.as_deref());
 
     let mut ctx = vec![0f32; s_len * h * vh];
 
+    let _tc = std::time::Instant::now();
     // GPU weight-absorption attention core for resident kv_b (falls back to CPU).
     // A DSA selection (long-context prefill) uses the sparse kernel; dense uses the
     // batch/decode kernels. Anything the GPU declines falls to the CPU cores below.
@@ -276,9 +293,12 @@ pub fn attention_with(
             }
         }
     }
+    atime(&crate::forward::ATTN_CORE_US, _tc);
 
     // ---- 4) output projection ----------------------------------------------
+    let _to = std::time::Instant::now();
     matmul_qt(out, &ctx, &l.o, s_len);
+    atime(&crate::forward::ATTN_OPROJ_US, _to);
 
     // Hand the caller the selection computed here (Some only on a FULL indexer layer
     // with DSA active) so it can be reused by the following SHARED layers instead of

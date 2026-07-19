@@ -29,6 +29,10 @@ typedef struct {
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
+    /* Device scratch for expert weights, so the kernel reads clean device memory
+     * instead of zero-copy from freshly-pread (dirty, coherence-heavy) host pages. */
+    uint8_t *ewg,*ewu,*ewd; size_t ewg_cap,ewu_cap,ewd_cap;
+    float *esg,*esu,*esd; size_t esg_cap,esu_cap,esd_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     void *asel,*acnt; size_t asel_cap,acnt_cap;  /* DSA sparse-attention selection */
     float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
@@ -660,6 +664,8 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->asel=ctx->acnt=nullptr;
         ctx->host_x=ctx->host_y=nullptr;ctx->stream=nullptr;
+        ctx->ewg=ctx->ewu=ctx->ewd=nullptr;ctx->esg=ctx->esu=ctx->esd=nullptr;
+        ctx->ewg_cap=ctx->ewu_cap=ctx->ewd_cap=ctx->esg_cap=ctx->esu_cap=ctx->esd_cap=0;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
@@ -863,19 +869,53 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
        !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
        !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    // Optional per-call GPU-time accounting (COLI_FFN_EVT=1): times just the kernel
+    // trio via events, accumulates, and prints running totals + row count to compare
+    // against the CPU-side wall-time (GPUFFN_US). Diagnostic only.
+    static int s_evt=-1; static cudaEvent_t s_e0=0,s_e1=0;
+    static double s_kms=0; static long s_calls=0,s_rows=0;
+    if(s_evt<0){ const char*e=getenv("COLI_FFN_EVT"); s_evt=e&&atoi(e); if(s_evt){cudaEventCreate(&s_e0);cudaEventCreate(&s_e1);} }
     std::memcpy(ctx->host_x,x,xb);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                                "expert fp8 input upload"))return 0;
     dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
     dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
-    fp8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
-        (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I);
+    // Expert weights live in pool-recycled host buffers that `pread` just wrote, so a
+    // zero-copy GPU read pays a cache-coherence penalty on every (dirty) weight line —
+    // measured ~2.8x/matmul slower than reading clean device memory. Stage them through
+    // one streaming H2D copy per weight (resolves coherence in bulk), then run the
+    // kernels on device pointers. Prefill-gated (COLI_FFN_DEVCOPY_MIN, default 16): at
+    // small S the copy can't amortize. COLI_FFN_DEVCOPY=0 forces the old zero-copy path.
+    const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
+    const float *gsc=gate->scales,*usc=up->scales,*dsc=down->scales;
+    static int s_dc=-1,s_dcmin=16;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
+    if(s_dc&&S>=s_dcmin){
+        size_t gwb=(size_t)I*D,dwb=(size_t)D*I;
+        if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gwb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gwb)&&
+           reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dwb)&&reserve(&ctx->esg,&ctx->esg_cap,(size_t)I*sizeof(float))&&
+           reserve(&ctx->esu,&ctx->esu_cap,(size_t)I*sizeof(float))&&reserve(&ctx->esd,&ctx->esd_cap,(size_t)D*sizeof(float))){
+            cudaMemcpyAsync(ctx->ewg,gw,gwb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ewu,uw,gwb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ewd,dw,dwb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->esg,gsc,(size_t)I*sizeof(float),cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->esu,usc,(size_t)I*sizeof(float),cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->esd,dsc,(size_t)D*sizeof(float),cudaMemcpyHostToDevice,ctx->stream);
+            gw=ctx->ewg;uw=ctx->ewu;dw=ctx->ewd;gsc=ctx->esg;usc=ctx->esu;dsc=ctx->esd;
+        }
+    }
+    if(s_evt) cudaEventRecord(s_e0,ctx->stream);
+    fp8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gsc,usc,S,D,I);
     silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
-    fp8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
+    fp8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dsc,S,I,D);
+    if(s_evt) cudaEventRecord(s_e1,ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert fp8 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "expert fp8 output download")||
        !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert fp8 synchronize"))return 0;
+    if(s_evt){ float km=0; cudaEventElapsedTime(&km,s_e0,s_e1); s_kms+=km; s_calls++; s_rows+=S;
+        if(s_calls%3000==0) fprintf(stderr,"[ffn-evt] calls=%ld rows=%ld kernel_gpu=%.1fs avg_kernel=%.3fms avg_rows=%.1f\n",
+            s_calls,s_rows,s_kms/1e3,s_kms/s_calls,(double)s_rows/s_calls); }
     std::memcpy(y,ctx->host_y,xb);
     return 1;
 }

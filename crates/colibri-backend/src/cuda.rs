@@ -74,6 +74,14 @@ extern "C" {
         x: *const f32,
         s: c_int,
     ) -> c_int;
+    fn coli_cuda_expert_mlp_fp8(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn coli_cuda_attention_absorb_batch(
         kv_b: *mut ColiCudaTensor,
@@ -375,6 +383,22 @@ pub unsafe fn expert_mlp_raw(
     s: i32,
 ) -> bool {
     coli_cuda_expert_mlp(gate, up, down, y, x, s) != 0
+}
+
+/// Tiled FP8 (e4m3 weights, fp16 activations) fused expert FFN — the tensor-core
+/// replacement for [`expert_mlp_raw`]. Requires all three tensors at fmt==4.
+///
+/// # Safety
+/// Same contract as [`expert_mlp_raw`].
+pub unsafe fn expert_mlp_fp8_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_fp8(gate, up, down, y, x, s) != 0
 }
 
 /// Causal MLA weight-absorption attention on the GPU: computes `ctx[S, H*V]` from

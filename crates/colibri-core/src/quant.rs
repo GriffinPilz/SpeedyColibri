@@ -214,6 +214,7 @@ impl QTensor {
         match self.fmt_code {
             0 => n * 4,
             1 => n + self.o as i64 * 4,
+            4 => n + self.o as i64 * 4, // e4m3 fp8: 1 byte/weight + scales
             3 => self.o as i64 * ((self.i as i64 + 3) / 4) + self.o as i64 * 4,
             _ => self.o as i64 * ((self.i as i64 + 1) / 2) + self.o as i64 * 4, // int4
         }

@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <cuda_fp8.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -77,7 +78,14 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 1) return (size_t)I;
     if (fmt == 2) return (size_t)(I + 1) / 2;
     if (fmt == 3) return (size_t)(I + 3) / 4;
+    if (fmt == 4) return (size_t)I;          // e4m3 fp8: 1 byte/weight
     return 0;
+}
+
+// Decode one e4m3 (fp8) byte to float via the hardware conversion.
+__device__ __forceinline__ static float e4m3f(uint8_t b) {
+    __half_raw hr = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3);
+    return __half2float(*reinterpret_cast<__half *>(&hr));
 }
 
 // `off`=1 reads int4 as offset-binary (value = nibble − 8, the on-disk / host
@@ -89,6 +97,7 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
+    if (fmt == 4) return e4m3f(base[i]);      // e4m3 fp8; per-row scale applied by caller
     const uint8_t *q = base;
     if (fmt == 2) {
         uint8_t v = q[i >> 1];
@@ -183,6 +192,66 @@ __global__ static void w4a16_gate_up(float *gate,float *up,const float *x,
         for(int z=lane;z<256;z+=32){int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
             if(gn<N&&gk<K){uint8_t q=w[(size_t)gn*rb+(gk>>1)];int a=(gk&1)?q>>4:q&15;
                 v=(float)(a&8?a-16:a)*scale[gn];}bh[warp][z]=__float2half(v);}
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[8][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*N+n0+n]=out[warp][z];}
+#endif
+}
+
+/* FP8 (e4m3) tiled tensor-core expert matmuls — clones of w4a16_* with the weight
+ * decode swapped int4 -> e4m3 (1 byte/weight, direct K stride). Weights are FP8,
+ * activations FP16, MMA runs in f16 (W8A16). This is the tiled path that replaces the
+ * naive quant_matmul's M-fold weight re-reads. */
+__global__ static void fp8a16_matmul(float *y,const float *x,const uint8_t *w,
+                                    const float *scale,int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){
+            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);
+        }
+        for(int z=lane;z<256;z+=32){
+            int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
+            if(gn<N&&gk<K) v=e4m3f(w[(size_t)gn*K+gk])*scale[gn];
+            bh[warp][z]=__float2half(v);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*N+n0+n]=out[warp][z];}
+#endif
+}
+
+__global__ static void fp8a16_gate_up(float *gate,float *up,const float *x,
+        const uint8_t *gw,const uint8_t *uw,const float *gs,const float *us,
+        int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+tile*16;const uint8_t *w=which?uw:gw;
+    const float *scale=which?us:gs;float *y=which?up:gate;
+    __shared__ __half ah[256],bh[8][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);}
+        for(int z=lane;z<256;z+=32){int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
+            if(gn<N&&gk<K) v=e4m3f(w[(size_t)gn*K+gk])*scale[gn];
+            bh[warp][z]=__float2half(v);}
         __syncthreads();
         wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
         wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
@@ -703,6 +772,38 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "shared w4a16 output download")||
        !cuda_ok(cudaStreamSynchronize(ctx->stream),"shared w4a16 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    return 1;
+}
+
+/* Tiled FP8 (e4m3 weights, fp16 activations) expert FFN — the tensor-core replacement
+ * for coli_cuda_expert_mlp/quant_matmul. Same signature; requires fmt==4 on all three
+ * projections and compute>=7. Weights read ONCE per 16-row tile (vs quant_matmul's
+ * S-fold re-read), so it is a strict prefill win that grows with S. */
+extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
+        ColiCudaTensor *down,float *y,const float *x,int S){
+    if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=4||up->fmt!=4||down->fmt!=4||
+       gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
+       gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
+    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert fp8 input upload"))return 0;
+    dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+    dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+    fp8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
+        (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I);
+    silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+    fp8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
+    if(!cuda_ok(cudaGetLastError(),"expert fp8 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert fp8 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert fp8 synchronize"))return 0;
     std::memcpy(y,ctx->host_y,xb);
     return 1;
 }

@@ -487,7 +487,11 @@ pub fn try_expert_ffn(
         // SAFETY: g/u/d live until end of scope, covering the synchronous kernel +
         // download in expert_mlp_raw; out/x sized [nr, O]/[nr, I] by ffn().
         let ok = unsafe {
-            cuda::expert_mlp_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            if gate.fmt_code == 4 {
+                cuda::expert_mlp_fp8_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            } else {
+                cuda::expert_mlp_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            }
         };
         if ok {
             GPU_FFN.with(|c| c.set(c.get() + 1));
@@ -507,7 +511,13 @@ pub fn try_expert_ffn(
         return false;
     };
     // SAFETY: handles are resident on device 0; out/x sized [nr, O]/[nr, I] by ffn().
-    let ok = unsafe { cuda::expert_mlp_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32) };
+    let ok = unsafe {
+        if gate.fmt_code == 4 {
+            cuda::expert_mlp_fp8_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        } else {
+            cuda::expert_mlp_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        }
+    };
     if ok {
         GPU_FFN.with(|c| c.set(c.get() + 1));
     }

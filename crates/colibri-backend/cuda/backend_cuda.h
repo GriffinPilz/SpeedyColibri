@@ -66,6 +66,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Tiled FP8 (e4m3 weights, FP16 activations, f16 Tensor Cores) expert FFN. Same
+ * contract as coli_cuda_expert_mlp but requires fmt==4 on all three projections;
+ * weights are read once per 16-row tile instead of once per row. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate, ColiCudaTensor *up,
+                         ColiCudaTensor *down, float *y, const float *x, int S);
+
 /* Prefill-oriented shared expert path.  INT4 weights stay packed in global
  * memory, activations are converted to FP16 per tile, and Tensor Cores
  * accumulate into FP32.  Unlike COLI_CUDA_TC_INT4 this does not quantize the

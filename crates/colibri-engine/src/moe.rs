@@ -316,6 +316,36 @@ pub fn load_expert(
     Ok(ex)
 }
 
+/// `COLI_EXPERT_FP8=1` converts routed experts to e4m3 fp8 at load so the tiled
+/// tensor-core kernel (`coli_cuda_expert_mlp_fp8`) runs instead of the naive
+/// per-row `quant_matmul`. Off by default (doubles in-RAM expert size).
+fn expert_fp8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_FP8").ok().as_deref() == Some("1"))
+}
+
+/// Convert a packed int4 weight matrix (offset-binary nibbles, value = nibble − 8,
+/// `o` rows × ceil(i/2) bytes) to e4m3 fp8 (1 byte/weight, `o`×`i`). The LUT was
+/// generated + roundtrip-verified with the hardware fp8 encoder (`__nv_cvt_float_to_fp8`):
+/// every int4 value −8..7 is exactly representable in e4m3.
+fn int4_to_e4m3(src: &[u8], o: usize, i: usize) -> Vec<u8> {
+    const LUT: [u8; 16] = [
+        0xD0, 0xCE, 0xCC, 0xCA, 0xC8, 0xC4, 0xC0, 0xB8, 0x00, 0x38, 0x40, 0x44, 0x48, 0x4A, 0x4C,
+        0x4E,
+    ];
+    let rb = i.div_ceil(2);
+    let mut out = vec![0u8; o * i];
+    for r in 0..o {
+        let srow = &src[r * rb..r * rb + rb];
+        let orow = &mut out[r * i..(r + 1) * i];
+        for c in 0..i {
+            let b = srow[c >> 1];
+            orow[c] = LUT[(if c & 1 == 1 { b >> 4 } else { b & 0x0f }) as usize];
+        }
+    }
+    out
+}
+
 /// Build an `Expert` from three raw weight views (`gate,up,down`, each as returned
 /// by [`Shards::read_raw_shared`]/`read_raw_shared_batched`), reading the tiny
 /// per-weight scales separately. Shared by the single-expert and batched loaders.
@@ -348,6 +378,14 @@ fn expert_from_views(
             t.q8 = buf[*off..*off + *len].iter().map(|&b| b as i8).collect();
         } else {
             t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+        }
+        if fmt == 2 && expert_fp8_enabled() {
+            // Convert int4 (offset-binary) experts to e4m3 fp8 for the tiled tensor-core
+            // path. Same per-row scales; e4m3 represents the int4 values −8..7 exactly,
+            // so this is lossless vs the int4 weights (true bf16→e4m3 is a separate
+            // quality task). Doubles the in-RAM expert size (0.5→1 B/weight).
+            t.q4 = Bytes::Owned(int4_to_e4m3(&buf[*off..*off + *len], o, i));
+            t.fmt_code = 4;
         }
         Ok(t)
     };
@@ -827,6 +865,35 @@ mod tests {
     use super::*;
     use crate::quantize::qtensor_from_f32;
     use std::collections::HashMap;
+
+    // The int4→e4m3 conversion + CPU e4m3 decode must reproduce the int4 matmul: every
+    // int4 value −8..7 is exact in e4m3, so the two paths compute (nibble−8)·scale
+    // identically (only f32 summation order differs). Guards the fp8 plumbing's math.
+    #[test]
+    fn int4_to_e4m3_reproduces_int4_matmul() {
+        use crate::linear::matmul_qt;
+        let (o, i, ns) = (4usize, 8usize, 3usize);
+        let rb = i.div_ceil(2);
+        let q4: Vec<u8> = (0..o * rb).map(|k| (k * 37 + 5) as u8).collect();
+        let s: Vec<f32> = (0..o).map(|r| 0.5 + r as f32 * 0.25).collect();
+        let mk = |fmt: i32, bytes: Vec<u8>| QTensor {
+            fmt_code: fmt,
+            q4: Bytes::Owned(bytes),
+            s: s.clone(),
+            o: o as i32,
+            i: i as i32,
+            ..Default::default()
+        };
+        let int4 = mk(2, q4.clone());
+        let fp8 = mk(4, int4_to_e4m3(&q4, o, i));
+        let x: Vec<f32> = (0..ns * i).map(|k| k as f32 * 0.1 - 0.35).collect();
+        let (mut y4, mut y8) = (vec![0f32; ns * o], vec![0f32; ns * o]);
+        matmul_qt(&mut y4, &x, &int4, ns);
+        matmul_qt(&mut y8, &x, &fp8, ns);
+        for (a, b) in y4.iter().zip(&y8) {
+            assert!((a - b).abs() < 1e-4, "int4 {a} vs e4m3 {b}");
+        }
+    }
 
     // In-memory provider for MoE math tests (no safetensors needed).
     struct MapProvider {

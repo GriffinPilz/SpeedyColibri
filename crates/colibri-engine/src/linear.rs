@@ -85,7 +85,37 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
                 }
             }
         }
+        4 => {
+            // e4m3 fp8, 1 byte/weight, per-row scale (see moe::int4_to_e4m3). CPU
+            // reference / fallback for the tiled GPU kernel.
+            let q = &w.q4;
+            for row in 0..o {
+                let wr = &q[row * i..(row + 1) * i];
+                let sc = w.s[row];
+                for si in 0..s {
+                    let xs = &x[si * i..(si + 1) * i];
+                    let mut a = 0f32;
+                    for k in 0..i {
+                        a += e4m3_to_f32(wr[k]) * xs[k];
+                    }
+                    y[si * o + row] = a * sc;
+                }
+            }
+        }
         other => panic!("matmul_qt: unknown QTensor format {other}"),
+    }
+}
+
+/// Decode one e4m3 byte (OCP FP8: 1 sign, 4 exp bias-7, 3 mantissa; no infinity,
+/// S.1111.111 = NaN) to f32. Used for the fp8 expert CPU reference/fallback.
+fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let e = ((b >> 3) & 0x0f) as i32;
+    let m = (b & 0x07) as f32;
+    if e == 0 {
+        sign * (m / 8.0) * 2f32.powi(-6) // subnormal
+    } else {
+        sign * (1.0 + m / 8.0) * 2f32.powi(e - 7)
     }
 }
 

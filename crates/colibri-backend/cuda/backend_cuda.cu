@@ -772,8 +772,19 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
-    dim3 grid((unsigned)O, (unsigned)S);
-    quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->wrapped);
+    // Tiled tensor-core path for the resident matmuls (attention q/kv/o/kv_b proj):
+    // reads each weight once per 16-row tile vs quant_matmul's S-fold re-read.
+    int tile = getenv("COLI_TILE_I8") && atoi(getenv("COLI_TILE_I8")) && ctx->compute_major >= 7;
+    if (tile && (fmt == 1 || fmt == 4)) {
+        dim3 tg((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
+        if (fmt == 4)
+            fp8a16_matmul<<<tg, 128>>>(ctx->y, ctx->x, (const uint8_t *)t->weights, t->scales, S, I, O);
+        else
+            i8a16_matmul<<<tg, 128>>>(ctx->y, ctx->x, (const uint8_t *)t->weights, t->scales, S, I, O);
+    } else {
+        dim3 grid((unsigned)O, (unsigned)S);
+        quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->wrapped);
+    }
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
@@ -1369,9 +1380,20 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
                                    int S){
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
-    dim3 grid((unsigned)t->O,(unsigned)S);
-    quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
-        row_bytes(t->fmt,t->I),t->wrapped);
+    // Tile only when S is large enough to amortize the 16-row tile (decode S=1 stays
+    // on the naive kernel, which is better for a single row).
+    int tile=getenv("COLI_TILE_I8")&&atoi(getenv("COLI_TILE_I8"))&&ctx->compute_major>=7&&S>=16;
+    if(tile&&(t->fmt==1||t->fmt==4)){
+        dim3 tg((unsigned)((t->O+63)/64),(unsigned)((S+15)/16));
+        if(t->fmt==4)
+            fp8a16_matmul<<<tg,128>>>(y_dev,x_dev,(const uint8_t*)t->weights,t->scales,S,t->I,t->O);
+        else
+            i8a16_matmul<<<tg,128>>>(y_dev,x_dev,(const uint8_t*)t->weights,t->scales,S,t->I,t->O);
+    }else{
+        dim3 grid((unsigned)t->O,(unsigned)S);
+        quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
+            row_bytes(t->fmt,t->I),t->wrapped);
+    }
     return cuda_ok(cudaGetLastError(),"pipe gemm");
 }
 /* copia diretta scheda->scheda (P2P se disponibile, altrimenti staging driver) */

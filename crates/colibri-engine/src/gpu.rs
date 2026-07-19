@@ -489,6 +489,8 @@ pub fn try_expert_ffn(
         let ok = unsafe {
             if gate.fmt_code == 4 {
                 cuda::expert_mlp_fp8_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            } else if gate.fmt_code == 1 && tile_i8_enabled() {
+                cuda::expert_mlp_i8a16_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
             } else {
                 cuda::expert_mlp_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
             }
@@ -514,6 +516,8 @@ pub fn try_expert_ffn(
     let ok = unsafe {
         if gate.fmt_code == 4 {
             cuda::expert_mlp_fp8_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        } else if gate.fmt_code == 1 && tile_i8_enabled() {
+            cuda::expert_mlp_i8a16_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
         } else {
             cuda::expert_mlp_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
         }
@@ -530,6 +534,14 @@ pub fn try_expert_ffn(
 pub fn expert_group_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() == Some("1"))
+}
+
+/// `COLI_TILE_I8=1` routes int8 experts/MLPs (the shared expert + dense layers) through
+/// the tiled `i8a16` tensor-core kernel instead of the naive `quant_matmul` — nsys found
+/// that kernel is 60% of GPU time (its S-fold weight re-reads).
+pub fn tile_i8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_TILE_I8").ok().as_deref() == Some("1"))
 }
 
 /// Batched routed-expert FFN. `active` is one `(expert, its token rows, its per-row

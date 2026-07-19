@@ -72,6 +72,11 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTenso
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Tiled int8 (W8A16, f16 Tensor Cores) expert/MLP FFN — tensor-core replacement for
+ * quant_matmul on resident int8 weights (the shared expert). Requires fmt==1. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate, ColiCudaTensor *up,
+                         ColiCudaTensor *down, float *y, const float *x, int S);
+
 /* Prefill-oriented shared expert path.  INT4 weights stay packed in global
  * memory, activations are converted to FP16 per tile, and Tensor Cores
  * accumulate into FP32.  Unlike COLI_CUDA_TC_INT4 this does not quantize the

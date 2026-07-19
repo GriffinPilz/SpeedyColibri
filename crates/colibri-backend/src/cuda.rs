@@ -82,6 +82,14 @@ extern "C" {
         x: *const f32,
         s: c_int,
     ) -> c_int;
+    fn coli_cuda_expert_mlp_i8a16(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
     fn coli_cuda_expert_group(
         gates: *const *mut ColiCudaTensor,
         ups: *const *mut ColiCudaTensor,
@@ -408,6 +416,22 @@ pub unsafe fn expert_mlp_fp8_raw(
     s: i32,
 ) -> bool {
     coli_cuda_expert_mlp_fp8(gate, up, down, y, x, s) != 0
+}
+
+/// Tiled int8 (W8A16) fused expert/MLP FFN — tensor-core replacement for the naive
+/// `quant_matmul` on resident int8 weights (the shared expert). Requires fmt==1.
+///
+/// # Safety
+/// Same contract as [`expert_mlp_raw`].
+pub unsafe fn expert_mlp_i8a16_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_i8a16(gate, up, down, y, x, s) != 0
 }
 
 /// Batched fused expert FFN: all `count` (≤64) experts computed with ONE H2D + ONE

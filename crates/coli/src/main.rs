@@ -140,6 +140,7 @@ fn main() -> ExitCode {
         "capacity" => cmd_capacity(&args),
         "loadbench" => cmd_loadbench(&args),
         "repack" => cmd_repack(&args),
+        "shard-export" => cmd_shard_export(&args),
         "backend" => cmd_backend(),
         "cluster" => cmd_cluster(&args),
         "worker" => cmd_worker(&args),
@@ -903,6 +904,120 @@ fn cmd_gen_preload_repacked(
 
 /// `coli repack <snap> <out_dir> [num_files]` — repack every routed expert into
 /// `num_files` (default: CPU cores) contiguous binary shards + a manifest, for
+/// The routed-expert id embedded in a tensor name
+/// (`model.layers.{L}.mlp.experts.{E}.{gate,up,down}_proj.weight[.qs]`), or `None`
+/// for a non-expert (resident) tensor.
+fn expert_id_of(name: &str) -> Option<u32> {
+    const M: &str = ".mlp.experts.";
+    let i = name.find(M)?;
+    let rest = &name[i + M.len()..];
+    let end = rest.find('.').unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// `coli shard-export <src-snap> <out-dir> --nodes N --rank R` — write a snapshot
+/// containing ONLY node R's owned routed experts plus every resident (non-expert)
+/// tensor, so a peer can load its shard from local disk instead of holding the full
+/// model. This is the multispark distribution primitive: rank 0 exports each rank's
+/// shard, then ships it over. Bytes are copied verbatim (the e4m3 container
+/// round-trips), and non-safetensors files (config/tokenizer) are copied too. The
+/// ownership map is the contiguous default — the same one the runtime uses, so the
+/// exported experts are exactly what `ShardsExpertProvider` will ask this node for.
+fn cmd_shard_export(args: &[String]) -> ExitCode {
+    use std::path::Path;
+    let mut pos: Vec<&String> = Vec::new();
+    let (mut nodes, mut rank): (u32, u32) = (0, u32::MAX);
+    let mut it = args.iter().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--nodes" => nodes = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            "--rank" => rank = it.next().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX),
+            _ => pos.push(a),
+        }
+    }
+    let (src, out) = match (pos.first(), pos.get(1)) {
+        (Some(s), Some(o)) => (s.as_str(), o.as_str()),
+        _ => {
+            eprintln!("usage: coli shard-export <src-snap> <out-dir> --nodes N --rank R");
+            return ExitCode::from(2);
+        }
+    };
+    if nodes < 1 || rank >= nodes {
+        eprintln!("shard-export: need --nodes >= 1 and 0 <= --rank < nodes (got nodes={nodes} rank={rank})");
+        return ExitCode::from(2);
+    }
+    let cfg = match colibri_core::Config::load(src) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("shard-export: config load: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let n_experts = cfg.n_experts as u32;
+    let shards = match colibri_safetensors::Shards::open(src) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("shard-export: open {src}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sharding = colibri_cluster::ExpertSharding::new(nodes, n_experts);
+    let me = colibri_cluster::NodeId(rank);
+
+    // Select: every resident tensor, plus routed experts owned by this rank.
+    let mut names: Vec<String> = Vec::new();
+    let (mut n_res, mut n_exp, mut bytes) = (0u64, 0u64, 0u64);
+    for t in shards.tensors() {
+        let keep = match expert_id_of(&t.name) {
+            Some(e) => e < n_experts && sharding.is_local(me, e),
+            None => true,
+        };
+        if keep {
+            if expert_id_of(&t.name).is_some() {
+                n_exp += 1;
+            } else {
+                n_res += 1;
+            }
+            bytes += t.nbytes;
+            names.push(t.name.clone());
+        }
+    }
+    eprintln!(
+        "shard-export rank {rank}/{nodes}: {} tensors ({n_res} resident + {n_exp} expert), {:.1} GB, owns {} experts",
+        names.len(),
+        bytes as f64 / 1e9,
+        sharding.count_for(me),
+    );
+    // ~5 GB/file, matching the source snapshot's shard size.
+    let out_path = Path::new(out);
+    let files = match shards.write_subset(&names, out_path, 5_000_000_000) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("shard-export: write: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Copy the non-safetensors metadata (config.json, generation_config.json,
+    // tokenizer*) so the shard is a self-contained, loadable snapshot.
+    let mut copied = 0;
+    if let Ok(rd) = std::fs::read_dir(src) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let is_st = p.extension().map(|e| e == "safetensors").unwrap_or(false);
+            let is_usage = p.file_name().map(|f| f == ".coli_usage").unwrap_or(false);
+            if p.is_file() && !is_st && !is_usage {
+                if let Some(fname) = p.file_name() {
+                    if std::fs::copy(&p, out_path.join(fname)).is_ok() {
+                        copied += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("shard-export: wrote {files} safetensors files + {copied} metadata files to {out}");
+    ExitCode::SUCCESS
+}
+
 /// fast parallel preloading (`COLI_PRELOAD`).
 fn cmd_repack(args: &[String]) -> ExitCode {
     use std::path::Path;

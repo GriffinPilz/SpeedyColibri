@@ -19,7 +19,7 @@ use colibri_core::SharedBuf;
 use colibri_json::Json;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -199,6 +199,76 @@ impl Shards {
         let t = self.tensor(name)?;
         let n = t.nbytes as usize;
         self.pread_into(t.file_idx, t.off, &mut out[..n])
+    }
+
+    /// Write a subset of this snapshot's tensors (by `names`) into a fresh
+    /// safetensors snapshot under `out_dir`, split across `out-NNNNN.safetensors`
+    /// files each up to ~`max_file_bytes`. Bytes are copied **verbatim** — no dtype
+    /// conversion — so a quantized / e4m3 container round-trips exactly through the
+    /// loader. A name absent from this snapshot is an error. Returns the file count.
+    /// Backs `coli shard-export`: writing one node's resident weights + owned experts.
+    pub fn write_subset(
+        &self,
+        names: &[String],
+        out_dir: &Path,
+        max_file_bytes: u64,
+    ) -> io::Result<usize> {
+        std::fs::create_dir_all(out_dir)?;
+        // Resolve up front so a missing name fails before any file is written.
+        let mut items: Vec<&StTensor> = Vec::with_capacity(names.len());
+        for n in names {
+            items.push(self.find(n).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("shard-export: tensor not found: {n}"))
+            })?);
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut file_no = 0usize;
+        let mut i = 0usize;
+        while i < items.len() {
+            // Greedily pack tensors into this output file up to the size cap (always
+            // at least one, so a single oversized tensor still gets its own file).
+            let start = i;
+            let mut acc = 0u64;
+            while i < items.len() && (i == start || acc + items[i].nbytes <= max_file_bytes) {
+                acc += items[i].nbytes;
+                i += 1;
+            }
+            let group = &items[start..i];
+            // Build the JSON header; data_offsets are relative to the data segment.
+            let mut header = String::from("{");
+            let mut rel = 0u64;
+            for (gi, t) in group.iter().enumerate() {
+                if gi > 0 {
+                    header.push(',');
+                }
+                let shape: Vec<String> = t.shape.iter().map(|d| d.to_string()).collect();
+                header.push_str(&format!(
+                    "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+                    t.name,
+                    t.dtype.safetensors_str(),
+                    shape.join(","),
+                    rel,
+                    rel + t.nbytes
+                ));
+                rel += t.nbytes;
+            }
+            header.push('}');
+            let path = out_dir.join(format!("out-{file_no:05}.safetensors"));
+            let mut f = io::BufWriter::new(File::create(&path)?);
+            f.write_all(&(header.len() as u64).to_le_bytes())?;
+            f.write_all(header.as_bytes())?;
+            for t in group {
+                let n = t.nbytes as usize;
+                if buf.len() < n {
+                    buf.resize(n, 0);
+                }
+                self.read_raw(&t.name, &mut buf[..n])?;
+                f.write_all(&buf[..n])?;
+            }
+            f.flush()?;
+            file_no += 1;
+        }
+        Ok(file_no)
     }
 
     /// Read several raw (U8) tensors, coalescing any that are **contiguous in the

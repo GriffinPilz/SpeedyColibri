@@ -38,6 +38,21 @@ impl DType {
         }
     }
 
+    /// The safetensors dtype string (inverse of [`parse`], round-tripping through
+    /// the reader). `U8` is emitted for the raw quantized-container variant (the
+    /// reader parses both `U8` and `I8` to `U8` and reads bytes verbatim, so the
+    /// distinction is immaterial). Used by the shard writer.
+    pub fn safetensors_str(self) -> &'static str {
+        match self {
+            DType::Bf16 => "BF16",
+            DType::F16 => "F16",
+            DType::F32 => "F32",
+            DType::U8 => "U8",
+            DType::F8E4M3 => "F8_E4M3",
+            DType::F8E5M2 => "F8_E5M2",
+        }
+    }
+
     /// Bytes per element on disk.
     pub fn elem_size(self) -> usize {
         match self {

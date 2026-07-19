@@ -141,6 +141,8 @@ fn main() -> ExitCode {
         "loadbench" => cmd_loadbench(&args),
         "repack" => cmd_repack(&args),
         "shard-export" => cmd_shard_export(&args),
+        "shard-serve" => cmd_shard_serve(&args),
+        "shard-pull" => cmd_shard_pull(&args),
         "backend" => cmd_backend(),
         "cluster" => cmd_cluster(&args),
         "worker" => cmd_worker(&args),
@@ -915,6 +917,283 @@ fn expert_id_of(name: &str) -> Option<u32> {
     rest[..end].parse().ok()
 }
 
+/// Tensor names for node `me`'s shard: every resident (non-expert) tensor plus the
+/// routed experts it owns under `sharding`. Shared by `shard-export` and `shard-serve`.
+fn select_shard_names(
+    shards: &colibri_safetensors::Shards,
+    sharding: &colibri_cluster::ExpertSharding,
+    me: colibri_cluster::NodeId,
+    n_experts: u32,
+) -> Vec<String> {
+    shards
+        .tensors()
+        .iter()
+        .filter(|t| match expert_id_of(&t.name) {
+            Some(e) => e < n_experts && sharding.is_local(me, e),
+            None => true,
+        })
+        .map(|t| t.name.clone())
+        .collect()
+}
+
+// Little-endian framing for the shard-distribute wire protocol.
+fn wr_u64<W: std::io::Write>(w: &mut W, v: u64) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
+fn wr_u32<W: std::io::Write>(w: &mut W, v: u32) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
+fn rd_u64<R: std::io::Read>(r: &mut R) -> std::io::Result<u64> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; Ok(u64::from_le_bytes(b)) }
+fn rd_u32<R: std::io::Read>(r: &mut R) -> std::io::Result<u32> { let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
+fn wr_path<W: std::io::Write>(w: &mut W, s: &str) -> std::io::Result<()> { wr_u32(w, s.len() as u32)?; w.write_all(s.as_bytes()) }
+fn rd_path<R: std::io::Read>(r: &mut R) -> std::io::Result<String> {
+    let n = rd_u32(r)? as usize;
+    let mut b = vec![0u8; n];
+    r.read_exact(&mut b)?;
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// `coli shard-serve <src-snap> [port]` — stream each connecting peer *its* expert
+/// shard over **raw TCP** (no SSH crypto → full RoCE bandwidth), reading the source
+/// **in parallel**. The peer runs `coli shard-pull`. Serves until killed. Replaces
+/// the slow single-threaded `shard-export` + `rsync -e ssh` bootstrap (~0.35 GB/s,
+/// ~20 min) with a direct source→peer-disk stream (no intermediate file).
+///
+/// Wire form (all little-endian): peer sends `nodes,rank`; server replies
+/// `n_files`, then per file `path_len,path,size,<size bytes>`. Each file is either a
+/// complete `out-NNNNN.safetensors` the server builds on the fly, or a metadata file
+/// (config/tokenizer) copied verbatim — so the receiver is a dumb byte sink.
+fn cmd_shard_serve(args: &[String]) -> ExitCode {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let src = match args.get(2) {
+        Some(s) => s.clone(),
+        None => {
+            eprintln!("usage: coli shard-serve <src-snap> [port]");
+            return ExitCode::from(2);
+        }
+    };
+    let port: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(48900);
+    let cfg = match colibri_core::Config::load(&src) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("shard-serve: config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let n_experts = cfg.n_experts as u32;
+    let shards = match colibri_safetensors::Shards::open(&src) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("shard-serve: open {src}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let read_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("shard-serve: bind :{port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("[shard-serve] {n_experts} experts, serving on 0.0.0.0:{port} ({read_threads} read threads)");
+    for conn in listener.incoming() {
+        let mut stream = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[shard-serve] accept: {e}");
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        let nodes = match rd_u32(&mut stream) { Ok(v) => v, Err(e) => { eprintln!("[shard-serve] handshake: {e}"); continue; } };
+        let rank = match rd_u32(&mut stream) { Ok(v) => v, Err(_) => continue };
+        if nodes < 1 || rank >= nodes {
+            eprintln!("[shard-serve] bad request nodes={nodes} rank={rank}");
+            continue;
+        }
+        let sharding = colibri_cluster::ExpertSharding::new(nodes, n_experts);
+        let me = colibri_cluster::NodeId(rank);
+        let names = select_shard_names(&shards, &sharding, me, n_experts);
+        let items: Vec<&colibri_safetensors::StTensor> =
+            names.iter().filter_map(|n| shards.find(n)).collect();
+        // Group tensors into ~5 GB out-*.safetensors, same packing as write_subset.
+        let max_file = 5_000_000_000u64;
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut i = 0;
+            while i < items.len() {
+                let start = i;
+                let mut acc = 0u64;
+                while i < items.len() && (i == start || acc + items[i].nbytes <= max_file) {
+                    acc += items[i].nbytes;
+                    i += 1;
+                }
+                groups.push((start, i));
+            }
+        }
+        // Metadata files (config/tokenizer/generation_config) shipped verbatim.
+        let mut meta: Vec<(String, std::path::PathBuf, u64)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&src) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                let is_st = p.extension().map(|e| e == "safetensors").unwrap_or(false);
+                let is_usage = p.file_name().map(|f| f == ".coli_usage").unwrap_or(false);
+                if p.is_file() && !is_st && !is_usage {
+                    if let (Some(fname), Ok(m)) =
+                        (p.file_name().and_then(|f| f.to_str()).map(String::from), std::fs::metadata(&p))
+                    {
+                        meta.push((fname, p, m.len()));
+                    }
+                }
+            }
+        }
+        let gb: f64 = (items.iter().map(|t| t.nbytes).sum::<u64>()
+            + meta.iter().map(|(_, _, s)| *s).sum::<u64>()) as f64 / 1e9;
+        eprintln!(
+            "[shard-serve] peer rank {rank}/{nodes}: {} tensors, {} shard files + {} meta, {gb:.1} GB",
+            items.len(), groups.len(), meta.len()
+        );
+        let t0 = std::time::Instant::now();
+        let res = (|| -> std::io::Result<()> {
+            let mut w = std::io::BufWriter::with_capacity(8 << 20, stream.try_clone()?);
+            wr_u64(&mut w, (groups.len() + meta.len()) as u64)?;
+            for (fi, &(start, end)) in groups.iter().enumerate() {
+                let grp = &items[start..end];
+                // safetensors header (relative data_offsets), then the tensor bytes.
+                let mut header = String::from("{");
+                let mut rel = 0u64;
+                for (gi, t) in grp.iter().enumerate() {
+                    if gi > 0 { header.push(','); }
+                    let shape: Vec<String> = t.shape.iter().map(|d| d.to_string()).collect();
+                    header.push_str(&format!(
+                        "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+                        t.name, t.dtype.safetensors_str(), shape.join(","), rel, rel + t.nbytes
+                    ));
+                    rel += t.nbytes;
+                }
+                header.push('}');
+                let group_bytes: u64 = grp.iter().map(|t| t.nbytes).sum();
+                let file_size = 8 + header.len() as u64 + group_bytes;
+                wr_path(&mut w, &format!("out-{fi:05}.safetensors"))?;
+                wr_u64(&mut w, file_size)?;
+                w.write_all(&(header.len() as u64).to_le_bytes())?;
+                w.write_all(header.as_bytes())?;
+                // Parallel read of this group's tensors into ordered buffers, then send.
+                let n = grp.len();
+                let mut bufs: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
+                let cursor = AtomicUsize::new(0);
+                let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+                std::thread::scope(|scope| {
+                    let nt = read_threads.min(n).max(1);
+                    for _ in 0..nt {
+                        let tx = tx.clone();
+                        let cursor = &cursor;
+                        let shards = &shards;
+                        scope.spawn(move || loop {
+                            let i = cursor.fetch_add(1, Ordering::Relaxed);
+                            if i >= grp.len() { break; }
+                            let mut buf = vec![0u8; grp[i].nbytes as usize];
+                            if shards.read_raw(&grp[i].name, &mut buf).is_ok() {
+                                let _ = tx.send((i, buf));
+                            }
+                        });
+                    }
+                    drop(tx);
+                    for (i, buf) in rx { bufs[i] = Some(buf); }
+                });
+                for b in &bufs {
+                    match b {
+                        Some(bytes) => w.write_all(bytes)?,
+                        None => return Err(std::io::Error::new(std::io::ErrorKind::Other, "shard-serve: tensor read failed")),
+                    }
+                }
+            }
+            for (fname, path, size) in &meta {
+                wr_path(&mut w, fname)?;
+                wr_u64(&mut w, *size)?;
+                let mut f = std::fs::File::open(path)?;
+                std::io::copy(&mut f, &mut w)?;
+            }
+            w.flush()
+        })();
+        match res {
+            Ok(()) => eprintln!(
+                "[shard-serve] peer rank {rank} done: {gb:.1} GB in {:.1}s ({:.2} GB/s)",
+                t0.elapsed().as_secs_f64(), gb / t0.elapsed().as_secs_f64().max(1e-9)
+            ),
+            Err(e) => eprintln!("[shard-serve] peer rank {rank} error: {e}"),
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `coli shard-pull <out-dir> <host:port> --nodes N --rank R` — pull this node's
+/// shard from a `coli shard-serve` peer over raw TCP, writing it to `out-dir` as a
+/// self-contained snapshot. A dumb byte sink: the server frames complete files.
+fn cmd_shard_pull(args: &[String]) -> ExitCode {
+    use std::io::{Read, Write};
+    let mut pos: Vec<&String> = Vec::new();
+    let (mut nodes, mut rank): (u32, u32) = (0, u32::MAX);
+    let mut it = args.iter().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--nodes" => nodes = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            "--rank" => rank = it.next().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX),
+            _ => pos.push(a),
+        }
+    }
+    let (out, addr) = match (pos.first(), pos.get(1)) {
+        (Some(o), Some(a)) => (o.as_str(), a.as_str()),
+        _ => {
+            eprintln!("usage: coli shard-pull <out-dir> <host:port> --nodes N --rank R");
+            return ExitCode::from(2);
+        }
+    };
+    if nodes < 1 || rank >= nodes {
+        eprintln!("shard-pull: need --nodes >= 1 and 0 <= --rank < nodes");
+        return ExitCode::from(2);
+    }
+    let out_dir = std::path::Path::new(out);
+    if let Err(e) = std::fs::create_dir_all(out_dir) {
+        eprintln!("shard-pull: mkdir {out}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let res = (|| -> std::io::Result<(usize, u64)> {
+        let stream = std::net::TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        let mut w = stream.try_clone()?;
+        wr_u32(&mut w, nodes)?;
+        wr_u32(&mut w, rank)?;
+        let mut r = std::io::BufReader::with_capacity(8 << 20, stream);
+        let n_files = rd_u64(&mut r)?;
+        let mut total = 0u64;
+        for _ in 0..n_files {
+            let path = rd_path(&mut r)?;
+            let size = rd_u64(&mut r)?;
+            let mut f = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(out_dir.join(&path))?);
+            let mut left = size;
+            let mut buf = vec![0u8; 8 << 20];
+            while left > 0 {
+                let want = (buf.len() as u64).min(left) as usize;
+                r.read_exact(&mut buf[..want])?;
+                f.write_all(&buf[..want])?;
+                left -= want as u64;
+            }
+            f.flush()?;
+            total += size;
+        }
+        Ok((n_files as usize, total))
+    })();
+    match res {
+        Ok((nf, total)) => {
+            eprintln!("shard-pull: received {nf} files, {:.1} GB → {out}", total as f64 / 1e9);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("shard-pull: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `coli shard-export <src-snap> <out-dir> --nodes N --rank R` — write a snapshot
 /// containing ONLY node R's owned routed experts plus every resident (non-expert)
 /// tensor, so a peer can load its shard from local disk instead of holding the full
@@ -964,27 +1243,13 @@ fn cmd_shard_export(args: &[String]) -> ExitCode {
     let sharding = colibri_cluster::ExpertSharding::new(nodes, n_experts);
     let me = colibri_cluster::NodeId(rank);
 
-    // Select: every resident tensor, plus routed experts owned by this rank.
-    let mut names: Vec<String> = Vec::new();
-    let (mut n_res, mut n_exp, mut bytes) = (0u64, 0u64, 0u64);
-    for t in shards.tensors() {
-        let keep = match expert_id_of(&t.name) {
-            Some(e) => e < n_experts && sharding.is_local(me, e),
-            None => true,
-        };
-        if keep {
-            if expert_id_of(&t.name).is_some() {
-                n_exp += 1;
-            } else {
-                n_res += 1;
-            }
-            bytes += t.nbytes;
-            names.push(t.name.clone());
-        }
-    }
+    let names = select_shard_names(&shards, &sharding, me, n_experts);
+    let bytes: u64 = names.iter().filter_map(|n| shards.find(n)).map(|t| t.nbytes).sum();
+    let n_exp = names.iter().filter(|n| expert_id_of(n).is_some()).count();
     eprintln!(
-        "shard-export rank {rank}/{nodes}: {} tensors ({n_res} resident + {n_exp} expert), {:.1} GB, owns {} experts",
+        "shard-export rank {rank}/{nodes}: {} tensors ({} resident + {n_exp} expert), {:.1} GB, owns {} experts",
         names.len(),
+        names.len() - n_exp,
         bytes as f64 / 1e9,
         sharding.count_for(me),
     );

@@ -807,37 +807,85 @@ pub fn moe_sharded<P: ExpertProvider, T: Transport + ?Sized>(
         by_node.entry(sharding.owner(e as u32).0).or_default().push(ui);
     }
 
+    // Split the routed experts into the driver's own shard and each peer's shard.
+    let mut local: Option<(Vec<u32>, Vec<f32>)> = None;
+    let mut remotes: Vec<(u32, Vec<u32>, Vec<f32>)> = Vec::new();
     for (node, cols) in by_node {
         let experts: Vec<u32> = cols.iter().map(|&ui| uniq[ui] as u32).collect();
         let weights = subcols(&w_mat, s_len, n_uniq, &cols);
         if NodeId(node) == me {
-            // Local: compute in-process against our provider.
-            let partial = compute_experts_partial(provider, layer, &experts, &weights, x, s_len, d)?;
-            for (o, p) in out.iter_mut().zip(partial.iter()) {
-                *o += *p;
-            }
+            local = Some((experts, weights));
         } else {
-            // Remote: ship activations + weights to the owner, add its partial sum.
-            let req = ExpertRequest {
-                experts,
-                weights,
-                activations: x.to_vec(),
-                n_tokens: s_len,
-                hidden: d,
-                layer: layer as u32,
-            };
-            let resp = transport
-                .exchange(NodeId(node), &req)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            if resp.outputs.len() != s_len * d {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("node {node}: expected {} outputs, got {}", s_len * d, resp.outputs.len()),
-                ));
+            remotes.push((node, experts, weights));
+        }
+    }
+
+    // Overlap the nodes. The serial loop above computed the local shard, THEN blocked
+    // shipping activations to each peer and waiting for its reply — so the nodes took
+    // turns (each idle while the other loaded + computed) and the expert-parallel split
+    // bought almost nothing (measured: 2-node expert-load halved but total prefill flat,
+    // the savings absorbed into peer-wait). Here every peer request flies concurrently
+    // while the local shard computes, so wall time is max(nodes) not sum(nodes). Partials
+    // are folded in ascending node order, so the f32 sum is bit-identical to the serial
+    // path (`Transport: Send + Sync` makes the concurrent exchange sound).
+    let mut partials: Vec<(u32, Vec<f32>)> = Vec::with_capacity(remotes.len() + 1);
+    let mut err: Option<io::Error> = None;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = remotes
+            .iter()
+            .map(|(node, experts, weights)| {
+                let node = *node;
+                let h = scope.spawn(move || {
+                    let req = ExpertRequest {
+                        experts: experts.clone(),
+                        weights: weights.clone(),
+                        activations: x.to_vec(),
+                        n_tokens: s_len,
+                        hidden: d,
+                        layer: layer as u32,
+                    };
+                    transport.exchange(NodeId(node), &req)
+                });
+                (node, h)
+            })
+            .collect();
+        // Local shard computes while the peer requests are in flight.
+        if let Some((experts, weights)) = &local {
+            match compute_experts_partial(provider, layer, experts, weights, x, s_len, d) {
+                Ok(p) => partials.push((me.0, p)),
+                Err(e) => err = Some(e),
             }
-            for (o, p) in out.iter_mut().zip(resp.outputs.iter()) {
-                *o += *p;
+        }
+        for (node, h) in handles {
+            match h.join() {
+                Ok(Ok(resp)) if resp.outputs.len() == s_len * d => partials.push((node, resp.outputs)),
+                Ok(Ok(resp)) => {
+                    err.get_or_insert_with(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("node {node}: expected {} outputs, got {}", s_len * d, resp.outputs.len()),
+                        )
+                    });
+                }
+                Ok(Err(e)) => {
+                    err.get_or_insert_with(|| io::Error::new(io::ErrorKind::Other, e.to_string()));
+                }
+                Err(_) => {
+                    err.get_or_insert_with(|| {
+                        io::Error::new(io::ErrorKind::Other, format!("node {node}: exchange thread panicked"))
+                    });
+                }
             }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    // Fold in ascending node order → identical accumulation order to the serial path.
+    partials.sort_by_key(|(n, _)| *n);
+    for (_, p) in &partials {
+        for (o, v) in out.iter_mut().zip(p.iter()) {
+            *o += *v;
         }
     }
 

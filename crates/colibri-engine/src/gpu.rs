@@ -536,12 +536,13 @@ pub fn expert_group_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() == Some("1"))
 }
 
-/// `COLI_TILE_I8=1` routes int8 experts/MLPs (the shared expert + dense layers) through
-/// the tiled `i8a16` tensor-core kernel instead of the naive `quant_matmul` — nsys found
-/// that kernel is 60% of GPU time (its S-fold weight re-reads).
+/// Routes int8 experts/MLPs (the shared expert + dense layers) through the tiled `i8a16`
+/// tensor-core kernel instead of the naive `quant_matmul` — nsys found that kernel is 60%
+/// of GPU time (its S-fold weight re-reads). Default-on; set `COLI_TILE_I8=0` to disable.
+/// Measured @512 tok: attn 60.3→19.9 s (3.0×), prefill 386→334 s, tokens bit-identical.
 pub fn tile_i8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_TILE_I8").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| std::env::var("COLI_TILE_I8").ok().as_deref() != Some("0"))
 }
 
 /// Batched routed-expert FFN. `active` is one `(expert, its token rows, its per-row

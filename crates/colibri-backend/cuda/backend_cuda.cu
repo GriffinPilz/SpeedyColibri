@@ -774,7 +774,8 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
     // Tiled tensor-core path for the resident matmuls (attention q/kv/o/kv_b proj):
     // reads each weight once per 16-row tile vs quant_matmul's S-fold re-read.
-    int tile = getenv("COLI_TILE_I8") && atoi(getenv("COLI_TILE_I8")) && ctx->compute_major >= 7;
+    const char *tile_env = getenv("COLI_TILE_I8");
+    int tile = (!tile_env || strcmp(tile_env, "0") != 0) && ctx->compute_major >= 7;
     if (tile && (fmt == 1 || fmt == 4)) {
         dim3 tg((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
         if (fmt == 4)
@@ -1382,7 +1383,8 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
     // Tile only when S is large enough to amortize the 16-row tile (decode S=1 stays
     // on the naive kernel, which is better for a single row).
-    int tile=getenv("COLI_TILE_I8")&&atoi(getenv("COLI_TILE_I8"))&&ctx->compute_major>=7&&S>=16;
+    const char *tile_env=getenv("COLI_TILE_I8");
+    int tile=(!tile_env||strcmp(tile_env,"0")!=0)&&ctx->compute_major>=7&&S>=16;
     if(tile&&(t->fmt==1||t->fmt==4)){
         dim3 tg((unsigned)((t->O+63)/64),(unsigned)((S+15)/16));
         if(t->fmt==4)

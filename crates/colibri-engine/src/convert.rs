@@ -776,6 +776,97 @@ pub struct ConvertStats {
     pub bytes_out: u64,
 }
 
+/// One processed source tensor: dropped, passed through as F32, or quantized to a
+/// (codes, scales) pair. Produced by [`process_one`] so the per-tensor dequant +
+/// quantize (the CPU-bound work) can run in parallel and be reassembled in order.
+enum TensorOut {
+    Skip,
+    F32(OutTensor),
+    Quant(OutTensor, OutTensor),
+}
+
+/// Dequant + (re)quantize one source tensor. Pure w.r.t. shared state (reads `shards`,
+/// which is `Sync`), so many run concurrently.
+fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<TensorOut> {
+    let f32_out = |name: &str, shape: Vec<i64>, w: &[f32]| OutTensor {
+        name: name.to_string(),
+        dtype: "F32",
+        shape,
+        bytes: f32_bytes(w),
+    };
+    match classify(name, opts.n_layers, opts.keep_indexer) {
+        Kind::Skip => Ok(TensorOut::Skip),
+        Kind::F32 => {
+            let (w, shape) = dequant(shards, name)?;
+            Ok(TensorOut::F32(f32_out(name, shape, &w)))
+        }
+        kind @ (Kind::Io | Kind::X | Kind::Q) => {
+            // Dequant first: the *logical* shape is authoritative (NVFP4 is stored
+            // packed as [O, I/2], so the on-disk shape would lie).
+            let (w, shape) = dequant(shards, name)?;
+            // Only 2D weights quantize; anything else stays F32.
+            if shape.len() != 2 {
+                return Ok(TensorOut::F32(f32_out(name, shape, &w)));
+            }
+            let bits = match kind {
+                Kind::Io => opts.io_bits,
+                Kind::X => opts.xbits,
+                _ => opts.ebits,
+            };
+            let (o, i) = (shape[0] as usize, shape[1] as usize);
+            let (codes_t, scale_t) = if matches!(kind, Kind::X) && opts.xfp8 {
+                quantize_e4m3(name, &w, o, i)
+            } else {
+                quantize(name, &w, o, i, bits)
+            };
+            Ok(TensorOut::Quant(codes_t, scale_t))
+        }
+    }
+}
+
+/// Process a shard's tensors across cores (the dequant + quantize is single-thread
+/// CPU-bound otherwise — 1 of 20 cores). Contiguous index ranges preserve the input
+/// order, so a routed expert's gate/up/down stay adjacent on disk. Cap with
+/// `COLI_CONVERT_THREADS`.
+fn process_names_parallel(
+    names: &[&str],
+    shards: &Shards,
+    opts: &ConvertOpts,
+) -> io::Result<Vec<TensorOut>> {
+    let n = names.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let cap = std::env::var("COLI_CONVERT_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4)
+        });
+    let nthreads = cap.min(n);
+    let chunk = n.div_ceil(nthreads);
+    let mut parts: Vec<io::Result<Vec<TensorOut>>> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = names
+            .chunks(chunk)
+            .map(|slice| {
+                scope.spawn(move || {
+                    slice.iter().map(|&nm| process_one(nm, shards, opts)).collect::<io::Result<Vec<_>>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            parts.push(h.join().unwrap());
+        }
+    });
+    let mut out = Vec::with_capacity(n);
+    for p in parts {
+        out.extend(p?);
+    }
+    Ok(out)
+}
+
 /// Convert a local FP8 snapshot directory to a colibrì int4 container directory.
 /// One output shard (`out-NNNNN.safetensors`) per input shard; `config.json` and
 /// tokenizer files are copied through. `progress` is called once per input shard
@@ -810,48 +901,15 @@ pub fn convert_snapshot(
         // their placement after the code block is irrelevant.
         let mut codes: Vec<OutTensor> = Vec::new();
         let mut floats: Vec<OutTensor> = Vec::new();
-        for &name in names {
-            match classify(name, opts.n_layers, opts.keep_indexer) {
-                Kind::Skip => {
-                    stats.tensors_skipped += 1;
-                }
-                Kind::F32 => {
-                    let (w, shape) = dequant(&shards, name)?;
-                    floats.push(OutTensor {
-                        name: name.to_string(),
-                        dtype: "F32",
-                        shape,
-                        bytes: f32_bytes(&w),
-                    });
+        // Dequant + quantize this shard's tensors across cores (order preserved).
+        for out in process_names_parallel(names, &shards, &opts)? {
+            match out {
+                TensorOut::Skip => stats.tensors_skipped += 1,
+                TensorOut::F32(t) => {
+                    floats.push(t);
                     stats.tensors_f32 += 1;
                 }
-                kind @ (Kind::Io | Kind::X | Kind::Q) => {
-                    // Dequant first: the *logical* shape is authoritative (NVFP4 is
-                    // stored packed as [O, I/2], so the on-disk shape would lie).
-                    let (w, shape) = dequant(&shards, name)?;
-                    // Only 2D weights quantize; anything else stays F32 (matches
-                    // the reference's `if w.ndim != 2` guard).
-                    if shape.len() != 2 {
-                        floats.push(OutTensor {
-                            name: name.to_string(),
-                            dtype: "F32",
-                            shape,
-                            bytes: f32_bytes(&w),
-                        });
-                        stats.tensors_f32 += 1;
-                        continue;
-                    }
-                    let bits = match kind {
-                        Kind::Io => opts.io_bits,
-                        Kind::X => opts.xbits,
-                        _ => opts.ebits,
-                    };
-                    let (o, i) = (shape[0] as usize, shape[1] as usize);
-                    let (codes_t, scale_t) = if matches!(kind, Kind::X) && opts.xfp8 {
-                        quantize_e4m3(name, &w, o, i)
-                    } else {
-                        quantize(name, &w, o, i, bits)
-                    };
+                TensorOut::Quant(codes_t, scale_t) => {
                     codes.push(codes_t);
                     floats.push(scale_t);
                     stats.tensors_quantized += 1;

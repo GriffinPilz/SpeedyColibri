@@ -112,7 +112,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,fl
  * maxsel must be index_topk. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_sparse(ColiCudaTensor *kv_b,float *ctx,const float *q,
                                      const float *latent,const float *rope,
-                                     const int *sel_idx,const int *sel_cnt,int maxsel,int S,
+                                     const int *sel_idx,const int *sel_cnt,int maxsel,
+                                     int H0,int HC,int S,
                                      int H,int Q,int R,int V,int K,int T,
                                      float attention_scale);
 

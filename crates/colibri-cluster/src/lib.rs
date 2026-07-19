@@ -18,9 +18,12 @@ pub mod sharding;
 pub mod transport;
 
 pub use discovery::{connectx_links, discover, ConnectXLink, Discovery, Peer, PeerKind};
-pub use net::{serve_experts, TcpTransport};
+pub use net::{serve_cluster, serve_experts, TcpTransport};
 pub use sharding::{ExpertSharding, NodeId};
-pub use transport::{ExpertRequest, ExpertResponse, LocalTransport, Transport, TransportError};
+pub use transport::{
+    AttnRequest, AttnResponse, ExpertRequest, ExpertResponse, LocalTransport, Transport,
+    TransportError,
+};
 
 /// Cluster-wide configuration derived from the runtime environment.
 #[derive(Debug, Clone)]

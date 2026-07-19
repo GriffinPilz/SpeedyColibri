@@ -6,15 +6,24 @@
 //! layers) → residual add. Then a final RMSNorm and the `lm_head` produce
 //! logits, and greedy decoding feeds the argmax back in one token at a time.
 
-use crate::attention::{attention_with, AttnCore};
+use crate::attention::{attention_sharded, attention_with, AttnCore};
 use crate::linear::{embed_row, matmul_qt};
 use crate::math::rmsnorm;
 use crate::model::{KvCache, Layer, Model};
-use crate::moe::{dense_mlp, moe, ExpertProvider};
+use crate::moe::{cluster_ctx, dense_mlp, moe, ExpertProvider};
 use crate::sampling::argmax;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+
+/// `COLI_TP_ATTN=1` enables tensor-parallel attention: split the heads across cluster
+/// nodes so every box's GPU runs part of the (dominant) attention core, instead of the
+/// driver computing all heads while peers idle. Off by default; only takes effect in a
+/// multi-node cluster during single-shot prefill (see [`layer_forward`]).
+fn tp_attn_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_TP_ATTN").ok().as_deref() == Some("1"))
+}
 
 /// COLI_PROFILE=1 accumulates per-section wall time (microseconds) across the
 /// forward pass so `generate_greedy` can print a breakdown. Off by default.
@@ -113,9 +122,23 @@ pub fn layer_forward<P: ExpertProvider>(
     // returns the selection it computed so we can carry it forward across the stack.
     let is_full = cfg.idx_type.get(li).copied().unwrap_or(false);
     let reused = if is_full { None } else { dsa_sel.as_deref() };
-    let computed = timed(&ATTN_US, || {
-        attention_with(cfg, l, li, kv, nrm, s, pos_base, tmp, AttnCore::Reconstruct, reused)
-    });
+    let computed = timed(&ATTN_US, || -> io::Result<Option<Vec<Vec<u32>>>> {
+        // Tensor-parallel attention: split the heads across nodes so every box's GPU
+        // runs part of the core. Only for a multi-node cluster during single-shot
+        // prefill (`pos_base == 0`, `s > 1`) — peers build a fresh KV from the shipped
+        // activations, so there is no cross-step state. Decode and the single-node
+        // build keep the driver computing all heads via `attention_with`.
+        if pos_base == 0 && s > 1 && tp_attn_enabled() {
+            if let Some(cc) = cluster_ctx() {
+                if cc.sharding.num_nodes() > 1 {
+                    return attention_sharded(
+                        cfg, l, li, kv, nrm, s, pos_base, tmp, reused, &cc.sharding, &*cc.transport,
+                    );
+                }
+            }
+        }
+        Ok(attention_with(cfg, l, li, kv, nrm, s, pos_base, tmp, AttnCore::Reconstruct, reused))
+    })?;
     if is_full {
         *dsa_sel = computed;
     }

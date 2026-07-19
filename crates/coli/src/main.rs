@@ -739,7 +739,30 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     // any activation is computed — disagreeing maps corrupt results silently.
     let fingerprint = sharding.fingerprint();
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    let bound = match colibri_cluster::serve_experts(addr, fingerprint, move |req| {
+    // Attention head-slice handler (tensor-parallel attention): compute this node's
+    // heads over the shipped layer input + the driver's DSA selection. Stateless — a
+    // fresh scratch KV per request (single-shot prefill), the real layer's resident
+    // weights via `model.layers`.
+    let attn = move |req: &colibri_cluster::AttnRequest| {
+        let mut outputs = vec![0.0f32; req.n_tokens * req.hidden];
+        if let Some(l) = model.layers.get(req.layer as usize) {
+            colibri_engine::compute_attention_partial(
+                &model.cfg,
+                l,
+                &req.activations,
+                req.n_tokens,
+                req.pos_base as usize,
+                req.h_start as usize,
+                req.h_count as usize,
+                &req.sel,
+                &mut outputs,
+            );
+        } else {
+            eprintln!("[worker] attention request for out-of-range layer {}", req.layer);
+        }
+        colibri_cluster::AttnResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
+    };
+    let bound = match colibri_cluster::serve_cluster(addr, fingerprint, move |req| {
         match colibri_engine::compute_experts_partial(
             &*provider,
             req.layer as usize,
@@ -761,7 +784,7 @@ fn cmd_worker(args: &[String]) -> ExitCode {
                 }
             }
         }
-    }) {
+    }, attn) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("coli worker: bind {addr}: {e}");

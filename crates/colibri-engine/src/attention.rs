@@ -24,7 +24,9 @@
 use crate::linear::{matmul_qt, qt_addrow, qt_matvec_rows};
 use crate::math::{rmsnorm_inplace, rope_interleave, softmax};
 use crate::model::{KvCache, Layer};
+use colibri_cluster::{AttnRequest, ExpertSharding, NodeId, Transport};
 use colibri_core::Config;
+use std::io;
 
 /// Add `t.elapsed()` to `acc` when `COLI_PROFILE` is on (else near-free). Backs the
 /// per-phase attention breakdown.
@@ -113,7 +115,41 @@ pub fn attention_with(
     core: AttnCore,
     sel: Option<&[Vec<u32>]>,
 ) -> Option<Vec<Vec<u32>>> {
+    attention_with_heads(cfg, l, layer, kv, x, s_len, pos_base, out, core, sel, (0, cfg.n_heads as usize))
+}
+
+/// As [`attention_with`], but computing only the head slice `heads = (h_start,
+/// h_count)` in the attention core and its o-projection, leaving `out` a **partial**
+/// sum (the contribution of heads `[h_start, h_start+h_count)`). Summing the partials
+/// from a disjoint cover of `0..n_heads` reconstructs full attention — this is the
+/// tensor-parallel split point: each node computes its head slice and the driver adds
+/// the partials, exactly as [`crate::moe::moe_sharded`] folds expert partials.
+///
+/// Everything head-independent still runs in full regardless of the slice: the q/kv
+/// projections, the RoPE, the KV-cache write (so the driver's cache stays complete for
+/// later decode), and the DSA indexer. Only the per-head core + o-proj are restricted.
+/// `heads == (0, n_heads)` is exactly [`attention_with`].
+#[allow(clippy::too_many_arguments)]
+pub fn attention_with_heads(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    kv: &mut KvCache,
+    x: &[f32],
+    s_len: usize,
+    pos_base: usize,
+    out: &mut [f32],
+    core: AttnCore,
+    sel: Option<&[Vec<u32>]>,
+    heads: (usize, usize),
+) -> Option<Vec<Vec<u32>>> {
     let h = cfg.n_heads as usize;
+    let (h0, hc) = heads;
+    debug_assert!(h0 + hc <= h && hc > 0, "head slice ({h0},{hc}) out of range for {h} heads");
+    // A partial head slice is only honored by the DSA-sparse GPU core and the CPU
+    // reconstruct core; the dense GPU/absorb paths compute all H heads, so a partial
+    // slice must not take them (guarded below with `full_heads`).
+    let full_heads = h0 == 0 && hc == h;
     let qh = cfg.qk_head as usize;
     let qk_nope = cfg.qk_nope as usize;
     let r = cfg.qk_rope as usize;
@@ -165,46 +201,7 @@ pub fn attention_with(
     let st0 = kv.kv_start[layer];
 
     let _ti = std::time::Instant::now();
-    // DSA lightning indexer: on a FULL indexer layer, once the context exceeds
-    // `index_topk`, select the top-k keys per query and attend only to those. Gated to
-    // **single-shot prefill** (`pos_base == 0`, so every cached position is one of the
-    // `s_len` new tokens the indexer computes keys for). Decode (`pos_base > 0`) has no
-    // keys for prior positions, so it stays dense — DSA targets long-context prefill,
-    // and decode is disk-bound anyway. `st0 == 0` alone was wrong: kv_start stays 0
-    // during decode, so it let DSA fire there and the indexer indexed past its keys.
-    // An explicit `sel` (tests), a missing indexer, a SHARED layer, or a short context
-    // all leave attention dense.
-    let dsa_selection: Option<Vec<Vec<u32>>> = if sel.is_none()
-        && st0 == 0
-        && pos_base == 0
-        && l.ix_wk.is_some()
-        && cfg.idx_type.get(layer).copied().unwrap_or(false)
-        && pos_base + s_len > cfg.index_topk as usize
-        && pos_base + s_len >= dsa_min_prefill()
-        && dsa_enabled()
-    {
-        let iw = crate::dsa::IndexerWeights {
-            wk: l.ix_wk.as_ref().unwrap(),
-            knorm_w: &l.ix_knorm_w,
-            knorm_b: &l.ix_knorm_b,
-            wq: l.ix_wq.as_ref().unwrap(),
-            wp: l.ix_wp.as_ref().unwrap(),
-        };
-        Some(crate::dsa::indexer_forward(
-            &iw,
-            x,
-            &qr,
-            s_len,
-            cfg.index_nh as usize,
-            cfg.index_hd as usize,
-            cfg.index_topk as usize,
-            r,
-            theta,
-            pos_base,
-        ))
-    } else {
-        None
-    };
+    let dsa_selection = indexer_select(cfg, l, layer, x, &qr, s_len, pos_base, st0, sel.is_some());
     atime(&crate::forward::ATTN_INDEX_US, _ti);
     let sel = sel.or(dsa_selection.as_deref());
 
@@ -236,6 +233,8 @@ pub fn attention_with(
                     kv.krot_rows(layer, st0, tk),
                     sels,
                     cfg.index_topk as usize,
+                    h0,
+                    hc,
                     s_len,
                     h,
                     qk_nope,
@@ -248,7 +247,14 @@ pub fn attention_with(
             }
             // Selection active but GPU ineligible (or Absorb core) → CPU reconstruct.
             Some(_) => false,
-            None if s_len == 1 && st0 == 0 && crate::gpu::available() && l.kv_b.gpu_eligible => {
+            // Dense GPU paths compute all H heads, so only take them for the full slice;
+            // a partial slice falls through to the head-range CPU reconstruct core.
+            None if full_heads
+                && s_len == 1
+                && st0 == 0
+                && crate::gpu::available()
+                && l.kv_b.gpu_eligible =>
+            {
                 // Decode: persistent device KV — append the new row, read on device.
                 match kv.sync_device(layer, pos_base, tk) {
                     Some((lat_dev, rope_dev)) => crate::gpu::try_attention_absorb_kvdev(
@@ -257,7 +263,7 @@ pub fn attention_with(
                     None => false,
                 }
             }
-            None if crate::gpu::available() && l.kv_b.gpu_eligible => {
+            None if full_heads && crate::gpu::available() && l.kv_b.gpu_eligible => {
                 // Prefill (S>1) or st0>0: one-time host upload of the cache slice.
                 crate::gpu::try_attention_absorb(
                     &l.kv_b,
@@ -284,11 +290,14 @@ pub fn attention_with(
     if !ran_gpu {
         match core {
             AttnCore::Reconstruct => {
-                reconstruct_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx, sel);
+                reconstruct_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx, sel, h0, hc);
             }
             // Absorb is the S==1 decode core; DSA sparsifies the long-context prefill
-            // (reconstruct), so a selection is not applied here.
+            // (reconstruct), so a selection is not applied here. It has no head-slice
+            // form (decode isn't tensor-parallel here) — a partial slice must use
+            // Reconstruct.
             AttnCore::Absorb => {
+                debug_assert!(full_heads, "Absorb core has no head-slice form; use Reconstruct");
                 absorb_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx);
             }
         }
@@ -306,6 +315,264 @@ pub fn attention_with(
     dsa_selection
 }
 
+/// The DSA lightning-indexer selection for this layer, or `None` when DSA is inactive
+/// here. On a FULL indexer layer, once the context exceeds `index_topk`, it selects the
+/// top-k keys per query so attention restricts to those. Gated to single-shot prefill
+/// (`pos_base == 0`/`st0 == 0`): decode has no keys for prior positions and stays
+/// dense. `have_sel` short-circuits when a selection was already supplied (SHARED-layer
+/// reuse, or tests). Shared by [`attention_with_heads`] and [`dsa_selection_for`] so
+/// both gate identically.
+#[allow(clippy::too_many_arguments)]
+fn indexer_select(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    x: &[f32],
+    qr: &[f32],
+    s_len: usize,
+    pos_base: usize,
+    st0: usize,
+    have_sel: bool,
+) -> Option<Vec<Vec<u32>>> {
+    if have_sel
+        || st0 != 0
+        || pos_base != 0
+        || l.ix_wk.is_none()
+        || !cfg.idx_type.get(layer).copied().unwrap_or(false)
+        || pos_base + s_len <= cfg.index_topk as usize
+        || pos_base + s_len < dsa_min_prefill()
+        || !dsa_enabled()
+    {
+        return None;
+    }
+    let iw = crate::dsa::IndexerWeights {
+        wk: l.ix_wk.as_ref().unwrap(),
+        knorm_w: &l.ix_knorm_w,
+        knorm_b: &l.ix_knorm_b,
+        wq: l.ix_wq.as_ref().unwrap(),
+        wp: l.ix_wp.as_ref().unwrap(),
+    };
+    Some(crate::dsa::indexer_forward(
+        &iw,
+        x,
+        qr,
+        s_len,
+        cfg.index_nh as usize,
+        cfg.index_hd as usize,
+        cfg.index_topk as usize,
+        cfg.qk_rope as usize,
+        cfg.theta,
+        pos_base,
+    ))
+}
+
+/// Compute this layer's DSA selection standalone — the tensor-parallel driver needs it
+/// *before* the attention core so it can ship the identical selection to every peer
+/// (no node runs its own indexer, so nothing can diverge). Recomputes the cheap
+/// normalized `q_a` projection the indexer consumes. Single-shot prefill only
+/// (`pos_base == 0`, cache start 0); returns `None` on non-FULL/short/decode/DSA-off
+/// layers, exactly as [`attention_with`] would.
+pub fn dsa_selection_for(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    x: &[f32],
+    s_len: usize,
+    pos_base: usize,
+) -> Option<Vec<Vec<u32>>> {
+    let ql = cfg.q_lora as usize;
+    let mut qr = vec![0f32; s_len * ql];
+    matmul_qt(&mut qr, x, &l.q_a, s_len);
+    for s in 0..s_len {
+        rmsnorm_inplace(&mut qr[s * ql..(s + 1) * ql], &l.q_a_ln, cfg.eps);
+    }
+    indexer_select(cfg, l, layer, x, &qr, s_len, pos_base, 0, false)
+}
+
+/// Contiguous, balanced head split for tensor-parallel attention: node `k` of
+/// `num_nodes` computes `(h_start, h_count)` of `n_heads`. Remainder heads go to the
+/// lowest-numbered nodes, so counts differ by at most one and the ranges exactly cover
+/// `0..n_heads`. Every node derives the same split; the driver also sends each peer its
+/// `(h_start, h_count)` explicitly.
+pub fn head_slice(node: u32, num_nodes: u32, n_heads: usize) -> (usize, usize) {
+    let n = (num_nodes as usize).max(1);
+    let k = node as usize;
+    let base = n_heads / n;
+    let rem = n_heads % n;
+    let start = k * base + k.min(rem);
+    let count = base + if k < rem { 1 } else { 0 };
+    (start, count)
+}
+
+/// Tensor-parallel MLA attention: split the heads across nodes so every box's GPU runs
+/// part of the (dominant) attention core, then sum the o-projected partials — the
+/// attention analogue of [`crate::moe::moe_sharded`]. This node computes its head slice
+/// locally (which also writes its full, head-independent KV cache for later decode)
+/// while each peer computes its slice over the shipped activations + the identical DSA
+/// selection; partials fold in ascending node order.
+///
+/// Prefill only (`pos_base == 0`), Reconstruct/DSA core. `incoming_sel` is the carried
+/// selection for SHARED layers (`None` on a FULL layer → computed here); the selection
+/// this call establishes is returned for the caller to carry, as [`attention_with`]
+/// does. On a single node this is never invoked (the caller gates on `num_nodes > 1`).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_sharded<T: Transport + ?Sized>(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    kv: &mut KvCache,
+    x: &[f32],
+    s_len: usize,
+    pos_base: usize,
+    out: &mut [f32],
+    incoming_sel: Option<&[Vec<u32>]>,
+    sharding: &ExpertSharding,
+    transport: &T,
+) -> io::Result<Option<Vec<Vec<u32>>>> {
+    let d = cfg.hidden as usize;
+    let h = cfg.n_heads as usize;
+    let num_nodes = sharding.num_nodes();
+    let me = transport.this_node();
+
+    // One selection for the whole cluster this layer: carried (SHARED) or freshly
+    // computed here (FULL). Shipped verbatim to peers so no node runs its own indexer.
+    let computed = if incoming_sel.is_none() {
+        dsa_selection_for(cfg, l, layer, x, s_len, pos_base)
+    } else {
+        None
+    };
+    let sel: Option<&[Vec<u32>]> = incoming_sel.or(computed.as_deref());
+    // Ship a length-`s_len` selection ALWAYS: the real per-query selection when sparse,
+    // or `s_len` empty per-query vecs when dense. This is the cluster's authoritative
+    // decision — because it is `Some` and length `s_len`, every node's
+    // `attention_with_heads` short-circuits its own indexer (`have_sel`) and treats
+    // empty per-query entries as dense. Both the driver-local slice and the peers then
+    // run the *same* sparse kernel (dense-mode when empty), so the per-head partials are
+    // consistent and sum cleanly. A `None` would instead let a node re-run the indexer
+    // against the wrong layer and diverge.
+    let sel_full: Vec<Vec<u32>> = match sel {
+        Some(s) => s.to_vec(),
+        None => vec![Vec::new(); s_len],
+    };
+
+    let (h0, hc) = head_slice(me.0, num_nodes, h);
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+
+    let mut partials: Vec<(u32, Vec<f32>)> = Vec::with_capacity(num_nodes as usize);
+    let mut err: Option<io::Error> = None;
+    std::thread::scope(|scope| {
+        // Peers: each computes its own head slice over the same activations + selection.
+        let handles: Vec<(u32, _)> = (0..num_nodes)
+            .filter(|&n| NodeId(n) != me)
+            .map(|n| {
+                let (ph0, phc) = head_slice(n, num_nodes, h);
+                let req = AttnRequest {
+                    activations: x.to_vec(),
+                    sel: sel_full.clone(),
+                    n_tokens: s_len,
+                    hidden: d,
+                    pos_base: pos_base as u32,
+                    h_start: ph0 as u32,
+                    h_count: phc as u32,
+                    layer: layer as u32,
+                };
+                let handle = scope.spawn(move || transport.exchange_attn(NodeId(n), &req));
+                (n, handle)
+            })
+            .collect();
+
+        // Local head slice computes while the peer requests are in flight. This also
+        // writes the full (head-independent) KV cache so the driver can decode later.
+        // Uses `sel_full` (not `sel`) so it takes the identical sparse-kernel path as
+        // the peers.
+        let mut local = vec![0f32; s_len * d];
+        attention_with_heads(
+            cfg, l, layer, kv, x, s_len, pos_base, &mut local, AttnCore::Reconstruct,
+            Some(&sel_full), (h0, hc),
+        );
+        partials.push((me.0, local));
+
+        for (n, handle) in handles {
+            match handle.join() {
+                Ok(Ok(resp)) if resp.outputs.len() == s_len * d => partials.push((n, resp.outputs)),
+                Ok(Ok(resp)) => {
+                    err.get_or_insert_with(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "node {n}: attention expected {} outputs, got {}",
+                                s_len * d,
+                                resp.outputs.len()
+                            ),
+                        )
+                    });
+                }
+                Ok(Err(e)) => {
+                    err.get_or_insert_with(|| io::Error::new(io::ErrorKind::Other, e.to_string()));
+                }
+                Err(_) => {
+                    err.get_or_insert_with(|| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("node {n}: attention exchange thread panicked"),
+                        )
+                    });
+                }
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    // Fold in ascending node order → deterministic accumulation across runs.
+    partials.sort_by_key(|(n, _)| *n);
+    for (_, p) in &partials {
+        for (o, v) in out.iter_mut().zip(p.iter()) {
+            *o += *v;
+        }
+    }
+    Ok(computed)
+}
+
+/// Peer-side handler for an [`AttnRequest`]: compute this node's head slice
+/// `[h0, h0+hc)` of MLA attention over layer input `x`, into `out` (`[s_len, hidden]`),
+/// using the driver-supplied `sel` (never re-running the indexer). Stateless — builds a
+/// fresh single-layer KV from `x` for single-shot prefill, so no persistent cache is
+/// needed. `l` is the real layer's resident weights; the scratch KV is indexed as
+/// layer 0. `sel` must be length `s_len` (the driver ships that invariant, empty
+/// per-query = dense); anything else is treated as fully dense.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_attention_partial(
+    cfg: &Config,
+    l: &Layer,
+    x: &[f32],
+    s_len: usize,
+    pos_base: usize,
+    h0: usize,
+    hc: usize,
+    sel: &[Vec<u32>],
+    out: &mut [f32],
+) {
+    let kvl = cfg.kv_lora as usize;
+    let r = cfg.qk_rope as usize;
+    let mut kv = KvCache::new(1, kvl, r, s_len);
+    // Always pass a length-`s_len` Some so `attention_with_heads` never re-runs the
+    // indexer against the wrong (scratch layer 0) index — the driver's decision is
+    // authoritative. A mis-sized ship degrades to dense rather than diverging.
+    let dense;
+    let sel_ref: &[Vec<u32>] = if sel.len() == s_len {
+        sel
+    } else {
+        dense = vec![Vec::new(); s_len];
+        &dense
+    };
+    attention_with_heads(
+        cfg, l, 0, &mut kv, x, s_len, pos_base, out, AttnCore::Reconstruct, Some(sel_ref), (h0, hc),
+    );
+}
+
 /// Reconstruction core: rebuild k_nope/value for all cached tokens via one kv_b
 /// matmul, then causal attention. Port of `attention_rows` step 2/3.
 #[allow(clippy::too_many_arguments)]
@@ -320,6 +587,8 @@ fn reconstruct_core(
     st0: usize,
     ctx: &mut [f32],
     sel: Option<&[Vec<u32>]>,
+    h0: usize,
+    hc: usize,
 ) {
     let h = cfg.n_heads as usize;
     let qh = cfg.qk_head as usize;
@@ -349,7 +618,9 @@ fn reconstruct_core(
             }
             _ => (0..nt).collect(),
         };
-        for hh in 0..h {
+        // Only this node's head slice; ctx columns for other heads stay zero (ctx is
+        // pre-zeroed), so the o-projection over the full ctx yields this slice's partial.
+        for hh in h0..h0 + hc {
             let qbase = s * h * qh + hh * qh;
             let (qnope, qrope) = q[qbase..qbase + qh].split_at(qk_nope);
             let mut sc = vec![0f32; jjs.len()];
@@ -568,13 +839,36 @@ mod tests {
 
         let mut ctx_gpu = vec![0f32; s_len * h * vh];
         let ok = crate::gpu::try_attention_absorb_sparse(
-            &l.kv_b, &mut ctx_gpu, &q, &latent, &rope, &sel, index_topk, s_len, h, qk_nope, r, vh,
-            kvl, t, scale,
+            &l.kv_b, &mut ctx_gpu, &q, &latent, &rope, &sel, index_topk, 0, h, s_len, h, qk_nope, r,
+            vh, kvl, t, scale,
         );
         assert!(ok, "GPU sparse kernel must run when a device is present");
 
         let mut ctx_cpu = vec![0f32; s_len * h * vh];
-        reconstruct_core(&cfg, &l, 0, &kv, &q, s_len, 0, 0, &mut ctx_cpu, Some(&sel));
+        reconstruct_core(&cfg, &l, 0, &kv, &q, s_len, 0, 0, &mut ctx_cpu, Some(&sel), 0, h);
+
+        // Tensor-parallel invariant: the GPU sparse kernel over two disjoint head
+        // slices [0,h/2) + [h/2,h) must reproduce the full-head kernel exactly (each
+        // slice zeroes the others' ctx columns), so summing head-parallel partials is
+        // faithful. Same device, same math → bit-identical.
+        let half = h / 2;
+        let mut ctx_lo = vec![0f32; s_len * h * vh];
+        let mut ctx_hi = vec![0f32; s_len * h * vh];
+        assert!(crate::gpu::try_attention_absorb_sparse(
+            &l.kv_b, &mut ctx_lo, &q, &latent, &rope, &sel, index_topk, 0, half, s_len, h, qk_nope,
+            r, vh, kvl, t, scale,
+        ));
+        assert!(crate::gpu::try_attention_absorb_sparse(
+            &l.kv_b, &mut ctx_hi, &q, &latent, &rope, &sel, index_topk, half, h - half, s_len, h,
+            qk_nope, r, vh, kvl, t, scale,
+        ));
+        let split_err = (0..ctx_gpu.len())
+            .map(|i| (ctx_gpu[i] - (ctx_lo[i] + ctx_hi[i])).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("head-split GPU sparse vs full: maxerr = {split_err:.2e}");
+        // Exact: if either slice wrote outside its heads, the sum would double-count and
+        // this would be non-zero.
+        assert!(split_err == 0.0, "head-slice sum must equal full attention exactly; err={split_err:.3e}");
 
         let maxerr =
             ctx_gpu.iter().zip(&ctx_cpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -805,6 +1099,122 @@ mod tests {
         for (a, b) in o1.iter().zip(&o2) {
             assert!((a - b).abs() < 1e-6, "reused selection must reproduce the sparse output: {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn head_slices_sum_to_full_cpu() {
+        // The tensor-parallel invariant on the CPU reconstruct core: summing the
+        // per-head-slice partials over a disjoint cover of 0..n_heads reproduces full
+        // attention (o-proj is linear in ctx, and disjoint slices zero each other's ctx
+        // columns). This is what `attention_sharded` relies on when the driver adds the
+        // peers' head-slice partials.
+        let c = cfg();
+        let l = make_layer(&c);
+        let d = c.hidden as usize;
+        let hh = c.n_heads as usize; // 2 in this fixture
+        let s_len = 3;
+        let x = vecf(s_len * d, 9);
+
+        let mut kv_full = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut out_full = vec![0f32; s_len * d];
+        attention_with_heads(
+            &c, &l, 0, &mut kv_full, &x, s_len, 0, &mut out_full, AttnCore::Reconstruct, None,
+            (0, hh),
+        );
+
+        // Two disjoint slices [0,1) + [1,2), each a fresh partial, summed.
+        let mut out_sum = vec![0f32; s_len * d];
+        for (h0, hc) in [(0usize, 1usize), (1usize, 1usize)] {
+            let mut kv = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+            let mut part = vec![0f32; s_len * d];
+            attention_with_heads(
+                &c, &l, 0, &mut kv, &x, s_len, 0, &mut part, AttnCore::Reconstruct, None, (h0, hc),
+            );
+            for (o, &p) in out_sum.iter_mut().zip(part.iter()) {
+                *o += p;
+            }
+        }
+        for (a, b) in out_full.iter().zip(&out_sum) {
+            assert!((a - b).abs() < 1e-5, "head-slice partial sum {b} != full {a}");
+        }
+        assert!(out_full.iter().any(|v| v.abs() > 1e-6));
+    }
+
+    #[test]
+    fn attention_sharded_two_nodes_equals_single_node() {
+        // Tensor-parallel attention must reproduce single-node attention: node 0
+        // computes head 0, node 1 computes head 1 (served over a real TCP loopback whose
+        // handler runs `compute_attention_partial`), and the driver sums the o-projected
+        // partials. Exercises the head split, the AttnRequest/Response wire path, the
+        // shipped (dense here — this fixture has no indexer) selection, and the fold.
+        use colibri_cluster::{serve_cluster, AttnResponse, ExpertRequest, ExpertResponse, TcpTransport};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let c = cfg(); // 2 heads, hidden 6
+        let l = make_layer(&c);
+        let d = c.hidden as usize;
+        let s_len = 3;
+        let x = vecf(s_len * d, 9);
+
+        // Reference: single-node attention (both heads together).
+        let mut kv_ref = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut out_single = vec![0f32; s_len * d];
+        attention_with(
+            &c, &l, 0, &mut kv_ref, &x, s_len, 0, &mut out_single, AttnCore::Reconstruct, None,
+        );
+
+        let sharding = ExpertSharding::new(2, c.n_experts as u32);
+        // Node 1's server. `make_layer` is deterministic, so this copy is identical to
+        // the driver's `l` (Layer isn't Clone). Expert handler is unused here.
+        let ch = c.clone();
+        let lh = Arc::new(make_layer(&c));
+        let addr = serve_cluster(
+            "127.0.0.1:0".parse().unwrap(),
+            sharding.fingerprint(),
+            |req: &ExpertRequest| ExpertResponse {
+                outputs: vec![0.0; req.n_tokens * req.hidden],
+                n_tokens: req.n_tokens,
+                hidden: req.hidden,
+            },
+            move |req: &AttnRequest| {
+                let mut outputs = vec![0.0f32; req.n_tokens * req.hidden];
+                compute_attention_partial(
+                    &ch,
+                    &lh,
+                    &req.activations,
+                    req.n_tokens,
+                    req.pos_base as usize,
+                    req.h_start as usize,
+                    req.h_count as usize,
+                    &req.sel,
+                    &mut outputs,
+                );
+                AttnResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
+            },
+        )
+        .unwrap();
+
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), addr);
+        let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
+
+        let mut kv_shard = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
+        let mut out_sharded = vec![0f32; s_len * d];
+        attention_sharded(
+            &c, &l, 0, &mut kv_shard, &x, s_len, 0, &mut out_sharded, None, &sharding, &transport,
+        )
+        .unwrap();
+
+        for i in 0..s_len * d {
+            assert!(
+                (out_single[i] - out_sharded[i]).abs() < 1e-5,
+                "mismatch at {i}: single {} vs sharded {}",
+                out_single[i],
+                out_sharded[i]
+            );
+        }
+        assert!(out_single.iter().any(|v| v.abs() > 1e-6));
     }
 
     #[test]

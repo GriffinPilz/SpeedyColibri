@@ -125,6 +125,8 @@ extern "C" {
         sel_idx: *const c_int,
         sel_cnt: *const c_int,
         maxsel: c_int,
+        h0: c_int,
+        hc: c_int,
         s: c_int,
         h: c_int,
         q_nope: c_int,
@@ -510,6 +512,8 @@ pub unsafe fn attention_absorb_sparse_raw(
     sel_idx: *const i32,
     sel_cnt: *const i32,
     maxsel: i32,
+    h0: i32,
+    hc: i32,
     s: i32,
     h: i32,
     q_nope: i32,
@@ -520,7 +524,8 @@ pub unsafe fn attention_absorb_sparse_raw(
     scale: f32,
 ) -> bool {
     coli_cuda_attention_absorb_sparse(
-        kv_b, ctx, q, latent, rope, sel_idx, sel_cnt, maxsel, s, h, q_nope, r, v, k, t, scale,
+        kv_b, ctx, q, latent, rope, sel_idx, sel_cnt, maxsel, h0, hc, s, h, q_nope, r, v, k, t,
+        scale,
     ) != 0
 }
 

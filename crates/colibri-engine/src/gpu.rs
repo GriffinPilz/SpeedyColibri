@@ -337,6 +337,12 @@ pub fn try_attention_absorb(
 /// back (returns false) when the GPU is unavailable, so the caller uses the CPU
 /// `reconstruct_core`.
 #[allow(clippy::too_many_arguments)]
+/// `h0`/`hc` select the head slice `[h0, h0+hc)` to compute (tensor-parallel
+/// attention); the full-attention call passes `(0, h)`. A partial slice writes only
+/// its `ctx` head-columns and the kernel zeroes the rest, so summing the slices'
+/// o-projections reconstructs full attention. `h` stays the full head count (the
+/// `[s, h, ·]` stride of `q`/`ctx`).
+#[allow(clippy::too_many_arguments)]
 pub fn try_attention_absorb_sparse(
     kv_b: &QTensor,
     ctx: &mut [f32],
@@ -345,6 +351,8 @@ pub fn try_attention_absorb_sparse(
     rope: &[f32],
     sel: &[Vec<u32>],
     index_topk: usize,
+    h0: usize,
+    hc: usize,
     s: usize,
     h: usize,
     qk_nope: usize,
@@ -355,6 +363,9 @@ pub fn try_attention_absorb_sparse(
     scale: f32,
 ) -> bool {
     if !available() || !kv_b.gpu_eligible || sel.len() != s || index_topk == 0 {
+        return false;
+    }
+    if h0 + hc > h || hc == 0 {
         return false;
     }
     let Some(handle) = upload_ffn(kv_b, &[]) else {
@@ -384,6 +395,8 @@ pub fn try_attention_absorb_sparse(
             sel_idx.as_ptr(),
             sel_cnt.as_ptr(),
             maxsel as i32,
+            h0 as i32,
+            hc as i32,
             s as i32,
             h as i32,
             qk_nope as i32,

@@ -29,7 +29,10 @@ pub mod quantize;
 pub mod sampling;
 pub mod usage;
 
-pub use attention::{attention, attention_with, AttnCore};
+pub use attention::{
+    attention, attention_sharded, attention_with, attention_with_heads, compute_attention_partial,
+    dsa_selection_for, head_slice, AttnCore,
+};
 pub use cache::{available_ram_bytes, capacity, total_ram_bytes, CacheStats, ExpertCache};
 pub use convert::{
     convert_snapshot, detect_format, quant_error, ConvertOpts, ConvertStats, Scheme,

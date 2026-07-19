@@ -496,8 +496,12 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
 __global__ static void attention_absorb_sparse_kernel(float *ctx,const float *q,
         const float *latent,const float *rope,const void *weights,const float *wscale,
         const int *sel_idx,const int *sel_cnt,int maxsel,
-        int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale){
-    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
+        int fmt,int H0,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    // Tensor-parallel head slice: this launch covers heads [H0, H0+gridDim.x); the
+    // global head index is H0+blockIdx.x while H stays the full head count so every
+    // `*H` stride (q, ctx) keeps the full [S,H,·] layout. Columns outside the slice
+    // are left untouched — the caller zeroes dc->ac first when the slice is partial.
+    int s=blockIdx.y,h=H0+blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
     if(s>=S||nt<1)return;
     int cnt=sel_cnt[s],dense=(cnt<=0),n=dense?nt:cnt;
     const int *sidx=sel_idx+(size_t)s*maxsel;
@@ -1165,9 +1169,14 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
 static int attention_absorb_sparse_run(ColiCudaTensor *w,ColiCudaTensor *proj,float *out,
         const float *q,const float *latent,const float *rope,
         const int *sel_idx,const int *sel_cnt,int maxsel,
-        int S,int H,int Q,int R,int V,int K,int T,float scale){
+        int H0,int HC,int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!w||!out||!q||!latent||!rope||!sel_idx||!sel_cnt||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
        T<S||T>65536||maxsel<1||maxsel>T||w->I!=K||w->O!=H*(Q+V))return 0;
+    // Head slice [H0, H0+HC) of the full H heads (tensor-parallel attention). Full
+    // range is H0=0, HC=H. A partial slice writes only its ctx columns, so zero the
+    // pooled context buffer first (stale from a prior call) — needed for the copy-back
+    // and for the fused GPU o_proj, which contracts over all H*V ctx columns.
+    if(H0<0||HC<1||H0+HC>H)return 0;
     if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
@@ -1181,9 +1190,10 @@ static int attention_absorb_sparse_run(ColiCudaTensor *w,ColiCudaTensor *proj,fl
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"sparse attn rope upload")||
        !cuda_ok(cudaMemcpyAsync(dc->asel,sel_idx,sib,cudaMemcpyHostToDevice,dc->stream),"sparse attn sel upload")||
        !cuda_ok(cudaMemcpyAsync(dc->acnt,sel_cnt,scb,cudaMemcpyHostToDevice,dc->stream),"sparse attn cnt upload"))return 0;
+    if((H0!=0||HC!=H)&&!cuda_ok(cudaMemsetAsync(dc->ac,0,cb,dc->stream),"sparse attn ctx zero"))return 0;
     size_t shared=(size_t)(2*K+maxsel+ATTN_TPB)*sizeof(float);
-    attention_absorb_sparse_kernel<<<dim3(H,S),ATTN_TPB,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,
-        dc->ar,w->weights,w->scales,(const int*)dc->asel,(const int*)dc->acnt,maxsel,w->fmt,S,H,Q,R,V,K,T,scale);
+    attention_absorb_sparse_kernel<<<dim3(HC,S),ATTN_TPB,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,
+        dc->ar,w->weights,w->scales,(const int*)dc->asel,(const int*)dc->acnt,maxsel,w->fmt,H0,S,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"sparse attn launch"))return 0;
     const float *src=dc->ac;size_t ob=cb;
     if(proj){
@@ -1200,8 +1210,8 @@ static int attention_absorb_sparse_run(ColiCudaTensor *w,ColiCudaTensor *proj,fl
 
 extern "C" int coli_cuda_attention_absorb_sparse(ColiCudaTensor *w,float *ctx,const float *q,
         const float *latent,const float *rope,const int *sel_idx,const int *sel_cnt,int maxsel,
-        int S,int H,int Q,int R,int V,int K,int T,float scale){
-    return attention_absorb_sparse_run(w,nullptr,ctx,q,latent,rope,sel_idx,sel_cnt,maxsel,S,H,Q,R,V,K,T,scale);
+        int H0,int HC,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    return attention_absorb_sparse_run(w,nullptr,ctx,q,latent,rope,sel_idx,sel_cnt,maxsel,H0,HC,S,H,Q,R,V,K,T,scale);
 }
 
 extern "C" int coli_cuda_attention_project_batch(ColiCudaTensor *w,ColiCudaTensor *proj,

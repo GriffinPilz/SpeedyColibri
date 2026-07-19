@@ -14,7 +14,9 @@
 //! stays free of any dependency on the compute path.
 
 use crate::sharding::NodeId;
-use crate::transport::{ExpertRequest, ExpertResponse, Transport, TransportError};
+use crate::transport::{
+    AttnRequest, AttnResponse, ExpertRequest, ExpertResponse, Transport, TransportError,
+};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -22,6 +24,8 @@ use std::sync::{Arc, Mutex};
 
 const REQ_MAGIC: u32 = 0x4352_4551; // "CREQ"
 const RSP_MAGIC: u32 = 0x4352_5350; // "CRSP"
+const AREQ_MAGIC: u32 = 0x4341_5251; // "CARQ" — attention (head-slice) request
+const ARSP_MAGIC: u32 = 0x4341_5250; // "CARP" — attention partial response
 const HELLO_MAGIC: u32 = 0x4348_454c; // "CHEL" — connect-time sharding handshake
 const HACK_MAGIC: u32 = 0x4348_4143; // "CHAC" — handshake ack
 /// Reject frames larger than this (guards against a bad length prefix -> OOM).
@@ -170,6 +174,74 @@ pub fn decode_response(b: &[u8]) -> Option<ExpertResponse> {
     Some(ExpertResponse { outputs, n_tokens, hidden })
 }
 
+/// Encode an attention (head-slice) request payload. Header, then the DSA selection
+/// (self-describing: a query count, then per-query `len` + positions), then the
+/// activations last so the largest block is contiguous.
+pub fn encode_attn_request(r: &AttnRequest) -> Vec<u8> {
+    let sel_bytes: usize = r.sel.iter().map(|q| 4 + q.len() * 4).sum();
+    let mut b = Vec::with_capacity(32 + sel_bytes + r.activations.len() * 4);
+    put_u32(&mut b, AREQ_MAGIC);
+    put_u32(&mut b, r.layer);
+    put_u32(&mut b, r.n_tokens as u32);
+    put_u32(&mut b, r.hidden as u32);
+    put_u32(&mut b, r.pos_base);
+    put_u32(&mut b, r.h_start);
+    put_u32(&mut b, r.h_count);
+    put_u32(&mut b, r.sel.len() as u32);
+    for q in &r.sel {
+        put_u32(&mut b, q.len() as u32);
+        for &p in q {
+            put_u32(&mut b, p);
+        }
+    }
+    put_f32s(&mut b, &r.activations);
+    b
+}
+
+/// Decode an attention request payload.
+pub fn decode_attn_request(b: &[u8]) -> Option<AttnRequest> {
+    let mut c = Cur { b, i: 0 };
+    if c.u32()? != AREQ_MAGIC {
+        return None;
+    }
+    let layer = c.u32()?;
+    let n_tokens = c.u32()? as usize;
+    let hidden = c.u32()? as usize;
+    let pos_base = c.u32()?;
+    let h_start = c.u32()?;
+    let h_count = c.u32()?;
+    let n_sel = c.u32()? as usize;
+    let mut sel = Vec::with_capacity(n_sel);
+    for _ in 0..n_sel {
+        let len = c.u32()? as usize;
+        sel.push(c.u32s(len)?);
+    }
+    let activations = c.f32s(n_tokens.checked_mul(hidden)?)?;
+    Some(AttnRequest { activations, sel, n_tokens, hidden, pos_base, h_start, h_count, layer })
+}
+
+/// Encode an attention partial response payload.
+pub fn encode_attn_response(r: &AttnResponse) -> Vec<u8> {
+    let mut b = Vec::with_capacity(12 + r.outputs.len() * 4);
+    put_u32(&mut b, ARSP_MAGIC);
+    put_u32(&mut b, r.n_tokens as u32);
+    put_u32(&mut b, r.hidden as u32);
+    put_f32s(&mut b, &r.outputs);
+    b
+}
+
+/// Decode an attention partial response payload.
+pub fn decode_attn_response(b: &[u8]) -> Option<AttnResponse> {
+    let mut c = Cur { b, i: 0 };
+    if c.u32()? != ARSP_MAGIC {
+        return None;
+    }
+    let n_tokens = c.u32()? as usize;
+    let hidden = c.u32()? as usize;
+    let outputs = c.f32s(n_tokens.checked_mul(hidden)?)?;
+    Some(AttnResponse { outputs, n_tokens, hidden })
+}
+
 // ---- framing ---------------------------------------------------------------
 
 fn write_frame(s: &mut impl Write, payload: &[u8]) -> io::Result<()> {
@@ -205,16 +277,41 @@ pub fn serve_experts<F>(listen: SocketAddr, fingerprint: u64, handler: F) -> io:
 where
     F: Fn(&ExpertRequest) -> ExpertResponse + Send + Sync + 'static,
 {
+    // Expert-only server: attention requests get a zeroed partial (never sent by a
+    // caller that only expects an expert server — the tests). `serve_cluster` wires a
+    // real attention handler.
+    serve_cluster(listen, fingerprint, handler, |req: &AttnRequest| AttnResponse {
+        outputs: vec![0.0; req.n_tokens * req.hidden],
+        n_tokens: req.n_tokens,
+        hidden: req.hidden,
+    })
+}
+
+/// Serve both expert-parallel MoE and tensor-parallel attention requests on `listen`,
+/// dispatched per frame by magic: `expert` handles [`ExpertRequest`]s, `attn` handles
+/// [`AttnRequest`]s. Same mandatory sharding handshake as [`serve_experts`].
+pub fn serve_cluster<FE, FA>(
+    listen: SocketAddr,
+    fingerprint: u64,
+    expert: FE,
+    attn: FA,
+) -> io::Result<SocketAddr>
+where
+    FE: Fn(&ExpertRequest) -> ExpertResponse + Send + Sync + 'static,
+    FA: Fn(&AttnRequest) -> AttnResponse + Send + Sync + 'static,
+{
     let listener = TcpListener::bind(listen)?;
     let addr = listener.local_addr()?;
-    let handler = Arc::new(handler);
+    let expert = Arc::new(expert);
+    let attn = Arc::new(attn);
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
-                    let h = handler.clone();
+                    let e = expert.clone();
+                    let a = attn.clone();
                     std::thread::spawn(move || {
-                        let _ = serve_conn(stream, fingerprint, &*h);
+                        let _ = serve_conn(stream, fingerprint, &*e, &*a);
                     });
                 }
                 Err(_) => continue,
@@ -225,15 +322,23 @@ where
 }
 
 /// One connection: a mandatory sharding handshake, then request/response until EOF.
+/// Each request frame is dispatched by its leading magic to the expert or attention
+/// handler.
 ///
 /// The first frame **must** be a hello whose fingerprint equals ours. A mismatch
 /// means the peer built a different expert→node map, which would silently corrupt
 /// results (experts computed twice or not at all), so we ack the rejection — telling
 /// the peer our fingerprint so it can report both sides — and drop the connection
-/// without ever calling the handler.
-fn serve_conn<F>(mut stream: TcpStream, fingerprint: u64, handler: &F) -> io::Result<()>
+/// without ever calling a handler.
+fn serve_conn<FE, FA>(
+    mut stream: TcpStream,
+    fingerprint: u64,
+    expert: &FE,
+    attn: &FA,
+) -> io::Result<()>
 where
-    F: Fn(&ExpertRequest) -> ExpertResponse,
+    FE: Fn(&ExpertRequest) -> ExpertResponse,
+    FA: Fn(&AttnRequest) -> AttnResponse,
 {
     let _ = stream.set_nodelay(true);
 
@@ -260,12 +365,23 @@ where
 
     loop {
         let frame = read_frame(&mut stream)?; // Err on clean EOF ends the loop
-        let req = match decode_request(&frame) {
-            Some(r) => r,
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request frame")),
-        };
-        let resp = handler(&req);
-        write_frame(&mut stream, &encode_response(&resp))?;
+        // Dispatch by leading magic without consuming the decode path twice.
+        let magic = frame.get(0..4).map(|m| u32::from_le_bytes(m.try_into().unwrap()));
+        match magic {
+            Some(REQ_MAGIC) => {
+                let req = decode_request(&frame).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad expert request frame")
+                })?;
+                write_frame(&mut stream, &encode_response(&expert(&req)))?;
+            }
+            Some(AREQ_MAGIC) => {
+                let req = decode_attn_request(&frame).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad attention request frame")
+                })?;
+                write_frame(&mut stream, &encode_attn_response(&attn(&req)))?;
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown request magic")),
+        }
     }
 }
 
@@ -342,13 +458,27 @@ impl Transport for TcpTransport {
     }
 
     fn exchange(&self, node: NodeId, req: &ExpertRequest) -> Result<ExpertResponse, TransportError> {
+        let frame = self.roundtrip(node, &encode_request(req))?;
+        decode_response(&frame).ok_or_else(|| TransportError::Io("bad response frame".into()))
+    }
+
+    fn exchange_attn(&self, node: NodeId, req: &AttnRequest) -> Result<AttnResponse, TransportError> {
+        let frame = self.roundtrip(node, &encode_attn_request(req))?;
+        decode_attn_response(&frame)
+            .ok_or_else(|| TransportError::Io("bad attention response frame".into()))
+    }
+}
+
+impl TcpTransport {
+    /// Send one framed `payload` to `node` on its pooled connection and return the raw
+    /// response frame; reconnect once on a stale socket. Shared by every request kind
+    /// (expert / attention) — the caller encodes the payload and decodes the reply.
+    fn roundtrip(&self, node: NodeId, payload: &[u8]) -> Result<Vec<u8>, TransportError> {
         let addr = *self
             .peers
             .get(&node)
             .ok_or_else(|| TransportError::Io(format!("no address for node {}", node.0)))?;
-        let payload = encode_request(req);
 
-        // One round-trip on a pooled connection; reconnect once on a stale socket.
         let mut conns = self.conns.lock().unwrap();
         for attempt in 0..2 {
             if !conns.contains_key(&node) {
@@ -358,7 +488,7 @@ impl Transport for TcpTransport {
                     }
                     // A map disagreement is fatal, not transient: never retry it and
                     // never fall through to sending activations to a peer that would
-                    // compute the wrong experts.
+                    // compute the wrong work.
                     Err(e @ TransportError::FingerprintMismatch { .. }) => return Err(e),
                     Err(e) => {
                         if attempt == 1 {
@@ -369,12 +499,9 @@ impl Transport for TcpTransport {
                 }
             }
             let stream = conns.get_mut(&node).unwrap();
-            let r = write_frame(stream, &payload).and_then(|_| read_frame(stream));
+            let r = write_frame(stream, payload).and_then(|_| read_frame(stream));
             match r {
-                Ok(frame) => {
-                    return decode_response(&frame)
-                        .ok_or_else(|| TransportError::Io("bad response frame".into()));
-                }
+                Ok(frame) => return Ok(frame),
                 Err(e) => {
                     conns.remove(&node); // drop the broken connection, retry fresh
                     if attempt == 1 {
@@ -418,6 +545,32 @@ mod tests {
     fn decode_rejects_garbage() {
         assert!(decode_request(&[0, 1, 2]).is_none());
         assert!(decode_request(&[9, 9, 9, 9]).is_none()); // wrong magic
+    }
+
+    #[test]
+    fn attn_request_roundtrip() {
+        // Mixed selection: a dense (empty) query and two sparse ones — exercises the
+        // variable-length per-query encoding.
+        let r = AttnRequest {
+            activations: (0..12).map(|i| i as f32 * 0.25).collect(),
+            sel: vec![vec![], vec![0, 2], vec![1]],
+            n_tokens: 3,
+            hidden: 4,
+            pos_base: 0,
+            h_start: 32,
+            h_count: 32,
+            layer: 5,
+        };
+        assert_eq!(decode_attn_request(&encode_attn_request(&r)).unwrap(), r);
+        // Cross-decoding an attn frame as an expert request must fail on the magic.
+        assert!(decode_request(&encode_attn_request(&r)).is_none());
+    }
+
+    #[test]
+    fn attn_response_roundtrip() {
+        let r = AttnResponse { outputs: vec![0.5, -1.0, 2.0, 3.0, 4.0, 5.0], n_tokens: 2, hidden: 3 };
+        assert_eq!(decode_attn_response(&encode_attn_response(&r)).unwrap(), r);
+        assert!(decode_response(&encode_attn_response(&r)).is_none());
     }
 
     #[test]

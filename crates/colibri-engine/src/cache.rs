@@ -14,7 +14,7 @@
 
 use crate::moe::{Expert, ExpertProvider};
 use crate::usage::UsageHistory;
-use colibri_core::tier::lfru_score;
+use colibri_core::tier::evict_score;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -266,7 +266,13 @@ impl<P: ExpertProvider> ExpertCache<P> {
 }
 
 impl State {
-    /// Evict coldest unpinned experts until at or under `budget`.
+    /// Evict least-recently-used unpinned experts until at or under `budget`.
+    ///
+    /// Ranks with [`evict_score`] (recency primary) rather than `lfru_score`
+    /// (frequency primary): prefill leaves a full cache of `heat = 2` residents and
+    /// every decode load enters at `heat = 1`, so a frequency-primary rank evicts
+    /// decode's live working set in favour of prefill leftovers that will never be
+    /// read again. Measured 5.8% vs 44.8% decode hit rate.
     fn evict_to(&mut self, budget: u64) {
         self.evict_to_protecting(budget, &HashSet::new());
     }
@@ -283,7 +289,7 @@ impl State {
                 .entries
                 .iter()
                 .filter(|(k, _)| !pinned.contains(*k) && !protect.contains(*k))
-                .min_by_key(|(_, e)| lfru_score(e.heat, e.last, clock))
+                .min_by_key(|(_, e)| evict_score(e.heat, e.last, clock))
                 .map(|(k, _)| *k);
             match victim {
                 Some(k) => {

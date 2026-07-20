@@ -190,18 +190,34 @@ pub fn indexer_forward(
         }
     }
 
-    // 2b) per query: score every causal key against the projected query, select top-k.
-    // This is the DSA hot loop — O(s_len · nk · nh · hd). It is embarrassingly
-    // parallel (each query writes only its own `sel[s]` and reads shared keys/x/
-    // q_lora), so split it across cores. Serial, it single-threads the whole indexer
-    // while the rest of the engine is on the GPU, which made DSA net-*slower* than
-    // dense despite the sparse-attention savings.
+    // 2b) scores: the DSA hot loop — O(s_len · nk · nh · hd), ~25.8 GFLOP per FULL
+    // layer. On the GPU it is one pass over the selecting queries; the kernel
+    // accumulates each head's dot in ascending `i` exactly like `indexer_score`, so
+    // the scores (and the top-k selection they drive) match the CPU reference.
+    // Falls back to the per-query CPU loop when the GPU declines.
+    let mut scores_all: Vec<f32> = Vec::new();
+    let mut gpu_scores = false;
+    #[cfg(feature = "cuda")]
+    if nsp > 0 {
+        scores_all = vec![0f32; nsp * s_len];
+        gpu_scores = crate::gpu::try_dsa_indexer_scores(
+            &mut scores_all, &qi_all, &hw_all, &keys, nsp, s0, nh, index_hd, s_len, pos_base,
+        );
+        if !gpu_scores {
+            scores_all = Vec::new();
+        }
+    }
+
+    // 2c) per query: select top-k from the scores. Embarrassingly parallel (each query
+    // writes only its own `sel[s]`), so split across cores — and when the GPU computed
+    // the scores this loop is just the selection.
     let mut sel = vec![Vec::new(); s_len];
     let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let chunk = s_len.div_ceil(nthreads).max(1);
     let keys = &keys;
     let qi_all = &qi_all;
     let hw_all = &hw_all;
+    let scores_all = &scores_all;
     std::thread::scope(|scope| {
         for (ci, sel_chunk) in sel.chunks_mut(chunk).enumerate() {
             let base = ci * chunk;
@@ -215,6 +231,10 @@ pub fn indexer_forward(
                     }
                     // projections were batched above for s >= s0 (== the selecting queries)
                     let si = s - s0;
+                    if gpu_scores {
+                        *out = select_topk(&scores_all[si * s_len..si * s_len + nk], index_topk);
+                        continue;
+                    }
                     let qi = &qi_all[si * qi_stride..(si + 1) * qi_stride];
                     let hw = &hw_all[si * nh..(si + 1) * nh];
 

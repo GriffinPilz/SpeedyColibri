@@ -532,6 +532,34 @@ __global__ static void attention_absorb_sparse_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* ==== DSA lightning-indexer scores ===========================================
+ * score[s][t] = (1/sqrt(nh)) * sum_h hw[s][h] * relu((1/sqrt(hd)) * dot(qi[s][h], key[t]))
+ * where key[t] is [hd], SHARED across all nh heads. This was the indexer's CPU hot
+ * loop (~25.8 GFLOP per FULL layer). One block per query; `i` outer / `h` inner so
+ * each key element is read once from global and every head's dot accumulates in the
+ * same ascending-i order as the CPU reference — the selection must not shift. */
+__global__ static void dsa_indexer_scores(float *scores,const float *qi,const float *hw,
+        const float *keys,int nsp,int s0,int nh,int hd,int T,int pos_base){
+    int si=blockIdx.x; if(si>=nsp)return;
+    int s=s0+si, nk=pos_base+s+1; if(nk>T)nk=T;
+    extern __shared__ float sm[];
+    float *q=sm, *w=q+(size_t)nh*hd;
+    for(int z=threadIdx.x;z<nh*hd;z+=blockDim.x)q[z]=qi[(size_t)si*nh*hd+z];
+    for(int z=threadIdx.x;z<nh;z+=blockDim.x)w[z]=hw[(size_t)si*nh+z];
+    __syncthreads();
+    float rs=rsqrtf((float)hd), wsc=rsqrtf((float)nh);
+    for(int t=threadIdx.x;t<nk;t+=blockDim.x){
+        const float *kt=keys+(size_t)t*hd;
+        float acc[32];                     /* nh <= 32 (GLM: 32); larger falls back to CPU */
+        for(int h=0;h<nh;h++)acc[h]=0.f;
+        for(int i=0;i<hd;i++){float ki=kt[i];const float *qi_i=q+i;
+            for(int h=0;h<nh;h++)acc[h]+=qi_i[(size_t)h*hd]*ki;}
+        float a=0.f;
+        for(int h=0;h<nh;h++){float d0=acc[h]*rs; if(d0>0.f)a+=w[h]*d0;}
+        scores[(size_t)si*T+t]=a*wsc;
+    }
+}
+
 /* ==== Tensor-core (WMMA) DSA sparse-attention prefill core ====================
  * The scalar attention_absorb_sparse_kernel is ~4 GFLOP/s (75% of prefill attn).
  * MLA-absorb attention is two GEMMs per head in latent space:
@@ -1291,6 +1319,29 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
  * and dispatches attention_absorb_sparse_kernel. `maxsel` must be `index_topk` (the
  * kernel's is_dense fallback relies on dense queries having nt <= maxsel). Larger T
  * than the dense path is fine — shared memory is sized to maxsel, not T. */
+/* Host entry for the DSA indexer scores (declared after `reserve`). Reuses the
+ * attention scratch — the indexer and the attention core run sequentially within a
+ * layer and each uploads/downloads inside one synchronized call. */
+extern "C" int coli_cuda_dsa_indexer_scores(float *scores,const float *qi,const float *hw,
+        const float *keys,int nsp,int s0,int nh,int hd,int T,int pos_base,int device){
+    if(!scores||!qi||!hw||!keys||nsp<1||nh<1||nh>32||hd<1||T<1)return 0;
+    DeviceContext *dc=find_ctx(device);if(!select_ctx(dc))return 0;
+    size_t qb=(size_t)nsp*nh*hd*sizeof(float),wb=(size_t)nsp*nh*sizeof(float);
+    size_t kb=(size_t)T*hd*sizeof(float),sb=(size_t)nsp*T*sizeof(float);
+    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ar,&dc->ar_cap,wb)||
+       !reserve(&dc->al,&dc->al_cap,kb)||!reserve(&dc->ac,&dc->ac_cap,sb))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(dc->aq,qi,qb,cudaMemcpyHostToDevice,dc->stream),"dsa qi")||
+       !cuda_ok(cudaMemcpyAsync(dc->ar,hw,wb,cudaMemcpyHostToDevice,dc->stream),"dsa hw")||
+       !cuda_ok(cudaMemcpyAsync(dc->al,keys,kb,cudaMemcpyHostToDevice,dc->stream),"dsa keys"))return 0;
+    size_t sh=((size_t)nh*hd+nh)*sizeof(float);
+    if(sh>96*1024)return 0;
+    dsa_indexer_scores<<<(unsigned)nsp,256,sh,dc->stream>>>(dc->ac,dc->aq,dc->ar,dc->al,nsp,s0,nh,hd,T,pos_base);
+    if(!cuda_ok(cudaGetLastError(),"dsa indexer scores launch"))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(scores,dc->ac,sb,cudaMemcpyDeviceToHost,dc->stream),"dsa scores download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"dsa scores sync"))return 0;
+    return 1;
+}
+
 /* Tensor-core sparse-attention path (COLI_TC_ATTN=1): build QA/KB (fp16) + the DSA key
  * bitmask, then run the WMMA flash kernel. Same [S,H,V] ctx output as the scalar run
  * (partial head slice zeroes the rest); no fused o_proj. */

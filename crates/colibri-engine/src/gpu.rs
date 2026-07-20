@@ -337,6 +337,51 @@ pub fn try_attention_absorb(
 /// back (returns false) when the GPU is unavailable, so the caller uses the CPU
 /// `reconstruct_core`.
 #[allow(clippy::too_many_arguments)]
+/// DSA lightning-indexer scores on the GPU — the indexer's hot loop
+/// (`score[s][t] = wsc·Σ_h hw[h]·relu(rs·dot(qi[h], key[t]))`, ~25.8 GFLOP per FULL
+/// layer on CPU). Fills `scores[nsp, t_len]`; row `si` (query `s0+si`) is valid for
+/// `t < pos_base+s0+si+1`. The kernel accumulates each head's dot in ascending `i`
+/// exactly like the CPU reference, so the scores — and therefore the top-k selection
+/// — match. Returns false (caller keeps the CPU path) when unavailable or `nh > 32`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_dsa_indexer_scores(
+    scores: &mut [f32],
+    qi: &[f32],
+    hw: &[f32],
+    keys: &[f32],
+    nsp: usize,
+    s0: usize,
+    nh: usize,
+    hd: usize,
+    t_len: usize,
+    pos_base: usize,
+) -> bool {
+    if !available() || nsp == 0 || nh == 0 || nh > 32 || hd == 0 || t_len == 0 {
+        return false;
+    }
+    if qi.len() < nsp * nh * hd || hw.len() < nsp * nh || keys.len() < t_len * hd
+        || scores.len() < nsp * t_len
+    {
+        return false;
+    }
+    // SAFETY: sizes checked above; device 0 is the engine's single GPU.
+    unsafe {
+        cuda::dsa_indexer_scores_raw(
+            scores.as_mut_ptr(),
+            qi.as_ptr(),
+            hw.as_ptr(),
+            keys.as_ptr(),
+            nsp as i32,
+            s0 as i32,
+            nh as i32,
+            hd as i32,
+            t_len as i32,
+            pos_base as i32,
+            0,
+        )
+    }
+}
+
 /// `h0`/`hc` select the head slice `[h0, h0+hc)` to compute (tensor-parallel
 /// attention); the full-attention call passes `(0, h)`. A partial slice writes only
 /// its `ctx` head-columns and the kernel zeroes the rest, so summing the slices'

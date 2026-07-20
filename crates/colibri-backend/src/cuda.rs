@@ -115,6 +115,20 @@ extern "C" {
         t: c_int,
         scale: f32,
     ) -> c_int;
+    // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
+    fn coli_cuda_dsa_indexer_scores(
+        scores: *mut f32,
+        qi: *const f32,
+        hw: *const f32,
+        keys: *const f32,
+        nsp: c_int,
+        s0: c_int,
+        nh: c_int,
+        hd: c_int,
+        t: c_int,
+        pos_base: c_int,
+        device: c_int,
+    ) -> c_int;
     // DSA sparse prefill absorb: each query attends only to its indexer selection.
     fn coli_cuda_attention_absorb_sparse(
         kv_b: *mut ColiCudaTensor,
@@ -503,6 +517,28 @@ pub unsafe fn attention_absorb_batch_raw(
 /// `kv_b` resident; `ctx`/`q`/`latent`/`rope` sized per the dims; `sel_idx` has
 /// `s*maxsel` ints and `sel_cnt` has `s` ints.
 #[allow(clippy::too_many_arguments)]
+/// DSA indexer scores for the selecting queries — `scores[nsp, t]`, row `si` valid
+/// for `t < pos_base+s0+si+1`.
+///
+/// # Safety
+/// `qi` has `nsp*nh*hd` floats, `hw` `nsp*nh`, `keys` `t*hd`, `scores` `nsp*t`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsa_indexer_scores_raw(
+    scores: *mut f32,
+    qi: *const f32,
+    hw: *const f32,
+    keys: *const f32,
+    nsp: i32,
+    s0: i32,
+    nh: i32,
+    hd: i32,
+    t: i32,
+    pos_base: i32,
+    device: i32,
+) -> bool {
+    coli_cuda_dsa_indexer_scores(scores, qi, hw, keys, nsp, s0, nh, hd, t, pos_base, device) != 0
+}
+
 pub unsafe fn attention_absorb_sparse_raw(
     kv_b: *mut ColiCudaTensor,
     ctx: *mut f32,

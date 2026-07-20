@@ -110,6 +110,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,fl
  * to its indexer selection. sel_idx is [S, maxsel] int (row s holds the chosen
  * cache positions), sel_cnt is [S] int (count per query; <=0 means dense/is_dense).
  * maxsel must be index_topk. */
+/* DSA lightning-indexer scores: scores[nsp,T] for the selecting queries.
+ * score[s][t] = (1/sqrt(nh)) * sum_h hw[s][h]*relu((1/sqrt(hd))*dot(qi[s][h],key[t])).
+ * qi is [nsp, nh*hd], hw is [nsp, nh], keys is [T, hd]. Row si is query s0+si and is
+ * filled for t < pos_base+s0+si+1 (causal); the rest of the row is untouched. */
+COLI_CUDA_DLLEXPORT int coli_cuda_dsa_indexer_scores(float *scores,const float *qi,const float *hw,
+                                     const float *keys,int nsp,int s0,int nh,int hd,
+                                     int T,int pos_base,int device);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_sparse(ColiCudaTensor *kv_b,float *ctx,const float *q,
                                      const float *latent,const float *rope,
                                      const int *sel_idx,const int *sel_cnt,int maxsel,

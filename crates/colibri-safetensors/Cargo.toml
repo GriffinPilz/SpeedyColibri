@@ -10,3 +10,6 @@ description = "On-demand safetensors indexing and reads across shards (port of c
 [dependencies]
 colibri-json = { workspace = true }
 colibri-core = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

@@ -9,10 +9,11 @@
 //!
 //! Fidelity note: the C version also calls `posix_fadvise(DONTNEED)` after
 //! streaming-expert reads and keeps an `O_DIRECT` twin fd to bypass the page
-//! cache. Those are *performance* behaviors (they bound RSS and lift cold
-//! throughput on VHDX-backed ext4); this port omits them for now and reads
-//! buffered. Correctness is unaffected. See PORTING.md — tracked as a follow-up
-//! to reintroduce via `libc::posix_fadvise` behind a `cfg(unix)` gate.
+//! cache. `DONTNEED` is now reintroduced here behind `COLI_FADVISE` (see
+//! [`fadvise_enabled`]); the `O_DIRECT` twin is still absent, and is harder
+//! than it looks because no tensor offset in our containers is 512-aligned
+//! (measured: 0 of 4326 sampled), so it needs span-level alignment rather than
+//! a drop-in fd swap. Correctness is unaffected either way.
 
 use colibri_core::dtype::{bf16_to_f32, f16_to_f32, f8e4m3_to_f32, f8e5m2_to_f32, DType};
 use colibri_core::SharedBuf;
@@ -22,6 +23,36 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Whether to drop streamed bytes from the page cache after reading them
+/// (`COLI_FADVISE=1`). **Off by default, and measured to be a large regression —
+/// do not turn it on.** Kept only so the result stays reproducible.
+///
+/// The hypothesis was that the ~58 GB of page cache holding expert bytes was dead
+/// weight competing with the LFRU expert cache, so freeing it would let the cache
+/// cap rise past `MemTotal/3`. **That was wrong.** Measured (1 node, prompt 512,
+/// ngen 12, tokens byte-identical in both arms):
+///
+/// |                | ms/token | cache misses | buff/cache |
+/// |----------------|----------|--------------|------------|
+/// | off (control)  |   3388.7 |       26,021 |      43 GB |
+/// | `COLI_FADVISE=1` | 5517.5 |       46,045 |      13 GB |
+///
+/// It freed the RAM exactly as intended and cost 63% of decode throughput (and 80%
+/// of prefill). Misses rose 77%, which is the tell: **the page cache was serving a
+/// large share of reads**. It is not competing with the expert cache, it is a
+/// second and much larger cache tier — effective residency is ~98 GB
+/// (40 GB LFRU + ~58 GB page cache), not 40 GB.
+///
+/// Two consequences worth carrying forward: `O_DIRECT` bypasses the same tier and
+/// so is now *expected to regress too* despite winning the raw-bandwidth
+/// microbenchmark; and raising `COLI_RAM_GB` likely hurt for this reason —
+/// it steals from a tier that caches at 4 KB page granularity and gives it to one
+/// that caches whole 38.3 MB experts.
+fn fadvise_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_FADVISE").ok().as_deref() == Some("1"))
+}
 
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
@@ -443,7 +474,16 @@ impl Shards {
             }
         }
 
-        // 3. Arc-wrap each span, then rebuild the per-group name views.
+        // 3. Release the page-cache copy of everything we just streamed. Done after
+        //    the join so each span is advised once as a whole range rather than per
+        //    2 MiB job, and only once the bytes are safely in our own buffer.
+        if fadvise_enabled() {
+            for s in spans.iter() {
+                self.fadvise_dontneed(s.file, s.off0, s.buf.len());
+            }
+        }
+
+        // 4. Arc-wrap each span, then rebuild the per-group name views.
         let arcs: Vec<Arc<SharedBuf>> = spans.into_iter().map(|s| Arc::new(s.buf)).collect();
         Ok(mapping
             .into_iter()
@@ -492,6 +532,39 @@ impl Shards {
         use std::os::unix::fs::FileExt;
         self.files[file_idx].1.read_exact_at(buf, off)
     }
+
+    /// Drop `[off, off+len)` of `file_idx` from the page cache.
+    ///
+    /// Expert bytes are streamed once and never re-read *through the page cache* —
+    /// the LFRU expert cache is the reuse tier, and measured decode reuse is ~0%
+    /// anyway. Leaving them resident costs twice: the pages evict the expert cache
+    /// they compete with for the same RAM, and the kernel burns time reclaiming a
+    /// cache that never produces a hit. Measured on GB10: buffered reads at 8-way
+    /// concurrency reach only 4.06 GB/s against 10.18 GB/s for `O_DIRECT` at the
+    /// same depth, and this is the cheap half of closing that gap.
+    ///
+    /// Advisory and best-effort: the pages are clean (read-only), so the kernel can
+    /// always honour it, but a failure is not actionable and is deliberately ignored.
+    ///
+    /// Linux-only: `posix_fadvise` is not in macOS's libc, and the deployment target
+    /// is the (Linux) DGX Spark. Elsewhere this is a no-op and reads stay buffered.
+    #[cfg(target_os = "linux")]
+    fn fadvise_dontneed(&self, file_idx: usize, off: u64, len: usize) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `fd` is owned by `self.files` and outlives the call; posix_fadvise
+        // only consults the page cache and never touches user memory.
+        unsafe {
+            libc::posix_fadvise(
+                self.files[file_idx].1.as_raw_fd(),
+                off as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn fadvise_dontneed(&self, _file_idx: usize, _off: u64, _len: usize) {}
 
     #[cfg(not(unix))]
     fn pread_into(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {

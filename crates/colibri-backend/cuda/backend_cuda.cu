@@ -35,6 +35,7 @@ typedef struct {
     float *esg,*esu,*esd; size_t esg_cap,esu_cap,esd_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     void *asel,*acnt; size_t asel_cap,acnt_cap;  /* DSA sparse-attention selection */
+    void *aqa,*akb,*amsk; size_t aqa_cap,akb_cap,amsk_cap;  /* tensor-core sparse attn: QA/KB fp16 + per-query key bitmask */
     float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
@@ -531,6 +532,127 @@ __global__ static void attention_absorb_sparse_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* ==== Tensor-core (WMMA) DSA sparse-attention prefill core ====================
+ * The scalar attention_absorb_sparse_kernel is ~4 GFLOP/s (75% of prefill attn).
+ * MLA-absorb attention is two GEMMs per head in latent space:
+ *   Scores[S,T] = QA[S,K+R] @ KB[T,K+R]^T ;  Ctx_lat[S,K] = P[S,T] @ Latent[T,K]
+ * with QA=[scale*qabs | scale*qrope], KB=[latent | rope]. WMMA does the GEMMs;
+ * a per-query DSA mask (unselected key -> -inf) keeps the sparse result exact;
+ * flash online-softmax tiles over T; causal tiling skips the future. ~3x the
+ * scalar core at GLM dims (microbench). Behind COLI_TC_ATTN. */
+#define ATC_QT 16
+
+/* KB[T,K+R] fp16 = [latent | rope]. */
+__global__ static void tc_build_kb(__half *KB,const float *latent,const float *rope,int K,int R,int T){
+    int t=blockIdx.x,tid=threadIdx.x,KR=K+R;
+    for(int c=tid;c<KR;c+=blockDim.x)
+        KB[(size_t)t*KR+c]=__float2half(c<K?latent[(size_t)t*K+c]:rope[(size_t)t*R+(c-K)]);
+}
+
+/* QA[S,H,K+R] fp16 = scale*[qabs | qrope] for the head slice [H0,H0+gridDim.x).
+ * qabs[k]=sum_d q_nope[d]*W_K[rbase+d][k]*(fmt?wscale:1). Scale folded so Scores come out scaled. */
+__global__ static void tc_build_qa(__half *QA,const float *q,const void *weights,const float *wscale,
+        int fmt,int H0,int S,int H,int Q,int R,int V,int K,float scale){
+    int s=blockIdx.y,h=H0+blockIdx.x,tid=threadIdx.x,KR=K+R,rbase=h*(Q+V);
+    const float *qs=q+((size_t)s*H+h)*(Q+R);
+    __half *dst=QA+((size_t)s*H+h)*KR; size_t rb=row_bytes(fmt,K);
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;
+        for(int d=0;d<Q;d++)a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*rb,k)*(fmt?wscale[rbase+d]:1.f);
+        dst[k]=__float2half(a*scale);}
+    for(int d=tid;d<R;d+=blockDim.x)dst[K+d]=__float2half(qs[Q+d]*scale);
+}
+
+/* Per-query key bitmask [S][ceil(T/8)]: for sparse queries (cnt>0) set the selected
+ * keys' bits. Dense queries (cnt<=0) leave the row zero — the flash kernel uses causal
+ * only there. One thread owns a whole query row (no atomics). Mask must be pre-zeroed. */
+__global__ static void tc_build_mask(uint8_t *mask,const int *sel_idx,const int *sel_cnt,int maxsel,int S,int T){
+    int s=blockIdx.x*blockDim.x+threadIdx.x; if(s>=S)return;
+    int cnt=sel_cnt[s]; if(cnt<=0)return;
+    size_t mr=(T+7)/8; uint8_t *row=mask+(size_t)s*mr; const int *sidx=sel_idx+(size_t)s*maxsel;
+    for(int j=0;j<cnt;j++){int t=sidx[j]; if(t>=0&&t<T) row[t>>3]|=(uint8_t)(1<<(t&7));}
+}
+
+/* Flash MLA attention. Block=(head-slice index, query-tile of 16). Both GEMMs run
+ * across all 8 warps (scores split-K; P@Latent by kn-tile). Dynamic shared: QA+KB
+ * (fp16) + acc (f32) = QT*(4*(K+R)+4*K) bytes. */
+__global__ static void tc_sparse_attn(float *ctx,const __half *QAh,const __half *KBh,
+        const float *latent,const void *weights,const float *wscale,const uint8_t *mask,const int *sel_cnt,
+        int fmt,int H0,int S,int H,int Q,int R,int V,int K,int T){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    int h=H0+blockIdx.x, qt=blockIdx.y, tid=threadIdx.x, warp=tid>>5, lane=tid&31;
+    int q0=qt*ATC_QT, rbase=h*(Q+V), KR=K+R, nwarp=blockDim.x>>5; size_t mr=(T+7)/8;
+    extern __shared__ char smem[];
+    __half *QA=(__half*)smem; __half *KB=QA+ATC_QT*KR; float *acc=(float*)(KB+ATC_QT*KR);
+    __shared__ __half Pt[ATC_QT*ATC_QT];
+    __shared__ __half ah[256], ah8[8][256], bh8[8][256];
+    __shared__ float scpart[8*256], sc[ATC_QT*ATC_QT], mrow[ATC_QT], lrow[ATC_QT], corr[ATC_QT];
+    for(int z=tid;z<ATC_QT*KR;z+=blockDim.x){int r=z/KR,c=z%KR;int s=q0+r;
+        QA[z]=(s<S)?QAh[((size_t)s*H+h)*KR+c]:__float2half(0.f);}
+    for(int r=tid;r<ATC_QT;r+=blockDim.x){mrow[r]=-3.4e38f;lrow[r]=0.f;}
+    for(int z=tid;z<ATC_QT*K;z+=blockDim.x)acc[z]=0.f;
+    __syncthreads();
+    int ktmax=q0+ATC_QT; if(ktmax>T)ktmax=T;                 // causal (single-shot prefill T==S)
+    for(int kt=0;kt<ktmax;kt+=ATC_QT){
+        for(int z=tid;z<ATC_QT*KR;z+=blockDim.x){int r=z/KR,c=z%KR;int t=kt+r;
+            KB[z]=(t<T)?KBh[(size_t)t*KR+c]:__float2half(0.f);}
+        __syncthreads();
+        // Scores[16,16]=QA@KB^T, split-K across warps.
+        { __half *myah=ah8[warp],*mybh=bh8[warp];
+          wmma::fragment<wmma::accumulator,16,16,16,float> accS; wmma::fill_fragment(accS,0.f);
+          for(int k0=warp*16;k0<KR;k0+=nwarp*16){
+            for(int z=lane;z<256;z+=32){int m=z/16,k=z%16;myah[z]=QA[m*KR+(k0+k)];mybh[z]=KB[m*KR+(k0+k)];}
+            __syncwarp();
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+            wmma::load_matrix_sync(af,myah,16);wmma::load_matrix_sync(bf,mybh,16);
+            wmma::mma_sync(accS,af,bf,accS);__syncwarp(); }
+          wmma::store_matrix_sync(&scpart[warp*256],accS,16,wmma::mem_row_major); }
+        __syncthreads();
+        for(int z=tid;z<ATC_QT*ATC_QT;z+=blockDim.x){float a=0;for(int wr=0;wr<nwarp;wr++)a+=scpart[wr*256+z];sc[z]=a;}
+        __syncthreads();
+        // mask + online softmax per query row (one warp per row)
+        for(int r=warp;r<ATC_QT;r+=nwarp){int s=q0+r;int sp=(s<S)?sel_cnt[s]:0;int pos=T-S+s;
+            float tmax=-3.4e38f;
+            for(int c=lane;c<ATC_QT;c+=32){int t=kt+c;
+                int keep=(s<S&&t<T&&t<=pos&&(sp>0?((mask[(size_t)s*mr+(t>>3)]>>(t&7))&1):1));
+                float v=keep?sc[r*ATC_QT+c]:-3.4e38f; sc[r*ATC_QT+c]=v; tmax=fmaxf(tmax,v);}
+            for(int o=16;o;o>>=1)tmax=fmaxf(tmax,__shfl_down_sync(0xffffffff,tmax,o));
+            tmax=__shfl_sync(0xffffffff,tmax,0);
+            float mold=mrow[r],mnew=fmaxf(mold,tmax),cr=expf(mold-mnew),lsum=0.f;
+            for(int c=lane;c<ATC_QT;c+=32){float e=(sc[r*ATC_QT+c]>-1e30f)?expf(sc[r*ATC_QT+c]-mnew):0.f;Pt[r*ATC_QT+c]=__float2half(e);lsum+=e;}
+            for(int o=16;o;o>>=1)lsum+=__shfl_down_sync(0xffffffff,lsum,o);
+            lsum=__shfl_sync(0xffffffff,lsum,0);
+            if(lane==0){mrow[r]=mnew;corr[r]=cr;lrow[r]=lrow[r]*cr+lsum;}}
+        __syncthreads();
+        // acc = acc*corr + P@Latent (accumulate into the WMMA fragment loaded from acc)
+        for(int z=tid;z<ATC_QT*K;z+=blockDim.x){int r=z/K;acc[z]*=corr[r];}
+        for(int z=tid;z<256;z+=blockDim.x)ah[z]=Pt[z];
+        __syncthreads();
+        { __half *mybh=bh8[warp];
+          for(int kn=warp*16;kn<K;kn+=nwarp*16){
+            wmma::fragment<wmma::accumulator,16,16,16,float> accP;
+            wmma::load_matrix_sync(accP,&acc[kn],K,wmma::mem_row_major);
+            for(int z=lane;z<256;z+=32){int n=z/16,key=z%16;int t=kt+key;
+                mybh[z]=(t<T)?__float2half(latent[(size_t)t*K+(kn+n)]):__float2half(0.f);}
+            __syncwarp();
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+            wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,mybh,16);
+            wmma::mma_sync(accP,af,bf,accP);
+            wmma::store_matrix_sync(&acc[kn],accP,K,wmma::mem_row_major);__syncwarp(); } }
+        __syncthreads();
+    }
+    // Ctx[s,v] = (acc/l) @ W_V^T
+    size_t rb=row_bytes(fmt,K);
+    for(int r=0;r<ATC_QT;r++){int s=q0+r;if(s>=S)continue;float inv=1.f/lrow[r];
+        for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;
+            for(int k=0;k<K;k++)a+=(acc[r*K+k]*inv)*weight_at(weights,fmt,(size_t)row*rb,k);
+            ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+        __syncthreads(); }
+#endif
+}
+
 /* ---- Flash-attention decode absorb (S=1): T-parallel with online softmax ----
  * The per-head kernel above serializes the whole context in one block (64 blocks
  * for H=64 → low parallelism on the GB10). Flash splits the key dimension across
@@ -658,6 +780,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
         if(ctx->asel)cudaFree(ctx->asel);if(ctx->acnt)cudaFree(ctx->acnt);
+        if(ctx->aqa)cudaFree(ctx->aqa);if(ctx->akb)cudaFree(ctx->akb);if(ctx->amsk)cudaFree(ctx->amsk);
         for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
@@ -667,6 +790,8 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->asel=ctx->acnt=nullptr;
+        ctx->aqa=ctx->akb=ctx->amsk=nullptr;
+        ctx->aqa_cap=ctx->akb_cap=ctx->amsk_cap=0;
         ctx->host_x=ctx->host_y=nullptr;ctx->stream=nullptr;
         ctx->ewg=ctx->ewu=ctx->ewd=nullptr;ctx->esg=ctx->esu=ctx->esd=nullptr;
         ctx->ewg_cap=ctx->ewu_cap=ctx->ewd_cap=ctx->esg_cap=ctx->esu_cap=ctx->esd_cap=0;
@@ -1166,6 +1291,41 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
  * and dispatches attention_absorb_sparse_kernel. `maxsel` must be `index_topk` (the
  * kernel's is_dense fallback relies on dense queries having nt <= maxsel). Larger T
  * than the dense path is fine — shared memory is sized to maxsel, not T. */
+/* Tensor-core sparse-attention path (COLI_TC_ATTN=1): build QA/KB (fp16) + the DSA key
+ * bitmask, then run the WMMA flash kernel. Same [S,H,V] ctx output as the scalar run
+ * (partial head slice zeroes the rest); no fused o_proj. */
+static int tc_sparse_attn_run(ColiCudaTensor *w,float *out,const float *q,const float *latent,const float *rope,
+        const int *sel_idx,const int *sel_cnt,int maxsel,int H0,int HC,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if(H0<0||HC<1||H0+HC>H||K<1||K>512||T<S)return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    int KR=K+R; size_t mr=(T+7)/8;
+    size_t qb=(size_t)S*H*(Q+R)*4,lb=(size_t)T*K*4,rbb=(size_t)T*R*4,cb=(size_t)S*H*V*4;
+    size_t sib=(size_t)S*maxsel*4,scb=(size_t)S*4;
+    size_t qab=(size_t)S*H*KR*2,kbb=(size_t)T*KR*2,mskb=(size_t)S*mr;
+    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||!reserve(&dc->ar,&dc->ar_cap,rbb)||
+       !reserve(&dc->ac,&dc->ac_cap,cb)||!reserve_bytes(&dc->asel,&dc->asel_cap,sib)||!reserve_bytes(&dc->acnt,&dc->acnt_cap,scb)||
+       !reserve_bytes(&dc->aqa,&dc->aqa_cap,qab)||!reserve_bytes(&dc->akb,&dc->akb_cap,kbb)||!reserve_bytes(&dc->amsk,&dc->amsk_cap,mskb))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"tc attn q")||
+       !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"tc attn latent")||
+       !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rbb,cudaMemcpyHostToDevice,dc->stream),"tc attn rope")||
+       !cuda_ok(cudaMemcpyAsync(dc->asel,sel_idx,sib,cudaMemcpyHostToDevice,dc->stream),"tc attn sel")||
+       !cuda_ok(cudaMemcpyAsync(dc->acnt,sel_cnt,scb,cudaMemcpyHostToDevice,dc->stream),"tc attn cnt"))return 0;
+    if(!cuda_ok(cudaMemsetAsync(dc->amsk,0,mskb,dc->stream),"tc attn mask zero"))return 0;
+    if((H0!=0||HC!=H)&&!cuda_ok(cudaMemsetAsync(dc->ac,0,cb,dc->stream),"tc attn ctx zero"))return 0;
+    tc_build_mask<<<(unsigned)(S+255)/256,256,0,dc->stream>>>((uint8_t*)dc->amsk,(const int*)dc->asel,(const int*)dc->acnt,maxsel,S,T);
+    tc_build_kb<<<(unsigned)T,256,0,dc->stream>>>((__half*)dc->akb,dc->al,dc->ar,K,R,T);
+    tc_build_qa<<<dim3(HC,S),256,0,dc->stream>>>((__half*)dc->aqa,dc->aq,w->weights,w->scales,w->fmt,H0,S,H,Q,R,V,K,scale);
+    if(!cuda_ok(cudaGetLastError(),"tc attn prep launch"))return 0;
+    size_t shW=(size_t)ATC_QT*(4*KR+4*K);
+    if(!cuda_ok(cudaFuncSetAttribute(tc_sparse_attn,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)shW),"tc attn shared attr"))return 0;
+    tc_sparse_attn<<<dim3(HC,(S+ATC_QT-1)/ATC_QT),256,shW,dc->stream>>>((float*)dc->ac,(const __half*)dc->aqa,
+        (const __half*)dc->akb,dc->al,w->weights,w->scales,(const uint8_t*)dc->amsk,(const int*)dc->acnt,w->fmt,H0,S,H,Q,R,V,K,T);
+    if(!cuda_ok(cudaGetLastError(),"tc attn launch"))return 0;
+    if(!cuda_ok(cudaMemcpyAsync(out,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"tc attn ctx download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"tc attn sync"))return 0;
+    return 1;
+}
+
 static int attention_absorb_sparse_run(ColiCudaTensor *w,ColiCudaTensor *proj,float *out,
         const float *q,const float *latent,const float *rope,
         const int *sel_idx,const int *sel_cnt,int maxsel,
@@ -1177,6 +1337,9 @@ static int attention_absorb_sparse_run(ColiCudaTensor *w,ColiCudaTensor *proj,fl
     // pooled context buffer first (stale from a prior call) — needed for the copy-back
     // and for the fused GPU o_proj, which contracts over all H*V ctx columns.
     if(H0<0||HC<1||H0+HC>H)return 0;
+    // Tensor-core WMMA path (opt-in). Only the non-fused case (no o_proj); ~3x the scalar core.
+    { static int tc=-1; if(tc<0){const char*e=getenv("COLI_TC_ATTN");tc=(e&&atoi(e))?1:0;}
+      if(tc && !proj) return tc_sparse_attn_run(w,out,q,latent,rope,sel_idx,sel_cnt,maxsel,H0,HC,S,H,Q,R,V,K,T,scale); }
     if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);

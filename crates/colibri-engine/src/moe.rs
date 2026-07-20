@@ -167,17 +167,43 @@ pub struct ShardsExpertProvider<'a> {
     ebits: u32,
     sharding: ExpertSharding,
     this_node: NodeId,
-    /// Cores each expert's ~18 MB read is chunked across (a single stream tops out
-    /// far below the NVMe). `COLI_LOAD_THREADS` overrides; defaults to core count.
+    /// Concurrent readers each expert's ~18 MB read is chunked across (a single
+    /// stream tops out far below the NVMe, which needs queue depth ~10 to saturate).
+    /// `COLI_LOAD_THREADS` overrides; see [`default_read_threads`] for why the
+    /// default is 2× cores rather than the core count.
     read_threads: usize,
 }
 
-/// Read-thread count for on-demand expert streaming: `COLI_LOAD_THREADS` else cores.
+/// Read-thread count for on-demand expert streaming: `COLI_LOAD_THREADS` else
+/// **twice the core count**.
+///
+/// This is an *I/O concurrency* knob, not a compute-parallelism one — the threads
+/// spend nearly all their time blocked in `pread`, so each contributes at most one
+/// outstanding request. Sizing them to cores (what this used to do, by borrowing
+/// [`crate::preload::default_num_files`] — which is right for *shard* counts and
+/// wrong here) leaves the NVMe queue under-fed.
+///
+/// Measured on GB10, 1 node, prompt 512, ngen 12, tokens byte-identical at every
+/// setting:
+///
+/// | threads | ms/token |
+/// |---------|----------|
+/// | 12      | 4768 |
+/// | 20 (= cores, the old default) | 3409–3422 |
+/// | 32      | 2941–3238 |
+/// | 40      | 2842 |
+/// | 48      | 2886 |
+///
+/// The curve is steep below the core count and flat from ~32 to ~48, where the
+/// differences sit inside run-to-run drift. 2× cores is chosen as a principled
+/// point in that flat region rather than over-fitting to the single fastest
+/// sample. The clamp keeps tiny boxes above a useful queue depth and stops
+/// many-core hosts spawning hundreds of blocked threads for one drive.
 fn default_read_threads() -> usize {
     std::env::var("COLI_LOAD_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(crate::preload::default_num_files)
+        .unwrap_or_else(|| crate::preload::default_num_files().saturating_mul(2).clamp(8, 64))
 }
 
 impl<'a> ShardsExpertProvider<'a> {

@@ -324,6 +324,10 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // COLI_XFP8=1 emits routed experts as per-row e4m3 fp8 (8-bit) instead of xbits
         // int — preserves the source FP8 precision for the tiled FP8 expert kernel.
         xfp8: env_u32("COLI_XFP8", 0) != 0,
+        // COLI_MTP_ONLY=1 converts ONLY the MTP speculative head (layer n_layers).
+        // Drop the resulting shard into an existing container (Shards::open indexes
+        // every *.safetensors in the dir) to enable drafting without re-converting.
+        mtp_only: env_u32("COLI_MTP_ONLY", 0) != 0,
     };
 
     eprintln!(

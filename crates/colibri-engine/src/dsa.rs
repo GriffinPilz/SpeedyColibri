@@ -166,7 +166,31 @@ pub fn indexer_forward(
         rope_interleave(&mut k[..rope], pos, rope, theta);
     }
 
-    // 2) per query: indexer query + head weights, score every causal key, select.
+    // 2a) Batch the indexer query + head-weight projections for the queries that
+    // actually need them. Only `nk > index_topk` queries select (the rest are the
+    // dense no-op), i.e. `s >= index_topk - pos_base`, so project just that range —
+    // one GEMM each instead of a single-row GEMV per query (the `wq` projection alone
+    // was ~37% of indexer FLOPs, issued 2048× as [1, q_lora] @ [nh*hd, q_lora]^T).
+    // `matmul_qt` computes each output row as an independent dot product, so batching
+    // is bit-identical to the per-query calls — the selection cannot shift.
+    let s0 = index_topk.saturating_sub(pos_base).min(s_len);
+    let nsp = s_len - s0;
+    let qi_stride = nh * index_hd;
+    let mut qi_all = vec![0f32; nsp * qi_stride];
+    let mut hw_all = vec![0f32; nsp * nh];
+    if nsp > 0 {
+        matmul_qt(&mut qi_all, &q_lora[s0 * q_lora_dim..], w.wq, nsp);
+        matmul_qt(&mut hw_all, &x[s0 * hidden..], w.wp, nsp);
+        for si in 0..nsp {
+            let pos = pos_base + s0 + si;
+            for h in 0..nh {
+                let b = si * qi_stride + h * index_hd;
+                rope_interleave(&mut qi_all[b..b + rope], pos, rope, theta);
+            }
+        }
+    }
+
+    // 2b) per query: score every causal key against the projected query, select top-k.
     // This is the DSA hot loop — O(s_len · nk · nh · hd). It is embarrassingly
     // parallel (each query writes only its own `sel[s]` and reads shared keys/x/
     // q_lora), so split it across cores. Serial, it single-threads the whole indexer
@@ -176,6 +200,8 @@ pub fn indexer_forward(
     let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let chunk = s_len.div_ceil(nthreads).max(1);
     let keys = &keys;
+    let qi_all = &qi_all;
+    let hw_all = &hw_all;
     std::thread::scope(|scope| {
         for (ci, sel_chunk) in sel.chunks_mut(chunk).enumerate() {
             let base = ci * chunk;
@@ -187,18 +213,15 @@ pub fn indexer_forward(
                     if is_dense(nk, index_topk) {
                         continue; // no-op: attention attends to all (empty selection)
                     }
-                    let mut qi = vec![0f32; nh * index_hd];
-                    matmul_qt(&mut qi, &q_lora[s * q_lora_dim..(s + 1) * q_lora_dim], w.wq, 1);
-                    for h in 0..nh {
-                        rope_interleave(&mut qi[h * index_hd..h * index_hd + rope], pos, rope, theta);
-                    }
-                    let mut hw = vec![0f32; nh];
-                    matmul_qt(&mut hw, &x[s * hidden..(s + 1) * hidden], w.wp, 1);
+                    // projections were batched above for s >= s0 (== the selecting queries)
+                    let si = s - s0;
+                    let qi = &qi_all[si * qi_stride..(si + 1) * qi_stride];
+                    let hw = &hw_all[si * nh..(si + 1) * nh];
 
                     let mut scores = vec![0f32; nk];
                     for (t, sc) in scores.iter_mut().enumerate() {
                         let kt = &keys[t * index_hd..(t + 1) * index_hd];
-                        *sc = indexer_score(&qi, kt, &hw, nh, index_hd);
+                        *sc = indexer_score(qi, kt, hw, nh, index_hd);
                     }
                     *out = select_topk(&scores, index_topk);
                 }

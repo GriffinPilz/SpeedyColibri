@@ -353,6 +353,15 @@ pub fn load_model_with(
         ] {
             t.gpu_eligible = true;
         }
+        // DSA indexer projections: batched in `indexer_forward`, so they want the GPU.
+        // `matmul_qt`'s CPU path is single-threaded — a batched call on one core is
+        // *slower* than the old per-query GEMVs spread across the indexer's worker
+        // threads (measured: 46s -> 81s). On the GPU the batched form is the fast one.
+        for t in [&mut l.ix_wk, &mut l.ix_wq, &mut l.ix_wp] {
+            if let Some(t) = t {
+                t.gpu_eligible = true;
+            }
+        }
     }
     Ok(model)
 }

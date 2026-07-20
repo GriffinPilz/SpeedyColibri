@@ -9,11 +9,13 @@
 //!
 //! Fidelity note: the C version also calls `posix_fadvise(DONTNEED)` after
 //! streaming-expert reads and keeps an `O_DIRECT` twin fd to bypass the page
-//! cache. `DONTNEED` is now reintroduced here behind `COLI_FADVISE` (see
-//! [`fadvise_enabled`]); the `O_DIRECT` twin is still absent, and is harder
-//! than it looks because no tensor offset in our containers is 512-aligned
-//! (measured: 0 of 4326 sampled), so it needs span-level alignment rather than
-//! a drop-in fd swap. Correctness is unaffected either way.
+//! cache. Both now exist here behind `COLI_FADVISE` (see [`fadvise_enabled`] —
+//! measured a large regression, leave off) and `COLI_O_DIRECT` (see
+//! [`o_direct_enabled`]). The `O_DIRECT` twin is not a drop-in fd swap: **no
+//! tensor offset in our containers is 512-aligned** (measured: 0 of 4326
+//! sampled), so reads are aligned at *span* granularity rather than bounced
+//! through a scratch buffer, which would otherwise reintroduce a full memcpy of
+//! every expert. Correctness is unaffected by either flag.
 
 use colibri_core::dtype::{bf16_to_f32, f16_to_f32, f8e4m3_to_f32, f8e5m2_to_f32, DType};
 use colibri_core::SharedBuf;
@@ -44,11 +46,11 @@ use std::sync::{Arc, Mutex};
 /// second and much larger cache tier — effective residency is ~98 GB
 /// (40 GB LFRU + ~58 GB page cache), not 40 GB.
 ///
-/// Two consequences worth carrying forward: `O_DIRECT` bypasses the same tier and
-/// so is now *expected to regress too* despite winning the raw-bandwidth
-/// microbenchmark; and raising `COLI_RAM_GB` likely hurt for this reason —
-/// it steals from a tier that caches at 4 KB page granularity and gives it to one
-/// that caches whole 38.3 MB experts.
+/// Both follow-ups have since been measured, and both confirmed it:
+/// [`o_direct_enabled`] bypasses the same tier and is 18% slower at equal cache size
+/// despite winning the raw-bandwidth microbenchmark; and raising `COLI_RAM_GB` hurts
+/// for the same reason, since it moves RAM from a tier that caches at 4 KB page
+/// granularity into one that caches whole 38.3 MB experts.
 fn fadvise_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_FADVISE").ok().as_deref() == Some("1"))
@@ -70,10 +72,72 @@ pub struct StTensor {
     pub shape: Vec<i64>,
 }
 
+/// Alignment O_DIRECT requires of the file offset, length, and destination address.
+/// The NVMe's logical block size (measured 512 on the DGX Spark).
+const DIO_ALIGN: u64 = 512;
+
+/// Bypass the page cache entirely for shard reads (`COLI_O_DIRECT=1`).
+///
+/// Distinct from [`fadvise_enabled`], and the difference is the whole point:
+/// `fadvise` still routes every read *through* the page cache and discards it
+/// afterwards, so it pays the landing-zone cost and gets no caching in return —
+/// measured a 63% loss. `O_DIRECT` never touches the page cache, so the RAM the
+/// kernel currently needs as a landing zone for 22.6 GB/token of streaming becomes
+/// available to the expert cache instead.
+///
+/// **MEASURED: it does not pay, and it does not lift the `MemTotal/3` cache ceiling.
+/// Leave off.** Kept because "why don't we just use O_DIRECT?" is a question this
+/// codebase will keep attracting, and this is the answer with numbers.
+///
+/// 1 node, prompt 512, ngen 12, tokens byte-identical in every arm:
+///
+/// | arm | ms/token | pgmajfault | compact_stall | buff/cache |
+/// |-----|----------|------------|---------------|------------|
+/// | buffered, 40 GB | **2942** | +715 | +177,766 | 43 GB |
+/// | O_DIRECT, 40 GB | 3480 (+18%) | +397 | **+23** | 37 GB |
+/// | O_DIRECT, 70 GB | 5002 (+70%) | +325,409 | +26 | 23 GB |
+/// | O_DIRECT, 90 GB | did not finish | +19,254 | +23 | 2 GB |
+///
+/// It does what it claims — compaction stalls collapse from 177,766 to 23, so the
+/// landing-zone pressure really is gone — but at equal cache size it is 18% slower,
+/// because bypassing the page cache forfeits a tier that was serving a large share
+/// of reads. And the large-cache configurations still thrash (325k major faults at
+/// 70 GB, 90 GB unable to complete), which proves the memory ceiling is **real
+/// rather than an artifact of buffered I/O**. `MemTotal/3` is the right operating
+/// point; the page cache is not waste to be reclaimed.
+fn o_direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_O_DIRECT").ok().as_deref() == Some("1"))
+}
+
+/// Open a second, `O_DIRECT` descriptor for `path`. `None` if the platform or
+/// filesystem refuses it, in which case reads fall back to the buffered fd.
+#[cfg(target_os = "linux")]
+fn open_direct(path: &Path) -> Option<File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path and the flags are read-only.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh, owned descriptor that nothing else holds.
+    Some(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_direct(_path: &Path) -> Option<File> {
+    None
+}
+
 /// A set of indexed safetensors shards, supporting on-demand reads by name.
 pub struct Shards {
     tensors: Vec<StTensor>,
     files: Vec<(PathBuf, File)>,
+    /// Parallel to `files`: `O_DIRECT` twin descriptors, populated only when
+    /// [`o_direct_enabled`]. `None` entries fall back to the buffered fd.
+    dio: Vec<Option<File>>,
     index: HashMap<String, usize>,
 }
 
@@ -95,6 +159,7 @@ impl Shards {
         let mut s = Shards {
             tensors: Vec::new(),
             files: Vec::new(),
+            dio: Vec::new(),
             index: HashMap::new(),
         };
 
@@ -162,6 +227,7 @@ impl Shards {
                 s.index.insert(name.to_string(), idx);
             }
 
+            s.dio.push(if o_direct_enabled() { open_direct(&path) } else { None });
             s.files.push((path, file));
         }
 
@@ -379,9 +445,17 @@ impl Shards {
         //    name maps back to (span index, offset-in-span, len).
         struct Span {
             file: usize,
-            off0: u64,
+            /// File offset the read starts at — 512-aligned under `O_DIRECT`, else
+            /// exactly the span's first tensor offset.
+            read_off: u64,
+            /// Bytes to read from `read_off`; a 512-multiple under `O_DIRECT`.
+            read_len: usize,
+            /// Offset within `buf` at which `read_off`'s byte lands: the allocation's
+            /// alignment skew. Views additionally add the file-side padding.
+            skew: usize,
             buf: SharedBuf,
         }
+        let dio = o_direct_enabled();
         let mut spans: Vec<Span> = Vec::new();
         let mut mapping: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(groups.len());
         for grp in groups {
@@ -410,11 +484,43 @@ impl Shards {
                 }
                 let span_len = (span_end - off0) as usize;
                 let span_idx = spans.len();
-                spans.push(Span { file, off0, buf: SharedBuf::with_len(span_len) });
+
+                // Under O_DIRECT the file offset, the length, and the destination
+                // address must all be 512-aligned, and no tensor offset in our
+                // containers is. Align the *span* rather than bouncing each read
+                // through an aligned scratch buffer: start at the 512 boundary below
+                // `off0`, round the length up, and over-allocate by one alignment unit
+                // so a 512-aligned address is guaranteed to exist inside the buffer.
+                // Views then sit at `skew + pad + (o - off0)`. Costs <1 KiB per span
+                // and, crucially, no copy — a bounce buffer would reintroduce exactly
+                // the per-expert memcpy removed in 29e27b2.
+                let (pad, extra) = if dio {
+                    ((off0 & (DIO_ALIGN - 1)) as usize, DIO_ALIGN as usize)
+                } else {
+                    (0, 0)
+                };
+                let read_off = off0 - pad as u64;
+                let read_len = if dio {
+                    (pad + span_len).next_multiple_of(DIO_ALIGN as usize)
+                } else {
+                    span_len
+                };
+                let mut buf = SharedBuf::with_len(read_len + extra);
+                // Skew is derived from the *actual* allocation: `SharedBuf` recycles
+                // pooled buffers, so alignment varies between calls and cannot be
+                // assumed.
+                let skew = if dio {
+                    let p = buf.as_mut_slice().as_ptr() as usize;
+                    p.wrapping_neg() & (DIO_ALIGN as usize - 1)
+                } else {
+                    0
+                };
+                let prefix = skew + pad;
+                spans.push(Span { file, read_off, read_len, skew, buf });
                 for gi in g..end {
                     let idx = order[gi];
                     let (_, o, nb) = meta[idx];
-                    names_map[idx] = (span_idx, (o - off0) as usize, nb as usize);
+                    names_map[idx] = (span_idx, prefix + (o - off0) as usize, nb as usize);
                 }
                 g = end;
             }
@@ -433,14 +539,15 @@ impl Shards {
         }
         let mut jobs: Vec<Job> = Vec::new();
         for s in spans.iter_mut() {
-            let (file, off0) = (s.file, s.off0);
-            let sl = s.buf.as_mut_slice();
-            let base = sl.as_mut_ptr() as usize;
-            let total = sl.len();
+            let (file, read_off, total, skew) = (s.file, s.read_off, s.read_len, s.skew);
+            // Tiling starts at the aligned address, not the allocation base. `SUB` is a
+            // 512-multiple and `total` was rounded up, so every job — including the
+            // last — keeps its offset, address and length 512-aligned under O_DIRECT.
+            let base = s.buf.as_mut_slice().as_mut_ptr() as usize + skew;
             let mut o = 0usize;
             while o < total {
                 let clen = SUB.min(total - o);
-                jobs.push(Job { file, off: off0 + o as u64, ptr: base + o, len: clen });
+                jobs.push(Job { file, off: read_off + o as u64, ptr: base + o, len: clen });
                 o += clen;
             }
         }
@@ -463,7 +570,7 @@ impl Shards {
                         // tile each buffer without overlap, so no two workers alias.
                         let dst =
                             unsafe { std::slice::from_raw_parts_mut(j.ptr as *mut u8, j.len) };
-                        if let Err(e) = self.pread_into(j.file, j.off, dst) {
+                        if let Err(e) = self.pread_dispatch(j.file, j.off, dst) {
                             *err_ref.lock().unwrap() = Some(e);
                         }
                     });
@@ -477,9 +584,9 @@ impl Shards {
         // 3. Release the page-cache copy of everything we just streamed. Done after
         //    the join so each span is advised once as a whole range rather than per
         //    2 MiB job, and only once the bytes are safely in our own buffer.
-        if fadvise_enabled() {
+        if fadvise_enabled() && !dio {
             for s in spans.iter() {
-                self.fadvise_dontneed(s.file, s.off0, s.buf.len());
+                self.fadvise_dontneed(s.file, s.read_off, s.read_len);
             }
         }
 
@@ -531,6 +638,22 @@ impl Shards {
     fn pread_into(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         self.files[file_idx].1.read_exact_at(buf, off)
+    }
+
+    /// Read into `buf`, preferring the `O_DIRECT` descriptor when one was opened.
+    ///
+    /// The caller is responsible for 512-alignment of `off`, `buf.as_ptr()` and
+    /// `buf.len()`; [`Shards::read_raw_shared_batched`] arranges it by aligning whole
+    /// spans. Falls back to the buffered fd wherever no direct descriptor exists —
+    /// non-Linux, or a filesystem that refused `O_DIRECT` — so enabling the flag can
+    /// never break a read, only fail to accelerate it.
+    fn pread_dispatch(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(f) = self.dio.get(file_idx).and_then(|o| o.as_ref()) {
+            use std::os::unix::fs::FileExt;
+            return f.read_exact_at(buf, off);
+        }
+        self.pread_into(file_idx, off, buf)
     }
 
     /// Drop `[off, off+len)` of `file_idx` from the page cache.

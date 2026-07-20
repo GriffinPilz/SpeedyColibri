@@ -373,13 +373,21 @@ fn expert_from_views(
         let mut s = vec![0f32; o];
         shards.read_f32(&sname, &mut s)?;
         let mut t = QTensor { fmt_code: fmt, o: o as i32, i: i as i32, s, ..Default::default() };
+        let fp8 = expert_fp8_enabled();
         if fmt == 1 {
-            // int8 goes in q8 (signed) — a copy; experts are int4 so this is rare.
-            t.q8 = buf[*off..*off + *len].iter().map(|&b| b as i8).collect();
+            // int8 goes in q8 (signed) — a copy. Skipped under `fp8`, where `fmt == 1`
+            // means an e4m3 container (1 B/weight, length-indistinguishable from int8):
+            // the block below replaces `q8` with a zero-copy view, so materializing it
+            // here is 37.7 MB of allocate-and-copy per expert that is discarded unused.
+            // At 8 experts × 75 layers that was 22.6 GB of dead single-threaded copying
+            // per decoded token, with the drive idle throughout.
+            if !fp8 {
+                t.q8 = buf[*off..*off + *len].iter().map(|&b| b as i8).collect();
+            }
         } else {
             t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
         }
-        if expert_fp8_enabled() {
+        if fp8 {
             if fmt == 2 {
                 // int4 snapshot → convert to e4m3 at load (scaffolding for a non-fp8
                 // container). Same per-row scales; e4m3 represents int4 −8..7 exactly,

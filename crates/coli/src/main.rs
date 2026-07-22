@@ -135,6 +135,7 @@ fn main() -> ExitCode {
         "config" => cmd_config(&args),
         "load" => cmd_load(&args),
         "gen" => cmd_gen(&args),
+        "genbatch" => cmd_genbatch(&args),
         "tf" => cmd_tf(&args),
         "ppl" => cmd_ppl(&args),
         "capacity" => cmd_capacity(&args),
@@ -881,6 +882,178 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     }
     eprintln!("[worker] shutdown signal received — stopping");
     shutdown_exit()
+}
+
+/// `coli genbatch <snap> <B> <ngen> [base token id...]` — batched multi-sequence
+/// decode benchmark. B sequences advance one token per `forward_batched`, so the
+/// routed-expert union streams from disk ONCE per step and amortizes across the
+/// batch (decode is bytes-bound — this is the throughput lever). The base prompt is
+/// diversified per slot so routing genuinely spreads (synthetic ids, kept in-vocab).
+/// Reports aggregate decode tok/s (B tokens/step). `COLI_BATCH_VERIFY=1` also decodes
+/// slot 0 single-sequence and asserts identical tokens (batching must not change
+/// output). Single-node measurement path; mirrors `cmd_gen`'s loader + autopin.
+fn cmd_genbatch(args: &[String]) -> ExitCode {
+    let snap = match args.get(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: coli genbatch <snapshot-dir> <B> <ngen> [token_id ...]");
+            return ExitCode::from(2);
+        }
+    };
+    let b: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let ngen: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(16);
+    let base: Vec<i32> = args
+        .get(5..)
+        .map(|a| a.iter().filter_map(|s| s.parse().ok()).collect())
+        .filter(|v: &Vec<i32>| !v.is_empty())
+        .unwrap_or_else(|| vec![1]);
+    if b == 0 {
+        eprintln!("genbatch: B must be >= 1");
+        return ExitCode::from(2);
+    }
+
+    let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let opts = colibri_engine::LoadOptions {
+        dbits: envbits("COLI_DBITS", 4),
+        ebits: envbits("COLI_EBITS", 4),
+    };
+    let model = match colibri_engine::load_model_with(snap, opts) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("coli genbatch: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let model: &'static colibri_engine::Model = Box::leak(Box::new(model));
+    let d = model.cfg.hidden as usize;
+    let vocab = model.cfg.vocab.max(1);
+
+    // Single-node provider (the measurement regime), mirroring cmd_gen's setup.
+    let usage_path = std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
+    let sharding = colibri_cluster::ExpertSharding::single(model.cfg.n_experts as u32);
+    let base_p = colibri_engine::ShardsExpertProvider::with_sharding(
+        &model.shards,
+        &model.cfg,
+        model.ebits as u32,
+        sharding,
+        colibri_cluster::NodeId(0),
+    );
+    let budget = ram_budget();
+    let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base_p, budget));
+    apply_autopin(&provider, &history, budget);
+
+    // Diversify the base prompt per slot so each sequence routes differently (this is
+    // a synthetic benchmark — like `gen`, ids need only be valid; the shift keeps them
+    // in-vocab). Identical prompts would route identically and hide the amortization.
+    let seqs: Vec<Vec<i32>> = (0..b)
+        .map(|n| {
+            base.iter()
+                .enumerate()
+                .map(|(i, &t)| (t + (n as i32 * 149 + i as i32 * 7) % vocab).rem_euclid(vocab))
+                .collect()
+        })
+        .collect();
+
+    use colibri_engine::{argmax, forward, forward_batched, logits, KvCache};
+
+    // Prefill each sequence into its own KV cache.
+    let cap = base.len() + ngen + 2;
+    let mut kvs: Vec<KvCache> = Vec::with_capacity(b);
+    let mut pos: Vec<usize> = Vec::with_capacity(b);
+    let mut logit: Vec<Vec<f32>> = Vec::with_capacity(b);
+    let t_pre = std::time::Instant::now();
+    for n in 0..b {
+        let mut kv = KvCache::for_model(model, cap);
+        let s = seqs[n].len();
+        let mut hidden = vec![0f32; s * d];
+        if let Err(e) = forward(model, &mut kv, &*provider, &seqs[n], 0, &mut hidden) {
+            eprintln!("genbatch prefill seq {n}: {e}");
+            return ExitCode::FAILURE;
+        }
+        logit.push(logits(model, &hidden[(s - 1) * d..s * d]));
+        pos.push(s);
+        kvs.push(kv);
+    }
+    eprintln!(
+        "[genbatch] prefilled B={b} seqs ({} tok each) in {:.1}s",
+        base.len(),
+        t_pre.elapsed().as_secs_f64()
+    );
+
+    // Batched decode: one token per sequence per step.
+    let mut outs: Vec<Vec<i32>> = vec![Vec::with_capacity(ngen); b];
+    let mut step_ms: Vec<f64> = Vec::with_capacity(ngen);
+    for _ in 0..ngen {
+        let ids: Vec<i32> = (0..b).map(|n| argmax(&logit[n]) as i32).collect();
+        for n in 0..b {
+            outs[n].push(ids[n]);
+        }
+        let t = std::time::Instant::now();
+        let mut hidden = vec![0f32; b * d];
+        if let Err(e) = forward_batched(model, &mut kvs, &*provider, &ids, &pos, &mut hidden) {
+            eprintln!("genbatch step: {e}");
+            return ExitCode::FAILURE;
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        step_ms.push(ms);
+        for n in 0..b {
+            logit[n] = logits(model, &hidden[n * d..(n + 1) * d]);
+            pos[n] += 1;
+        }
+        eprintln!(
+            "[genbatch] step {}/{ngen}: {ms:.1} ms  -> {:.2} tok/s aggregate",
+            step_ms.len(),
+            b as f64 / (ms / 1e3)
+        );
+    }
+
+    // Steady-state = drop the first 2 warm-up steps.
+    let warm = 2.min(step_ms.len().saturating_sub(1));
+    let ss = &step_ms[warm..];
+    let mean = ss.iter().sum::<f64>() / ss.len().max(1) as f64;
+    println!(
+        "genbatch B={b} ngen={ngen}: steady-state {:.1} ms/step  aggregate {:.2} tok/s  per-seq {:.3} tok/s",
+        mean,
+        b as f64 / (mean / 1e3),
+        1.0 / (mean / 1e3)
+    );
+    let s0 = &outs[0];
+    println!("slot0 tokens: {:?}", &s0[..s0.len().min(12)]);
+    let st = provider.stats();
+    println!(
+        "expert cache: {} resident ({:.1} MB), {} hits / {} misses, {} evictions",
+        st.resident,
+        st.bytes as f64 / (1024.0 * 1024.0),
+        st.hits,
+        st.misses,
+        st.evictions
+    );
+
+    // Token-identity gate: slot 0 batched must equal slot 0 decoded alone.
+    if std::env::var("COLI_BATCH_VERIFY").ok().as_deref() == Some("1") {
+        let mut kv = KvCache::for_model(model, cap);
+        let s = seqs[0].len();
+        let mut hidden = vec![0f32; s * d];
+        forward(model, &mut kv, &*provider, &seqs[0], 0, &mut hidden).unwrap();
+        let mut lg = logits(model, &hidden[(s - 1) * d..s * d]);
+        let mut p = s;
+        let mut single: Vec<i32> = Vec::with_capacity(ngen);
+        for _ in 0..ngen {
+            let nx = argmax(&lg) as i32;
+            single.push(nx);
+            let mut h = vec![0f32; d];
+            forward(model, &mut kv, &*provider, &[nx], p, &mut h).unwrap();
+            lg = logits(model, &h);
+            p += 1;
+        }
+        if single == outs[0] {
+            println!("VERIFY PASS: slot0 batched == single-sequence ({ngen} tok)");
+        } else {
+            println!("VERIFY FAIL: slot0 diverged\n single:  {single:?}\n batched: {:?}", outs[0]);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Direct parallel preload from the original model (no repack). One thread per

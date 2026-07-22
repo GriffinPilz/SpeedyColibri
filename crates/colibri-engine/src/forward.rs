@@ -215,6 +215,123 @@ pub fn forward<P: ExpertProvider>(
     Ok(())
 }
 
+/// One transformer layer over an N-sequence decode batch: each sequence `si`
+/// contributes one token at absolute position `positions[si]` with its own
+/// `kvs[si]`. Attention runs **per sequence** (an S=1 decode against that
+/// sequence's own KV history — you cannot express N different positions over N
+/// different-length histories as one contiguous `pos_base` sweep), but the
+/// post-attention MoE/dense block runs **once** over all N rows. That single MoE
+/// call is the point: [`crate::moe::compute_experts_partial`] streams the union of
+/// routed experts from disk exactly once and scatters the result to every
+/// contributing token, so the (bytes-bound) expert reads amortize across the batch.
+#[allow(clippy::too_many_arguments)]
+fn layer_forward_batched<P: ExpertProvider>(
+    model: &Model,
+    kvs: &mut [KvCache],
+    provider: &P,
+    l: &Layer,
+    li: usize,
+    x: &mut [f32],
+    positions: &[usize],
+    nrm: &mut [f32],
+    tmp: &mut [f32],
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    let n = positions.len();
+    // in_ln -> attention (per sequence) -> residual
+    for si in 0..n {
+        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
+    }
+    timed(&ATTN_US, || {
+        for si in 0..n {
+            // S=1, its own KV, its own position; decode never fires DSA (pos_base>0),
+            // so there is no selection to carry — same core as single-sequence decode.
+            attention_with(
+                cfg,
+                l,
+                li,
+                &mut kvs[si],
+                &nrm[si * d..(si + 1) * d],
+                1,
+                positions[si],
+                &mut tmp[si * d..(si + 1) * d],
+                AttnCore::Reconstruct,
+                None,
+            );
+        }
+    });
+    for j in 0..n * d {
+        x[j] += tmp[j];
+    }
+    // post_ln -> MoE/dense (ONCE over all N rows — the amortization) -> residual
+    for si in 0..n {
+        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
+    }
+    if l.sparse {
+        timed(&MOE_US, || moe(cfg, l, li, nrm, n, tmp, true, provider))?;
+    } else {
+        timed(&DENSE_US, || dense_mlp(l, nrm, n, tmp));
+    }
+    for j in 0..n * d {
+        x[j] += tmp[j];
+    }
+    Ok(())
+}
+
+/// Advance **N independent sequences by one decode step each** in a single forward.
+/// Sequence `si` feeds token `ids[si]` at absolute position `positions[si]` with its
+/// own `kvs[si]`, and its raw hidden row is written to `hidden_out[si*d..]`.
+///
+/// The whole reason this exists: decode is **bytes-bound** — each step streams the
+/// routed experts' weights from disk, which dwarfs the compute. Running N sequences'
+/// steps through one MoE call makes each unique expert's weights load **once** for the
+/// whole batch instead of once per sequence, so aggregate tok/s rises with N (until
+/// the per-layer expert union saturates all 256 experts). Per-sequence output is
+/// unchanged: attention is per-sequence and every matmul is per-row, so sequence
+/// `si`'s row is identical to a lone [`forward`] of that token — batching only shares
+/// the expert reads. See [`crate::moe`] `union_and_weights`/`compute_experts_partial`.
+pub fn forward_batched<P: ExpertProvider>(
+    model: &Model,
+    kvs: &mut [KvCache],
+    provider: &P,
+    ids: &[i32],
+    positions: &[usize],
+    hidden_out: &mut [f32],
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    let n = ids.len();
+    assert_eq!(kvs.len(), n, "one KvCache per sequence");
+    assert_eq!(positions.len(), n, "one position per sequence");
+    assert_eq!(hidden_out.len(), n * d);
+    FWD_STEP.fetch_add(1, Ordering::Relaxed);
+
+    let mut x = vec![0f32; n * d];
+    timed(&EMBED_US, || {
+        for (i, &tok) in ids.iter().enumerate() {
+            embed_row(&model.embed, tok as usize, &mut x[i * d..(i + 1) * d]);
+        }
+    });
+    let mut nrm = vec![0f32; n * d];
+    let mut tmp = vec![0f32; n * d];
+    for li in 0..model.layers.len() {
+        layer_forward_batched(
+            model,
+            kvs,
+            provider,
+            &model.layers[li],
+            li,
+            &mut x,
+            positions,
+            &mut nrm,
+            &mut tmp,
+        )?;
+    }
+    hidden_out.copy_from_slice(&x);
+    Ok(())
+}
+
 /// Logits for a single hidden-state row: final RMSNorm then `lm_head`. Port of
 /// the tail of `forward_all`.
 pub fn logits(model: &Model, hidden_row: &[f32]) -> Vec<f32> {

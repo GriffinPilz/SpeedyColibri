@@ -41,8 +41,8 @@ pub use convert::{
 pub use usage::UsageHistory;
 pub use colibri_core::Config;
 pub use forward::{
-    forward, generate_greedy, generate_stream, generate_stream_drafting, layer_forward, logits,
-    DecodeStats,
+    forward, forward_batched, generate_greedy, generate_stream, generate_stream_drafting,
+    layer_forward, logits, DecodeStats,
 };
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load};

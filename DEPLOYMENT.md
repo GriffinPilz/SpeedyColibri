@@ -39,15 +39,15 @@ The model resolves in this order: a snapshot mounted at `/model`
 (`COLI_MODEL_DIR=<dir> docker/run-dgx.sh ...`), the HF cache (the launcher
 mounts the host's `~/.cache/huggingface`, so the 358 GB download happens at most
 once and is shared with non-container runs), else `hf download
-$COLI_MODEL_REPO` (default `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
+$COLI_MODEL_REPO` (default `nvidia/GLM-5.2-NVFP4`).
 
 ### Any model: `--model <repo | url | path>`
 
 Point the container at a model with `--model` (or `$COLI_MODEL_REPO`). It takes an
 HF repo id, an HF URL, or a local path — and the model may be an
 **already-converted colibrì container** *or* a source checkpoint in block-scaled
-**FP8** or modelopt **NVFP4**. A source checkpoint is converted to the int4
-container automatically on first run:
+**FP8** or modelopt **NVFP4**. A source checkpoint is converted to the NVFP4
+container automatically on first run (`COLI_XFP8=1` for 8-bit e4m3 experts instead):
 
 ```bash
 # already-converted container (default) — served directly
@@ -66,10 +66,11 @@ docker/run-dgx.sh --model /data/my-glm-fp8 serve 8080
 `coli probe <snap>` decides which path is taken (`container` → serve as-is;
 `fp8`/`nvfp4` → convert first). The conversion is the slow part — **~1h+ and
 ~350 GB** for GLM-5.2 — so it is cached under `$COLI_CONVERT_DIR`
-(default `<HF cache>/colibri-int4/<repo-slug>-e<ebits>x<xbits>io<io_bits>`, i.e.
-inside the mounted host cache, so it survives container restarts and is only ever
-done once per model+bit-width). Bit widths come from `COLI_EBITS` (4),
-`COLI_XBITS` (=ebits), `COLI_IO_BITS` (8) and are part of the cache key. You can
+(default `<HF cache>/colibri-int4/<repo-slug>-x<xfmt>-e<ebits>io<iobits>`, where
+`xfmt` is `nvfp4` (default) or `e4m3` (`COLI_XFP8=1`)), i.e. inside the mounted host
+cache, so it survives container restarts and is only ever done once per
+model+format. The expert format (`xfmt`), resident bits (`COLI_EBITS`, 8) and I/O
+bits (`COLI_IO_BITS`, 8) are part of the cache key. You can
 also run the conversion yourself:
 
 ```bash
@@ -165,7 +166,7 @@ HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm -p 8080:808
 | `COLI_PORT` | `serve` listen port (a positional arg after `serve` overrides) | `8080` |
 | `COLI_WARMUP` | `serve` warm-up prompts, `\|`-separated | unset |
 | `COLI_CTX` | `serve` context length (prompt + completion), e.g. `64k`. Clamped to the model max (`max_position_embeddings`, 1M for GLM-5.2). KV is ~175 KB/token (~5.6 GB at 32K, ~22 GB at 128K), so raise it within your RAM budget. Requests over the limit get a `context_length_exceeded` 400. | `32768` |
-| `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
+| `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
 | `COLI_MODEL_DIR` | host path to a pre-resolved snapshot → mounted at `/model` | unset |
 | `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budget overrides. The RAM default auto-caps at `MemTotal/3` and is safe; overriding *higher* is measured to swap and lose throughput (85 → ~0.11 tok/s vs ~0.46 at default on a 121 GB Spark). | auto: `MemTotal/3` RAM |
 | `COLI_NUM_NODES` | cluster size (expert-parallel) | `1` |
@@ -248,7 +249,7 @@ a GPU matmul smoke test passes (`cargo test -p colibri-backend --features cuda`)
 `matmul_qt` routes resident weights (dense + preloaded experts) to
 `coli_cuda_matmul`, CPU fallback otherwise. Validated on the GB10 —
 `COLI_PRELOAD=1 coli gen` runs matmuls on the GPU with output identical to the CPU
-path, and an int4 `[8192,6144]` matmul measured **~18× faster** than one Grace
+path, and a quantized `[8192,6144]` matmul measured **~18× faster** than one Grace
 core (429–448 vs 24 GFLOP/s). The expert / shared / dense FFN is **fused** onto
 the GPU (`coli_cuda_expert_mlp`, one on-device `down(silu(gate·x)⊙up·x)`) —
 measured **19.2×** vs one Grace core (165 µs vs 3171 µs per expert at hidden 6144

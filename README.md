@@ -14,7 +14,7 @@ the GB10 Grace-Blackwell superchip, with the whole hot path on the GPU.
 > the **[colibrì](https://github.com/JustVugg/colibri)** project. Every idea that
 > makes this work — treating VRAM, RAM, and disk as one managed memory hierarchy;
 > streaming a 744B model's routed experts on demand while keeping the dense part
-> resident at int4; the faithful, quality-preserving GLM-5.2 forward pass — is
+> resident in low precision; the faithful, quality-preserving GLM-5.2 forward pass — is
 > theirs. This repository is a Rust rewrite of that engine — now the engine in its
 > own right; the original C sources have been retired from the tree, and correctness
 > is carried by the port's own test suite. None of this would
@@ -162,7 +162,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_TIMING` | `1` → print per-token latency + steady-state tok/s | off |
 | `COLI_EXPERT_LOG` | path → log every routing decision (`step layer pos e0..e7`) for `scripts/expert_hotset_analysis.py` | off |
 | `COLI_PREFETCH` | speculative next-layer expert prefetch. **Leave off**: measured *slower* at every degree (0.82–0.99 vs 1.01 tok/s) — speculative loads evict the working set and contend for an already-saturated NVMe | off |
-| `DRAFT` | MTP speculative decoding: draft this many tokens per step with the model's own next-token (MTP) head, then verify them in one main-model forward. Output is **bit-identical** to `DRAFT=0` (only accepted-if-they-match drafts are kept) — a decode-latency lever, never a quality change. Needs a container carrying the MTP head (kept by default; see [MTP](#mtp-speculative-decoding)). Auto-disables if acceptance falls below 10%. | off (`0`) |
+| `DRAFT` | MTP speculative decoding: draft this many tokens per step with the model's own next-token (MTP) head, then verify them in one main-model forward. **Measured break-even at best on single-sequence NVFP4** (decode is bytes-bound, not compute-bound — drafting *adds* expert reads), and **not bit-exact while drafting** (`DRAFT=0` is exact; drafting's multi-token verify runs a different attention path than S=1 decode, so ~1 token in 16 can differ). Only pays in batched serving. Auto-disables below 10% acceptance. See [Speculative decoding + batched decode](#speculative-decoding-mtp--batched-decode). | off (`0`) |
 | `MTP` | `0` force-disables the MTP head even if the container ships one (equivalent to `DRAFT=0`) | on when present |
 
 Multi-node variables (`COLI_NUM_NODES`, `COLI_PEERS`, …) are in
@@ -217,6 +217,19 @@ attention/MoE/load breakdown; `COLI_NGEN=N` sets how many tokens to generate
 COLI_TIMING=1 COLI_PROFILE=1 docker/run-dgx.sh gen 100 200 300 400
 ```
 
+### Low-level: `genbatch` (batched-decode benchmark)
+
+`coli genbatch <snap> <B> <ngen> [token_id...]` advances **B sequences one token per
+step through a single MoE call**, so the routed-expert union streams from disk once and
+amortizes across the batch (decode is bytes-bound — this is the throughput lever). It
+reports aggregate tok/s; `COLI_BATCH_VERIFY=1` also checks that a batched sequence is
+token-identical to decoding it alone. See [the measured curve](#speculative-decoding-mtp--batched-decode)
+— on a single node it's U-shaped (worse at moderate B, ~1.34× at B=64).
+
+```bash
+COLI_BATCH_VERIFY=1 ./target/release/coli genbatch /path/to/container 64 16 785 6722 315
+```
+
 ## Where it stands
 
 Running the real 358 GB model on **one** DGX Spark (GB10). The bottleneck is
@@ -255,8 +268,8 @@ optimization does:
 - Output is **bit-identical** across node counts, so **quality is node-independent** —
   it's tracked once, not per size.
 
-Config: GLM-5.2 744B MoE, **int8 resident + NVFP4 experts** (int4 experts are no longer
-produced), GB10 Grace-Blackwell, greedy decode. The 2026-07-17 rows below were on the
+Config: GLM-5.2 744B MoE, **int8 resident + NVFP4 experts** (int4 support has been
+removed from the engine entirely), GB10 Grace-Blackwell, greedy decode. The 2026-07-17 rows below were on the
 earlier int4-experts build and establish the *resident* bit-width choice; the NVFP4-vs-e4m3
 *expert*-format A/B is in [Expert quantization](#expert-quantization-nvfp4-default-e4m3-opt-out).
 
@@ -298,6 +311,51 @@ case for the multi-node work below: sharding experts cuts per-node prefill strea
 The 32k/64k rows are **extrapolations from the two measured points**, not measurements
 — they will be replaced with real numbers or struck out.
 
+### Speculative decoding (MTP) & batched decode
+
+Both are throughput levers aimed at the bytes-bound decode. Measured 2026-07-22, single
+node, NVFP4, warm.
+
+**MTP speculative decoding (`DRAFT=n`)** — the model ships a next-token (MTP) head; the
+converter keeps it by default (`has_mtp=true`), and `DRAFT=n` drafts *n* tokens per step
+and verifies them in one forward. On **single-sequence** decode it is **break-even at
+best** and a loss beyond DRAFT=2:
+
+| `DRAFT` | draft acceptance | effective tok/s | vs baseline |
+|---|---|---|---|
+| 0 (baseline) | — | 0.81 | — (bit-exact) |
+| 2 | 57% | 0.81 | break-even |
+| 4 | 30% | 0.67 | −17% |
+| 8 | 8% | auto-disabled | — |
+
+Why it doesn't pay: decode is **bytes-bound** (each token streams the routed experts from
+disk), and a verify pass over *k* drafts routes each token to its own top-8, *growing* the
+per-layer expert union — so drafting reads *more* bytes to make the same tokens. Acceptance
+improves with quantization quality (an int4 head auto-disabled at <10%; e4m3 45%; NVFP4
+57%) but never enough to win single-sequence. Drafting is also **not bit-exact** on NVFP4
+(`DRAFT=0` is exact; the multi-token verify runs a different attention path than S=1 decode
+and flips ~1 token in 16). **Keep `DRAFT=0` unless batching.**
+
+**Batched decode (`coli genbatch`)** — B sequences advance one token/step through one MoE
+call, so the expert union loads once and amortizes across the batch. Aggregate tok/s is
+**U-shaped** on a single node — batching loses in the middle (union grown, 40 GB cache
+thrashed) and wins once the union saturates:
+
+| B | aggregate tok/s | ms/token | vs B=1 |
+|---|---|---|---|
+| 1 | 0.82 | 1213 | 1.0× |
+| 8 | 0.50 | 2000 | 0.61× |
+| 16 | 0.59 | 1681 | 0.72× |
+| 32 | 0.77 | 1295 | 0.94× |
+| **64** | **1.10** | **908** | **1.34×** |
+
+This is with near-worst-case routing diversity (each sequence offset to route almost
+disjointly) — realistic traffic overlaps more, so it crosses earlier and peaks higher. The
+ceiling is set by disk bandwidth: even at saturation the union (~all 256 experts) never
+fits the cache, so every step still streams ~the whole expert set. The real lever is
+**RAM-resident experts across a cluster**, which lifts the whole curve; a continuous-batching
+scheduler pairs with that, not with a single node.
+
 ### Expert quantization: NVFP4 (default), e4m3 opt-out
 
 The routed experts (97% of the weights, and what every token streams) are stored as
@@ -314,8 +372,8 @@ block-scaled **FP8** [`unsloth/GLM-5.2-FP8`](https://huggingface.co/unsloth/GLM-
 **NVFP4 is a 4-bit block-scaled format** — 4-bit weights with a shared scale per 16
 inputs, so it is int4-small while nearly matching e4m3's accuracy. It is the default output
 of `coli convert` for **any** source (a modelopt NVFP4 source stays NVFP4 with no
-dequant/requant loss; an FP8 source is quantized straight to NVFP4). **int4 experts are no
-longer produced.** The one command:
+dequant/requant loss; an FP8 source is quantized straight to NVFP4). **int4 has been
+removed from the engine entirely** (NVFP4 is the 4-bit format now). The one command:
 
 ```bash
 docker/run-dgx.sh <hf_token> serve 8080 "warm up"   # defaults to nvidia/GLM-5.2-NVFP4 → NVFP4

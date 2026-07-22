@@ -151,10 +151,10 @@ pub fn try_gqa_attn(
     scale: f32,
 ) -> bool {
     let dbg = std::env::var("COLI_DEBUG_ACT").ok().as_deref() == Some("1");
+    if dbg {
+        eprintln!("[gqa] called S={s} T={t} avail={}", available());
+    }
     if !available() {
-        if dbg {
-            eprintln!("[gqa] gpu unavailable");
-        }
         return false;
     }
     // SAFETY: the caller (attention_gqa) sizes ctx/q as [S,H,D] and k/v as [T,Hkv,D].

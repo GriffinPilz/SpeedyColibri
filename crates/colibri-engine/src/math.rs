@@ -99,6 +99,26 @@ pub fn rope_interleave(v: &mut [f32], pos: usize, qk_rope: usize, theta: f32) {
     }
 }
 
+/// NeoX "rotate-half" partial RoPE on a `dim`-length vector at position `pos`
+/// (the HF `rotate_half` convention used by MiniMax-M3, GPT-NeoX, Llama, etc.).
+///
+/// Pairs dimension `j` with `j + dim/2` (contiguous halves), NOT the interleaved
+/// `(2j, 2j+1)` pairs of [`rope_interleave`]. `q_embed[j] = q[j]·cos − q[half+j]·sin`,
+/// `q_embed[half+j] = q[half+j]·cos + q[j]·sin`, with `freq_j = theta^(-2j/dim)`.
+pub fn rope_neox(v: &mut [f32], pos: usize, dim: usize, theta: f32) {
+    let half = dim / 2;
+    debug_assert!(v.len() >= dim);
+    for j in 0..half {
+        let inv = theta.powf(-2.0 * j as f32 / dim as f32);
+        let ang = pos as f32 * inv;
+        let (sn, cs) = ang.sin_cos();
+        let a = v[j];
+        let b = v[half + j];
+        v[j] = a * cs - b * sn;
+        v[half + j] = b * cs + a * sn;
+    }
+}
+
 /// Sigmoid. Port of `sigmoidf`.
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {

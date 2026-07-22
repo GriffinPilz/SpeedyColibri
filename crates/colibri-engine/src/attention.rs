@@ -22,7 +22,7 @@
 //! a no-op for context ≤ `index_topk` and a strict speedup above it.
 
 use crate::linear::{matmul_qt, qt_addrow, qt_matvec_rows};
-use crate::math::{rmsnorm_inplace, rope_interleave, softmax};
+use crate::math::{rmsnorm_inplace, rope_interleave, rope_neox, softmax};
 use crate::model::{KvCache, Layer};
 use colibri_cluster::{AttnRequest, ExpertSharding, NodeId, Transport};
 use colibri_core::Config;
@@ -145,12 +145,12 @@ pub fn attention_gqa(
         for hh in 0..h {
             let qs = &mut q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
             rmsnorm_inplace(qs, &l.q_norm, eps);
-            rope_interleave(&mut qs[..rot], pos, rot, theta);
+            rope_neox(&mut qs[..rot], pos, rot, theta);
         }
         for hh in 0..kvh {
             let ks = &mut k[s * kv_dim + hh * hd..s * kv_dim + hh * hd + hd];
             rmsnorm_inplace(ks, &l.k_norm, eps);
-            rope_interleave(&mut ks[..rot], pos, rot, theta);
+            rope_neox(&mut ks[..rot], pos, rot, theta);
         }
         kv.k_full_row_mut(layer, pos)
             .copy_from_slice(&k[s * kv_dim..(s + 1) * kv_dim]);

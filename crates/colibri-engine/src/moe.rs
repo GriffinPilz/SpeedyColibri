@@ -1120,6 +1120,39 @@ mod tests {
         Config::from_json(&json).unwrap()
     }
 
+    // MiniMax-M3 (and GLM) routing: sigmoid scoring, additive selection bias,
+    // top-k by (sigmoid + bias), weights = normalized raw sigmoids × routed_scale.
+    #[test]
+    fn route_sigmoid_bias_topk_normalized_scaled() {
+        let json = colibri_json::Json::parse(
+            r#"{"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,
+                "n_routed_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":3,
+                "intermediate_size":4,"first_k_dense_replace":0,"q_lora_rank":2,
+                "kv_lora_rank":2,"qk_nope_head_dim":2,"qk_rope_head_dim":2,"v_head_dim":2,
+                "n_shared_experts":1,"vocab_size":8,"n_group":1,"topk_group":1,
+                "norm_topk_prob":true,"rms_norm_eps":1e-5,"routed_scaling_factor":2.0,
+                "rope_parameters":{"rope_theta":10000.0},"eos_token_id":[7],
+                "index_topk":0,"index_n_heads":0,"index_head_dim":0}"#,
+        )
+        .unwrap();
+        let cfg = Config::from_json(&json).unwrap();
+        // Expert 0 has the lowest logit but a large selection bias → it must be
+        // chosen; expert 1 has the highest logit. 2 and 3 lose on sigmoid+bias.
+        let logits = [0.0f32, 2.0, -1.0, 0.3];
+        let bias = [5.0f32, 0.0, 0.0, 0.0];
+        let (idx, w) = route(&cfg, &logits, &bias);
+        assert_eq!(idx.len(), 2);
+        assert!(idx.contains(&0) && idx.contains(&1), "chosen {idx:?}");
+        // Weights are the *raw* sigmoid(logit) (bias affects selection only),
+        // normalized over the chosen set, then scaled by routed_scaling_factor.
+        let (s0, s1) = (crate::math::sigmoid(0.0), crate::math::sigmoid(2.0));
+        let sum = s0 + s1;
+        let wmap: std::collections::HashMap<usize, f32> =
+            idx.iter().copied().zip(w.iter().copied()).collect();
+        assert!((wmap[&0] - s0 / sum * 2.0).abs() < 1e-5);
+        assert!((wmap[&1] - s1 / sum * 2.0).abs() < 1e-5);
+    }
+
     fn expert(seed: usize, inter: usize, d: usize) -> Expert {
         let mk = |o: usize, i: usize, s: usize| {
             let w: Vec<f32> = (0..o * i)

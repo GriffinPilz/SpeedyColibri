@@ -199,7 +199,11 @@ fn load_layer(
     } else {
         // MoE: router (f32) + shared expert. Routed experts stream on demand.
         l.router = ld(shards, &p("mlp.gate.weight"))?;
-        l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))?;
+        // The router selection bias sits under `.gate.` on GLM but directly under the
+        // MoE block on MiniMax-M3 (`block_sparse_moe.e_score_correction_bias` →
+        // `mlp.e_score_correction_bias`); accept either.
+        l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))
+            .or_else(|_| ld(shards, &p("mlp.e_score_correction_bias")))?;
         let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
         l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?;
         l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?;

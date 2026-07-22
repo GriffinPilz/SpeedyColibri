@@ -1329,9 +1329,11 @@ mod tests {
             m("language_model.model.layers.3.block_sparse_moe.gate.weight").as_deref(),
             Some("model.layers.3.mlp.gate.weight")
         );
+        // The router bias sits directly under the MoE block in M3 (not under `.gate.`);
+        // it maps to `mlp.e_score_correction_bias`, which the loader accepts.
         assert_eq!(
-            m("language_model.model.layers.3.block_sparse_moe.gate.e_score_correction_bias").as_deref(),
-            Some("model.layers.3.mlp.gate.e_score_correction_bias")
+            m("language_model.model.layers.3.block_sparse_moe.e_score_correction_bias").as_deref(),
+            Some("model.layers.3.mlp.e_score_correction_bias")
         );
         assert_eq!(
             m("language_model.model.layers.3.block_sparse_moe.shared_experts.up_proj.weight").as_deref(),

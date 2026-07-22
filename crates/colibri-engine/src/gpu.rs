@@ -150,15 +150,11 @@ pub fn try_gqa_attn(
     t: usize,
     scale: f32,
 ) -> bool {
-    let dbg = std::env::var("COLI_DEBUG_ACT").ok().as_deref() == Some("1");
-    if dbg {
-        eprintln!("[gqa] called S={s} T={t} avail={}", available());
-    }
     if !available() {
         return false;
     }
     // SAFETY: the caller (attention_gqa) sizes ctx/q as [S,H,D] and k/v as [T,Hkv,D].
-    let ok = unsafe {
+    unsafe {
         cuda::gqa_attn_raw(
             ctx.as_mut_ptr(),
             q.as_ptr(),
@@ -171,11 +167,7 @@ pub fn try_gqa_attn(
             t as i32,
             scale,
         )
-    };
-    if dbg && !ok {
-        eprintln!("[gqa] kernel declined: S={s} H={h} Hkv={hkv} D={d} T={t}");
     }
-    ok
 }
 
 /// How many matmuls actually ran on the GPU this thread (proof the path fired).

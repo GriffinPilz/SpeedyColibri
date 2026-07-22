@@ -478,6 +478,20 @@ fn weight_ptr(w: &QTensor) -> *const c_void {
 /// true while the caller holds the `Arc<Expert>` across the kernel call. int4 stays
 /// offset-binary (the kernel reads it with off=1). Only valid when `zerocopy()`.
 fn wrap_fresh(w: &QTensor) -> Option<cuda::ResidentTensor> {
+    // NVFP4 carries three host buffers (nibbles + ue4m3 block scales + f32 global)
+    // rather than weights + per-row scale; wrap all three zero-copy.
+    if w.fmt_code == 5 {
+        return unsafe {
+            cuda::ResidentTensor::wrap_raw_nvfp4(
+                w.q4.as_ptr() as *const c_void,
+                w.bs.as_ptr() as *const c_void,
+                w.g,
+                w.i,
+                w.o,
+                0,
+            )
+        };
+    }
     unsafe { cuda::ResidentTensor::wrap_raw(weight_ptr(w), w.s.as_ptr(), w.fmt_code, w.i, w.o, 0) }
 }
 
@@ -545,7 +559,9 @@ pub fn try_expert_ffn(
         // SAFETY: g/u/d live until end of scope, covering the synchronous kernel +
         // download in expert_mlp_raw; out/x sized [nr, O]/[nr, I] by ffn().
         let ok = unsafe {
-            if gate.fmt_code == 4 {
+            if gate.fmt_code == 5 {
+                cuda::expert_mlp_nvfp4_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            } else if gate.fmt_code == 4 {
                 cuda::expert_mlp_fp8_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
             } else if gate.fmt_code == 1 && tile_i8_enabled() {
                 cuda::expert_mlp_i8a16_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
@@ -557,6 +573,11 @@ pub fn try_expert_ffn(
             GPU_FFN.with(|c| c.set(c.get() + 1));
         }
         return ok;
+    }
+    // NVFP4 has no device-copy path (the block-scale/global plumbing is zero-copy only);
+    // fall back to the CPU decode (matmul_qt fmt=5) when zero-copy is unavailable.
+    if gate.fmt_code == 5 {
+        return false;
     }
     // Copy path: cached device uploads. all three must stay resident together for
     // the fused kernel — protect them from eviction.

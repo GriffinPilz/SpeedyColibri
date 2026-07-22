@@ -90,11 +90,18 @@ pub struct ConvertOpts {
     /// `xbits`-bit int — `--xfp8`. Preserves the source FP8's 8-bit weight precision
     /// (vs int4's 4) at 2× the streamed bytes; consumed by the tiled FP8 expert kernel.
     pub xfp8: bool,
+    /// emit routed experts as **NVFP4** (e2m1 nibbles + per-16 ue4m3 block scale +
+    /// per-tensor global) — `COLI_XNVFP4=1`. The weight is one U8 blob (nibbles ++
+    /// block-scales) plus a `{name}.g` F32 global; consumed by the `nvfp4_gemv`/tiled
+    /// kernels. 0.5625 B/wt (vs int4 0.5, e4m3 1.0) at ~e4m3 quality; the natural
+    /// output when the SOURCE is already modelopt NVFP4 (no dequant/requant loss).
+    /// Takes precedence over `xfp8`. See [`quantize_nvfp4`].
+    pub xnvfp4: bool,
 }
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false }
+        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, xnvfp4: false, mtp_only: false }
     }
 }
 
@@ -415,7 +422,7 @@ fn quantize(name: &str, w: &[f32], o: usize, i: usize, bits: u32) -> (OutTensor,
 /// Encode f32 → e4m3 fp8 (OCP: 1 sign, 4 exp bias-7, 3 mantissa; no infinity; max
 /// normal ±448; round-to-nearest on the mantissa). The caller pre-scales into range,
 /// so saturation is a safety net. NaN/0 → signed zero.
-fn float_to_e4m3(x: f32) -> u8 {
+pub(crate) fn float_to_e4m3(x: f32) -> u8 {
     let sign: u8 = if x.is_sign_negative() { 0x80 } else { 0x00 };
     let a = x.abs();
     if !(a > 0.0) {
@@ -477,6 +484,268 @@ fn quantize_e4m3(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, OutTe
         bytes: f32_bytes(&scale),
     };
     (codes_t, scale_t)
+}
+
+/// Nearest e2m1 code (0..15, bit 3 = sign) for `t`. Mirrors [`e2m1_round`] but returns
+/// the packed nibble instead of the value; ties resolve to the first (even) magnitude,
+/// matching `e2m1_round`/the CUDA LUT decode.
+fn e2m1_code(t: f32) -> u8 {
+    let a = t.abs();
+    let mut best = 0usize;
+    let mut bd = f32::INFINITY;
+    for (idx, &c) in E2M1_LEVELS.iter().enumerate() {
+        let d = (a - c).abs();
+        if d < bd {
+            bd = d;
+            best = idx;
+        }
+    }
+    (if t.is_sign_negative() { 8u8 } else { 0 }) | best as u8
+}
+
+/// Encode `[o, i]` f32 → NVFP4: `(nibbles, block_scales, global)`.
+///   - `nibbles`      packed e2m1, 2/byte, low nibble = even column, `o*ceil(i/2)` bytes
+///   - `block_scales` one ue4m3 byte per 16 inputs, `o*ceil(i/16)` bytes, row-major
+///   - `global`       one f32 (modelopt-style, multiplied): `amax / (6 * 448)`
+///
+/// The block scale is encoded with [`float_to_e4m3`] and the effective divisor is read
+/// **back** from that byte (`f8e4m3_to_f32(code) * global`), so encode and the kernel/CPU
+/// decode agree exactly. This is the real quantizer behind [`quantize_nvfp4_sim`]'s
+/// reconstruction (which was scored at 9.4% rel-RMS on the real experts).
+fn quantize_nvfp4(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<u8>, f32) {
+    let amax = w.iter().fold(0f32, |m, &v| m.max(v.abs()));
+    let global = (amax / (E2M1_LEVELS[7] * UE4M3_MAX)).max(f32::MIN_POSITIVE);
+    let nb = i.div_ceil(NVFP4_BLOCK);
+    let rb = i.div_ceil(2);
+    let mut nib = vec![0u8; o * rb];
+    let mut bsc = vec![0u8; o * nb];
+    for r in 0..o {
+        for b in 0..nb {
+            let c0 = b * NVFP4_BLOCK;
+            let c1 = ((b + 1) * NVFP4_BLOCK).min(i);
+            let blk = &w[r * i + c0..r * i + c1];
+            let bmax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let code = float_to_e4m3(bmax / E2M1_LEVELS[7] / global);
+            bsc[r * nb + b] = code;
+            let eff = colibri_core::dtype::f8e4m3_to_f32(code) * global;
+            for (k, &v) in blk.iter().enumerate() {
+                let cd = if eff > 0.0 { e2m1_code(v / eff) } else { 0 };
+                let c = c0 + k;
+                if c & 1 == 0 {
+                    nib[r * rb + (c >> 1)] |= cd;
+                } else {
+                    nib[r * rb + (c >> 1)] |= cd << 4;
+                }
+            }
+        }
+    }
+    (nib, bsc, global)
+}
+
+/// gate/up_proj are `[moe_inter, hidden]`; down_proj is `[hidden, moe_inter]`.
+fn expert_oi(name: &str, hidden: usize, moe_inter: usize) -> (usize, usize) {
+    if name.contains("down_proj") {
+        (hidden, moe_inter)
+    } else {
+        (moe_inter, hidden)
+    }
+}
+
+/// One re-quantized tensor: dropped (a consumed expert `.qs`), copied through raw, or an
+/// expert weight turned into (weight-blob U8 = nibbles++block-scales, global F32). The
+/// block scales are CONCATENATED onto the nibbles in a single U8 tensor so the loader's
+/// coalesced gate/up/down read grabs them together, zero-copy — a separate `.bs` sidecar
+/// would cost one uncoalesced random-seek pread per expert (measured 15x slower decode).
+enum ReqOut {
+    Skip,
+    Raw(OutTensor),
+    Nvfp4(OutTensor, OutTensor),
+}
+
+/// Copy one tensor through unchanged (raw on-disk bytes, same dtype + shape).
+fn copy_raw(name: &str, shards: &Shards) -> io::Result<ReqOut> {
+    let t = shards
+        .find(name)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}")))?;
+    let mut bytes = vec![0u8; t.nbytes as usize];
+    shards.read_raw(name, &mut bytes)?;
+    Ok(ReqOut::Raw(OutTensor {
+        name: name.to_string(),
+        dtype: t.dtype.safetensors_str(),
+        shape: t.shape.clone(),
+        bytes,
+    }))
+}
+
+/// Re-quantize one container tensor: expert e4m3 weight → NVFP4; its `.qs` dropped;
+/// everything else copied through byte-for-byte.
+fn requant_one(
+    name: &str,
+    shards: &Shards,
+    n_layers: usize,
+    hidden: usize,
+    moe_inter: usize,
+) -> io::Result<ReqOut> {
+    // A per-row `.qs` belonging to an expert weight is consumed by that weight's NVFP4
+    // encoding (which reads it to dequant e4m3); drop it. Resident `.qs` copies through.
+    if let Some(base) = name.strip_suffix(".qs") {
+        if classify(base, n_layers, true, false) == Kind::X {
+            return Ok(ReqOut::Skip);
+        }
+        return copy_raw(name, shards);
+    }
+    if name.ends_with(".weight") && classify(name, n_layers, true, false) == Kind::X {
+        let (o, i) = expert_oi(name, hidden, moe_inter);
+        let t = shards.find(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}"))
+        })?;
+        if t.numel as usize != o * i {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name}: expected {o}x{i}={} e4m3 codes, got {}", o * i, t.numel),
+            ));
+        }
+        let mut codes = vec![0u8; o * i];
+        shards.read_raw(name, &mut codes)?;
+        let mut qs = vec![0f32; o];
+        shards.read_f32(&format!("{name}.qs"), &mut qs)?;
+        let mut w = vec![0f32; o * i];
+        for r in 0..o {
+            let s = qs[r];
+            for c in 0..i {
+                w[r * i + c] = colibri_core::dtype::f8e4m3_to_f32(codes[r * i + c]) * s;
+            }
+        }
+        let (mut blob, bsc, g) = quantize_nvfp4(&w, o, i);
+        blob.extend_from_slice(&bsc); // weight = nibbles ++ block-scales (one coalesced read)
+        return Ok(ReqOut::Nvfp4(
+            OutTensor { name: name.to_string(), dtype: "U8", shape: vec![blob.len() as i64], bytes: blob },
+            OutTensor { name: format!("{name}.g"), dtype: "F32", shape: vec![1], bytes: f32_bytes(&[g]) },
+        ));
+    }
+    copy_raw(name, shards)
+}
+
+/// Re-quantize the routed experts of an existing colibrì **e4m3 container** to NVFP4,
+/// copying every other tensor through byte-for-byte. Container→container because the
+/// source FP8 checkpoint is no longer on disk; the e4m3 experts are 8-bit, so decoding
+/// them to f32 and re-quantizing to 4-bit NVFP4 loses essentially nothing beyond NVFP4's
+/// own floor. Only `Kind::X` expert weights change; resident/router/norm/indexer stay
+/// exactly as they were (quality-critical, already 8-bit int).
+///
+/// Per expert weight `W`: `W` U8 = packed e2m1 nibbles (`O*ceil(I/2)`) CONCATENATED with
+/// ue4m3 block scales (`O*ceil(I/16)`), and `W.g` F32 global. Concatenating means the
+/// loader's one coalesced gate/up/down read grabs the block scales too, zero-copy — a
+/// separate `.bs` tensor cost one uncoalesced random-seek pread per expert (15x slower
+/// decode, measured). Expert blobs stay contiguous per shard so `load_expert` coalesces
+/// gate/up/down. `keep_indexer=true` (DSA container) is assumed.
+pub fn requant_experts_nvfp4(
+    indir: impl AsRef<Path>,
+    outdir: impl AsRef<Path>,
+    n_layers: usize,
+    hidden: usize,
+    moe_inter: usize,
+    mut progress: impl FnMut(usize, usize, &ConvertStats),
+) -> io::Result<ConvertStats> {
+    let indir = indir.as_ref();
+    let outdir = outdir.as_ref();
+    std::fs::create_dir_all(outdir)?;
+    let shards = Shards::open(indir)?;
+    let nfiles = shards.num_files();
+    let mut by_file: Vec<Vec<&str>> = vec![Vec::new(); nfiles];
+    for t in shards.tensors() {
+        by_file[t.file_idx].push(&t.name);
+    }
+    let cap = std::env::var("COLI_CONVERT_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4));
+
+    // Reborrow as `&Shards` so the worker `move` closures copy the reference instead of
+    // moving the owned `Shards` (which `by_file` still borrows). Mirrors `process_names_parallel`.
+    let sref: &Shards = &shards;
+    let mut stats = ConvertStats::default();
+    for (fi, names) in by_file.iter().enumerate() {
+        // Parallel dequant + NVFP4 encode across cores, order preserved.
+        let n = names.len();
+        let mut parts: Vec<io::Result<Vec<ReqOut>>> = Vec::new();
+        let nthreads = cap.min(n.max(1));
+        let chunk = n.div_ceil(nthreads.max(1));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = names
+                .chunks(chunk.max(1))
+                .map(|slice| {
+                    scope.spawn(move || {
+                        slice
+                            .iter()
+                            .map(|&nm| requant_one(nm, sref, n_layers, hidden, moe_inter))
+                            .collect::<io::Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+            for h in handles {
+                parts.push(h.join().unwrap());
+            }
+        });
+        let mut codes: Vec<OutTensor> = Vec::new();
+        let mut floats: Vec<OutTensor> = Vec::new();
+        for part in parts {
+            for out in part? {
+                match out {
+                    ReqOut::Skip => stats.tensors_skipped += 1,
+                    ReqOut::Raw(t) => {
+                        if t.dtype == "U8" {
+                            codes.push(t);
+                        } else {
+                            floats.push(t);
+                        }
+                        stats.tensors_f32 += 1;
+                    }
+                    ReqOut::Nvfp4(blob, g) => {
+                        codes.push(blob); // weight = nibbles++block-scales, kept contiguous
+                        floats.push(g);
+                        stats.tensors_quantized += 1;
+                    }
+                }
+            }
+        }
+        if !codes.is_empty() || !floats.is_empty() {
+            codes.extend(floats);
+            let path = outdir.join(format!("out-{fi:05}.safetensors"));
+            write_shard(&path, &codes)?;
+            stats.shards_written += 1;
+            stats.bytes_out += codes.iter().map(|t| t.bytes.len() as u64).sum::<u64>();
+        }
+        progress(fi, nfiles, &stats);
+    }
+    for fname in [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "generation_config.json",
+        "special_tokens_map.json",
+    ] {
+        let src = indir.join(fname);
+        if src.exists() {
+            std::fs::copy(&src, outdir.join(fname))?;
+        }
+    }
+    Ok(stats)
+}
+
+/// Emit a routed expert as an NVFP4 container tensor pair, matching what the loader
+/// (`moe::expert_from_views` fmt=5) reads: `name` = U8 blob of packed e2m1 nibbles
+/// CONCATENATED with ue4m3 block scales (so the coalesced gate/up/down read grabs both),
+/// and `{name}.g` = the F32 per-tensor global. Same shape as [`quantize`]'s output pair
+/// (codes + scale sidecar), so it drops into the existing `TensorOut::Quant` path.
+fn quantize_nvfp4_out(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, OutTensor) {
+    let (mut blob, bsc, g) = quantize_nvfp4(w, o, i);
+    blob.extend_from_slice(&bsc);
+    (
+        OutTensor { name: name.to_string(), dtype: "U8", shape: vec![blob.len() as i64], bytes: blob },
+        OutTensor { name: format!("{name}.g"), dtype: "F32", shape: vec![1], bytes: f32_bytes(&[g]) },
+    )
 }
 
 /// Write a safetensors shard from tensors already materialized in memory.
@@ -598,7 +867,7 @@ fn ue4m3_round(v: f32) -> f32 {
 /// ~0.56 bytes/weight against int4's 0.5 (e2m1 plus one ue4m3 per 16 inputs) — what
 /// that byte difference costs in throughput is NOT measured here and should not be
 /// inferred from it.
-fn quantize_nvfp4_sim(w: &[f32], o: usize, i: usize) -> Vec<f32> {
+pub(crate) fn quantize_nvfp4_sim(w: &[f32], o: usize, i: usize) -> Vec<f32> {
     let amax = w.iter().fold(0f32, |m, &v| m.max(v.abs()));
     let global = (amax / (E2M1_LEVELS[7] * UE4M3_MAX)).max(f32::MIN_POSITIVE);
     let mut out = vec![0f32; o * i];
@@ -840,7 +1109,9 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
                 _ => opts.ebits,
             };
             let (o, i) = (shape[0] as usize, shape[1] as usize);
-            let (codes_t, scale_t) = if matches!(kind, Kind::X) && opts.xfp8 {
+            let (codes_t, scale_t) = if matches!(kind, Kind::X) && opts.xnvfp4 {
+                quantize_nvfp4_out(name, &w, o, i)
+            } else if matches!(kind, Kind::X) && opts.xfp8 {
                 quantize_e4m3(name, &w, o, i)
             } else {
                 quantize(name, &w, o, i, bits)
@@ -1088,6 +1359,46 @@ mod tests {
         let approx = quantize_nvfp4_sim(&w, o, i);
         let diff = w.iter().zip(&approx).filter(|(a, b)| a != b).count();
         assert!(diff > w.len() / 4, "only {diff}/{} values changed — sim is a no-op?", w.len());
+    }
+
+    #[test]
+    fn nvfp4_encode_decode_matches_sim() {
+        // The REAL quantizer's decoded output must equal the validated reconstruction
+        // (quantize_nvfp4_sim), scored at 9.4% rel-RMS on real experts. If the packed
+        // container decodes to something else, the shipped model no longer matches what
+        // the quality gate measured — this test ties the two together. It also exercises
+        // exactly the nibble packing (low=even col), per-16 block-scale indexing, and
+        // global application that the CPU (linear.rs fmt=5) and CUDA kernels decode.
+        let (o, i) = (8usize, 128usize);
+        let mut w = vec![0f32; o * i];
+        for r in 0..o {
+            for c in 0..i {
+                let mag = 10f32.powi(-((c / 16) as i32 % 4)); // wide dynamic range per row
+                w[r * i + c] = mag * if (r + c) % 3 == 0 { -1.0 } else { 1.0 };
+            }
+        }
+        let (nib, bs, g) = quantize_nvfp4(&w, o, i);
+        let nb = i.div_ceil(NVFP4_BLOCK);
+        let rb = i.div_ceil(2);
+        assert_eq!(nib.len(), o * rb);
+        assert_eq!(bs.len(), o * nb);
+        let mut dec = vec![0f32; o * i];
+        for r in 0..o {
+            for c in 0..i {
+                let byte = nib[r * rb + (c >> 1)];
+                let code = if c & 1 == 1 { byte >> 4 } else { byte & 0x0f } as usize;
+                let bsc = colibri_core::dtype::f8e4m3_to_f32(bs[r * nb + c / NVFP4_BLOCK]);
+                dec[r * i + c] = E2M1[code] * bsc * g;
+            }
+        }
+        let sim = quantize_nvfp4_sim(&w, o, i);
+        let (mut se, mut sr) = (0f64, 0f64);
+        for (&a, &b) in dec.iter().zip(&sim) {
+            se += ((a - b) as f64).powi(2);
+            sr += (b as f64).powi(2);
+        }
+        let rel = (se / sr.max(1e-30)).sqrt();
+        assert!(rel < 1e-4, "decode(quantize_nvfp4) vs sim rel-RMS {rel:e} too large");
     }
 
     #[test]
@@ -1475,7 +1786,7 @@ mod tests {
         drop(f);
 
         let outdir = tmp();
-        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false };
+        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, xnvfp4: false, mtp_only: false };
         let stats = convert_snapshot(&indir, &outdir, opts, |_, _, _| {}).unwrap();
         assert_eq!(stats.tensors_quantized, 1); // o_proj
         assert_eq!(stats.tensors_f32, 1); // norm

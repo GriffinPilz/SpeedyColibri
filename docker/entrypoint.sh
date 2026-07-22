@@ -149,22 +149,36 @@ ensure_container() {
       ;;
   esac
 
-  # Cache key: the model spec, flattened. Bit-widths are part of the key so a
-  # different COLI_EBITS/COLI_XBITS doesn't silently reuse the wrong container.
+  # Preserve NVFP4: a modelopt NVFP4 source (nvidia/GLM-5.2-NVFP4) is converted to an
+  # NVFP4 container by default — 4-bit block-scaled experts, ~2x faster prefill+decode
+  # than e4m3 at <1% perplexity — instead of being DOWNGRADED to int4. The user can still
+  # force int4 (COLI_XNVFP4=0 COLI_XFP8=0) or e4m3 (COLI_XFP8=1).
+  if [[ "$fmt" == "nvfp4" && -z "${COLI_XFP8:-}" && -z "${COLI_XNVFP4:-}" ]]; then
+    export COLI_XNVFP4=1
+  fi
+
+  # Human-readable expert-format tag for the cache key + logs, so nvfp4 / e4m3 / int4
+  # conversions of the same source don't collide.
+  local xfmt="int${COLI_XBITS:-4}"
+  [[ "${COLI_XFP8:-0}" == 1 ]] && xfmt="e4m3"
+  [[ "${COLI_XNVFP4:-0}" == 1 ]] && xfmt="nvfp4"
+
+  # Cache key: the model spec, flattened, plus the expert format + resident bit-widths so
+  # a different COLI_XNVFP4/COLI_XFP8/COLI_EBITS doesn't silently reuse the wrong container.
   slug="${COLI_MODEL_REPO//\//--}"
   slug="${slug//[^A-Za-z0-9._-]/_}"
-  dest="${COLI_CONVERT_DIR}/${slug}-e${COLI_EBITS:-8}x${COLI_XBITS:-4}io${COLI_IO_BITS:-8}"
+  dest="${COLI_CONVERT_DIR}/${slug}-x${xfmt}-e${COLI_EBITS:-8}io${COLI_IO_BITS:-8}"
 
   if [[ -f "$dest/.convert-complete" ]]; then
-    echo "[coli] using cached int4 container: $dest" >&2
+    echo "[coli] using cached ${xfmt} container: $dest" >&2
     echo "$dest"
     return
   fi
 
-  echo "[coli] source format: $fmt — converting to the int4 container (one time)" >&2
+  echo "[coli] source format: $fmt — converting to the ${xfmt} container (one time)" >&2
   echo "[coli]   $src" >&2
   echo "[coli]   -> $dest   (cache: \$COLI_CONVERT_DIR=$COLI_CONVERT_DIR)" >&2
-  echo "[coli]   this takes a while (~1h+ for GLM-5.2) and needs ~350 GB free" >&2
+  echo "[coli]   this takes a while (~20-60 min for GLM-5.2) and needs ~450 GB free" >&2
   # A partial dir from an interrupted run must not be reused: rebuild from scratch,
   # and only mark complete after convert exits 0.
   rm -rf "$dest"

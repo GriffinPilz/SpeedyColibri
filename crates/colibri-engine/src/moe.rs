@@ -314,7 +314,9 @@ pub fn load_expert(
 ) -> io::Result<Expert> {
     let wn = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
     let (gate_w, up_w, down_w) = (wn("gate_proj"), wn("up_proj"), wn("down_proj"));
-    let mut ex = if shards.has(&format!("{gate_w}.qs")) {
+    // Container marker is `.qs` (int/e4m3 per-row scales) OR `.g` (NVFP4 global scale);
+    // NVFP4 experts drop `.qs` entirely, so both must count as "pre-quantized container".
+    let mut ex = if shards.has(&format!("{gate_w}.qs")) || shards.has(&format!("{gate_w}.g")) {
         // Pre-quantized container: the 3 weights are contiguous on disk (~18 MB),
         // so read them in ONE coalesced read into a shared buffer the tensors view
         // — instead of 3 separate reads + allocations (the streaming bottleneck).
@@ -348,6 +350,48 @@ pub fn load_expert(
 fn expert_fp8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_FP8").ok().as_deref() == Some("1"))
+}
+
+/// `COLI_EXPERT_NVFP4_SIM=1` (requires `COLI_EXPERT_FP8=1`): at load, round-trip each
+/// e4m3 expert weight through the NVFP4 grid (e2m1 + per-16 ue4m3 block scale +
+/// per-tensor global) and re-encode to e4m3, so the existing tiled/GEMV fp8 kernel runs
+/// at NVFP4 *quality* while keeping e4m3 *speed and bytes*. This measures NVFP4's true
+/// end-to-end perplexity cost (`coli ppl`) BEFORE committing to the NVFP4 container +
+/// dedicated FP4 kernel — the reconstruction-error probe (9.4% rel-RMS) does not predict
+/// perplexity. Slower to load (per-expert re-quantize on the reader threads); off by
+/// default. Tokens WILL differ from the e4m3 baseline — that divergence is the signal.
+fn expert_nvfp4_sim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_NVFP4_SIM").ok().as_deref() == Some("1"))
+}
+
+/// Round-trip e4m3 codes (`o`×`i`, per-row `row_scale`) through NVFP4 and re-encode to
+/// e4m3, returning `(new_codes, new_row_scales)`. Decode e4m3→f32, apply the validated
+/// [`crate::convert::quantize_nvfp4_sim`] (per-tensor global + per-16 ue4m3 blocks +
+/// e2m1), then re-quantize per-row to e4m3 (absmax/448). The re-encode adds negligible
+/// error — e4m3's 8 bits are far finer than the NVFP4 grid the values now sit on.
+fn nvfp4_sim_e4m3(codes: &[u8], o: usize, i: usize, row_scale: &[f32]) -> (Vec<u8>, Vec<f32>) {
+    let mut w = vec![0f32; o * i];
+    for r in 0..o {
+        let s = row_scale[r];
+        for c in 0..i {
+            w[r * i + c] = colibri_core::dtype::f8e4m3_to_f32(codes[r * i + c]) * s;
+        }
+    }
+    let recon = crate::convert::quantize_nvfp4_sim(&w, o, i);
+    let mut out = vec![0u8; o * i];
+    let mut ns = vec![0f32; o];
+    for r in 0..o {
+        let row = &recon[r * i..(r + 1) * i];
+        let amax = row.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let s = if amax > 0.0 { amax / 448.0 } else { 1.0 };
+        let inv = 1.0 / s;
+        for c in 0..i {
+            out[r * i + c] = crate::convert::float_to_e4m3(row[c] * inv);
+        }
+        ns[r] = s;
+    }
+    (out, ns)
 }
 
 /// Convert a packed int4 weight matrix (offset-binary nibbles, value = nibble − 8,
@@ -388,6 +432,29 @@ fn expert_from_views(
               w: &(Arc<colibri_core::SharedBuf>, usize, usize),
               sname: String|
      -> io::Result<QTensor> {
+        // NVFP4 experts: the weight blob is `nibbles ++ ue4m3 block-scales`, read as ONE
+        // coalesced buffer together with gate/up/down (a separate `.bs` read cost one
+        // uncoalesced random-seek pread per expert — 15x slower decode). Told apart from
+        // int4 by the `.g` (per-tensor global scale) sidecar. Both halves are zero-copy
+        // views into the shared buffer. See convert::requant_experts_nvfp4.
+        let base = sname.strip_suffix(".qs").unwrap_or(&sname);
+        let g_name = format!("{base}.g");
+        if shards.has(&g_name) {
+            let (buf, off, _len) = w;
+            let nib_bytes = o * i.div_ceil(2);
+            let bs_bytes = o * i.div_ceil(16);
+            let mut g = [0f32; 1];
+            shards.read_f32(&g_name, &mut g)?;
+            return Ok(QTensor {
+                fmt_code: 5,
+                o: o as i32,
+                i: i as i32,
+                q4: Bytes::Shared { buf: buf.clone(), off: *off, len: nib_bytes },
+                bs: Bytes::Shared { buf: buf.clone(), off: *off + nib_bytes, len: bs_bytes },
+                g: g[0],
+                ..Default::default()
+            });
+        }
         let (buf, off, len) = w;
         let fmt = if *len == o * i {
             1
@@ -425,7 +492,15 @@ fn expert_from_views(
                 // 1 B/weight, indistinguishable by length from int8. Use them directly,
                 // no conversion. Routed experts are never genuinely int8.
                 t.q8 = Vec::new();
-                t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+                if expert_nvfp4_sim_enabled() {
+                    // NVFP4-quality probe: round-trip through the NVFP4 grid, re-encode
+                    // to e4m3. `t.s` currently holds the container's per-row scales.
+                    let (nc, ns) = nvfp4_sim_e4m3(&buf[*off..*off + *len], o, i, &t.s);
+                    t.s = ns;
+                    t.q4 = Bytes::Owned(nc);
+                } else {
+                    t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+                }
                 t.fmt_code = 4;
             }
         }
@@ -467,12 +542,10 @@ pub fn load_experts_batch(
         return Ok(Vec::new());
     }
     // The pooled path applies only to the pre-quantized container (contiguous
-    // gate|up|down + sidecar scales). Detect via the first expert's scales tensor.
-    let probe = format!(
-        "model.layers.{layer}.mlp.experts.{}.gate_proj.weight.qs",
-        eids[0]
-    );
-    if !shards.has(&probe) {
+    // gate|up|down + sidecar scales). Detect via the first expert's scale sidecar:
+    // `.qs` (int/e4m3) or `.g` (NVFP4, which has no `.qs`).
+    let base = format!("model.layers.{layer}.mlp.experts.{}.gate_proj.weight", eids[0]);
+    if !shards.has(&format!("{base}.qs")) && !shards.has(&format!("{base}.g")) {
         return eids
             .iter()
             .map(|&e| load_expert(shards, hidden, moe_inter, ebits, layer, e, read_threads))

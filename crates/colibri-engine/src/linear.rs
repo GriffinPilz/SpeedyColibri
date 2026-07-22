@@ -102,9 +102,39 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
                 }
             }
         }
+        5 => {
+            // NVFP4: e2m1 nibbles (2/byte, low=even col) × per-16 ue4m3 block scale ×
+            // per-tensor global. W[o,k] = E2M1[nib] · e4m3(bs[o*nb + k/16]) · g. CPU
+            // reference / fallback for the tiled+GEMV GPU nvfp4 kernels.
+            let q4 = &w.q4;
+            let bs = &w.bs;
+            let g = w.g;
+            let rb = (i + 1) / 2;
+            let nb = (i + 15) / 16;
+            for row in 0..o {
+                let wr = &q4[row * rb..(row + 1) * rb];
+                let br = &bs[row * nb..(row + 1) * nb];
+                for si in 0..s {
+                    let xs = &x[si * i..(si + 1) * i];
+                    let mut a = 0f32;
+                    for k in 0..i {
+                        let byte = wr[k >> 1];
+                        let nib = if k & 1 == 1 { byte >> 4 } else { byte & 0x0f } as usize;
+                        a += E2M1[nib] * e4m3_to_f32(br[k >> 4]) * xs[k];
+                    }
+                    y[si * o + row] = a * g;
+                }
+            }
+        }
         other => panic!("matmul_qt: unknown QTensor format {other}"),
     }
 }
+
+/// FP4 `e2m1` codebook (1 sign / 2 exp / 1 mantissa): 16 non-uniform levels, bit 3 =
+/// sign. Indexed by the 4-bit nibble. Matches `convert::E2M1` and the CUDA device LUT.
+const E2M1: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
 
 /// Decode one e4m3 byte (OCP FP8: 1 sign, 4 exp bias-7, 3 mantissa; no infinity,
 /// S.1111.111 = NaN) to f32. Used for the fp8 expert CPU reference/fallback.

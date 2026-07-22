@@ -19,6 +19,11 @@ struct ColiCudaTensor {
     // host (RAM) buffers — no cudaMalloc, no memcpy, no device-side offset→signed
     // conversion. int4 stays offset-binary, so kernels must read it with off=1.
     int wrapped;
+    // NVFP4 (fmt==5) only: `weights` holds packed e2m1 nibbles [O, ceil(I/2)], `bscale`
+    // holds ue4m3 per-16 block scales [O, ceil(I/16)], `gscale` is the per-tensor global.
+    // `scales` is unused for NVFP4. Zero for every other format.
+    const void *bscale;
+    float gscale;
 };
 
 typedef struct {
@@ -33,6 +38,7 @@ typedef struct {
      * instead of zero-copy from freshly-pread (dirty, coherence-heavy) host pages. */
     uint8_t *ewg,*ewu,*ewd; size_t ewg_cap,ewu_cap,ewd_cap;
     float *esg,*esu,*esd; size_t esg_cap,esu_cap,esd_cap;
+    uint8_t *ebsg,*ebsu,*ebsd; size_t ebsg_cap,ebsu_cap,ebsd_cap;  /* NVFP4 block-scale device scratch (devcopy) */
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     void *asel,*acnt; size_t asel_cap,acnt_cap;  /* DSA sparse-attention selection */
     void *aqa,*akb,*amsk; size_t aqa_cap,akb_cap,amsk_cap;  /* tensor-core sparse attn: QA/KB fp16 + per-query key bitmask */
@@ -84,6 +90,7 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 2) return (size_t)(I + 1) / 2;
     if (fmt == 3) return (size_t)(I + 3) / 4;
     if (fmt == 4) return (size_t)I;          // e4m3 fp8: 1 byte/weight
+    if (fmt == 5) return (size_t)(I + 1) / 2; // nvfp4: packed e2m1 nibbles, 2/byte
     return 0;
 }
 
@@ -266,6 +273,143 @@ __global__ static void fp8a16_gate_up(float *gate,float *up,const float *x,
     __shared__ float out[8][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
     for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
         if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*N+n0+n]=out[warp][z];}
+#endif
+}
+
+/* FP8 (e4m3) GEMV for the single-row decode case (M==1). The tiled `fp8a16_matmul`
+ * is a 16x16x16 WMMA kernel: at M==1 it computes a 16-row MMA of which 15 rows are
+ * padding, and only a subset of threads load each weight tile — measured ~51 GB/s
+ * against the GPU's ~155 GB/s pageable-host read ceiling. This path instead assigns
+ * one warp per output column and streams the weight row with all 32 lanes reading
+ * consecutive bytes (a coalesced sweep), so the whole block is doing the
+ * memory-bound read rather than a subset of threads.
+ *
+ *   y[n] = scale[n] * Σ_k x[k] · e4m3(w[n*K + k])          n ∈ [0,N)
+ *
+ * `x` (K floats) is loaded into shared once per block. Per-byte reads (not `uchar4`)
+ * because expert weight offsets are not 4-byte aligned — 0 of 4326 sampled were even
+ * 512-aligned — and a misaligned vector load is UB; the tiled kernels read per-byte
+ * for the same reason. Consecutive lanes still read consecutive bytes, so the access
+ * coalesces into cache-line transactions. */
+__global__ static void fp8a16_gemv(float *y,const float *x,const uint8_t *w,
+                                   const float *scale,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    const uint8_t *wr=w+(size_t)n*K; float acc=0.f;
+    for(int k=lane;k<K;k+=32) acc+=xs[k]*e4m3f(wr[k]);
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*scale[n];
+}
+
+/* ==== NVFP4 (e2m1 nibbles + ue4m3 per-16 block scale + f32 global) expert kernels ====
+ * Weight decode: W[n,k] = e2m1(nib(n,k)) · e4m3(bscale[n*ceil(K/16) + k/16]) · gscale.
+ * Nibbles are packed 2/byte (low = even k). At 0.5 B/wt + one ue4m3/16 (0.0625 B/wt) the
+ * decode GEMV reads ~half the bytes of the fp8 GEMV — the bytes-bound decode win. Compute
+ * mirrors the fp8a16 path (decode → f16 → WMMA), NOT native FP4 MMA (a later lever). */
+
+// Decode one 4-bit e2m1 code (bit 3 = sign; low 3 bits pick a magnitude) to float.
+__device__ __forceinline__ static float e2m1f(int nib) {
+    const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    float m = mag[nib & 7];
+    return (nib & 8) ? -m : m;
+}
+
+/* Single-row decode GEMV (S==1): one warp per output column, all 32 lanes sweep the
+ * nibble row coalesced. Mirror of `fp8a16_gemv` with the nvfp4 decode + global. */
+__global__ static void nvfp4_gemv(float *y,const float *x,const uint8_t *w,
+                                  const uint8_t *bs,float g,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int k=lane;k<K;k+=32){
+        uint8_t byte=wr[k>>1];
+        int nib=(k&1)?(byte>>4):(byte&0xF);
+        acc += xs[k]*e2m1f(nib)*e4m3f(br[k>>4]);
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* Tiled WMMA down-proj (S>1 prefill). Mirror of `fp8a16_matmul` with the nvfp4 decode. */
+__global__ static void nvfp4_matmul(float *y,const float *x,const uint8_t *w,
+                                    const uint8_t *bs,float g,int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){
+            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);
+        }
+        for(int z=lane;z<256;z+=32){
+            int nn=z/16,gk=k0+(z%16),gn=n0+nn;float v=0.f;
+            if(gn<N&&gk<K){
+                uint8_t byte=w[(size_t)gn*Kh+(gk>>1)];
+                int nib=(gk&1)?(byte>>4):(byte&0xF);
+                v=e2m1f(nib)*e4m3f(bs[(size_t)gn*nb+(gk>>4)])*g;
+            }
+            bh[warp][z]=__float2half(v);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,nn=z%16;
+        if(m0+m<M&&n0+nn<N)y[(size_t)(m0+m)*N+n0+nn]=out[warp][z];}
+#endif
+}
+
+/* Tiled WMMA fused gate+up (S>1 prefill). Mirror of `fp8a16_gate_up`; each weight carries
+ * its own block-scale array + global. */
+__global__ static void nvfp4_gate_up(float *gate,float *up,const float *x,
+        const uint8_t *gw,const uint8_t *uw,const uint8_t *gbs,const uint8_t *ubs,
+        float gg,float ug,int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+tile*16;
+    const uint8_t *w=which?uw:gw;const uint8_t *bs=which?ubs:gbs;
+    float g=which?ug:gg;float *y=which?up:gate;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    __shared__ __half ah[256],bh[8][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);}
+        for(int z=lane;z<256;z+=32){int nn=z/16,gk=k0+(z%16),gn=n0+nn;float v=0.f;
+            if(gn<N&&gk<K){
+                uint8_t byte=w[(size_t)gn*Kh+(gk>>1)];
+                int nib=(gk&1)?(byte>>4):(byte&0xF);
+                v=e2m1f(nib)*e4m3f(bs[(size_t)gn*nb+(gk>>4)])*g;
+            }
+            bh[warp][z]=__float2half(v);}
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[8][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,nn=z%16;
+        if(m0+m<M&&n0+nn<N)y[(size_t)(m0+m)*N+n0+nn]=out[warp][z];}
 #endif
 }
 
@@ -823,6 +967,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->host_x=ctx->host_y=nullptr;ctx->stream=nullptr;
         ctx->ewg=ctx->ewu=ctx->ewd=nullptr;ctx->esg=ctx->esu=ctx->esd=nullptr;
         ctx->ewg_cap=ctx->ewu_cap=ctx->ewd_cap=ctx->esg_cap=ctx->esu_cap=ctx->esd_cap=0;
+        ctx->ebsg=ctx->ebsu=ctx->ebsd=nullptr;ctx->ebsg_cap=ctx->ebsu_cap=ctx->ebsd_cap=0;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
@@ -1062,9 +1207,23 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
         }
     }
     if(s_evt) cudaEventRecord(s_e0,ctx->stream);
-    fp8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gsc,usc,S,D,I);
-    silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
-    fp8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dsc,S,I,D);
+    // Single-row decode GEMV path (COLI_FFN_GEMV=1). The tiled WMMA kernels waste
+    // 15/16 of their MMA at S==1; the GEMV streams the weight coalesced with the whole
+    // block. Restricted to S==1 (decode) — for S>1 the tiled path amortizes the weight
+    // read across rows and wins.
+    static int s_gemv=-1;
+    if(s_gemv<0){const char*e=getenv("COLI_FFN_GEMV");s_gemv=e&&atoi(e);}
+    if(s_gemv&&S==1){
+        int tpb=256,wpb=tpb>>5;
+        fp8a16_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gsc,D,I);
+        fp8a16_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,usc,D,I);
+        silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I);
+        fp8a16_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dsc,I,D);
+    }else{
+        fp8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gsc,usc,S,D,I);
+        silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+        fp8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dsc,S,I,D);
+    }
     if(s_evt) cudaEventRecord(s_e1,ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert fp8 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -1073,6 +1232,71 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
     if(s_evt){ float km=0; cudaEventElapsedTime(&km,s_e0,s_e1); s_kms+=km; s_calls++; s_rows+=S;
         if(s_calls%3000==0) fprintf(stderr,"[ffn-evt] calls=%ld rows=%ld kernel_gpu=%.1fs avg_kernel=%.3fms avg_rows=%.1f\n",
             s_calls,s_rows,s_kms/1e3,s_kms/s_calls,(double)s_rows/s_calls); }
+    std::memcpy(y,ctx->host_y,xb);
+    return 1;
+}
+
+/* NVFP4 fused expert FFN — GEMV at S==1 (decode; ~half the weight bytes of fp8), tiled
+ * WMMA at S>1 (prefill). Requires fmt==5 on all three projections and compute>=7. Zero-copy
+ * only (no device-copy staging path); the block-scale + global travel on the ColiCudaTensor.
+ * `COLI_NVFP4_TILED=1` forces the tiled path even at S==1 (A/B against the GEMV). */
+extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *up,
+        ColiCudaTensor *down,float *y,const float *x,int S){
+    if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=5||up->fmt!=5||down->fmt!=5||
+       gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
+       gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
+    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert nvfp4 input upload"))return 0;
+    const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
+    const uint8_t *gbs=(const uint8_t*)gate->bscale,*ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
+    float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
+    // Prefill devcopy (COLI_FFN_DEVCOPY, default on for S>=COLI_FFN_DEVCOPY_MIN=16): stage
+    // nibbles + ue4m3 block scales to device so the tiled kernel reads clean memory instead
+    // of freshly-pread (dirty, coherence-heavy) host pages — the fp8-path win. Decode (S==1
+    // gemv) never reaches this; zero-copy stays the decode path.
+    static int s_dc=-1,s_dcmin=16;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
+    if(s_dc&&S>=s_dcmin){
+        size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (gate/up, down)
+        size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
+        if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gnb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gnb)&&
+           reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dnb)&&reserve_bytes((void**)&ctx->ebsg,&ctx->ebsg_cap,gsb)&&
+           reserve_bytes((void**)&ctx->ebsu,&ctx->ebsu_cap,gsb)&&reserve_bytes((void**)&ctx->ebsd,&ctx->ebsd_cap,dsb)){
+            cudaMemcpyAsync(ctx->ewg,gw,gnb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ewu,uw,gnb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ewd,dw,dnb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ebsg,gbs,gsb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ebsu,ubs,gsb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ebsd,dbs,dsb,cudaMemcpyHostToDevice,ctx->stream);
+            gw=ctx->ewg;uw=ctx->ewu;dw=ctx->ewd;gbs=ctx->ebsg;ubs=ctx->ebsu;dbs=ctx->ebsd;
+        }
+    }
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+    if(S==1&&!s_tiled){
+        int tpb=256,wpb=tpb>>5;
+        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
+        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+        silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I);
+        nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
+    }else{
+        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+        nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
+        silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+        nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert nvfp4 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert nvfp4 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert nvfp4 synchronize"))return 0;
     std::memcpy(y,ctx->host_y,xb);
     return 1;
 }
@@ -1472,6 +1696,28 @@ extern "C" int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
     t->weight_bytes = rb * (size_t)O;
     t->weights = const_cast<void *>(weights);
     t->scales = const_cast<float *>(scales);
+    t->wrapped = 1;
+    *tensor = t;
+    return 1;
+}
+
+/* Zero-copy wrap of an NVFP4 expert weight (fmt=5): nibbles + ue4m3 block scales +
+ * per-tensor global, all read from host RAM in place. See coli_cuda_expert_mlp_nvfp4. */
+extern "C" int coli_cuda_tensor_wrap_nvfp4(ColiCudaTensor **tensor,
+        const void *weights, const void *bscale, float gscale,
+        int I, int O, int device) {
+    if (!tensor || !weights || !bscale || I < 1 || O < 1) return 0;
+    if (*tensor) {
+        ColiCudaTensor *t = *tensor;
+        return t->fmt == 5 && t->I == I && t->O == O && t->device == device;
+    }
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = 5; t->I = I; t->O = O; t->device = device;
+    t->weight_bytes = row_bytes(5, I) * (size_t)O;
+    t->weights = const_cast<void *>(weights);
+    t->bscale = bscale;
+    t->gscale = gscale;
     t->wrapped = 1;
     *tensor = t;
     return 1;

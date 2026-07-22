@@ -148,6 +148,7 @@ fn main() -> ExitCode {
         "worker" => cmd_worker(&args),
         "serve" => serve::cmd_serve(&args),
         "convert" => cmd_convert(&args),
+        "requant-nvfp4" => cmd_requant_nvfp4(&args),
         "probe" => cmd_probe(&args),
         "qerr" => cmd_qerr(&args),
         "bench" => {
@@ -297,6 +298,70 @@ fn cmd_qerr(args: &[String]) -> ExitCode {
 /// (`ebits=8 xbits=4 io_bits=8`): 7.9x better perplexity than all-int4 (6.189 vs
 /// 48.665) for ~33% throughput. Override via `COLI_EBITS` / `COLI_IO_BITS` /
 /// `COLI_XBITS` / `COLI_NLAYERS`; see `ConvertOpts`.
+/// `coli requant-nvfp4 <container-in> <container-out>` — re-quantize the routed experts
+/// of an existing e4m3 colibrì container to NVFP4 (e2m1 nibbles + per-16 ue4m3 block
+/// scales + f32 global), copying every other tensor through byte-for-byte. hidden /
+/// moe_inter / n_layers come from the input's config.json.
+fn cmd_requant_nvfp4(args: &[String]) -> ExitCode {
+    let (indir, outdir) = match (args.get(2), args.get(3)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            eprintln!("usage: coli requant-nvfp4 <e4m3-container-dir> <output-container-dir>");
+            eprintln!("  re-quantizes routed experts e4m3 -> NVFP4; everything else copied through");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match colibri_core::Config::load(indir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[requant-nvfp4] load config ({indir}): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (hidden, moe_inter, n_layers) =
+        (cfg.hidden as usize, cfg.moe_inter as usize, cfg.n_layers as usize);
+    eprintln!(
+        "[requant-nvfp4] {indir} -> {outdir}  (hidden={hidden} moe_inter={moe_inter} n_layers={n_layers})"
+    );
+    let t0 = std::time::Instant::now();
+    let res = colibri_engine::requant_experts_nvfp4(
+        indir,
+        outdir,
+        n_layers,
+        hidden,
+        moe_inter,
+        |fi, n, st| {
+            eprintln!(
+                "[requant-nvfp4] shard {:>3}/{n}  experts_nvfp4={} copied={} skipped={}  out={:.1} GB  {:.0}s",
+                fi + 1,
+                st.tensors_quantized,
+                st.tensors_f32,
+                st.tensors_skipped,
+                st.bytes_out as f64 / 1e9,
+                t0.elapsed().as_secs_f64()
+            );
+        },
+    );
+    match res {
+        Ok(st) => {
+            eprintln!(
+                "[requant-nvfp4] done: {} shards, {} expert weights -> NVFP4, {} copied, {} dropped, {:.1} GB out, {:.0}s",
+                st.shards_written,
+                st.tensors_quantized,
+                st.tensors_f32,
+                st.tensors_skipped,
+                st.bytes_out as f64 / 1e9,
+                t0.elapsed().as_secs_f64()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[requant-nvfp4] error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn cmd_convert(args: &[String]) -> ExitCode {
     let (indir, outdir) = match (args.get(2), args.get(3)) {
         (Some(a), Some(b)) => (a, b),
@@ -324,6 +389,10 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // COLI_XFP8=1 emits routed experts as per-row e4m3 fp8 (8-bit) instead of xbits
         // int — preserves the source FP8 precision for the tiled FP8 expert kernel.
         xfp8: env_u32("COLI_XFP8", 0) != 0,
+        // COLI_XNVFP4=1 emits routed experts as NVFP4 (4-bit block-scaled) — the natural,
+        // ~lossless output when the source is already modelopt NVFP4 (nvidia/GLM-5.2-NVFP4).
+        // ~2x faster prefill+decode than e4m3 at <1% perplexity. Takes precedence over xfp8.
+        xnvfp4: env_u32("COLI_XNVFP4", 0) != 0,
         // COLI_MTP_ONLY=1 converts ONLY the MTP speculative head (layer n_layers).
         // Drop the resulting shard into an existing container (Shards::open indexes
         // every *.safetensors in the dir) to enable drafting without re-converting.
@@ -331,8 +400,8 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     };
 
     eprintln!(
-        "[convert] {indir} -> {outdir}  (ebits={} io_bits={} xbits={} xfp8={} n_layers={})",
-        opts.ebits, opts.io_bits, opts.xbits, opts.xfp8, opts.n_layers
+        "[convert] {indir} -> {outdir}  (ebits={} io_bits={} xbits={} xfp8={} xnvfp4={} n_layers={})",
+        opts.ebits, opts.io_bits, opts.xbits, opts.xfp8, opts.xnvfp4, opts.n_layers
     );
     let t0 = std::time::Instant::now();
     let res = colibri_engine::convert_snapshot(indir, outdir, opts, |fi, n, st| {

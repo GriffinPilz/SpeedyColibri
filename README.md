@@ -175,16 +175,29 @@ The workspace has **no crates.io dependencies** (std + path crates only), so a
 direct build needs only the CUDA toolkit and rustup:
 
 ```bash
-# Build (~3–5 min): the CUDA backend compiles crates/colibri-backend/cuda/backend_cuda.cu with nvcc.
-# NVCC and CUDA_HOME are set explicitly because a non-interactive shell often lacks
-# nvcc on PATH (a login shell, `bash -lc`, usually has it). If nvcc is missing the
-# build now fails immediately and says so, instead of dying later at link time with
-# `undefined reference to coli_cuda_*`.
+# Build (~3–5 min): PREFER the wrapper — it locates nvcc, sets the arch, adds the CUDA
+# lib path (cudart is under targets/<arch>-linux/lib on ARM/DGX, lib64 on x86), and
+# VERIFIES the result is a CUDA binary. A plain `cargo build -p coli` WITHOUT
+# `--features cuda` silently builds a CPU-only binary (`coli backend` -> cpu) that runs
+# the expert FFN single-threaded, ~16-40x slower with the GPU idle — the wrapper refuses
+# to produce that.
+scripts/build.sh
+
+# Or the raw command (equivalent; build.rs now finds cudart on ARM automatically):
 NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
   cargo build --release -p coli --features cuda
+# Always confirm: `coli backend` must print `backend: cuda (Cuda(0))`, not `cpu`.
 
 # Serve: serve <snapshot-dir> [port] [warm-up prompt...]
 ./target/release/coli serve /path/to/snapshot 8080 "warm-up prompt"
+
+# Convert an HF FP8/NVFP4 checkpoint into a colibrì container (int4 experts by default;
+# COLI_XFP8=1 for e4m3 experts):
+./target/release/coli convert /path/to/hf-snapshot /path/to/container
+
+# Re-quantize an existing e4m3 container's experts to NVFP4 (in place, ~18 min, ~2× faster
+# decode + prefill at <1% perplexity — see the Expert quantization section below):
+./target/release/coli requant-nvfp4 /path/to/e4m3-container /path/to/nvfp4-container
 ```
 
 ### Low-level: `gen` (forward-pass smoke test)
@@ -278,6 +291,42 @@ is why 64k single-node is impractical on time (memory fits fine, no swap). This 
 case for the multi-node work below: sharding experts cuts per-node prefill streaming.
 The 32k/64k rows are **extrapolations from the two measured points**, not measurements
 — they will be replaced with real numbers or struck out.
+
+### Expert quantization: int4 → e4m3 → NVFP4
+
+The routed experts (97% of the weights, and what every token streams) can be stored in
+three formats. Resident weights (attention / dense / shared) stay 8-bit int throughout.
+
+| expert format | bytes/wt | experts on disk | build |
+|---|---|---|---|
+| int4 (per-row) | 0.5 | ~368 GB | `coli convert` (default) |
+| e4m3 fp8 (per-row) | 1.0 | ~735 GB | `coli convert … COLI_XFP8=1` |
+| **NVFP4** (e2m1 + per-16 ue4m3 block scale + global) | **0.5625** | **~436 GB** | `coli requant-nvfp4 <e4m3-dir> <out-dir>` |
+
+**NVFP4 is a 4-bit block-scaled format** — 4-bit weights with a shared scale per 16
+inputs, so it keeps int4's size while recovering most of e4m3's accuracy. Switching is
+just pointing the server at a different container (the formats are auto-detected; the fp8
+path is unchanged, so `e4m3` + `COLI_EXPERT_FP8=1` still works). `requant-nvfp4`
+re-quantizes an existing e4m3 container in place (~18 min for the 744B model, no re-download).
+
+**Measured NVFP4 vs e4m3, single node GB10, GPU, warm cache** (2026-07-21; a same-session
+A/B — the *ratio* is the robust result, the absolute tok/s uses a short warm prompt and
+is not comparable to the diverse-prompt record above):
+
+| | e4m3 (8-bit) | NVFP4 (4-bit) | NVFP4 win |
+|---|---|---|---|
+| decode | 2571 ms/tok (0.39 tok/s) | **1186 ms/tok (0.84 tok/s)** | **2.17×** |
+| decode + `COLI_PIN_GB=30` | — | 1049 ms/tok (0.95 tok/s) | 2.45× |
+| prefill @1024 (+prefetch+tc) | 5.6 tok/s | **11.1 tok/s** | **1.98×** |
+| perplexity (128 tok) ↓ | 4.670 | 4.707 | +0.8% |
+| top-1 ↑ | 58.3% | 59.8% | +1.5 pt |
+
+**~2× faster on both prefill and decode at under 1% perplexity cost** — NVFP4 wins on
+both the halved streamed bytes *and* a dedicated single-row `nvfp4_gemv` decode kernel
+(1.59× faster than the tiled path at batch 1). A device-copy staging variant of the
+prefill kernel was tested and did not help (left off by default). NVFP4 experts are
+stored as one coalesced blob (nibbles ++ block-scales) so the loader's gate/up/down read
+grabs the scales for free — a separate scale sidecar cost an uncoalesced read per expert.
 
 ## Multi-Spark (expert-parallel)
 

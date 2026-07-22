@@ -143,7 +143,22 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=colibri_cuda");
     if let Ok(home) = env::var("CUDA_HOME") {
-        println!("cargo:rustc-link-search=native={home}/lib64");
+        // `cudart` lives in `lib64` on x86 CUDA but under `targets/<arch>-linux/lib`
+        // on the ARM/sbsa DGX Spark — add every candidate so the linker finds
+        // `-lcudart` regardless of layout (missing it = `cannot find -lcudart` and a
+        // silent push toward the CPU-only fallback). Only existing dirs are emitted.
+        for sub in [
+            "lib64",
+            "lib",
+            "targets/sbsa-linux/lib",   // ARM DGX Spark
+            "targets/aarch64-linux/lib",
+            "targets/x86_64-linux/lib",
+        ] {
+            let p = format!("{home}/{sub}");
+            if std::path::Path::new(&p).is_dir() {
+                println!("cargo:rustc-link-search=native={p}");
+            }
+        }
     }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");

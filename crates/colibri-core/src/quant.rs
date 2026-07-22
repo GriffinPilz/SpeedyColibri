@@ -192,6 +192,13 @@ pub struct QTensor {
     pub q4: Bytes,
     /// per-row scales (length `O`), empty for `F32`
     pub s: Vec<f32>,
+    /// NVFP4 (`fmt_code == 5`) only: ue4m3 per-16-input block scales, `O × ceil(I/16)`
+    /// bytes row-major. The effective scale of the 16-wide block containing column `c`
+    /// of row `r` is `f8e4m3_to_f32(bs[r*ceil(I/16) + c/16]) * g`. Empty otherwise.
+    pub bs: Bytes,
+    /// NVFP4 (`fmt_code == 5`) only: per-tensor global scale (modelopt-style; the block
+    /// scales above are multiplied by it). `0.0` / unused for every other format.
+    pub g: f32,
     /// rows (output dim)
     pub o: i32,
     /// cols (input dim)
@@ -215,6 +222,12 @@ impl QTensor {
             0 => n * 4,
             1 => n + self.o as i64 * 4,
             4 => n + self.o as i64 * 4, // e4m3 fp8: 1 byte/weight + scales
+            // NVFP4: ceil(I/2) nibbles + ceil(I/16) ue4m3 block scales per row + 1 global.
+            5 => {
+                self.o as i64 * ((self.i as i64 + 1) / 2)
+                    + self.o as i64 * ((self.i as i64 + 15) / 16)
+                    + 4
+            }
             3 => self.o as i64 * ((self.i as i64 + 3) / 4) + self.o as i64 * 4,
             _ => self.o as i64 * ((self.i as i64 + 1) / 2) + self.o as i64 * 4, // int4
         }

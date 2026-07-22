@@ -53,6 +53,18 @@ extern "C" {
         o: c_int,
         device: c_int,
     ) -> c_int;
+    // Zero-copy wrap of an NVFP4 expert weight: `weights` = packed e2m1 nibbles
+    // [O, ceil(I/2)], `bscale` = ue4m3 per-16 block scales [O, ceil(I/16)], `gscale` =
+    // per-tensor global. Sets fmt=5.
+    fn coli_cuda_tensor_wrap_nvfp4(
+        tensor: *mut *mut ColiCudaTensor,
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        i: c_int,
+        o: c_int,
+        device: c_int,
+    ) -> c_int;
     fn coli_cuda_pageable_access(device: c_int) -> c_int;
     fn coli_cuda_matmul(
         tensor: *mut *mut ColiCudaTensor,
@@ -83,6 +95,14 @@ extern "C" {
         s: c_int,
     ) -> c_int;
     fn coli_cuda_expert_mlp_i8a16(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
+    fn coli_cuda_expert_mlp_nvfp4(
         gate: *mut ColiCudaTensor,
         up: *mut ColiCudaTensor,
         down: *mut ColiCudaTensor,
@@ -294,6 +314,31 @@ impl ResidentTensor {
         }
     }
 
+    /// Zero-copy wrap of an NVFP4 expert weight `[O, I]`: `weights` = packed e2m1
+    /// nibbles, `bscale` = ue4m3 per-16 block scales, `gscale` = per-tensor global.
+    /// Sets fmt=5; the GPU reads all three from host RAM in place.
+    ///
+    /// # Safety
+    /// `weights` (`O*ceil(I/2)` bytes) and `bscale` (`O*ceil(I/16)` bytes) must stay
+    /// alive and valid while this tensor is used in a kernel. Only when [`pageable_access`].
+    pub unsafe fn wrap_raw_nvfp4(
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        i: i32,
+        o: i32,
+        device: i32,
+    ) -> Option<ResidentTensor> {
+        let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
+        if coli_cuda_tensor_wrap_nvfp4(&mut ptr, weights, bscale, gscale, i, o, device) != 0
+            && !ptr.is_null()
+        {
+            Some(ResidentTensor { ptr })
+        } else {
+            None
+        }
+    }
+
     /// Raw device handle (for the fused expert pipeline). Borrowed; do not free.
     pub fn as_raw(&self) -> *mut ColiCudaTensor {
         self.ptr
@@ -432,6 +477,23 @@ pub unsafe fn expert_mlp_fp8_raw(
     s: i32,
 ) -> bool {
     coli_cuda_expert_mlp_fp8(gate, up, down, y, x, s) != 0
+}
+
+/// NVFP4 (e2m1 nibbles + ue4m3 per-16 block scale + f32 global) fused expert FFN —
+/// GEMV at S==1 (decode; reads half the bytes of e4m3), tiled tensor-core at S>1
+/// (prefill). Requires all three tensors at fmt==5.
+///
+/// # Safety
+/// Same contract as [`expert_mlp_raw`].
+pub unsafe fn expert_mlp_nvfp4_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_nvfp4(gate, up, down, y, x, s) != 0
 }
 
 /// Tiled int8 (W8A16) fused expert/MLP FFN — tensor-core replacement for the naive

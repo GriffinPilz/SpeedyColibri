@@ -376,13 +376,24 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     let env_u32 = |k: &str, d: u32| {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     };
+    // Detect the source architecture from its config: MiniMax-M3 needs name remapping
+    // + Gemma-norm folding, and its layer count comes from `text_config` (env
+    // COLI_NLAYERS still overrides for GLM). A missing/unreadable config falls back to GLM.
+    let src_cfg = colibri_core::Config::load(indir).ok();
+    let minimax = src_cfg.as_ref().map(|c| c.arch == colibri_core::Arch::MinimaxM3).unwrap_or(false);
+    let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
+    let n_layers = if minimax {
+        src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)
+    } else {
+        env_u32("COLI_NLAYERS", 78) as usize
+    };
     // Routed experts are NVFP4 (4-bit block-scaled) regardless of `ebits`, or e4m3
     // under COLI_XFP8 — they do not inherit the resident bit width, so raising
     // `ebits` never drags the streamed experts (or the 0.74 TB container) up with it.
     let opts = colibri_engine::ConvertOpts {
         ebits: env_u32("COLI_EBITS", 8),
         io_bits: env_u32("COLI_IO_BITS", 8),
-        n_layers: env_u32("COLI_NLAYERS", 78) as usize,
+        n_layers,
         // COLI_KEEP_INDEXER=1 keeps the DSA lightning-indexer weights so the container
         // can run DSA sparse attention (dropped by default, matching the reference).
         keep_indexer: env_u32("COLI_KEEP_INDEXER", 0) != 0,
@@ -393,6 +404,9 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // Drop the resulting shard into an existing container (Shards::open indexes
         // every *.safetensors in the dir) to enable drafting without re-converting.
         mtp_only: env_u32("COLI_MTP_ONLY", 0) != 0,
+        // MiniMax-M3 name/norm handling (auto-detected above).
+        minimax,
+        gemma_norm,
     };
 
     eprintln!(

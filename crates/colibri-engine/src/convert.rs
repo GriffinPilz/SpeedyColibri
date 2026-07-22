@@ -90,12 +90,60 @@ pub struct ConvertOpts {
     /// by the tiled FP8 expert kernel. Experts are **NVFP4 by default** (see [`quantize_nvfp4`]);
     /// int4 experts are no longer produced.
     pub xfp8: bool,
+    /// source is MiniMax-M3 (`minimax_m3_vl`): map its `language_model.*` /
+    /// `block_sparse_moe.*` tensor names to the container's GLM-style names, drop the
+    /// vision tower and the MTP module (deferred), and fold Gemma-norm `+1`.
+    pub minimax: bool,
+    /// fold `+1` into RMSNorm weights (MiniMax-M3 Gemma-norm) so the engine's plain
+    /// `rmsnorm` computes `x·(1+w)`; requires `minimax`.
+    pub gemma_norm: bool,
 }
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { ebits: 8, io_bits: 8, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false }
+        ConvertOpts {
+            ebits: 8,
+            io_bits: 8,
+            n_layers: 78,
+            keep_indexer: false,
+            xfp8: false,
+            mtp_only: false,
+            minimax: false,
+            gemma_norm: false,
+        }
     }
+}
+
+/// Map a MiniMax-M3 source tensor name to its colibrì-container (GLM-style) name, or
+/// `None` to drop it. Strips the `language_model.` prefix, renames the MoE block
+/// (`block_sparse_moe` → `mlp`, expert `w1/w2/w3` → `gate/down/up_proj`), and drops the
+/// vision tower + multimodal projectors + the MTP/next-n module (text-only MVP). The
+/// attention (`self_attn.{q,k,v,o}_proj`, `q_norm`/`k_norm`) and dense/norm names already
+/// match the container, so they pass through unchanged. Sidecar scales ride along via the
+/// same substring rewrites (`.w1.weight_scale` → `.gate_proj.weight_scale`).
+fn m3_container_name(name: &str) -> Option<String> {
+    for drop in [
+        "vision_tower",
+        "multi_modal_projector",
+        "patch_merge_mlp",
+        "image_",
+        "visual",
+        ".mtp",
+        "nextn",
+        "num_nextn",
+    ] {
+        if name.contains(drop) {
+            return None;
+        }
+    }
+    let mut n = name.strip_prefix("language_model.").unwrap_or(name).to_string();
+    n = n.replace(".block_sparse_moe.", ".mlp.");
+    // Expert sub-weights: w1 = gate, w3 = up, w2 = down.
+    n = n
+        .replace(".w1.", ".gate_proj.")
+        .replace(".w3.", ".up_proj.")
+        .replace(".w2.", ".down_proj.");
+    Some(n)
 }
 
 /// What conversion should do with a tensor. `Skip` folds the Python `"skip"` and
@@ -1065,17 +1113,36 @@ enum TensorOut {
 /// Dequant + (re)quantize one source tensor. Pure w.r.t. shared state (reads `shards`,
 /// which is `Sync`), so many run concurrently.
 fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<TensorOut> {
-    let f32_out = |name: &str, shape: Vec<i64>, w: &[f32]| OutTensor {
-        name: name.to_string(),
+    // Container (output) name. MiniMax-M3 remaps `language_model.*`/`block_sparse_moe.*`
+    // to GLM-style names and drops the vision tower + the MTP module (layer >= n_layers).
+    // Reads still use the ORIGINAL source `name` (and its sidecars); only the output name
+    // and classification use `out_name`.
+    let out_name: String = if opts.minimax {
+        match m3_container_name(name) {
+            Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
+            _ => return Ok(TensorOut::Skip),
+        }
+    } else {
+        name.to_string()
+    };
+    let f32_out = |nm: &str, shape: Vec<i64>, w: &[f32]| OutTensor {
+        name: nm.to_string(),
         dtype: "F32",
         shape,
         bytes: f32_bytes(w),
     };
-    match classify(name, opts.n_layers, opts.keep_indexer, opts.mtp_only) {
+    match classify(&out_name, opts.n_layers, opts.keep_indexer, opts.mtp_only) {
         Kind::Skip => Ok(TensorOut::Skip),
         Kind::F32 => {
-            let (w, shape) = dequant(shards, name)?;
-            Ok(TensorOut::F32(f32_out(name, shape, &w)))
+            let (mut w, shape) = dequant(shards, name)?;
+            // Gemma-norm (MiniMax-M3): fold +1 into RMSNorm weights so the engine's plain
+            // rmsnorm computes x*(1+w). Norms only — never the router or the bias.
+            if opts.gemma_norm && out_name.ends_with("norm.weight") {
+                for v in w.iter_mut() {
+                    *v += 1.0;
+                }
+            }
+            Ok(TensorOut::F32(f32_out(&out_name, shape, &w)))
         }
         kind @ (Kind::Io | Kind::X | Kind::Q) => {
             // Dequant first: the *logical* shape is authoritative (NVFP4 is stored
@@ -1083,7 +1150,7 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             let (w, shape) = dequant(shards, name)?;
             // Only 2D weights quantize; anything else stays F32.
             if shape.len() != 2 {
-                return Ok(TensorOut::F32(f32_out(name, shape, &w)));
+                return Ok(TensorOut::F32(f32_out(&out_name, shape, &w)));
             }
             let (o, i) = (shape[0] as usize, shape[1] as usize);
             let (codes_t, scale_t) = if matches!(kind, Kind::X) {
@@ -1091,15 +1158,15 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
                 // than e4m3 at <1% perplexity); `COLI_XFP8=1` opts into 8-bit e4m3.
                 // int4 experts are no longer produced — NVFP4 supersedes them.
                 if opts.xfp8 {
-                    quantize_e4m3(name, &w, o, i)
+                    quantize_e4m3(&out_name, &w, o, i)
                 } else {
-                    quantize_nvfp4_out(name, &w, o, i)
+                    quantize_nvfp4_out(&out_name, &w, o, i)
                 }
             } else {
                 // Resident weights (attention/dense/shared) at `ebits`, embeddings/lm_head
                 // at `io_bits` — int8 by default.
                 let bits = if matches!(kind, Kind::Io) { opts.io_bits } else { opts.ebits };
-                quantize(name, &w, o, i, bits)
+                quantize(&out_name, &w, o, i, bits)
             };
             Ok(TensorOut::Quant(codes_t, scale_t))
         }
@@ -1240,6 +1307,47 @@ pub fn convert_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m3_container_name_maps_and_drops() {
+        let m = |s: &str| m3_container_name(s);
+        // Prefix strip + MoE rename + expert w1/w2/w3 -> gate/down/up.
+        assert_eq!(
+            m("language_model.model.layers.5.block_sparse_moe.experts.7.w1.weight").as_deref(),
+            Some("model.layers.5.mlp.experts.7.gate_proj.weight")
+        );
+        assert_eq!(
+            m("language_model.model.layers.5.block_sparse_moe.experts.7.w2.weight_scale").as_deref(),
+            Some("model.layers.5.mlp.experts.7.down_proj.weight_scale")
+        );
+        assert_eq!(
+            m("language_model.model.layers.5.block_sparse_moe.experts.7.w3.weight").as_deref(),
+            Some("model.layers.5.mlp.experts.7.up_proj.weight")
+        );
+        // Router, its bias, and the shared expert.
+        assert_eq!(
+            m("language_model.model.layers.3.block_sparse_moe.gate.weight").as_deref(),
+            Some("model.layers.3.mlp.gate.weight")
+        );
+        assert_eq!(
+            m("language_model.model.layers.3.block_sparse_moe.gate.e_score_correction_bias").as_deref(),
+            Some("model.layers.3.mlp.gate.e_score_correction_bias")
+        );
+        assert_eq!(
+            m("language_model.model.layers.3.block_sparse_moe.shared_experts.up_proj.weight").as_deref(),
+            Some("model.layers.3.mlp.shared_experts.up_proj.weight")
+        );
+        // Attention (GQA) + norms + lm_head pass through after the prefix strip.
+        assert_eq!(
+            m("language_model.model.layers.0.self_attn.q_norm.weight").as_deref(),
+            Some("model.layers.0.self_attn.q_norm.weight")
+        );
+        assert_eq!(m("language_model.lm_head.weight").as_deref(), Some("lm_head.weight"));
+        // Dropped: vision tower, multimodal projectors, MTP/next-n module.
+        assert!(m("vision_tower.vision_model.embeddings.patch_embedding.weight").is_none());
+        assert!(m("multi_modal_projector.linear_1.weight").is_none());
+        assert!(m("language_model.model.mtp.layers.0.weight").is_none());
+    }
 
     /// `float_to_e4m3` must match the hardware fp8 encoder (`__nv_cvt_float_to_fp8`,
     /// __NV_SATFINITE, __NV_E4M3) — reference bytes generated on the GB10. A wrong
@@ -1822,7 +1930,7 @@ mod tests {
         drop(f);
 
         let outdir = tmp();
-        let opts = ConvertOpts { ebits: 8, io_bits: 8, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false };
+        let opts = ConvertOpts { ebits: 8, io_bits: 8, n_layers: 78, ..Default::default() };
         let stats = convert_snapshot(&indir, &outdir, opts, |_, _, _| {}).unwrap();
         assert_eq!(stats.tensors_quantized, 1); // o_proj
         assert_eq!(stats.tensors_f32, 1); // norm

@@ -128,6 +128,12 @@ pub fn available() -> bool {
     AVAIL.with(|c| *c.get_or_init(|| cuda::CudaBackend::probe().is_some()))
 }
 
+/// Tell the CUDA backend which SwiGLU variant the FFN kernels should apply
+/// (`oai` = clamped OpenAI-SwiGLU for MiniMax-M3, else SiLU). Set once at load.
+pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
+    cuda::set_activation(oai, alpha, limit);
+}
+
 /// How many matmuls actually ran on the GPU this thread (proof the path fired).
 pub fn matmul_count() -> u64 {
     GPU_MATMULS.with(|c| c.get())

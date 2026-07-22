@@ -143,6 +143,44 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
+/* Clamped OpenAI-SwiGLU (MiniMax-M3 "swigluoai"): gate clamped to <= limit, up
+ * clamped to [-limit, limit], out = (up + 1) * gate * sigmoid(alpha * gate).
+ * Mirrors the CPU `swiglu_oai` reference so the GPU expert path is token-identical. */
+__global__ static void swiglu_oai_mul(float *gate, const float *up, size_t n,
+                                      float alpha, float limit) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        if (g > limit) g = limit;                    // clamp upper only
+        float u = fminf(fmaxf(up[i], -limit), limit); // clamp [-limit, limit]
+        float gated = g / (1.0f + expf(-alpha * g));  // g * sigmoid(alpha * g)
+        gate[i] = gated * (u + 1.0f);
+    }
+}
+
+/* FFN gate/up activation-combine variant, set once from the host by
+ * coli_cuda_set_activation: 0 = SiLU-SwiGLU (GLM, the default), 1 = clamped
+ * OpenAI-SwiGLU (MiniMax-M3). Applies to every FFN kernel (routed experts, shared
+ * expert, dense MLP) since the activation is a per-model constant. */
+static int   g_act_oai   = 0;
+static float g_act_alpha = 1.702f;
+static float g_act_limit = 7.0f;
+
+extern "C" void coli_cuda_set_activation(int oai, float alpha, float limit) {
+    g_act_oai = oai;
+    g_act_alpha = alpha;
+    g_act_limit = limit;
+}
+
+/* Launch the selected gate*up activation-combine over `n` elements on `stream`. */
+static inline void act_mul(float *gate, const float *up, size_t n, cudaStream_t stream) {
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    if (g_act_oai)
+        swiglu_oai_mul<<<blocks, 256, 0, stream>>>(gate, up, n, g_act_alpha, g_act_limit);
+    else
+        silu_mul<<<blocks, 256, 0, stream>>>(gate, up, n);
+}
+
 /* FP8 (e4m3) tiled tensor-core expert matmuls (1 byte/weight, direct K stride).
  * Weights are FP8, activations FP16, MMA runs in f16 (W8A16). This is the tiled
  * path that replaces the naive quant_matmul's M-fold weight re-reads. */
@@ -958,7 +996,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
         up->fmt,S,D,I,row_bytes(up->fmt,D),up->wrapped);
     size_t n=(size_t)S*I;
-    silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
+    act_mul(ctx->gate,ctx->up,n,0);
     quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
         down->fmt,S,I,D,row_bytes(down->fmt,I),down->wrapped);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
@@ -1027,11 +1065,11 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
         int tpb=256,wpb=tpb>>5;
         fp8a16_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gsc,D,I);
         fp8a16_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,usc,D,I);
-        silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I);
+        act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
         fp8a16_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dsc,I,D);
     }else{
         fp8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gsc,usc,S,D,I);
-        silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+        act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
         fp8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dsc,S,I,D);
     }
     if(s_evt) cudaEventRecord(s_e1,ctx->stream);
@@ -1094,13 +1132,13 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
         int tpb=256,wpb=tpb>>5;
         nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
         nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
-        silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I);
+        act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
         nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
     }else{
         dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
         dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
         nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
-        silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+        act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
         nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
     }
     if(!cuda_ok(cudaGetLastError(),"expert nvfp4 launch")||
@@ -1132,7 +1170,7 @@ extern "C" int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate,ColiCudaTensor *u
     dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
     i8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
         (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I);
-    silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+    act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
     i8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
     if(!cuda_ok(cudaGetLastError(),"expert i8 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -1198,7 +1236,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
             dim3 og8((unsigned)((D+63)/64),(unsigned)((r+15)/16));
             fp8a16_gate_up<<<hg8,256,0,ctx->stream>>>(g8,u8,x8,
                 (const uint8_t*)host[c].g,(const uint8_t*)host[c].u,host[c].gs,host[c].us,r,D,I);
-            silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g8,u8,(size_t)r*I);
+            act_mul(g8,u8,(size_t)r*I,ctx->stream);
             fp8a16_matmul<<<og8,128,0,ctx->stream>>>(y8,g8,
                 (const uint8_t*)host[c].d,host[c].ds,r,I,D);
             off8+=r;
@@ -1207,7 +1245,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        act_mul(ctx->gate,ctx->up,(size_t)total*I,ctx->stream);
         grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }
     if(profile) cudaEventRecord(ev[2],ctx->stream);
@@ -1623,7 +1661,7 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
 extern "C" int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *up_dev,
                                        size_t n){
     DeviceContext *ctx=find_ctx(device); if(!n||!select_ctx(ctx)) return 0;
-    silu_mul<<<(unsigned)((n+255)/256),256>>>(gate_dev,up_dev,n);
+    act_mul(gate_dev,up_dev,n,0);
     return cuda_ok(cudaGetLastError(),"pipe silu mul");
 }
 extern "C" int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){

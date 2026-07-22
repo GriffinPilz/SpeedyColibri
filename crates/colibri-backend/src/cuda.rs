@@ -32,6 +32,7 @@ pub struct ColiCudaTensor {
 extern "C" {
     fn coli_cuda_init(devices: *const c_int, count: c_int) -> c_int;
     fn coli_cuda_shutdown();
+    fn coli_cuda_set_activation(oai: c_int, alpha: f32, limit: f32);
     fn coli_cuda_device_count() -> c_int;
     fn coli_cuda_mem_info(device: c_int, free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
 
@@ -210,6 +211,13 @@ pub fn init(devices: &[i32]) -> bool {
 /// Release all CUDA resources.
 pub fn shutdown() {
     unsafe { coli_cuda_shutdown() }
+}
+
+/// Select the FFN gate/up activation-combine used by every expert/shared/dense
+/// kernel: `oai = false` → SiLU-SwiGLU (GLM), `oai = true` → clamped OpenAI-SwiGLU
+/// (MiniMax-M3, with `alpha`/`limit`). A per-model constant; set once at load.
+pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
+    unsafe { coli_cuda_set_activation(oai as c_int, alpha, limit) }
 }
 
 /// Whether `device` can read pageable host memory directly (coherent unified

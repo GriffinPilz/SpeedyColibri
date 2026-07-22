@@ -47,6 +47,10 @@ pub fn set_activation(cfg: &Config) {
         alpha: cfg.swiglu_alpha,
         limit: cfg.swiglu_limit,
     });
+    // Mirror the choice into the CUDA backend so the fused FFN kernels apply the
+    // same SwiGLU variant (host-side globals; safe to set before device init).
+    #[cfg(feature = "cuda")]
+    crate::gpu::set_activation(cfg.swiglu_oai, cfg.swiglu_alpha, cfg.swiglu_limit);
 }
 
 /// The active SwiGLU variant (defaults to SiLU when unset — the GLM path and
@@ -678,11 +682,12 @@ pub fn route(cfg: &Config, logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32
 /// `out = down(silu(gate·x) ⊙ up·x)`. Port of the expert compute in `moe()`.
 fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
     // Fused GPU expert pipeline (one host round-trip) for resident weights. The
-    // fused kernels bake in SiLU-SwiGLU; the clamped OpenAI-SwiGLU (MiniMax-M3)
-    // has no kernel yet, so it takes the CPU reference below.
+    // fused kernels apply the model's SwiGLU variant (set via gpu::set_activation),
+    // so this path is correct for both GLM (SiLU) and MiniMax-M3 (swigluoai). CPU
+    // reference below on decline.
     #[cfg(feature = "cuda")]
     {
-        if !activation().oai && crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
+        if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
             return;
         }
     }
@@ -800,7 +805,7 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     // instead of a synchronous upload/kernel/download per expert — the per-expert
     // round-trip is what dominates moe-compute. Falls through per-expert if it can't run.
     #[cfg(feature = "cuda")]
-    if crate::gpu::expert_group_enabled() && !activation().oai {
+    if crate::gpu::expert_group_enabled() {
         let mut active = Vec::with_capacity(per_expert.len());
         for (e, rows, rw) in &per_expert {
             active.push((provider.expert(layer, *e)?, rows.clone(), rw.clone()));

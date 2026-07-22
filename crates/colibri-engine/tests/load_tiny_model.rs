@@ -175,21 +175,21 @@ fn tiny_model_loads_end_to_end() {
     std::fs::write(dir.join("config.json"), config_json()).unwrap();
     write_model(&dir);
 
-    let m = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load_model");
+    let m = load_model_with(&dir, LoadOptions { dbits: 8, ebits: 8 }).expect("load_model");
 
     // structure
     assert_eq!(m.cfg.n_layers, NL as i32);
     assert_eq!(m.layers.len(), NL);
     assert!(!m.layers[0].sparse, "layer 0 should be dense");
     assert!(m.layers[1].sparse, "layer 1 should be sparse (MoE)");
-    assert_eq!(m.dbits, 4);
-    assert_eq!(m.ebits, 4);
+    assert_eq!(m.dbits, 8);
+    assert_eq!(m.ebits, 8);
     assert!(!m.has_mtp);
     assert!(!m.has_dsa);
 
-    // I/O boundary: embed/lm_head loaded at io_bits=4 -> int4 (fmt 2), shape [vocab, D]
+    // I/O boundary: embed/lm_head loaded at io_bits=16 -> f32 (fmt 0), shape [vocab, D]
     assert_eq!((m.embed.o, m.embed.i), (VOCAB as i32, D as i32));
-    assert_eq!(m.embed.fmt_code, 2);
+    assert_eq!(m.embed.fmt_code, 0);
     assert_eq!((m.lm_head.o, m.lm_head.i), (VOCAB as i32, D as i32));
     assert_eq!(m.final_norm.len(), D);
 
@@ -228,7 +228,7 @@ fn tiny_model_with_mtp_head_loads() {
     std::fs::write(dir.join("config.json"), config_json()).unwrap();
     write_model_with(&dir, true);
 
-    let m = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load_model");
+    let m = load_model_with(&dir, LoadOptions { dbits: 8, ebits: 8 }).expect("load_model");
 
     assert!(m.has_mtp, "complete MTP tensor set must enable the head");
     let mtp = m.mtp.as_ref().expect("mtp head loaded");

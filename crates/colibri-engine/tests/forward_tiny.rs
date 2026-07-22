@@ -198,9 +198,9 @@ fn mtp_head_drafts_and_absorbs() {
     std::fs::write(dir.join("config.json"), config_json()).unwrap();
     write_model_opt(&dir, true);
 
-    let model = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load");
+    let model = load_model_with(&dir, LoadOptions { dbits: 8, ebits: 8 }).expect("load");
     assert!(model.has_mtp, "fixture ships a complete head");
-    let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 4);
+    let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 8);
 
     // prefill a prompt through the main stack
     let prompt = [1i32, 5, 2];
@@ -267,9 +267,9 @@ fn speculation_does_not_change_output() {
     let dir = temp_dir();
     std::fs::write(dir.join("config.json"), config_json()).unwrap();
     write_model_opt(&dir, true);
-    let model = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load");
+    let model = load_model_with(&dir, LoadOptions { dbits: 8, ebits: 8 }).expect("load");
     assert!(model.has_mtp);
-    let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 4);
+    let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 8);
     let prompt = [1i32, 5, 2];
     let n_new = 8;
 
@@ -335,7 +335,7 @@ fn mtp_paths_are_noops_without_a_head() {
     write_model(&dir); // no MTP head
     let model = load_model_with(&dir, LoadOptions::default()).expect("load");
     assert!(!model.has_mtp);
-    let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 4);
+    let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 8);
     let mut kv = KvCache::for_model(&model, 16);
     let h = vec![0f32; D];
     assert!(colibri_engine::mtp_draft(&model, &mut kv, &provider, 1, 1, 4, &h)
@@ -351,8 +351,8 @@ fn full_forward_and_greedy_decode() {
     std::fs::write(dir.join("config.json"), config_json()).unwrap();
     write_model(&dir);
 
-    let model = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load");
-    let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 4);
+    let model = load_model_with(&dir, LoadOptions { dbits: 8, ebits: 8 }).expect("load");
+    let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 8);
 
     // one forward over a 3-token prompt -> finite logits, argmax in range
     let prompt = [1i32, 5, 2];
@@ -386,8 +386,8 @@ fn repack_then_parallel_preload_matches_disk() {
     std::fs::write(dir.join("config.json"), config_json()).unwrap();
     write_model(&dir);
 
-    let model = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load");
-    let shards = ShardsExpertProvider::new(&model.shards, &model.cfg, 4);
+    let model = load_model_with(&dir, LoadOptions { dbits: 8, ebits: 8 }).expect("load");
+    let shards = ShardsExpertProvider::new(&model.shards, &model.cfg, 8);
 
     // repack the E experts of the sparse layer into 3 shard files
     let out = dir.join("repacked");
@@ -427,10 +427,10 @@ fn direct_parallel_preload_matches_disk() {
     std::fs::write(dir.join("config.json"), config_json()).unwrap();
     write_model(&dir);
 
-    let model = load_model_with(&dir, LoadOptions { dbits: 4, ebits: 4 }).expect("load");
-    let shards = ShardsExpertProvider::new(&model.shards, &model.cfg, 4);
+    let model = load_model_with(&dir, LoadOptions { dbits: 8, ebits: 8 }).expect("load");
+    let shards = ShardsExpertProvider::new(&model.shards, &model.cfg, 8);
 
-    let store = preload_parallel(&model.shards, &model.cfg, 4, 4, u64::MAX).expect("preload");
+    let store = preload_parallel(&model.shards, &model.cfg, 8, 4, u64::MAX).expect("preload");
     assert_eq!(store.len(), E);
     for eid in 0..E {
         let a = shards.expert(1, eid).unwrap();

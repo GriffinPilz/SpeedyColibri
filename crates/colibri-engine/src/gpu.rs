@@ -475,8 +475,8 @@ fn weight_ptr(w: &QTensor) -> *const c_void {
 ///
 /// # Safety
 /// `weight_ptr(w)`/`w.s` must stay valid until the returned tensor is dropped —
-/// true while the caller holds the `Arc<Expert>` across the kernel call. int4 stays
-/// offset-binary (the kernel reads it with off=1). Only valid when `zerocopy()`.
+/// true while the caller holds the `Arc<Expert>` across the kernel call. The wrapped
+/// weights stay in their on-disk layout. Only valid when `zerocopy()`.
 fn wrap_fresh(w: &QTensor) -> Option<cuda::ResidentTensor> {
     // NVFP4 carries three host buffers (nibbles + ue4m3 block scales + f32 global)
     // rather than weights + per-row scale; wrap all three zero-copy.
@@ -496,8 +496,8 @@ fn wrap_fresh(w: &QTensor) -> Option<cuda::ResidentTensor> {
 }
 
 /// Upload `w` to the GPU (once) and return its resident handle, caching by data
-/// pointer under the VRAM budget (the copy path — device copy with int4 converted
-/// to signed). `protect` lists the current op's other tensor keys so eviction never
+/// pointer under the VRAM budget (the copy path — device copy). `protect` lists the
+/// current op's other tensor keys so eviction never
 /// drops a tensor still needed this op. The zero-copy path uses [`wrap_fresh`]
 /// instead; this is only reached when zero-copy is unavailable/disabled.
 fn upload_ffn(w: &QTensor, protect: &[usize]) -> Option<*mut ColiCudaTensor> {
@@ -810,10 +810,10 @@ mod tests {
             eprintln!("skip: no CUDA device");
             return;
         }
-        // o_proj-scale int4 weight [O, I]
+        // o_proj-scale int8 weight [O, I]
         let (o, i) = (8192usize, 6144usize);
         let wf: Vec<f32> = (0..o * i).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
-        let mut w = qtensor_from_f32(&wf, o, i, 4);
+        let mut w = qtensor_from_f32(&wf, o, i, 8);
         for &s in &[1usize, 32] {
             let x = vec![0.01f32; s * i];
             let mut y = vec![0f32; s * o];
@@ -825,7 +825,7 @@ mod tests {
                 matmul_qt(&mut y, &x, &w, s);
             }
             let gpu = t.elapsed().as_secs_f64();
-            w.gpu_eligible = false; // force CPU (NEON int4)
+            w.gpu_eligible = false; // force CPU (NEON int8)
             let t = std::time::Instant::now();
             for _ in 0..iters {
                 matmul_qt(&mut y, &x, &w, s);

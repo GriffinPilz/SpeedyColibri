@@ -249,7 +249,7 @@ impl Shards {
     }
 
     /// All indexed tensors, in file/offset discovery order. The `file_idx` field
-    /// groups them by shard — used by the FP8→int4 converter to stream one input
+    /// groups them by shard — used by the FP8/NVFP4 converter to stream one input
     /// shard at a time.
     pub fn tensors(&self) -> &[StTensor] {
         &self.tensors
@@ -291,7 +291,8 @@ impl Shards {
     }
 
     /// Read the raw bytes of a tensor with no dtype conversion — for the already
-    /// int4/int8-quantized container weights (`U8`). Port of `st_read_raw`.
+    /// quantized container weights (int8/int2 codes, nvfp4 nibbles, e4m3; `U8`).
+    /// Port of `st_read_raw`.
     pub fn read_raw(&self, name: &str, out: &mut [u8]) -> io::Result<()> {
         let t = self.tensor(name)?;
         let n = t.nbytes as usize;

@@ -14,8 +14,8 @@
 //!     the [`Expert`]s directly in RAM.
 //!
 //! A blob is `gate.q | gate.scales | up.q | up.scales | down.q | down.scales`;
-//! the layer's `(fmt, dims)` in the manifest say how to slice it. int4 (fmt 2)
-//! and int8 (fmt 1) experts are supported.
+//! the layer's `(fmt, dims)` in the manifest say how to slice it. int8 (fmt 1)
+//! experts are supported.
 
 use crate::moe::{expert_gate_name, load_expert, Expert, ExpertProvider};
 use colibri_core::{Config, QTensor};
@@ -150,11 +150,7 @@ fn layout(hidden: usize, moe_inter: usize, fmt: i32) -> BlobLayout {
     // gate/up: [moe_inter, hidden]; down: [hidden, moe_inter]
     let (gq, dq) = match fmt {
         1 => (moe_inter * hidden, hidden * moe_inter), // int8: 1 byte/param
-        2 => (
-            moe_inter * hidden.div_ceil(2),
-            hidden * moe_inter.div_ceil(2),
-        ), // int4: 2/byte
-        f => panic!("preload supports int8/int4 experts only, got fmt {f}"),
+        f => panic!("preload supports int8 experts only, got fmt {f}"),
     };
     BlobLayout {
         gate_q: gq,
@@ -174,7 +170,6 @@ fn blob_bytes(hidden: usize, moe_inter: usize, fmt: i32) -> usize {
 fn push_q(b: &mut Vec<u8>, t: &QTensor) {
     match t.fmt_code {
         1 => b.extend(t.q8.iter().map(|&x| x as u8)),
-        2 => b.extend_from_slice(&t.q4),
         f => panic!("preload: unsupported expert fmt {f}"),
     }
 }
@@ -215,7 +210,6 @@ fn read_qt(blob: &[u8], off: &mut usize, qlen: usize, slen: usize, o: usize, i: 
     };
     match fmt {
         1 => t.q8 = q.iter().map(|&b| b as i8).collect(),
-        2 => t.q4 = q.to_vec().into(),
         f => panic!("preload: unsupported expert fmt {f}"),
     }
     t
@@ -476,7 +470,7 @@ mod tests {
     fn tiny_expert(seed: usize) -> Expert {
         let mk = |o: usize, i: usize, s: usize| {
             let w: Vec<f32> = (0..o * i).map(|k| (((k + s) % 9) as f32 - 4.0) * 0.1).collect();
-            qtensor_from_f32(&w, o, i, 4) // int4
+            qtensor_from_f32(&w, o, i, 8) // int8
         };
         Expert {
             gate: mk(4, 8, seed),
@@ -489,12 +483,12 @@ mod tests {
     fn blob_roundtrip_is_byte_identical() {
         let ex = tiny_expert(3);
         let blob = expert_blob(&ex);
-        assert_eq!(blob.len(), blob_bytes(8, 4, 2));
-        let back = expert_from_blob(&blob, 8, 4, 2);
-        assert_eq!(back.gate.q4, ex.gate.q4);
+        assert_eq!(blob.len(), blob_bytes(8, 4, 1));
+        let back = expert_from_blob(&blob, 8, 4, 1);
+        assert_eq!(back.gate.q8, ex.gate.q8);
         assert_eq!(back.gate.s, ex.gate.s);
-        assert_eq!(back.up.q4, ex.up.q4);
-        assert_eq!(back.down.q4, ex.down.q4);
+        assert_eq!(back.up.q8, ex.up.q8);
+        assert_eq!(back.down.q8, ex.down.q8);
         assert_eq!(back.down.s, ex.down.s);
         assert_eq!((back.gate.o, back.gate.i), (4, 8));
         assert_eq!((back.down.o, back.down.i), (8, 4));
@@ -506,7 +500,7 @@ mod tests {
             num_files: 3,
             hidden: 8,
             moe_inter: 4,
-            layers: vec![(1, 2, 128)],
+            layers: vec![(1, 1, 128)],
             experts: vec![
                 ExpertLoc { layer: 1, eid: 0, file: 0, offset: 0 },
                 ExpertLoc { layer: 1, eid: 1, file: 1, offset: 128 },
@@ -517,7 +511,7 @@ mod tests {
         m.save(&path).unwrap();
         let m2 = Manifest::load(&path).unwrap();
         assert_eq!(m2.num_files, 3);
-        assert_eq!(m2.layers, vec![(1, 2, 128)]);
+        assert_eq!(m2.layers, vec![(1, 1, 128)]);
         assert_eq!(m2.experts.len(), 2);
         assert_eq!((m2.experts[1].file, m2.experts[1].offset), (1, 128));
         std::fs::remove_file(&path).ok();

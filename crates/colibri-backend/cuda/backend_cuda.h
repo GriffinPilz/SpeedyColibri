@@ -41,7 +41,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
 
 /* Zero-copy wrap: point at host (RAM) buffers directly instead of copying to
  * device memory. Only valid on unified-memory devices with pageable host access
- * (the GB10). int4 weights stay offset-binary. No device allocation. */
+ * (the GB10). Weights stay in their on-disk layout. No device allocation. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
@@ -51,7 +51,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pageable_access(int device);
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2.
+ * fmt matches QT in glm.c: 0=f32, 1=int8, 3=int2, 4=e4m3, 5=nvfp4.
  * The first successful call uploads W and its row scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
@@ -76,14 +76,6 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate, ColiCudaT
  * quant_matmul on resident int8 weights (the shared expert). Requires fmt==1. */
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
-
-/* Prefill-oriented shared expert path.  INT4 weights stay packed in global
- * memory, activations are converted to FP16 per tile, and Tensor Cores
- * accumulate into FP32.  Unlike COLI_CUDA_TC_INT4 this does not quantize the
- * activation to INT4. */
-COLI_CUDA_DLLEXPORT int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up,
-                               ColiCudaTensor *down, float *y,
-                               const float *x, int S);
 
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */

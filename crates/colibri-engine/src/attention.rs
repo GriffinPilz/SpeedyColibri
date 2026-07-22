@@ -800,7 +800,7 @@ mod tests {
         let (h, qk_nope, r, vh, kvl) = (64usize, 128usize, 64usize, 128usize, 512usize);
         let kvb_dim = h * (qk_nope + vh);
         let wf: Vec<f32> = (0..kvb_dim * kvl).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
-        let mut kv_b = qtensor_from_f32(&wf, kvb_dim, kvl, 4); // int4, like production
+        let mut kv_b = qtensor_from_f32(&wf, kvb_dim, kvl, 8); // int8, like production
         kv_b.gpu_eligible = true;
         let mut l = Layer::default();
         l.kv_b = kv_b;

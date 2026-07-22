@@ -394,28 +394,6 @@ fn nvfp4_sim_e4m3(codes: &[u8], o: usize, i: usize, row_scale: &[f32]) -> (Vec<u
     (out, ns)
 }
 
-/// Convert a packed int4 weight matrix (offset-binary nibbles, value = nibble − 8,
-/// `o` rows × ceil(i/2) bytes) to e4m3 fp8 (1 byte/weight, `o`×`i`). The LUT was
-/// generated + roundtrip-verified with the hardware fp8 encoder (`__nv_cvt_float_to_fp8`):
-/// every int4 value −8..7 is exactly representable in e4m3.
-fn int4_to_e4m3(src: &[u8], o: usize, i: usize) -> Vec<u8> {
-    const LUT: [u8; 16] = [
-        0xD0, 0xCE, 0xCC, 0xCA, 0xC8, 0xC4, 0xC0, 0xB8, 0x00, 0x38, 0x40, 0x44, 0x48, 0x4A, 0x4C,
-        0x4E,
-    ];
-    let rb = i.div_ceil(2);
-    let mut out = vec![0u8; o * i];
-    for r in 0..o {
-        let srow = &src[r * rb..r * rb + rb];
-        let orow = &mut out[r * i..(r + 1) * i];
-        for c in 0..i {
-            let b = srow[c >> 1];
-            orow[c] = LUT[(if c & 1 == 1 { b >> 4 } else { b & 0x0f }) as usize];
-        }
-    }
-    out
-}
-
 /// Build an `Expert` from three raw weight views (`gate,up,down`, each as returned
 /// by [`Shards::read_raw_shared`]/`read_raw_shared_batched`), reading the tiny
 /// per-weight scales separately. Shared by the single-expert and batched loaders.
@@ -434,9 +412,9 @@ fn expert_from_views(
      -> io::Result<QTensor> {
         // NVFP4 experts: the weight blob is `nibbles ++ ue4m3 block-scales`, read as ONE
         // coalesced buffer together with gate/up/down (a separate `.bs` read cost one
-        // uncoalesced random-seek pread per expert — 15x slower decode). Told apart from
-        // int4 by the `.g` (per-tensor global scale) sidecar. Both halves are zero-copy
-        // views into the shared buffer. See convert::requant_experts_nvfp4.
+        // uncoalesced random-seek pread per expert — 15x slower decode). Recognized by
+        // the `.g` (per-tensor global scale) sidecar. Both halves are zero-copy views
+        // into the shared buffer. See convert::requant_experts_nvfp4.
         let base = sname.strip_suffix(".qs").unwrap_or(&sname);
         let g_name = format!("{base}.g");
         if shards.has(&g_name) {
@@ -456,13 +434,9 @@ fn expert_from_views(
             });
         }
         let (buf, off, len) = w;
-        let fmt = if *len == o * i {
-            1
-        } else if *len == o * i.div_ceil(2) {
-            2
-        } else {
-            3
-        };
+        // int8/e4m3 (`o*i` bytes, told apart by `fp8`) vs int2 (`o*ceil(i/4)`).
+        // int4 experts are no longer produced.
+        let fmt = if *len == o * i { 1 } else { 3 };
         let mut s = vec![0f32; o];
         shards.read_f32(&sname, &mut s)?;
         let mut t = QTensor { fmt_code: fmt, o: o as i32, i: i as i32, s, ..Default::default() };
@@ -481,13 +455,7 @@ fn expert_from_views(
             t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
         }
         if fp8 {
-            if fmt == 2 {
-                // int4 snapshot → convert to e4m3 at load (scaffolding for a non-fp8
-                // container). Same per-row scales; e4m3 represents int4 −8..7 exactly,
-                // so it is lossless vs the int4 weights. Doubles in-RAM size.
-                t.q4 = Bytes::Owned(int4_to_e4m3(&buf[*off..*off + *len], o, i));
-                t.fmt_code = 4;
-            } else if fmt == 1 {
+            if fmt == 1 {
                 // e4m3 snapshot (COLI_XFP8 container): the bytes are already e4m3 —
                 // 1 B/weight, indistinguishable by length from int8. Use them directly,
                 // no conversion. Routed experts are never genuinely int8.
@@ -1087,35 +1055,6 @@ mod tests {
     use crate::quantize::qtensor_from_f32;
     use std::collections::HashMap;
 
-    // The int4→e4m3 conversion + CPU e4m3 decode must reproduce the int4 matmul: every
-    // int4 value −8..7 is exact in e4m3, so the two paths compute (nibble−8)·scale
-    // identically (only f32 summation order differs). Guards the fp8 plumbing's math.
-    #[test]
-    fn int4_to_e4m3_reproduces_int4_matmul() {
-        use crate::linear::matmul_qt;
-        let (o, i, ns) = (4usize, 8usize, 3usize);
-        let rb = i.div_ceil(2);
-        let q4: Vec<u8> = (0..o * rb).map(|k| (k * 37 + 5) as u8).collect();
-        let s: Vec<f32> = (0..o).map(|r| 0.5 + r as f32 * 0.25).collect();
-        let mk = |fmt: i32, bytes: Vec<u8>| QTensor {
-            fmt_code: fmt,
-            q4: Bytes::Owned(bytes),
-            s: s.clone(),
-            o: o as i32,
-            i: i as i32,
-            ..Default::default()
-        };
-        let int4 = mk(2, q4.clone());
-        let fp8 = mk(4, int4_to_e4m3(&q4, o, i));
-        let x: Vec<f32> = (0..ns * i).map(|k| k as f32 * 0.1 - 0.35).collect();
-        let (mut y4, mut y8) = (vec![0f32; ns * o], vec![0f32; ns * o]);
-        matmul_qt(&mut y4, &x, &int4, ns);
-        matmul_qt(&mut y8, &x, &fp8, ns);
-        for (a, b) in y4.iter().zip(&y8) {
-            assert!((a - b).abs() < 1e-4, "int4 {a} vs e4m3 {b}");
-        }
-    }
-
     // In-memory provider for MoE math tests (no safetensors needed).
     struct MapProvider {
         experts: HashMap<(usize, usize), Arc<Expert>>,
@@ -1561,7 +1500,7 @@ mod tests {
         }
     }
 
-    /// End-to-end: write a real int4 `.weight` + f32 `.qs` shard for one expert,
+    /// End-to-end: write a real int2 `.weight` + f32 `.qs` shard for one expert,
     /// load it through the coalesced + chunked path (`read_threads=8`), and assert
     /// the resulting `Bytes::Shared` views (a) hold exactly the on-disk bytes and
     /// (b) dequant identically to an owned byte-for-byte reference via `matmul_qt`.
@@ -1620,10 +1559,12 @@ mod tests {
         }
         let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
 
-        let hidden = 768usize;
+        // hidden=1536 (2x) so the int2 weight span stays 2.25 MiB (0.75 MiB/tensor),
+        // matching the int4-era byte layout so the 2-chunk split still lands in gate.
+        let hidden = 1536usize;
         let moe_inter = 2048usize;
-        let rb_gu = hidden.div_ceil(2); // int4 row bytes for gate/up [moe_inter, hidden]
-        let rb_d = moe_inter.div_ceil(2); // for down [hidden, moe_inter]
+        let rb_gu = hidden.div_ceil(4); // int2 row bytes for gate/up [moe_inter, hidden]
+        let rb_d = moe_inter.div_ceil(4); // for down [hidden, moe_inter]
 
         // Distinct byte + scale patterns per tensor so a wrong offset/length shows up.
         let gate_q4: Vec<u8> = (0..moe_inter * rb_gu).map(|k| (k * 7 + 1) as u8).collect();
@@ -1665,14 +1606,14 @@ mod tests {
         assert_eq!(ex.gate.s, gate_s);
         assert_eq!(ex.up.s, up_s);
         assert_eq!(ex.down.s, down_s);
-        assert_eq!((ex.gate.fmt_code, ex.gate.o, ex.gate.i), (2, moe_inter as i32, hidden as i32));
-        assert_eq!((ex.down.fmt_code, ex.down.o, ex.down.i), (2, hidden as i32, moe_inter as i32));
+        assert_eq!((ex.gate.fmt_code, ex.gate.o, ex.gate.i), (3, moe_inter as i32, hidden as i32));
+        assert_eq!((ex.down.fmt_code, ex.down.o, ex.down.i), (3, hidden as i32, moe_inter as i32));
 
         // (b) the shared views dequant identically to an owned reference through the
         // real matmul kernel (proves the QTensor is usable, not just byte-equal).
         let check = |loaded: &QTensor, q4: &[u8], s: &[f32], o: usize, i: usize| {
             let reference = QTensor {
-                fmt_code: 2,
+                fmt_code: 3,
                 q4: Bytes::Owned(q4.to_vec()),
                 s: s.to_vec(),
                 o: o as i32,
@@ -1693,9 +1634,9 @@ mod tests {
             // only platform that ships CUDA, which hid every other CUDA regression
             // behind a permanently red suite.
             //
-            // 1e-5 still catches what this test is for: a mis-decoded int4 nibble or a
-            // dropped offset-binary bias moves a value by ~8*scale, i.e. orders of
-            // magnitude, not epsilons.
+            // 1e-5 still catches what this test is for: a mis-decoded int2 field or a
+            // dropped bias moves a value by ~2*scale, i.e. orders of magnitude, not
+            // epsilons.
             for (k, (&a, &b)) in y_loaded.iter().zip(&y_ref).enumerate() {
                 let tol = 1e-5 * a.abs().max(b.abs()).max(1.0);
                 assert!(

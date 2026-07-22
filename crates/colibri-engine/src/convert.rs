@@ -1,12 +1,13 @@
-//! FP8 → int4 container conversion — Rust port of `c/tools/convert_fp8_to_int4.py`
+//! FP8 → colibrì container conversion — Rust port of `c/tools/convert_fp8_to_int4.py`
 //! (the default, non-`--mtp`/`--indexer` path).
 //!
 //! Reads a Hugging Face GLM-5.2 snapshot whose linear weights are **block-scaled
 //! FP8** (`F8_E4M3` codes + a `name.weight_scale_inv` F32 grid of 128×128 block
-//! scales) and rewrites it as colibrì's own pre-quantized container: for each
-//! quantized weight, a `name` `U8` tensor of packed int4/int8 codes plus a
-//! `name.qs` `F32` tensor of per-row scales — exactly what [`crate::loader::qt_load`]
-//! reads. Norms, the MoE router, biases, and embeddings-passthrough stay `F32`.
+//! scales) and rewrites it as colibrì's own pre-quantized container: resident
+//! weights become a `name` `U8` tensor of packed int8 codes plus a `name.qs` `F32`
+//! tensor of per-row scales — exactly what [`crate::loader::qt_load`] reads; routed
+//! experts become NVFP4 (or e4m3 under `COLI_XFP8`). Norms, the MoE router, biases,
+//! and embeddings-passthrough stay `F32`.
 //!
 //! The MTP speculative head (layer `n_layers`: `eh_proj`/`enorm`/`hnorm`/
 //! `shared_head` plus its own attention + MoE block) is **kept by default**, so every
@@ -30,7 +31,7 @@
 //! The quantizer math is the shared, C-exact [`crate::quantize`] code, so a
 //! converted weight is byte-identical to a runtime-quantized one.
 
-use crate::quantize::{pack_int2, pack_int4, qtensor_from_f32, quantize_rows};
+use crate::quantize::{qtensor_from_f32, quantize_rows};
 use colibri_core::dtype::DType;
 use colibri_core::quant::QTensor;
 use colibri_safetensors::Shards;
@@ -51,38 +52,28 @@ const E2M1: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
-/// Bit-widths for each tensor class.
+/// Bit-widths for each resident tensor class (routed experts are NVFP4/e4m3, not
+/// int-quantized — see `xfp8` / [`quantize_nvfp4_out`]).
 ///
-/// **Defaults are 8-bit resident / 4-bit experts (`8/4`), measured.** The reference
-/// converter defaults everything to int4; on GLM-5.2 that wrecks the model. Same
-/// source (unsloth/GLM-5.2-FP8), same converter, only `ebits` changed:
+/// **Resident weights default to 8-bit int8, measured.** The reference converter
+/// defaults everything to int4; on GLM-5.2 that wrecks the model. Same source
+/// (unsloth/GLM-5.2-FP8), same converter, only `ebits` changed:
 ///
 /// | | perplexity | top-1 |
 /// |---|---|---|
-/// | `4/4` (reference default) | 48.665 | 32.1% |
-/// | `8/4` (ours)              |  6.189 | 57.9% |
+/// | `4` resident (reference default) | 48.665 | 32.1% |
+/// | `8` resident (ours)              |  6.189 | 57.9% |
 ///
 /// 7.9x the quality — perplexity 48.7 means the model was effectively guessing among
 /// ~49 tokens; 6.2 is a healthy frontier-model number. The damage is in the *resident*
 /// path, not the experts: attention + dense + shared expert are only 2.5% of the
 /// parameters but 42% of what every token touches, and they cross all 78 layers.
-///
-/// **The throughput cost of 8/4 is unresolved.** A 4/4-vs-8/4 comparison at
-/// `COLI_RAM_GB=60` read 0.52 vs 0.35 tok/s, but that is confounded: 8/4 carries ~9 GB
-/// more resident, and the swap cliff was later measured between RSS 74 (clean) and 89
-/// (15 GB swap). At a 60 GB budget 4/4 lands near RSS 70 and 8/4 near 79 — so that
-/// number may be measuring swap rather than bit width. Do not quote it.
-///
-/// `xbits` (the streamed experts) stays at 4. What 8-bit experts would cost has never
-/// been measured: the container needs 0.74 TB and does not fit on the box.
 #[derive(Debug, Clone, Copy)]
 pub struct ConvertOpts {
     /// bits for resident weights (attention, dense MLP, shared expert) — `--ebits`
     pub ebits: u32,
     /// bits for embeddings + `lm_head` — `--io-bits`
     pub io_bits: u32,
-    /// bits for routed (streamed) experts — `--xbits`, defaults to `ebits`
-    pub xbits: u32,
     /// number of transformer layers; layer index `>= n_layers` is the MTP head
     pub n_layers: usize,
     /// keep the DSA lightning-indexer weights (`self_attn.indexer.*`) instead of
@@ -103,7 +94,7 @@ pub struct ConvertOpts {
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false }
+        ConvertOpts { ebits: 8, io_bits: 8, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false }
     }
 }
 
@@ -116,7 +107,7 @@ enum Kind {
     F32,
     /// embeddings / lm_head → `io_bits`
     Io,
-    /// routed expert weight → `xbits`
+    /// routed expert weight → NVFP4 (or e4m3 under `xfp8`)
     X,
     /// resident weight (attention / dense MLP / shared) → `ebits`
     Q,
@@ -398,17 +389,15 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Quantize a 2D weight to the container form: packed `U8` codes + `F32` per-row
-/// scales. `bits` selects int2/int4/int8 exactly as the reference does.
+/// Quantize a 2D resident weight to the container form: per-row int8 `U8` codes +
+/// `F32` per-row scales. Resident/io weights are int8 (`bits >= 8`); sub-8-bit
+/// widths are no longer produced (int4/int2 removed here — routed experts use the
+/// NVFP4/e4m3 paths instead).
 fn quantize(name: &str, w: &[f32], o: usize, i: usize, bits: u32) -> (OutTensor, OutTensor) {
-    let (codes, scale) = if bits <= 2 {
-        pack_int2(w, o, i, bits)
-    } else if bits <= 4 {
-        pack_int4(w, o, i, bits)
-    } else {
-        let (q, s) = quantize_rows(w, o, i, bits);
-        (q.iter().map(|&x| x as u8).collect(), s)
-    };
+    assert!(bits >= 8, "quantize() produces int8 only; got bits={bits} (< 8)");
+    let (q, s) = quantize_rows(w, o, i, bits);
+    let codes: Vec<u8> = q.iter().map(|&x| x as u8).collect();
+    let scale = s;
     let codes_t = OutTensor {
         name: name.to_string(),
         dtype: "U8",
@@ -462,7 +451,7 @@ pub(crate) fn float_to_e4m3(x: f32) -> u8 {
 /// Per-row absmax e4m3 quantization for routed experts: scale = max|w|/448 per row so
 /// the row fits e4m3's range, store e4m3(w/scale) codes + the f32 scale. Same output
 /// layout as [`quantize`] (U8 codes + `{name}.qs` F32 scales) but 8-bit fp precision
-/// (1 byte/weight) instead of int4 — preserves the source FP8's precision.
+/// (1 byte/weight) — preserves the source FP8's precision.
 fn quantize_e4m3(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, OutTensor) {
     let mut codes = vec![0u8; o * i];
     let mut scale = vec![0f32; o];
@@ -812,7 +801,7 @@ pub enum Scheme {
 
 /// The eight magnitudes e2m1 can represent (1 sign, 2 exponent, 1 mantissa bit).
 const E2M1_LEVELS: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-/// NVFP4 scales one ue4m3 factor per this many inputs (vs int4's one per 6144-wide row).
+/// NVFP4 scales one ue4m3 factor per this many inputs (vs one per-row scale for int-N).
 const NVFP4_BLOCK: usize = 16;
 /// Largest finite ue4m3 scale (e=15,m=6; m=7 is NaN in the `fn` variant).
 const UE4M3_MAX: f32 = 448.0;
@@ -907,18 +896,6 @@ fn dequantize_qtensor(t: &QTensor) -> Vec<f32> {
                 }
             }
         }
-        2 => {
-            // int4 is offset-binary on disk: stored v+8, so decode as nibble-8.
-            let rb = (i + 1) / 2;
-            let q = t.q4.as_slice();
-            for r in 0..o {
-                for c in 0..i {
-                    let byte = q[r * rb + (c >> 1)];
-                    let nib = if c & 1 == 1 { byte >> 4 } else { byte & 0x0F } as i32;
-                    out[r * i + c] = (nib - 8) as f32 * t.s[r];
-                }
-            }
-        }
         _ => {} // int2 unused for resident weights; leave zeroed rather than lie
     }
     out
@@ -939,12 +916,12 @@ fn dequantize_qtensor(t: &QTensor) -> Vec<f32> {
 ///
 /// `experts` selects which population to report:
 /// - `false` → resident weights ([`Kind::Q`]): attention/dense/shared. 2.5% of params,
-///   but measured to matter enormously — int4 there put perplexity at 48.665, int8 at
-///   6.189.
+///   but measured to matter enormously — 4-bit resident put perplexity at 48.665,
+///   int8 at 6.189, which is why resident weights ship int8.
 /// - `true` → routed experts ([`Kind::X`]): 97.5% of params and 58% of the weights a
-///   token touches, held at int4 throughout. Their error has never been measured in
-///   perplexity terms, because an 8-bit-expert container needs 0.74 TB and does not
-///   fit on the box. This probe reaches them without converting anything.
+///   token touches, shipped as NVFP4 (4-bit block-scaled). This probe reaches them
+///   without converting anything, so an expert scheme can be scored on the real
+///   weights before committing to a container.
 pub fn quant_error(
     indir: impl AsRef<Path>,
     scheme: Scheme,
@@ -1108,16 +1085,11 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             if shape.len() != 2 {
                 return Ok(TensorOut::F32(f32_out(name, shape, &w)));
             }
-            let bits = match kind {
-                Kind::Io => opts.io_bits,
-                Kind::X => opts.xbits,
-                _ => opts.ebits,
-            };
             let (o, i) = (shape[0] as usize, shape[1] as usize);
             let (codes_t, scale_t) = if matches!(kind, Kind::X) {
                 // Routed experts are **NVFP4** by default (4-bit block-scaled, ~2× faster
                 // than e4m3 at <1% perplexity); `COLI_XFP8=1` opts into 8-bit e4m3.
-                // **int4 experts are no longer produced** — NVFP4 supersedes them.
+                // int4 experts are no longer produced — NVFP4 supersedes them.
                 if opts.xfp8 {
                     quantize_e4m3(name, &w, o, i)
                 } else {
@@ -1126,6 +1098,7 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             } else {
                 // Resident weights (attention/dense/shared) at `ebits`, embeddings/lm_head
                 // at `io_bits` — int8 by default.
+                let bits = if matches!(kind, Kind::Io) { opts.io_bits } else { opts.ebits };
                 quantize(name, &w, o, i, bits)
             };
             Ok(TensorOut::Quant(codes_t, scale_t))
@@ -1176,8 +1149,9 @@ fn process_names_parallel(
     Ok(out)
 }
 
-/// Convert a local FP8 snapshot directory to a colibrì int4 container directory.
-/// One output shard (`out-NNNNN.safetensors`) per input shard; `config.json` and
+/// Convert a local FP8 snapshot directory to a colibrì container directory (int8
+/// resident, NVFP4/e4m3 experts). One output shard (`out-NNNNN.safetensors`) per
+/// input shard; `config.json` and
 /// tokenizer files are copied through. `progress` is called once per input shard
 /// with `(shard_index, total_shards)`.
 pub fn convert_snapshot(
@@ -1311,12 +1285,12 @@ mod tests {
             }
             (se / sr).sqrt()
         };
-        let (e16, e8, e4) = (err(16), err(8), err(4));
+        let (e16, e8) = (err(16), err(8));
         assert!(e16 < 1e-9, "f32 round trip must be exact, got {e16}");
-        assert!(e8 < e4, "int8 ({e8}) must beat int4 ({e4})");
         assert!(e8 > 1e-6, "int8 on a wide-dynamic-range row should show real error, got {e8}");
-        // ~6 dB per bit: 4 extra bits should buy well over an order of magnitude.
-        assert!(e4 / e8 > 5.0, "int4/int8 error ratio only {:.2}", e4 / e8);
+        // The metric must react in the right direction: int8 loses measurably more
+        // than the exact f32 baseline it approximates.
+        assert!(e8 > e16, "int8 error ({e8}) must exceed the exact f32 baseline ({e16})");
     }
 
     #[test]
@@ -1343,11 +1317,12 @@ mod tests {
     }
 
     #[test]
-    fn nvfp4_beats_per_row_int4_when_dynamic_range_is_wide() {
+    fn nvfp4_beats_per_row_int8_when_dynamic_range_is_wide() {
         // The whole premise of block scaling: one scale per row is hostage to that
         // row's largest value, so small values quantize to nothing. Per-16 scales
-        // track the local magnitude instead. If this doesn't show up here, NVFP4 has
-        // no mechanism to help the experts and the measurement below means nothing.
+        // track the local magnitude instead. Compared against per-row int8 (what the
+        // resident path ships) — if NVFP4's block scales don't help here, they have no
+        // mechanism to help the experts and the measurement below means nothing.
         let (o, i) = (2usize, 512usize);
         let mut w = vec![0f32; o * i];
         for r in 0..o {
@@ -1365,10 +1340,9 @@ mod tests {
             }
             (se / sr).sqrt()
         };
-        let int4 = rel(&dequantize_qtensor(&qtensor_from_f32(&w, o, i, 4)));
+        let int8 = rel(&dequantize_qtensor(&qtensor_from_f32(&w, o, i, 8)));
         let nvfp4 = rel(&quantize_nvfp4_sim(&w, o, i));
-        assert!(nvfp4 < int4, "nvfp4 {nvfp4:.4} should beat per-row int4 {int4:.4}");
-        assert!(nvfp4 < int4 / 2.0, "expected a large win, got {int4:.4} -> {nvfp4:.4}");
+        assert!(nvfp4 < int8, "nvfp4 {nvfp4:.4} should beat per-row int8 {int8:.4}");
     }
 
     #[test]
@@ -1425,30 +1399,21 @@ mod tests {
     }
 
     #[test]
-    fn default_is_8bit_resident_4bit_experts() {
+    fn default_is_8bit_resident_nvfp4_experts() {
         // Measured on unsloth/GLM-5.2-FP8, same converter, only ebits changed:
-        //   4/4  perplexity 48.665  top-1 32.1%
-        //   8/4  perplexity  6.189  top-1 57.9%
+        //   4-bit resident  perplexity 48.665  top-1 32.1%
+        //   8-bit resident  perplexity  6.189  top-1 57.9%
         // 8-bit resident is worth 7.9x the quality. Its throughput cost is unresolved
         // and deliberately not asserted here — see ConvertOpts' docs for why the
         // 0.52-vs-0.35 reading is confounded by the swap cliff.
         let d = ConvertOpts::default();
         assert_eq!(d.ebits, 8, "resident weights (attention/dense/shared) must default to 8-bit");
-        assert_eq!(d.xbits, 4, "streamed experts must stay 4-bit");
         assert_eq!(d.io_bits, 8);
-    }
-
-    #[test]
-    fn expert_bits_are_independent_of_resident_bits() {
-        // The trap: xbits used to default to ebits (mirroring the reference
-        // converter). With ebits now 8 that would silently produce 8/8 — doubling the
-        // bytes streamed per token and needing a 0.74 TB container that does not fit,
-        // to recover quality that fixing attention already recovers. They must move
-        // independently.
-        let d = ConvertOpts::default();
-        assert_ne!(d.xbits, d.ebits, "xbits must not track ebits");
+        // Routed experts default to NVFP4 (4-bit block-scaled), independent of `ebits`:
+        // raising the resident width must not flip experts onto the 8-bit e4m3 path.
+        assert!(!d.xfp8, "routed experts must default to NVFP4, not e4m3");
         let hi = ConvertOpts { ebits: 16, ..Default::default() };
-        assert_eq!(hi.xbits, 4, "raising ebits must not drag the experts up with it");
+        assert!(!hi.xfp8, "raising ebits must not drag the experts up with it");
     }
     use super::*;
     use std::path::PathBuf;
@@ -1857,25 +1822,25 @@ mod tests {
         drop(f);
 
         let outdir = tmp();
-        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false };
+        let opts = ConvertOpts { ebits: 8, io_bits: 8, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false };
         let stats = convert_snapshot(&indir, &outdir, opts, |_, _, _| {}).unwrap();
         assert_eq!(stats.tensors_quantized, 1); // o_proj
         assert_eq!(stats.tensors_f32, 1); // norm
         assert_eq!(stats.shards_written, 1);
 
-        // Read the container back and check the weight round-trips through int4.
+        // Read the container back and check the weight round-trips through int8.
         let out = Shards::open(&outdir).unwrap();
         assert!(out.has(name)); // U8 codes
         assert!(out.has(&format!("{name}.qs"))); // scales
         assert!(out.has(nname)); // norm passthrough as F32
 
-        // qt_load the int4 weight and dequantize row 0: dequant target [[2,4],[-2,1]].
-        // per-row int4: row0 amax=4 → s=4/7; codes round(2/s)=4, round(4/s)=7.
-        let qt = crate::loader::qt_load(&out, name, 2, 2, 4).unwrap();
-        assert_eq!(qt.fmt_code, 2); // int4
+        // qt_load the int8 weight and check row 0: dequant target [[2,4],[-2,1]].
+        // per-row int8: row0 amax=4 → s=4/127; codes round(2/s)=64, round(4/s)=127.
+        let qt = crate::loader::qt_load(&out, name, 2, 2, 8).unwrap();
+        assert_eq!(qt.fmt_code, 1); // int8
         assert_eq!(qt.o, 2);
         assert_eq!(qt.i, 2);
-        assert!((qt.s[0] - 4.0 / 7.0).abs() < 1e-6);
+        assert!((qt.s[0] - 4.0 / 127.0).abs() < 1e-6);
 
         std::fs::remove_dir_all(&indir).ok();
         std::fs::remove_dir_all(&outdir).ok();

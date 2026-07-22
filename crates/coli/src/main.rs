@@ -97,7 +97,7 @@ COMMANDS:
   serve <snap> [port] [warm-up prompt...]  OpenAI-compatible HTTP server  [working]
   worker <snap> [port]     expert-shard server for a peer node (multi-node)  [working]
   bench <snap>             throughput benchmark        [pending]
-  convert <src-snap> <out-snap>  FP8/NVFP4 -> int4 container converter  [working]
+  convert <src-snap> <out-snap>  FP8/NVFP4 -> int8/nvfp4 container converter  [working]
   probe <snap>             print snapshot format (container|fp8|nvfp4|unknown)  [working]
   qerr <src-snap> [bits] [n] [experts|resident]  requant error vs the FP8 source  [working]
   tokenize <tok.json> <text>   encode/decode round-trip   [working]
@@ -293,12 +293,13 @@ fn cmd_qerr(args: &[String]) -> ExitCode {
 }
 
 /// `coli convert <src-snapshot> <out-snapshot>` — rewrite a block-scaled FP8 or
-/// modelopt-NVFP4 GLM-5.2 snapshot as the colibrì int4/int8 container the engine loads.
+/// modelopt-NVFP4 GLM-5.2 snapshot as the colibrì container the engine loads (int8
+/// resident, NVFP4 experts).
 ///
-/// Bit-widths default to the measured sweet spot — **8-bit resident, 4-bit experts**
-/// (`ebits=8 xbits=4 io_bits=8`): 7.9x better perplexity than all-int4 (6.189 vs
-/// 48.665) for ~33% throughput. Override via `COLI_EBITS` / `COLI_IO_BITS` /
-/// `COLI_XBITS` / `COLI_NLAYERS`; see `ConvertOpts`.
+/// Bit-widths default to the measured sweet spot — **8-bit resident** (`ebits=8
+/// io_bits=8`): 7.9x better perplexity than all-4-bit resident (6.189 vs 48.665).
+/// Routed experts ship NVFP4 (4-bit block-scaled), or e4m3 under `COLI_XFP8`.
+/// Override via `COLI_EBITS` / `COLI_IO_BITS` / `COLI_NLAYERS`; see `ConvertOpts`.
 /// `coli requant-nvfp4 <container-in> <container-out>` — re-quantize the routed experts
 /// of an existing e4m3 colibrì container to NVFP4 (e2m1 nibbles + per-16 ue4m3 block
 /// scales + f32 global), copying every other tensor through byte-for-byte. hidden /
@@ -368,21 +369,19 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         (Some(a), Some(b)) => (a, b),
         _ => {
             eprintln!("usage: coli convert <fp8|nvfp4-snapshot-dir> <output-snapshot-dir>");
-            eprintln!("  env: COLI_EBITS(8) COLI_IO_BITS(8) COLI_XBITS(4) COLI_NLAYERS(78) COLI_KEEP_INDEXER(0)");
+            eprintln!("  env: COLI_EBITS(8) COLI_IO_BITS(8) COLI_NLAYERS(78) COLI_KEEP_INDEXER(0) COLI_XFP8(0)");
             return ExitCode::from(2);
         }
     };
     let env_u32 = |k: &str, d: u32| {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     };
-    // NB: xbits does NOT default to ebits. It used to (mirroring the reference
-    // converter), which would make the new `ebits=8` default silently mean 8/8 —
-    // doubling bytes-per-token and needing a 0.74 TB container that does not fit on
-    // the box, for quality that fixing attention already recovers.
+    // Routed experts are NVFP4 (4-bit block-scaled) regardless of `ebits`, or e4m3
+    // under COLI_XFP8 — they do not inherit the resident bit width, so raising
+    // `ebits` never drags the streamed experts (or the 0.74 TB container) up with it.
     let opts = colibri_engine::ConvertOpts {
         ebits: env_u32("COLI_EBITS", 8),
         io_bits: env_u32("COLI_IO_BITS", 8),
-        xbits: env_u32("COLI_XBITS", 4),
         n_layers: env_u32("COLI_NLAYERS", 78) as usize,
         // COLI_KEEP_INDEXER=1 keeps the DSA lightning-indexer weights so the container
         // can run DSA sparse attention (dropped by default, matching the reference).
@@ -489,12 +488,12 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         .filter(|v: &Vec<i32>| !v.is_empty())
         .unwrap_or_else(|| vec![1]);
 
-    // Bit-widths default to int4; overridable via env for the C-vs-Rust
-    // validation harness (e.g. COLI_DBITS=16 for the exact f32 path).
+    // Bit-widths default to int8 (int8-resident container); overridable via env for
+    // the C-vs-Rust validation harness (e.g. COLI_DBITS=16 for the exact f32 path).
     let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
     let opts = colibri_engine::LoadOptions {
-        dbits: envbits("COLI_DBITS", 4),
-        ebits: envbits("COLI_EBITS", 4),
+        dbits: envbits("COLI_DBITS", 8),
+        ebits: envbits("COLI_EBITS", 8),
     };
     let model = match colibri_engine::load_model_with(snap, opts) {
         Ok(m) => m,
@@ -914,8 +913,8 @@ fn cmd_genbatch(args: &[String]) -> ExitCode {
 
     let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
     let opts = colibri_engine::LoadOptions {
-        dbits: envbits("COLI_DBITS", 4),
-        ebits: envbits("COLI_EBITS", 4),
+        dbits: envbits("COLI_DBITS", 8),
+        ebits: envbits("COLI_EBITS", 8),
     };
     let model = match colibri_engine::load_model_with(snap, opts) {
         Ok(m) => m,
@@ -2112,8 +2111,8 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
         .unwrap_or(128);
     let ctx = args.get(4).and_then(|s| parse_ctx(s)).unwrap_or(0);
 
-    // Fixed reserves (GLM-5.2 int4 estimates): resident dense ~10 GB, working
-    // buffers / OS headroom ~4 GB.
+    // Fixed reserves (GLM-5.2 int8-resident estimates): resident dense ~10 GB,
+    // working buffers / OS headroom ~4 GB.
     let dense_gb = 10u64;
     let working_gb = 4u64;
     let kv_per_tok = kv_bytes_per_token(cfg.kv_lora as u64, cfg.qk_rope as u64, cfg.n_layers as u64);
@@ -2127,7 +2126,7 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
 
     println!("model: hidden={} moe_inter={} experts/layer={} attn_layers={} sparse_layers={}",
         cfg.hidden, cfg.moe_inter, cfg.n_experts, cfg.n_layers, sparse_layers);
-    println!("per expert (int4): {:.2} MB   total routed: {total_experts} → {:.0} GB",
+    println!("per expert (nvfp4 ~4-bit): {:.2} MB   total routed: {total_experts} → {:.0} GB",
         mb(bpe), gb(total_experts * bpe));
     println!("KV cache: {:.1} KB/token (compressed MLA, {} layers)",
         kv_per_tok as f64 / 1024.0, cfg.n_layers);
@@ -2149,7 +2148,7 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
 }
 
 /// Bits per weight actually stored in a loaded tensor, from its container format
-/// (`fmt_code`: 0 = f32, 1 = int8, 2 = packed int4).
+/// (`fmt_code`: 0 = f32, 1 = int8, 3 = packed int2, 4 = e4m3, 5 = nvfp4).
 ///
 /// `model.dbits`/`model.ebits` are the **LoadOptions** the caller asked for, which
 /// only bite when quantizing a full-precision snapshot at load. For a pre-quantized
@@ -2159,7 +2158,9 @@ fn tensor_bits(t: &colibri_core::QTensor) -> &'static str {
     match t.fmt_code {
         0 => "f32",
         1 => "int8",
-        2 => "int4",
+        3 => "int2",
+        4 => "e4m3",
+        5 => "nvfp4",
         _ => "?",
     }
 }
@@ -2185,16 +2186,16 @@ fn logprob_of(logits: &[f32], t: usize) -> f32 {
 ///
 /// Its reason to exist: choosing quantization by intuition is expensive. `COLI_EBITS
 /// 4->8` (attention + dense + shared expert — resident, never streamed) is worth 7.9x
-/// the perplexity for ~9 GB of RAM. `COLI_XBITS 4->8` (routed experts) doubles the
-/// bytes streamed per token; its cost has **not** been measured, because an 8-bit-
-/// expert container needs 0.74 TB and does not fit on the box. Measure which one
-/// actually buys the quality before paying for it.
+/// the perplexity for ~9 GB of RAM. Routed experts ship NVFP4 (4-bit block-scaled);
+/// the 8-bit e4m3 alternative doubles the bytes streamed per token and needs a
+/// 0.74 TB container that does not fit on the box. Measure which knob actually buys
+/// the quality before paying for it.
 ///
 /// One forward over the whole sequence (prefill), then the mean negative
 /// log-likelihood of each *actual* next token — not the argmax, which only says
 /// whether the top pick matched and is blind to how much probability mass moved.
 /// Honors `COLI_DBITS`/`COLI_EBITS`, which only bite on a full-precision snapshot: a
-/// pre-quantized int4 container is already 4-bit on disk and cannot be un-rounded, so
+/// pre-quantized container is already fixed on disk and cannot be un-rounded, so
 /// comparing bit-widths on the real model means converting the FP8 source at each
 /// setting.
 fn cmd_ppl(args: &[String]) -> ExitCode {
@@ -2244,8 +2245,8 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
 
     let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
     let opts = colibri_engine::LoadOptions {
-        dbits: envbits("COLI_DBITS", 4),
-        ebits: envbits("COLI_EBITS", 4),
+        dbits: envbits("COLI_DBITS", 8),
+        ebits: envbits("COLI_EBITS", 8),
     };
     let model = match colibri_engine::load_model_with(snap, opts) {
         Ok(m) => m,
@@ -2264,7 +2265,7 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
     let mut kv = colibri_engine::KvCache::for_model(&model, ids.len());
     let mut hidden = vec![0f32; ids.len() * d];
     // Report what the container actually holds, per class — `ebits` governs the
-    // resident path, `xbits` the streamed experts, and they differ independently.
+    // resident path; the streamed experts are NVFP4/e4m3, independent of it.
     let resident_fmt = model
         .layers
         .iter()
@@ -2336,8 +2337,8 @@ fn cmd_tf(args: &[String]) -> ExitCode {
     }
     let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
     let opts = colibri_engine::LoadOptions {
-        dbits: envbits("COLI_DBITS", 4),
-        ebits: envbits("COLI_EBITS", 4),
+        dbits: envbits("COLI_DBITS", 8),
+        ebits: envbits("COLI_EBITS", 8),
     };
     let model = match colibri_engine::load_model_with(snap, opts) {
         Ok(m) => m,

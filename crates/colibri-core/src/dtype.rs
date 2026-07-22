@@ -14,10 +14,11 @@ pub enum DType {
     F16,
     /// float32
     F32,
-    /// raw bytes — quantized int4/int8 container (safetensors `U8`/`I8`)
+    /// raw bytes — quantized container codes: int8/int2, or nvfp4 nibbles / e4m3
+    /// (safetensors `U8`/`I8`)
     U8,
     /// float8 e4m3 (`fn` finite variant) — block-scaled FP8 weights. Read-only:
-    /// used by the FP8→int4 converter, never on the inference path.
+    /// used by the FP8/NVFP4 converter, never on the inference path.
     F8E4M3,
     /// float8 e5m2 — the other FP8 weight variant (has inf/nan). Converter-only.
     F8E5M2,

@@ -93,8 +93,8 @@ impl From<std::io::Error> for EngineError {
     }
 }
 
-/// Options controlling weight materialization. Defaults match the int4 GLM-5.2
-/// container (`dbits = ebits = 4`); the pre-quantized `.qs` tensors are
+/// Options controlling weight materialization. Defaults match the int8-resident
+/// GLM-5.2 container (`dbits = ebits = 8`); the pre-quantized `.qs`/nvfp4 tensors are
 /// self-describing, so `bits` only affects any full-precision fallback tensors.
 #[derive(Debug, Clone, Copy)]
 pub struct LoadOptions {
@@ -106,7 +106,7 @@ pub struct LoadOptions {
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        LoadOptions { dbits: 4, ebits: 4 }
+        LoadOptions { dbits: 8, ebits: 8 }
     }
 }
 

@@ -3,9 +3,9 @@
 //!
 //! A tensor is loaded one of two ways:
 //!   - **pre-quantized container:** if `name.qs` exists, `name` holds the raw
-//!     int8/int4/int2 codes (safetensors `U8`) and `name.qs` holds the per-row
+//!     int8/int2 codes (safetensors `U8`) and `name.qs` holds the per-row
 //!     f32 scales — read directly, no requantization. The format is inferred from
-//!     the byte count (`O*I` → int8, `O*ceil(I/2)` → int4, else int2).
+//!     the byte count (`O*I` → int8, else int2).
 //!   - **full tensor:** otherwise `name` is a full f32/bf16 tensor that gets
 //!     runtime-quantized to `bits` (the tiny oracle / full-precision path).
 
@@ -25,13 +25,9 @@ pub fn qt_load(shards: &Shards, name: &str, o: usize, i: usize, bits: u32) -> io
             return Err(missing(name));
         }
         let nb = nb as usize;
-        let fmt = if nb == o * i {
-            1
-        } else if nb == o * ((i + 1) / 2) {
-            2
-        } else {
-            3
-        };
+        // int8 (`O*I` bytes) vs int2 (`O*ceil(I/4)`), inferred from the byte count.
+        // int4 containers are no longer produced.
+        let fmt = if nb == o * i { 1 } else { 3 };
         let mut t = QTensor {
             fmt_code: fmt,
             o: o as i32,

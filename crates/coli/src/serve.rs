@@ -758,10 +758,10 @@ mod tests {
     #[test]
     fn model_id_from_hf_cache_path() {
         assert_eq!(
-            model_id_from("/root/.cache/huggingface/hub/models--mateogrgic--GLM-5.2-colibri-int4-with-int8-mtp/snapshots/abc123"),
-            "mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp"
+            model_id_from("/root/.cache/huggingface/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/abc123"),
+            "nvidia/GLM-5.2-NVFP4"
         );
-        assert_eq!(model_id_from("/data/glm52-int4/"), "glm52-int4");
+        assert_eq!(model_id_from("/data/glm52-nvfp4/"), "glm52-nvfp4");
         assert_eq!(model_id_from("/model"), "model");
     }
 

@@ -237,7 +237,7 @@ pub struct ResidentTensor {
 }
 
 impl ResidentTensor {
-    /// Upload a quantized weight `[O, I]` (fmt: 0=f32, 1=int8, 2=int4, 3=int2)
+    /// Upload a quantized weight `[O, I]` (fmt: 0=f32, 1=int8, 3=int2)
     /// to `device`, so a later matmul reuses it. `weights` is the raw code bytes.
     pub fn upload(
         weights: &[u8],
@@ -289,9 +289,8 @@ impl ResidentTensor {
         }
     }
 
-    /// Zero-copy wrap of host buffers `[O, I]` (fmt: 0=f32, 1=int8, 2=int4). The
-    /// GPU reads the RAM copy in place — no device allocation, no memcpy. int4 must
-    /// be **offset-binary** (the on-disk / CPU form); the kernel handles it.
+    /// Zero-copy wrap of host buffers `[O, I]` (fmt: 0=f32, 1=int8). The GPU reads
+    /// the RAM copy in place — no device allocation, no memcpy.
     ///
     /// # Safety
     /// `weights`/`scales` must stay alive and valid for `[O, I]`/`fmt` for as long

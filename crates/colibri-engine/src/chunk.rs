@@ -49,12 +49,11 @@ pub struct ChunkDesc {
 }
 
 /// Bytes per output row for a packed weight of `i` input columns at `fmt`
-/// (0=f32, 1=int8, 2=int4, 3=int2, 4=e4m3). Mirrors the backend's `row_bytes`.
+/// (0=f32, 1=int8, 3=int2, 4=e4m3). Mirrors the backend's `row_bytes`.
 pub fn row_bytes(fmt: i32, i: usize) -> usize {
     match fmt {
         0 => i * 4,
         1 | 4 => i,
-        2 => i.div_ceil(2),
         3 => i.div_ceil(4),
         _ => 0,
     }
@@ -118,7 +117,7 @@ pub fn plan_expert_chunks(
 }
 
 /// The packed weight buffer of one of an expert's matrices. Routed experts are always
-/// q4-packed (int4/int2/e4m3); int8/f32 experts aren't streamed, so they're rejected.
+/// q4-packed (int2/e4m3); int8/f32 experts aren't streamed, so they're rejected.
 pub fn matrix_weight_bytes(ex: &Expert, m: ExpertMatrix) -> io::Result<&[u8]> {
     let t: &QTensor = match m {
         ExpertMatrix::Gate => &ex.gate,
@@ -126,7 +125,7 @@ pub fn matrix_weight_bytes(ex: &Expert, m: ExpertMatrix) -> io::Result<&[u8]> {
         ExpertMatrix::Down => &ex.down,
     };
     match t.fmt_code {
-        2 | 3 | 4 => Ok(t.q4.as_slice()),
+        3 | 4 => Ok(t.q4.as_slice()),
         other => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("chunk fetch: fmt {other} experts unsupported (routed experts are q4-packed)"),

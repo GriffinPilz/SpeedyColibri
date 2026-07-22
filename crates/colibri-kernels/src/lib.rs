@@ -8,7 +8,7 @@
 //! reference kernels below are the oracle those SIMD paths must match.
 //!
 //! Formats follow [`colibri_core::quant::QFormat`]: int8 is one byte/param with a
-//! per-row f32 scale; int4/int2 pack 2/4 values per byte with a per-row scale.
+//! per-row f32 scale; int2 packs 4 values per byte with a per-row scale.
 
 /// Symmetric per-row int8 activation quantization — port of `qrow_i8` in
 /// `c/glm.c` (the IDOT activation path).
@@ -60,24 +60,8 @@ pub fn matvec_i8(
     }
 }
 
-/// Unpack a packed int4 nibble stream (2 values/byte, low nibble first) into
-/// signed values in `[-8, 7]`. Port of the int4 dequant unpack.
-pub fn unpack_i4(packed: &[u8], n: usize, out: &mut [i8]) {
-    debug_assert!(out.len() >= n);
-    for k in 0..n {
-        let byte = packed[k / 2];
-        let nib = if k % 2 == 0 { byte & 0x0F } else { byte >> 4 };
-        // signed 4-bit: values 8..15 are negative
-        out[k] = if nib >= 8 {
-            nib as i8 - 16
-        } else {
-            nib as i8
-        };
-    }
-}
-
 /// f32 dot product — the fallback path used when int quant measured slower
-/// (int4 single-row on some shapes stays f32 in the C engine).
+/// (single-row on some shapes stays f32 in the C engine).
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b).map(|(&x, &y)| x * y).sum()
@@ -87,43 +71,9 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 //
 // These back the exact `matmul_qt` path (attention projections, expert FFN,
 // lm_head). On aarch64 (the DGX Spark Grace CPU) they use NEON with the same
-// two-accumulator / `vfmaq` / `vaddvq` structure as the C engine's `matmul_i4`
-// / `matmul_q`; elsewhere they fall back to the scalar reference. The f32 path
-// stays scalar (see `dot_f32`) so it remains byte-exact with the C f32 kernel.
-
-/// `Σ (nibble_i − 8) · x[i]` over `n` int4 weights packed 2/byte (low nibble
-/// first). NEON on aarch64, scalar otherwise.
-#[inline]
-pub fn dot_i4_f32(w4: &[u8], x: &[f32], n: usize) -> f32 {
-    debug_assert!(w4.len() >= n.div_ceil(2));
-    debug_assert!(x.len() >= n);
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is baseline on aarch64; bounds checked via the asserts above.
-    unsafe {
-        dot_i4_f32_neon(w4, x, n)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        dot_i4_f32_scalar(w4, x, n)
-    }
-}
-
-/// Scalar reference for [`dot_i4_f32`] — also the oracle for the NEON path.
-pub fn dot_i4_f32_scalar(w4: &[u8], x: &[f32], n: usize) -> f32 {
-    let mut a = 0f32;
-    let mut i = 0;
-    while i + 1 < n {
-        let b = w4[i >> 1];
-        a += ((b & 0x0F) as i32 - 8) as f32 * x[i];
-        a += ((b >> 4) as i32 - 8) as f32 * x[i + 1];
-        i += 2;
-    }
-    if i < n {
-        let b = w4[i >> 1];
-        a += ((b & 0x0F) as i32 - 8) as f32 * x[i];
-    }
-    a
-}
+// two-accumulator / `vfmaq` / `vaddvq` structure as the C engine's `matmul_q`;
+// elsewhere they fall back to the scalar reference. The f32 path stays scalar
+// (see `dot_f32`) so it remains byte-exact with the C f32 kernel.
 
 /// `Σ w[i] · x[i]` over `n` int8 weights (as f32). NEON on aarch64, scalar else.
 #[inline]
@@ -146,41 +96,6 @@ pub fn dot_i8_f32_scalar(w8: &[i8], x: &[f32], n: usize) -> f32 {
     let mut a = 0f32;
     for i in 0..n {
         a += x[i] * w8[i] as f32;
-    }
-    a
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn dot_i4_f32_neon(w4: &[u8], x: &[f32], n: usize) -> f32 {
-    use std::arch::aarch64::*;
-    let m4 = vdup_n_u8(0x0F);
-    let b8 = vdup_n_s8(8);
-    let mut ac0 = vdupq_n_f32(0.0);
-    let mut ac1 = vdupq_n_f32(0.0);
-    let mut i = 0usize;
-    while i + 16 <= n {
-        // 8 bytes = 16 nibbles; de-interleave low/high nibbles into index order.
-        let by = vld1_u8(w4.as_ptr().add(i >> 1));
-        let z = vzip_u8(vand_u8(by, m4), vshr_n_u8::<4>(by));
-        let w0 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.0), b8)); // nibbles 0..8, value−8
-        let w1 = vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.1), b8)); // nibbles 8..16
-        ac0 = vfmaq_f32(ac0, vld1q_f32(x.as_ptr().add(i)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
-        ac1 = vfmaq_f32(ac1, vld1q_f32(x.as_ptr().add(i + 4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
-        ac0 = vfmaq_f32(ac0, vld1q_f32(x.as_ptr().add(i + 8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
-        ac1 = vfmaq_f32(ac1, vld1q_f32(x.as_ptr().add(i + 12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1))));
-        i += 16;
-    }
-    let mut a = vaddvq_f32(vaddq_f32(ac0, ac1));
-    while i + 1 < n {
-        let b = *w4.get_unchecked(i >> 1);
-        a += ((b & 0x0F) as i32 - 8) as f32 * *x.get_unchecked(i);
-        a += ((b >> 4) as i32 - 8) as f32 * *x.get_unchecked(i + 1);
-        i += 2;
-    }
-    if i < n {
-        let b = *w4.get_unchecked(i >> 1);
-        a += ((b & 0x0F) as i32 - 8) as f32 * *x.get_unchecked(i);
     }
     a
 }
@@ -238,35 +153,9 @@ mod tests {
         assert_eq!(out, [3.0, 7.0]);
     }
 
-    #[test]
-    fn i4_unpack_signed() {
-        // byte 0x0F -> low nibble 15 -> -1 ; high nibble 0 -> 0
-        // byte 0x87 -> low nibble 7 -> 7 ; high nibble 8 -> -8
-        let packed = [0x0F, 0x87];
-        let mut out = [0i8; 4];
-        unpack_i4(&packed, 4, &mut out);
-        assert_eq!(out, [-1, 0, 7, -8]);
-    }
-
-    // deterministic pseudo-random f32 / packed-int4 for kernel tests
+    // deterministic pseudo-random f32 for kernel tests
     fn xs(n: usize) -> Vec<f32> {
         (0..n).map(|k| (((k * 37 + 11) % 97) as f32 - 48.0) * 0.02).collect()
-    }
-    fn packed_i4(n: usize) -> Vec<u8> {
-        (0..n.div_ceil(2)).map(|k| ((k * 53 + 7) % 251) as u8).collect()
-    }
-
-    #[test]
-    fn dot_i4_f32_neon_matches_scalar() {
-        // exercise multiples of 16, non-multiples, and odd n (tail paths)
-        for &n in &[0usize, 1, 3, 15, 16, 17, 31, 64, 100, 6144, 6145] {
-            let w = packed_i4(n);
-            let x = xs(n);
-            let simd = dot_i4_f32(&w, &x, n);
-            let scal = dot_i4_f32_scalar(&w, &x, n);
-            let tol = 1e-3 * (1.0 + scal.abs());
-            assert!((simd - scal).abs() <= tol, "n={n}: simd {simd} vs scalar {scal}");
-        }
     }
 
     #[test]
@@ -281,30 +170,4 @@ mod tests {
         }
     }
 
-    // Micro-benchmark: `cargo test -p colibri-kernels --release -- --ignored --nocapture bench_dot_i4`
-    #[test]
-    #[ignore]
-    fn bench_dot_i4() {
-        let n = 6144usize; // GLM-5.2 hidden
-        let w = packed_i4(n);
-        let x = xs(n);
-        let iters = 2_000_000u64;
-        let t0 = std::time::Instant::now();
-        let mut acc = 0f32;
-        for _ in 0..iters {
-            acc += dot_i4_f32(&w, &x, n);
-        }
-        let simd_s = t0.elapsed().as_secs_f64();
-        let t1 = std::time::Instant::now();
-        let mut acc2 = 0f32;
-        for _ in 0..iters {
-            acc2 += dot_i4_f32_scalar(&w, &x, n);
-        }
-        let scal_s = t1.elapsed().as_secs_f64();
-        let flops = iters as f64 * n as f64 * 2.0;
-        println!(
-            "dot_i4_f32 n={n} x{iters}: SIMD {:.3}s ({:.1} GFLOP/s) | scalar {:.3}s ({:.1} GFLOP/s) | {:.2}x  (chk {} {})",
-            simd_s, flops / simd_s / 1e9, scal_s, flops / scal_s / 1e9, scal_s / simd_s, acc, acc2
-        );
-    }
 }

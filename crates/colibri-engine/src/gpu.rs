@@ -330,6 +330,134 @@ pub fn try_attention_absorb(
     ok
 }
 
+/// DSA sparse attention on the GPU — the [`try_attention_absorb`] twin that attends
+/// only to each query's indexer selection. `sel[q]` holds the query's chosen cache
+/// positions (relative to the latent's first row; the DSA path runs at `st0 == 0`, so
+/// these are the absolute positions). An empty `sel[q]` is the is_dense case. Falls
+/// back (returns false) when the GPU is unavailable, so the caller uses the CPU
+/// `reconstruct_core`.
+#[allow(clippy::too_many_arguments)]
+/// DSA lightning-indexer scores on the GPU — the indexer's hot loop
+/// (`score[s][t] = wsc·Σ_h hw[h]·relu(rs·dot(qi[h], key[t]))`, ~25.8 GFLOP per FULL
+/// layer on CPU). Fills `scores[nsp, t_len]`; row `si` (query `s0+si`) is valid for
+/// `t < pos_base+s0+si+1`. The kernel accumulates each head's dot in ascending `i`
+/// exactly like the CPU reference, so the scores — and therefore the top-k selection
+/// — match. Returns false (caller keeps the CPU path) when unavailable or `nh > 32`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_dsa_indexer_scores(
+    scores: &mut [f32],
+    qi: &[f32],
+    hw: &[f32],
+    keys: &[f32],
+    nsp: usize,
+    s0: usize,
+    nh: usize,
+    hd: usize,
+    t_len: usize,
+    pos_base: usize,
+) -> bool {
+    if !available() || nsp == 0 || nh == 0 || nh > 32 || hd == 0 || t_len == 0 {
+        return false;
+    }
+    if qi.len() < nsp * nh * hd || hw.len() < nsp * nh || keys.len() < t_len * hd
+        || scores.len() < nsp * t_len
+    {
+        return false;
+    }
+    // SAFETY: sizes checked above; device 0 is the engine's single GPU.
+    unsafe {
+        cuda::dsa_indexer_scores_raw(
+            scores.as_mut_ptr(),
+            qi.as_ptr(),
+            hw.as_ptr(),
+            keys.as_ptr(),
+            nsp as i32,
+            s0 as i32,
+            nh as i32,
+            hd as i32,
+            t_len as i32,
+            pos_base as i32,
+            0,
+        )
+    }
+}
+
+/// `h0`/`hc` select the head slice `[h0, h0+hc)` to compute (tensor-parallel
+/// attention); the full-attention call passes `(0, h)`. A partial slice writes only
+/// its `ctx` head-columns and the kernel zeroes the rest, so summing the slices'
+/// o-projections reconstructs full attention. `h` stays the full head count (the
+/// `[s, h, ·]` stride of `q`/`ctx`).
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_absorb_sparse(
+    kv_b: &QTensor,
+    ctx: &mut [f32],
+    q: &[f32],
+    latent: &[f32],
+    rope: &[f32],
+    sel: &[Vec<u32>],
+    index_topk: usize,
+    h0: usize,
+    hc: usize,
+    s: usize,
+    h: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    v_head: usize,
+    kv_lora: usize,
+    t: usize,
+    scale: f32,
+) -> bool {
+    if !available() || !kv_b.gpu_eligible || sel.len() != s || index_topk == 0 {
+        return false;
+    }
+    if h0 + hc > h || hc == 0 {
+        return false;
+    }
+    let Some(handle) = upload_ffn(kv_b, &[]) else {
+        return false;
+    };
+    // Flatten into fixed-stride [s, maxsel] indices + per-query counts. A query with an
+    // empty selection keeps count 0 → the kernel attends causally (is_dense).
+    let maxsel = index_topk;
+    let mut sel_idx = vec![0i32; s * maxsel];
+    let mut sel_cnt = vec![0i32; s];
+    for (qi, positions) in sel.iter().enumerate() {
+        let n = positions.len().min(maxsel);
+        sel_cnt[qi] = n as i32;
+        for (j, &p) in positions.iter().take(maxsel).enumerate() {
+            sel_idx[qi * maxsel + j] = p as i32;
+        }
+    }
+    // SAFETY: handle resident; ctx/q/latent/rope sized by the dims; sel_idx has
+    // s*maxsel ints and sel_cnt has s ints (allocated just above).
+    let ok = unsafe {
+        cuda::attention_absorb_sparse_raw(
+            handle,
+            ctx.as_mut_ptr(),
+            q.as_ptr(),
+            latent.as_ptr(),
+            rope.as_ptr(),
+            sel_idx.as_ptr(),
+            sel_cnt.as_ptr(),
+            maxsel as i32,
+            h0 as i32,
+            hc as i32,
+            s as i32,
+            h as i32,
+            qk_nope as i32,
+            qk_rope as i32,
+            v_head as i32,
+            kv_lora as i32,
+            t as i32,
+            scale,
+        )
+    };
+    if ok {
+        GPU_ATTN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 fn weight_ptr(w: &QTensor) -> *const c_void {
     match w.fmt_code {
         0 => w.qf.as_ptr() as *const c_void,
@@ -347,15 +475,29 @@ fn weight_ptr(w: &QTensor) -> *const c_void {
 ///
 /// # Safety
 /// `weight_ptr(w)`/`w.s` must stay valid until the returned tensor is dropped —
-/// true while the caller holds the `Arc<Expert>` across the kernel call. int4 stays
-/// offset-binary (the kernel reads it with off=1). Only valid when `zerocopy()`.
+/// true while the caller holds the `Arc<Expert>` across the kernel call. The wrapped
+/// weights stay in their on-disk layout. Only valid when `zerocopy()`.
 fn wrap_fresh(w: &QTensor) -> Option<cuda::ResidentTensor> {
+    // NVFP4 carries three host buffers (nibbles + ue4m3 block scales + f32 global)
+    // rather than weights + per-row scale; wrap all three zero-copy.
+    if w.fmt_code == 5 {
+        return unsafe {
+            cuda::ResidentTensor::wrap_raw_nvfp4(
+                w.q4.as_ptr() as *const c_void,
+                w.bs.as_ptr() as *const c_void,
+                w.g,
+                w.i,
+                w.o,
+                0,
+            )
+        };
+    }
     unsafe { cuda::ResidentTensor::wrap_raw(weight_ptr(w), w.s.as_ptr(), w.fmt_code, w.i, w.o, 0) }
 }
 
 /// Upload `w` to the GPU (once) and return its resident handle, caching by data
-/// pointer under the VRAM budget (the copy path — device copy with int4 converted
-/// to signed). `protect` lists the current op's other tensor keys so eviction never
+/// pointer under the VRAM budget (the copy path — device copy). `protect` lists the
+/// current op's other tensor keys so eviction never
 /// drops a tensor still needed this op. The zero-copy path uses [`wrap_fresh`]
 /// instead; this is only reached when zero-copy is unavailable/disabled.
 fn upload_ffn(w: &QTensor, protect: &[usize]) -> Option<*mut ColiCudaTensor> {
@@ -417,12 +559,25 @@ pub fn try_expert_ffn(
         // SAFETY: g/u/d live until end of scope, covering the synchronous kernel +
         // download in expert_mlp_raw; out/x sized [nr, O]/[nr, I] by ffn().
         let ok = unsafe {
-            cuda::expert_mlp_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            if gate.fmt_code == 5 {
+                cuda::expert_mlp_nvfp4_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            } else if gate.fmt_code == 4 {
+                cuda::expert_mlp_fp8_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            } else if gate.fmt_code == 1 && tile_i8_enabled() {
+                cuda::expert_mlp_i8a16_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            } else {
+                cuda::expert_mlp_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+            }
         };
         if ok {
             GPU_FFN.with(|c| c.set(c.get() + 1));
         }
         return ok;
+    }
+    // NVFP4 has no device-copy path (the block-scale/global plumbing is zero-copy only);
+    // fall back to the CPU decode (matmul_qt fmt=5) when zero-copy is unavailable.
+    if gate.fmt_code == 5 {
+        return false;
     }
     // Copy path: cached device uploads. all three must stay resident together for
     // the fused kernel — protect them from eviction.
@@ -437,11 +592,130 @@ pub fn try_expert_ffn(
         return false;
     };
     // SAFETY: handles are resident on device 0; out/x sized [nr, O]/[nr, I] by ffn().
-    let ok = unsafe { cuda::expert_mlp_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32) };
+    let ok = unsafe {
+        if gate.fmt_code == 4 {
+            cuda::expert_mlp_fp8_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        } else if gate.fmt_code == 1 && tile_i8_enabled() {
+            cuda::expert_mlp_i8a16_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        } else {
+            cuda::expert_mlp_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        }
+    };
     if ok {
         GPU_FFN.with(|c| c.set(c.get() + 1));
     }
     ok
+}
+
+/// `COLI_EXPERT_GROUP=1` batches a layer's routed experts through the grouped async
+/// kernel (one H2D/D2H per ≤64-expert chunk) instead of a synchronous call per expert
+/// — attacks the per-expert round-trip that dominates moe-compute.
+pub fn expert_group_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() == Some("1"))
+}
+
+/// Routes int8 experts/MLPs (the shared expert + dense layers) through the tiled `i8a16`
+/// tensor-core kernel instead of the naive `quant_matmul` — nsys found that kernel is 60%
+/// of GPU time (its S-fold weight re-reads). Default-on; set `COLI_TILE_I8=0` to disable.
+/// Measured @512 tok: attn 60.3→19.9 s (3.0×), prefill 386→334 s, tokens bit-identical.
+pub fn tile_i8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_TILE_I8").ok().as_deref() != Some("0"))
+}
+
+/// Batched routed-expert FFN. `active` is one `(expert, its token rows, its per-row
+/// weights)` per active expert. Gathers all rows into one buffer (grouped by expert),
+/// wraps each expert zero-copy, computes them in ≤64-expert grouped calls (one H2D/D2H
+/// each), then scatters the weighted results into `out` `[n_tokens, d]`. Returns false
+/// — leaving `out` untouched — if unavailable/ineligible, so the caller falls back
+/// per-expert. FP8-only for now (the grouped kernel's e4m3 branch).
+pub fn try_expert_group(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if active.is_empty() {
+        return true; // nothing routed — `out` unchanged
+    }
+    if !active.iter().all(|(ex, _, _)| {
+        ex.gate.gpu_eligible && ex.gate.fmt_code == 4 && ex.up.fmt_code == 4 && ex.down.fmt_code == 4
+    }) {
+        return false;
+    }
+    let total: usize = active.iter().map(|(_, r, _)| r.len()).sum();
+    // Gather activations, rows grouped by expert; remember each global row's dest token+weight.
+    let mut x_all = vec![0f32; total * d];
+    let mut token_of = vec![0usize; total];
+    let mut weight_of = vec![0f32; total];
+    let mut g = 0usize;
+    for (_, rows, rw) in active {
+        for (r, &t) in rows.iter().enumerate() {
+            x_all[g * d..(g + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
+            token_of[g] = t;
+            weight_of[g] = rw[r];
+            g += 1;
+        }
+    }
+    let mut y_all = vec![0f32; total * d];
+    // Grouped calls in chunks of ≤64 experts (the C-side GroupDesc cap).
+    let mut row_off = 0usize;
+    let mut ci = 0usize;
+    while ci < active.len() {
+        let c1 = (ci + 64).min(active.len());
+        let (mut gs, mut us, mut ds, mut rows_i) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut keep = Vec::new(); // hold descriptors alive across the synchronous call
+        let mut chunk_rows = 0usize;
+        for (ex, rows, _) in &active[ci..c1] {
+            let (Some(gt), Some(ut), Some(dt)) =
+                (wrap_fresh(&ex.gate), wrap_fresh(&ex.up), wrap_fresh(&ex.down))
+            else {
+                return false;
+            };
+            gs.push(gt.as_raw());
+            us.push(ut.as_raw());
+            ds.push(dt.as_raw());
+            keep.push(gt);
+            keep.push(ut);
+            keep.push(dt);
+            rows_i.push(rows.len() as i32);
+            chunk_rows += rows.len();
+        }
+        let off = row_off * d;
+        // SAFETY: gs/us/ds stay resident until `keep` drops (after the synchronous
+        // group call); the x/y sub-slices hold chunk_rows*d floats each.
+        let ok = unsafe {
+            cuda::expert_group_raw(
+                &gs,
+                &us,
+                &ds,
+                &rows_i,
+                y_all[off..off + chunk_rows * d].as_mut_ptr(),
+                x_all[off..off + chunk_rows * d].as_ptr(),
+            )
+        };
+        drop(keep);
+        if !ok {
+            return false;
+        }
+        row_off += chunk_rows;
+        ci = c1;
+    }
+    // Scatter weighted results into the destination tokens.
+    for gg in 0..total {
+        let (t, wgt) = (token_of[gg], weight_of[gg]);
+        let ys = &y_all[gg * d..(gg + 1) * d];
+        let os = &mut out[t * d..(t + 1) * d];
+        for dd in 0..d {
+            os[dd] += wgt * ys[dd];
+        }
+    }
+    true
 }
 
 /// Try to run `y[S,O] = x[S,I] @ W^T` on the GPU. Returns `true` if it ran there;
@@ -483,6 +757,44 @@ pub fn try_matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) -> bool {
     })
 }
 
+/// Dense f32 matmul `y[s,o] = x[s,i] @ w[o,i]^T` on the GPU, full f32 precision.
+/// For the MoE router projection: a single-threaded CPU `matmul_f32` there was
+/// measured at ~40% of moe-compute (~248 s @4096 tok) while the GPU sat idle. The
+/// router weight is numerically sensitive so it stays f32 (fmt=0 — no scales). The
+/// weight is resident-cached by its pointer, so it uploads once. Returns false to
+/// fall back to the CPU path when CUDA is unavailable.
+pub fn try_matmul_f32(y: &mut [f32], x: &[f32], w: &[f32], s: usize, i: usize, o: usize) -> bool {
+    if !available() || w.len() != o * i {
+        return false;
+    }
+    let key = w.as_ptr() as usize;
+    RESIDENT.with(|r| {
+        let mut map = r.borrow_mut();
+        let slot = map.entry(key).or_insert(std::ptr::null_mut());
+        // SAFETY: y sized [s,o], x sized [s,i] by the caller; w is [o,i] f32 and
+        // outlives the resident tensor (a model weight). fmt=0 ⇒ scales unused, so
+        // a null scales pointer is valid (see coli_cuda_tensor_upload / quant_matmul).
+        let ok = unsafe {
+            cuda::matmul_raw(
+                slot,
+                y.as_mut_ptr(),
+                x.as_ptr(),
+                w.as_ptr() as *const c_void,
+                std::ptr::null(),
+                0,
+                s as i32,
+                i as i32,
+                o as i32,
+                0,
+            )
+        };
+        if ok {
+            GPU_MATMULS.with(|c| c.set(c.get() + 1));
+        }
+        ok
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,10 +810,10 @@ mod tests {
             eprintln!("skip: no CUDA device");
             return;
         }
-        // o_proj-scale int4 weight [O, I]
+        // o_proj-scale int8 weight [O, I]
         let (o, i) = (8192usize, 6144usize);
         let wf: Vec<f32> = (0..o * i).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
-        let mut w = qtensor_from_f32(&wf, o, i, 4);
+        let mut w = qtensor_from_f32(&wf, o, i, 8);
         for &s in &[1usize, 32] {
             let x = vec![0.01f32; s * i];
             let mut y = vec![0f32; s * o];
@@ -513,7 +825,7 @@ mod tests {
                 matmul_qt(&mut y, &x, &w, s);
             }
             let gpu = t.elapsed().as_secs_f64();
-            w.gpu_eligible = false; // force CPU (NEON int4)
+            w.gpu_eligible = false; // force CPU (NEON int8)
             let t = std::time::Instant::now();
             for _ in 0..iters {
                 matmul_qt(&mut y, &x, &w, s);

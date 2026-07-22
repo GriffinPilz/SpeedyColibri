@@ -39,6 +39,15 @@ const DEFAULT_CTX: usize = 32_768;
 /// Tokens generated per warm-up prompt (enough to route a spread of experts).
 const WARMUP_TOKENS: usize = 8;
 
+/// How many copies of the KV cache to reserve for. `KvCache` lazily allocates a
+/// full-size device-side shadow per layer (`model.rs`'s `DeviceKv`) on the GPU decode
+/// path — and on GB10's unified memory that shadow comes out of the *same* pool as
+/// the host copy, so under CUDA the KV genuinely costs twice.
+#[cfg(feature = "cuda")]
+const KV_COPIES: u64 = 2;
+#[cfg(not(feature = "cuda"))]
+const KV_COPIES: u64 = 1;
+
 /// Parse a token count like `32k`, `1m`, or `131072`.
 fn parse_ctx(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
@@ -100,6 +109,9 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Leak to 'static so the optional background prefetch loader can hold the cache
+    // (a server owns the model for its whole lifetime).
+    let model: &'static colibri_engine::Model = Box::leak(Box::new(model));
     let tok_path = format!("{snap}/tokenizer.json");
     let tok = match Tokenizer::load(&tok_path) {
         Ok(t) => t,
@@ -108,19 +120,125 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let base = ShardsExpertProvider::new(&model.shards, &model.cfg, model.ebits as u32);
-    let provider = ExpertCache::new(base, crate::ram_budget());
     let model_id = model_id_from(&snap);
-
     // Served context length (prompt + completion). The model's hard ceiling is
     // `max_position_embeddings`; the served value is COLI_CTX (else a memory-safe
     // default), clamped to that ceiling. Requests are validated against it.
+    //
+    // Computed *before* the expert-cache budget: the budget has to reserve the KV
+    // this window can allocate, and KV is sized from ctx_len.
     let model_max = if model.cfg.max_ctx > 0 { model.cfg.max_ctx as usize } else { usize::MAX };
     let ctx_len = std::env::var("COLI_CTX")
         .ok()
         .and_then(|s| parse_ctx(&s))
         .unwrap_or(DEFAULT_CTX)
         .clamp(1, model_max);
+
+    // Worst-case KV for the served window — a single full-context request allocates
+    // exactly this, and the expert cache must not have already eaten it.
+    let kv_reserve = (kv_bytes_per_token(&model.cfg) as u64)
+        .saturating_mul(ctx_len as u64)
+        .saturating_mul(KV_COPIES);
+    let budget = crate::ram_budget_reserving(kv_reserve);
+    let gib = (1u64 << 30) as f64;
+    if budget == u64::MAX {
+        // No /proc/meminfo (non-Linux dev box): the budget is unbounded, and printing
+        // it as a number renders "17179869184 GB". Say what actually happened.
+        println!(
+            "[serve] expert cache: unbounded (no MemAvailable to budget from) \
+             — set COLI_RAM_GB to cap it"
+        );
+    } else {
+        println!(
+            "[serve] expert cache: {:.0} GB budget (reserved {:.1} GB KV for {} ctx{}) \
+             — set COLI_RAM_GB to override",
+            budget as f64 / gib,
+            kv_reserve as f64 / gib,
+            ctx_len,
+            if KV_COPIES > 1 { ", incl. device shadow" } else { "" }
+        );
+    }
+
+    let usage_path =
+        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
+
+    // The expert->node map comes first: it gates what this node may load (below), and
+    // a cluster that disagrees about it must fail before we pay for the AUTOPIN
+    // warm-up (verification is seconds, pinning can be minutes). Single-node collapses
+    // to "everything is local".
+    let cluster = colibri_cluster::ClusterConfig::from_env();
+    let sharding = if cluster.is_single_node() {
+        colibri_cluster::ExpertSharding::single(model.cfg.n_experts as u32)
+    } else {
+        crate::build_sharding(&cluster, model.cfg.n_experts as u32, &history)
+    };
+
+    // Ownership is enforced at the load layer too, not just at dispatch: the provider
+    // refuses experts this node doesn't own, so a routing bug fails loudly instead of
+    // silently streaming a peer's expert off disk.
+    let base = ShardsExpertProvider::with_sharding(
+        &model.shards,
+        &model.cfg,
+        model.ebits as u32,
+        sharding.clone(),
+        cluster.this_node,
+    );
+    let provider = std::sync::Arc::new(ExpertCache::new(base, budget));
+    if let Some(topn) = crate::prefetch_topn() {
+        provider.enable_prefetch(topn);
+        println!("[serve] speculative next-layer prefetch on (top-{topn}/layer)");
+    }
+
+    // Multi-node: install the expert-parallel context so moe() splits experts by
+    // ownership — this node computes its own shard, and peers' experts are fetched
+    // from their `worker` servers over TCP/RoCE. Single-node leaves it unset.
+    if !cluster.is_single_node() {
+        let peers = match crate::cluster_peers(&cluster) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("coli serve: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let n_peers = peers.len();
+        let owned = sharding.count_for(cluster.this_node);
+        let transport =
+            colibri_cluster::TcpTransport::new(cluster.this_node, peers, sharding.fingerprint());
+
+        // Handshake with every worker up front: if any disagrees about the expert map
+        // (or isn't up yet), fail here rather than silently mis-routing experts once
+        // tokens start flowing.
+        use colibri_cluster::Transport as _;
+        if let Err(e) = transport.verify_peers() {
+            eprintln!("coli serve: cluster verification failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "[serve] expert-parallel: {} nodes, rank {} owns {} experts; \
+             {} peer(s) agreed on sharding {:#018x}",
+            cluster.num_nodes,
+            cluster.this_node.0,
+            owned,
+            n_peers,
+            sharding.fingerprint()
+        );
+        colibri_engine::set_cluster(colibri_engine::ClusterCtx {
+            sharding: sharding.clone(),
+            transport: Box::new(transport),
+        });
+    }
+
+    // Pinned hot-store (AUTOPIN) from the persistent usage history: routing is heavily
+    // skewed, so keeping the hot head resident stops it churning through the LRU.
+    // `COLI_PIN_GB=auto` sizes it to the usage curve's knee. Can take minutes (it reads
+    // every pinned expert), so it runs only once the cluster is known-good.
+    //
+    // Restricted to the experts we own: every node reads the same history, so an
+    // unfiltered pin would spend this node's cache on a peer's shard (and now be
+    // rejected outright by the provider's ownership gate).
+    let own_history = crate::owned_history(&history, &sharding, cluster.this_node);
+    crate::apply_autopin(&provider, &own_history, budget);
 
     // ---- warm-up ----------------------------------------------------------
     for (i, w) in warmups.iter().enumerate() {
@@ -129,8 +247,8 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             continue;
         }
         eprintln!("[serve] warm-up {}/{}: {} tokens", i + 1, warmups.len(), ids.len());
-        let mut kv = mk_kv(&model, ids.len() + WARMUP_TOKENS);
-        if let Err(e) = colibri_engine::generate_greedy(&model, &mut kv, &provider, &ids, WARMUP_TOKENS) {
+        let mut kv = mk_kv(model, ids.len() + WARMUP_TOKENS);
+        if let Err(e) = colibri_engine::generate_greedy(model, &mut kv, &*provider, &ids, WARMUP_TOKENS) {
             eprintln!("[serve] warm-up failed: {e}");
         }
     }
@@ -148,7 +266,17 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("[serve] OpenAI-compatible server on http://{addr}  (model: {model_id})");
+    // Handle SIGINT/SIGTERM so the server (often PID 1 under Docker) stops on Ctrl-C or
+    // `docker stop` instead of hanging until SIGKILL. Nonblocking accept + a poll of
+    // the shutdown flag is what lets the blocking loop below actually notice it.
+    crate::install_shutdown_handlers();
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!("[serve] warning: set_nonblocking failed ({e}); Ctrl-C may be slow");
+    }
+    println!(
+        "[serve] coli {} — OpenAI-compatible server on http://{addr}  (model: {model_id})",
+        crate::version_string()
+    );
     let kv_at_ctx = kv_bytes_per_token(&model.cfg).saturating_mul(ctx_len) as f64 / (1u64 << 30) as f64;
     let model_max_str =
         if model.cfg.max_ctx > 0 { model.cfg.max_ctx.to_string() } else { "unknown".to_string() };
@@ -158,22 +286,48 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     );
     println!("[serve]   POST /v1/chat/completions   POST /v1/completions   GET /v1/models   GET /health");
 
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => handle(stream, &model, &provider, &tok, &model_id, ctx_len),
+    // Scan the ConnectX/RoCE fabric and print the other Sparks we can see, so the
+    // operator can verify the multi-node wiring at startup, then keep beaconing so
+    // peers that start later discover this node too. COLI_DISCOVER_SECS=0 skips.
+    let disc_secs = std::env::var("COLI_DISCOVER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(3.0);
+    if disc_secs > 0.0 {
+        let rank: u32 = std::env::var("COLI_NODE_RANK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let d = colibri_cluster::discover(rank, port, Duration::from_secs_f64(disc_secs));
+        let _ = colibri_cluster::discovery::print_report(&d, &mut std::io::stdout());
+        colibri_cluster::discovery::spawn_beacon(rank, port);
+    }
+
+    while !crate::shutdown_requested() {
+        match listener.accept() {
+            // handle() does blocking, timeout-bounded reads; the listener is
+            // nonblocking but the accepted socket must not be, or reads spin.
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                handle(stream, model, &*provider, &tok, &model_id, ctx_len);
+            }
+            // No pending connection: nap briefly, then re-check SHUTDOWN. 100 ms of
+            // accept latency is nothing next to a multi-second generation, and it
+            // bounds how long Ctrl-C takes to be noticed.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // EINTR from the signal itself: loop and let the SHUTDOWN check handle it.
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => eprintln!("[serve] accept: {e}"),
         }
     }
-    ExitCode::SUCCESS
+    println!("[serve] shutdown signal received — stopping");
+    // Loop noticed the signal in ~50ms (measured); shutdown_exit then skips Drop. The
+    // remaining ~2s is the kernel reclaiming this ~60 GB process, unavoidable and well
+    // inside docker's grace — see shutdown_exit's docs.
+    crate::shutdown_exit()
 }
 
 fn mk_kv(model: &Model, max_t: usize) -> KvCache {
-    KvCache::new(
-        model.cfg.n_layers as usize,
-        model.cfg.kv_lora as usize,
-        model.cfg.qk_rope as usize,
-        max_t,
-    )
+    KvCache::for_model(model, max_t)
 }
 
 /// Derive a display model id from the snapshot path (the HF repo dir name, or the
@@ -604,10 +758,10 @@ mod tests {
     #[test]
     fn model_id_from_hf_cache_path() {
         assert_eq!(
-            model_id_from("/root/.cache/huggingface/hub/models--mateogrgic--GLM-5.2-colibri-int4-with-int8-mtp/snapshots/abc123"),
-            "mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp"
+            model_id_from("/root/.cache/huggingface/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/abc123"),
+            "nvidia/GLM-5.2-NVFP4"
         );
-        assert_eq!(model_id_from("/data/glm52-int4/"), "glm52-int4");
+        assert_eq!(model_id_from("/data/glm52-nvfp4/"), "glm52-nvfp4");
         assert_eq!(model_id_from("/model"), "model");
     }
 

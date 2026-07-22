@@ -1,9 +1,12 @@
 # colibrì → Rust port status (SpeedyColibri)
 
-This repository is being converted from the original C engine (`c/`) to Rust.
-The Rust workspace lives at the repo root (`Cargo.toml` + `crates/`); the C
-sources stay in the tree as the reference implementation until each module is
-fully ported and validated.
+This repository was converted from the original C engine to Rust. The Rust
+workspace lives at the repo root (`Cargo.toml` + `crates/`) and is now the engine;
+the C reference sources have been removed from the tree. The one exception is the
+CUDA kernel source (`crates/colibri-backend/cuda/backend_cuda.{cu,h}`), which is the
+live GPU backend compiled via FFI — it has no Rust equivalent. The "Ports (C
+source)" column below is retained as **provenance** — where each crate's logic came
+from — not as a pointer to in-tree files.
 
 **Goal:** a full 1:1 rewrite of the whole engine (CPU forward pass, kernels,
 grammar, tokenizer, backends, tools) that runs GLM-5.2 token-exact against the
@@ -17,7 +20,7 @@ Blackwell, aarch64 + CUDA), single node first, designed to split across nodes
 
 **Approach:** bottom-up. Leaf modules first (no dependencies, easy to validate),
 then the forward pass, then the GPU backends and tooling. Every ported module
-ships with unit tests; the C code is the oracle.
+ships with unit tests that encode the reference behavior.
 
 ## Workspace layout
 
@@ -29,9 +32,9 @@ ships with unit tests; the C code is the oracle.
 | `colibri-tokenizer` | `c/tok.h`, `c/tok_unicode.h` | ✅ ported + tested |
 | `colibri-kernels` | `c/glm.c` (idot/quant/dequant) | 🟡 **NEON int4·f32 / int8·f32 dots (5.4× vs scalar)** wired into `matmul_qt`; int2 + IDOT int8-activation path pending |
 | `colibri-grammar` | `c/grammar.h`, `c/schema_gbnf.h` | ⬜ skeleton |
-| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache**; DSA/SIMD/speculation deferred |
+| `colibri-engine` | `c/glm.c` (forward, MoE, MLA, KV, gen) | 🟡 **full CPU forward pass + greedy decode + resident expert cache + DSA sparse attention**; SIMD/speculation deferred |
 | `colibri-backend` | `c/backend_loader.c`, `backend_cuda.*` | 🟡 CPU trait live; **CUDA FFI binding GPU-verified on a DGX Spark** (GB10, sm_121, CUDA 13 — builds/links/inits, GPU matmul smoke test passes); not yet wired into forward; Metal deprioritized |
-| `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; RDMA transport stubbed |
+| `colibri-cluster` | (new — multi-node) | 🟡 expert-parallel sharding tested; **ConnectX/RoCE peer discovery working** (`coli cluster`); RDMA transport stubbed |
 | `coli` (bin) | `c/glm.c` `main()`, `c/coli` launcher | 🟡 tokenize/config/load/gen/repack/**serve** work; interactive chat REPL dropped (server is the interface) |
 | Docker / deploy | (new — DGX Spark) | ✅ aarch64+CUDA image, compose, entrypoint |
 | — | `c/olmoe.c` | ⬜ not started (second model variant) |
@@ -65,7 +68,10 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
    - ✅ MLA attention (`attention.rs`) with compressed KV-cache (`KvCache`) — both
      the reconstruction reference and the DeepSeek weight-absorption decode core;
      tested that the two agree, and that batched prefill == step-by-step decode.
-     (DSA sparse-indexer top-k selection still ⬜ — this is the dense path.)
+     ✅ **DSA sparse-indexer top-k selection ported** (`dsa.rs`): lightning-indexer
+     scoring + top-k + sparse attention, wired into `attention_with` for FULL
+     indexer layers. Unit-tested incl. the select-all==dense invariant. SHARED-layer
+     selection-reuse ⬜ (runs dense); end-to-end needs the --indexer weights.
    - ✅ MoE block (`moe.rs`): sigmoid router + bias top-K (noaux_tc), SwiGLU
      experts, shared expert; experts streamed via an `ExpertProvider` whose
      `ShardsExpertProvider` checks `colibri-cluster` ownership (single-node local
@@ -99,7 +105,7 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
      expert LRU cache) and the deferred pieces (DSA, speculation, CUDA).
 4. **CUDA (Blackwell) backend:** primary GPU tier for DGX Spark.
    - ✅ FFI binding (`colibri-backend/src/cuda.rs` + `build.rs`): compiles
-     `c/backend_cuda.cu` with nvcc (`--features cuda`, `CUDA_ARCH=native`/`sm_121`),
+     `crates/colibri-backend/cuda/backend_cuda.cu` with nvcc (`--features cuda`, auto-detected `CUDA_ARCH`),
      links `cudart`+`stdc++`; safe wrappers for init/mem_info/tensor_upload/matmul/
      expert_mlp/lifecycle; `CudaBackend::probe()` (init-based); `coli backend`.
      **GPU-VERIFIED on a DGX Spark** (GB10, sm_121, CUDA 13.0): builds+links, inits
@@ -250,19 +256,32 @@ Legend: ✅ done · 🟡 partial · ⬜ not started
    OpenAI-compatible server, web dashboard.
 7. **Multi-node (expert-parallel):** real `num_nodes > 1` sharding + RDMA/RoCE
    transport over ConnectX-7 (GPUDirect); split-model on-disk layout per node.
+   - ✅ **ConnectX/RoCE peer discovery** (`colibri-cluster::discovery`, `coli cluster
+     [seconds]`, and a scan printed at `serve` startup). Enumerates local RoCE links
+     from `/sys/class/infiniband` + `ip`; finds peers two ways — a UDP beacon each
+     node broadcasts (announcing hostname/rank/serve-port) and the kernel ARP table
+     (primed by a subnet sweep), classifying a neighbour as a Spark when its MAC OUI
+     matches a local ConnectX NIC. Verified across two real GB10 Sparks (gx10-42b2 ↔
+     gx10-5a4f on 192.168.100.0/24): each finds the other by hardware and, when both
+     run colibrì, by beacon (rank + serve port). `serve` keeps a background beacon so
+     later-starting nodes still discover it. Container needs `--network host` (bridge
+     hides the fabric) — `run-dgx.sh` sets it for `serve`/`cluster`.
+   - ⬜ next: the RDMA transport itself, then wiring the MoE path to fetch non-local
+     experts through it, and a per-node on-disk expert-shard layout.
 8. **Second model:** `olmoe.c`.
 
 ## Validation strategy
 
-- Unit tests per crate (the C behavior is the spec). 87 tests currently pass.
-- **C-vs-Rust harness (`scripts/validate_c_vs_rust.py`, see [VALIDATION.md](VALIDATION.md)):**
-  runs both engines on the same tiny synthetic model (real GLM architecture, no
-  torch / no 370 GB model) and diffs greedy generation + teacher-forcing at f32
-  and int4. **Currently PASSES** — byte-exact at f32, token-exact at int4, on
-  both modes. The C engine is forced onto the exact CPU path
-  (`IDOT=0 ABSORB=0 DRAFT=0`). Since the C engine is itself token-exact vs a
-  `transformers` oracle, this transitively validates the Rust dense path.
-- Not yet covered by the harness: DSA indexer, MTP speculation, CUDA (unported).
+- Unit + integration tests per crate encode the reference behavior (the C engine's
+  semantics are the spec). The tiny synthetic-model integration tests
+  (`colibri-engine/tests/forward_tiny.rs`, `load_tiny_model.rs`) exercise the full
+  forward pass + greedy decode on real GLM architecture without the 370 GB model.
+- The C reference engine and the C-vs-Rust oracle harness (`validate_c_vs_rust.py`,
+  `VALIDATION.md`) have been **removed** — the port is the engine now, and the tests
+  above carry correctness forward. The C engine was historically token-exact vs a
+  `transformers` oracle, which is the behavior those tests encode.
+- CUDA is verified separately on a CUDA host: GPU-vs-CPU tokens match within f32
+  epsilon (`colibri-engine/tests/forward_tiny.rs` under `--features cuda`).
 
 ## Notes
 

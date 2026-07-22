@@ -39,6 +39,46 @@ pub struct Layer {
     pub sh_gate: QTensor,
     pub sh_up: QTensor,
     pub sh_down: QTensor,
+
+    // DSA lightning indexer (present only on FULL indexer layers, i.e. when the
+    // checkpoint was converted with the indexer weights). `None`/empty → no DSA on
+    // this layer, so attention runs the dense path. See `crate::dsa`.
+    pub ix_wk: Option<QTensor>,     // key proj: hidden -> index_hd
+    pub ix_wq: Option<QTensor>,     // query proj: q_lora -> index_nh*index_hd
+    pub ix_wp: Option<QTensor>,     // per-head weight proj: hidden -> index_nh
+    pub ix_knorm_w: Vec<f32>,       // key LayerNorm weight (eps 1e-6)
+    pub ix_knorm_b: Vec<f32>,       // key LayerNorm bias
+}
+
+/// The MTP (multi-token prediction) speculative head — port of the `mtpL` /
+/// `eh_proj` / `enorm` / `hnorm` / `mtp_norm` members of the C `Model`.
+///
+/// Structurally it is a **normal sparse [`Layer`]** living at the extra layer
+/// index `n_layers` (its routed experts stream like any other layer's), plus four
+/// tensors that fuse the main model's hidden state with the next token's
+/// embedding before that layer runs:
+///
+/// ```text
+/// e  = rmsnorm(embed(next_tok), enorm)
+/// h  = rmsnorm(rmsnorm(hidden, final_norm), hnorm)   // hidden is POST model.norm
+/// hx = eh_proj · [e ; h]                             // [D, 2D] · [2D] -> [D]
+/// hx = layer_forward(mtp_layer, hx, pos)
+/// draft = argmax(lm_head · rmsnorm(hx, mtp_norm))
+/// ```
+///
+/// The head is trained to predict token `t+2` from the state at `t` and the
+/// embedding of `t+1`, which is what makes its drafts worth verifying.
+pub struct MtpHead {
+    /// the MTP transformer block (always sparse), at layer index `n_layers`
+    pub layer: Layer,
+    /// `[D, 2D]` — projects the concatenated `[e ; h]` back to hidden width
+    pub eh_proj: QTensor,
+    /// RMSNorm weight applied to the next token's embedding
+    pub enorm: Vec<f32>,
+    /// RMSNorm weight applied to the (already final_norm'd) hidden state
+    pub hnorm: Vec<f32>,
+    /// `shared_head.norm.weight` — the head's own final norm before `lm_head`
+    pub mtp_norm: Vec<f32>,
 }
 
 /// The compressed MLA KV-cache — port of the `Lc`/`Rc` per-layer buffers in
@@ -63,18 +103,62 @@ pub struct KvCache {
     dev: Option<crate::gpu::DeviceKv>,
 }
 
+/// `kv_start` value meaning "this layer's cache has not started yet" — the MTP
+/// row's state until the first draft establishes its first position.
+///
+/// The C uses `-1` in an `int` array and tests `kv_start[li] < 0 || kv_start[li] > p`.
+/// `usize::MAX` collapses that to just `kv_start[li] > p`, since the sentinel is
+/// greater than every real position — same semantics, no signed type needed.
+pub const KV_UNSET: usize = usize::MAX;
+
 impl KvCache {
-    /// Allocate a cache for `n_layers` layers holding up to `max_t` tokens.
-    pub fn new(n_layers: usize, kv_lora: usize, qk_rope: usize, max_t: usize) -> KvCache {
+    /// Allocate a cache for `n_rows` layer rows holding up to `max_t` tokens.
+    ///
+    /// Prefer [`KvCache::for_model`], which sizes the rows (including the MTP
+    /// head's extra row) from the model itself.
+    pub fn new(n_rows: usize, kv_lora: usize, qk_rope: usize, max_t: usize) -> KvCache {
         KvCache {
             max_t,
             kv_lora,
             qk_rope,
-            latent: vec![vec![0.0; max_t * kv_lora]; n_layers],
-            k_rot: vec![vec![0.0; max_t * qk_rope]; n_layers],
-            kv_start: vec![0; n_layers],
+            latent: vec![vec![0.0; max_t * kv_lora]; n_rows],
+            k_rot: vec![vec![0.0; max_t * qk_rope]; n_rows],
+            kv_start: vec![0; n_rows],
             #[cfg(feature = "cuda")]
             dev: None,
+        }
+    }
+
+    /// Allocate a cache sized for `model`, holding up to `max_t` tokens.
+    ///
+    /// When the model carries an MTP head this allocates **`n_layers + 1`** rows
+    /// (C: `NR = c->n_layers + 1`) — the head is a real layer at index `n_layers`
+    /// with its own KV. That row starts [`KV_UNSET`] rather than 0 (C:
+    /// `kv_start[i] = -1`): unlike the main stack, the head's cache begins at the
+    /// first *decode* position, not at the start of the prompt, so it holds only a
+    /// partial suffix of the sequence.
+    pub fn for_model(model: &Model, max_t: usize) -> KvCache {
+        let n_layers = model.cfg.n_layers as usize;
+        let rows = n_layers + usize::from(model.has_mtp);
+        let mut kv = KvCache::new(
+            rows,
+            model.cfg.kv_lora as usize,
+            model.cfg.qk_rope as usize,
+            max_t,
+        );
+        if model.has_mtp {
+            kv.kv_start[n_layers] = KV_UNSET;
+        }
+        kv
+    }
+
+    /// Record that the layer's cache covers positions from `pos` onward, if that
+    /// is earlier than what it already covers. Port of the C's
+    /// `if(kv_start[li] < 0 || kv_start[li] > p) kv_start[li] = p;` — the
+    /// [`KV_UNSET`] sentinel makes the `< 0` arm unnecessary.
+    pub fn start_at(&mut self, layer: usize, pos: usize) {
+        if self.kv_start[layer] > pos {
+            self.kv_start[layer] = pos;
         }
     }
 
@@ -149,8 +233,13 @@ pub struct Model {
 
     /// whether the DSA lightning indexer weights are present
     pub has_dsa: bool,
-    /// whether the native MTP speculative head is present
+    /// whether the native MTP speculative head is present and loaded
+    /// (mirrors `mtp.is_some()`; both are set together by the loader)
     pub has_mtp: bool,
+    /// the loaded MTP head, when the container ships a complete one and `MTP=0`
+    /// was not set. `None` on the default containers, which are converted without
+    /// `--mtp`.
+    pub mtp: Option<MtpHead>,
 }
 
 impl Model {

@@ -33,6 +33,12 @@ use crate::sharding::NodeId;
 pub struct ExpertRequest {
     /// experts (global ids) the peer should apply, all owned by the target node
     pub experts: Vec<u32>,
+    /// routing weight for each expert in `experts` (per the requester's router).
+    /// The owner returns `sum_e weight[e] * expert_e(x)` so the response is one
+    /// `[n_tokens, hidden]` partial sum regardless of how many experts it owns.
+    /// For the batched (`n_tokens > 1`) case, weights are `[n_tokens * n_experts]`
+    /// row-major (per token, per expert); for `n_tokens == 1` it is just per expert.
+    pub weights: Vec<f32>,
     /// token activations, `[n_tokens * hidden]` row-major f32
     pub activations: Vec<f32>,
     pub n_tokens: usize,
@@ -51,6 +57,46 @@ pub struct ExpertResponse {
     pub hidden: usize,
 }
 
+/// A batch of layer-input activations for a peer to run **its head slice** of MLA
+/// attention over (tensor-parallel attention — the analogue of [`ExpertRequest`] for
+/// the attention block). The peer computes the projections, KV, and the DSA-sparse
+/// core for heads `[h_start, h_start+h_count)`, then its o-projection, and returns the
+/// partial `[n_tokens, hidden]` output. The driver adds the partials from every head
+/// slice to reconstruct full attention.
+///
+/// Prefill-only: `pos_base == 0` and the peer builds a fresh KV from these activations
+/// (no cross-request state), so the handler is a pure function.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttnRequest {
+    /// post-`in_ln` layer input, `[n_tokens * hidden]` row-major f32
+    pub activations: Vec<f32>,
+    /// the driver's DSA selection: `sel[q]` = the cached positions query `q` attends
+    /// to (empty = dense/causal for that query). Shipped so every node's sparse
+    /// attention uses the *identical* selection — the peer never runs the indexer, so
+    /// there is no selection to diverge or carry across layers. Empty outer vec = no
+    /// selection (fully dense attention).
+    pub sel: Vec<Vec<u32>>,
+    pub n_tokens: usize,
+    pub hidden: usize,
+    /// position of the first token (0 for single-shot prefill).
+    pub pos_base: u32,
+    /// first head this node computes, and how many.
+    pub h_start: u32,
+    pub h_count: u32,
+    /// which transformer layer.
+    pub layer: u32,
+}
+
+/// The peer's attention output for its head slice: a partial `[n_tokens, hidden]` to
+/// be summed into the full attention output on the driver.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttnResponse {
+    /// `[n_tokens * hidden]` row-major f32 — this head slice's o-projected partial.
+    pub outputs: Vec<f32>,
+    pub n_tokens: usize,
+    pub hidden: usize,
+}
+
 /// Transport errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
@@ -58,6 +104,11 @@ pub enum TransportError {
     NotConnected,
     /// The RDMA transport is not compiled in (`rdma` feature off).
     RdmaUnavailable,
+    /// The peer's expert→node map differs from ours. Fatal and **not retryable**:
+    /// with disagreeing maps each side ships experts to the node it *thinks* owns
+    /// them, so some experts are computed twice and others never — silently wrong
+    /// output. Refuse the connection instead.
+    FingerprintMismatch { node: u32, local: u64, remote: u64 },
     Io(String),
 }
 
@@ -68,6 +119,13 @@ impl std::fmt::Display for TransportError {
             TransportError::RdmaUnavailable => {
                 write!(f, "transport: RDMA support not compiled in (enable feature `rdma`)")
             }
+            TransportError::FingerprintMismatch { node, local, remote } => write!(
+                f,
+                "transport: node {node} has a different expert sharding map \
+                 (ours {local:#018x}, theirs {remote:#018x}). Every node must build the \
+                 identical map — check that COLI_SHARD and the usage history (.coli_usage) \
+                 match on all nodes. Refusing to run: mismatched maps corrupt results silently."
+            ),
             TransportError::Io(s) => write!(f, "transport io error: {s}"),
         }
     }
@@ -96,6 +154,28 @@ pub trait Transport: Send + Sync {
         node: NodeId,
         req: &ExpertRequest,
     ) -> Result<ExpertResponse, TransportError>;
+
+    /// Send an attention request (this node's head slice) to `node` and block for its
+    /// partial. Same connection/transport as [`Transport::exchange`], different payload.
+    ///
+    /// Default errors — only the real multi-node transports implement it.
+    fn exchange_attn(
+        &self,
+        _node: NodeId,
+        _req: &AttnRequest,
+    ) -> Result<AttnResponse, TransportError> {
+        Err(TransportError::NotConnected)
+    }
+
+    /// Handshake with every peer up front and confirm they agree on the expert
+    /// sharding map, so a misconfigured cluster fails at startup rather than
+    /// silently producing wrong tokens. Implementations that carry a fingerprint
+    /// should return [`TransportError::FingerprintMismatch`] on disagreement.
+    ///
+    /// Default: no peers to verify (single-node), so `Ok`.
+    fn verify_peers(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 /// Single-node transport: this process is the whole cluster.
@@ -179,6 +259,7 @@ mod tests {
         let t = LocalTransport;
         let req = ExpertRequest {
             experts: vec![0],
+            weights: vec![1.0],
             activations: vec![0.0; 4],
             n_tokens: 1,
             hidden: 4,

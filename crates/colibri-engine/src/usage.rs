@@ -51,6 +51,19 @@ impl UsageHistory {
         self.counts.values().sum()
     }
 
+    /// Per-expert selection weight summed across all layers: `w[e] = Σ_layer
+    /// count(layer, e)`, length `n_experts`. Feeds [`ExpertSharding::balanced`] —
+    /// expert ownership is layer-independent, so we balance the aggregate traffic.
+    pub fn expert_weights(&self, n_experts: usize) -> Vec<u64> {
+        let mut w = vec![0u64; n_experts];
+        for (&(_layer, e), &c) in &self.counts {
+            if e < n_experts {
+                w[e] += c;
+            }
+        }
+        w
+    }
+
     /// `(layer, eid)` ranked by count descending; ties broken by `(layer, eid)`
     /// ascending for determinism. This is the pin order (global, all layers
     /// pooled — matching the C `pin_load` ranking).
@@ -59,6 +72,81 @@ impl UsageHistory {
             self.counts.iter().map(|(&k, &c)| (k, c)).collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// Descending selection counts (the `ranked()` order), for coverage/knee math.
+    fn sorted_counts(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.counts.values().copied().collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v
+    }
+
+    /// Fraction of all selections covered by the `n` hottest experts (the pin
+    /// coverage if the top-`n` were pinned). `n == 0` → 0; `n >= len` → 1.
+    pub fn coverage_of_top(&self, n: usize) -> f64 {
+        let total = self.total();
+        if total == 0 || n == 0 {
+            return 0.0;
+        }
+        let covered: u64 = self.sorted_counts().iter().take(n).sum();
+        covered as f64 / total as f64
+    }
+
+    /// The **knee** of the cumulative-coverage curve: how many of the hottest
+    /// experts to pin before returns flatten. Auto-sizing for AUTOPIN — instead of
+    /// a hand-picked `COLI_PIN_GB`, pin exactly the hot head and stream the tail.
+    ///
+    /// The curve `cum[i] = Σ_{j≤i} count[j] / total` (experts hottest-first) is
+    /// concave-increasing, so it has a well-defined elbow. We take the Kneedle
+    /// point: the index of maximum vertical distance above the chord joining the
+    /// first and last points. Returns a **count of experts** (≥1 when non-empty).
+    pub fn knee(&self) -> usize {
+        let counts = self.sorted_counts();
+        let n = counts.len();
+        if n <= 2 {
+            return n;
+        }
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return n;
+        }
+        // Cumulative coverage in [0,1], then farthest point above the endpoints' chord.
+        let inv_total = 1.0 / total as f64;
+        let inv_span = 1.0 / (n - 1) as f64;
+        let mut cum = 0u64;
+        let y0 = counts[0] as f64 * inv_total; // cum[0]
+        let mut best_i = 0usize;
+        let mut best_d = f64::NEG_INFINITY;
+        for (i, &c) in counts.iter().enumerate() {
+            cum += c;
+            let y = cum as f64 * inv_total;
+            let x = i as f64 * inv_span; // 0..1
+            let chord = y0 + x * (1.0 - y0); // line from (0,y0) to (1,1)
+            let d = y - chord;
+            if d > best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        best_i + 1 // count = index + 1
+    }
+
+    /// A copy keeping only the entries whose **expert id** passes `keep`.
+    ///
+    /// Expert ownership is layer-independent, so this restricts an AUTOPIN candidate
+    /// set to the experts a node actually computes. On a sharded cluster every node
+    /// reads the *same* usage history (it has to — the hot-aware map is derived from
+    /// it), but each only ever computes its own shard; pinning an expert this node is
+    /// never asked for would just burn its cache on a peer's work.
+    pub fn filter_experts(&self, keep: impl Fn(usize) -> bool) -> UsageHistory {
+        UsageHistory {
+            counts: self
+                .counts
+                .iter()
+                .filter(|(&(_layer, e), _)| keep(e))
+                .map(|(&k, &v)| (k, v))
+                .collect(),
+        }
     }
 
     /// Merge another history into this one (summing counts).
@@ -142,6 +230,99 @@ mod tests {
     fn missing_file_is_empty() {
         let h = UsageHistory::load("/no/such/coli_usage").unwrap();
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn coverage_of_top_matches_hand_count() {
+        let mut h = UsageHistory::new();
+        h.add(0, 0, 70);
+        h.add(0, 1, 20);
+        h.add(0, 2, 10); // total 100
+        assert_eq!(h.total(), 100);
+        assert!((h.coverage_of_top(0) - 0.0).abs() < 1e-9);
+        assert!((h.coverage_of_top(1) - 0.70).abs() < 1e-9);
+        assert!((h.coverage_of_top(2) - 0.90).abs() < 1e-9);
+        assert!((h.coverage_of_top(3) - 1.00).abs() < 1e-9);
+        assert!((h.coverage_of_top(99) - 1.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn knee_finds_elbow_of_skewed_curve() {
+        // 5 hot experts (count 100) then a long flat tail (count 1). The elbow of
+        // the cumulative-coverage curve should land right at the head, not the tail.
+        let mut h = UsageHistory::new();
+        for e in 0..5 {
+            h.add(0, e, 100);
+        }
+        for e in 5..200 {
+            h.add(0, e, 1);
+        }
+        let k = h.knee();
+        assert!((5..=15).contains(&k), "knee {k} should sit near the 5-expert head");
+        // Pinning the knee captures the bulk of the traffic.
+        assert!(h.coverage_of_top(k) > 0.7, "knee coverage {}", h.coverage_of_top(k));
+    }
+
+    #[test]
+    fn knee_of_uniform_is_not_degenerate() {
+        // Uniform usage has no elbow; knee must stay in-range and never panic.
+        let mut h = UsageHistory::new();
+        for e in 0..50 {
+            h.add(0, e, 10);
+        }
+        let k = h.knee();
+        assert!((1..=50).contains(&k));
+    }
+
+    #[test]
+    fn knee_tiny_histories() {
+        assert_eq!(UsageHistory::new().knee(), 0);
+        let mut one = UsageHistory::new();
+        one.add(0, 0, 5);
+        assert_eq!(one.knee(), 1);
+    }
+
+    #[test]
+    fn filter_experts_keeps_only_owned() {
+        // A cluster-wide history: node 0 owns even experts, node 1 odd. Each node's
+        // pin candidates must be its own shard only — otherwise it burns cache on a
+        // peer's experts (and the provider's ownership gate rejects them anyway).
+        let mut h = UsageHistory::new();
+        h.add(0, 0, 10); // even -> node 0
+        h.add(0, 1, 99); // odd  -> node 1 (hottest overall)
+        h.add(5, 2, 7); // even -> node 0
+        h.add(5, 3, 50); // odd  -> node 1
+
+        let n0 = h.filter_experts(|e| e % 2 == 0);
+        assert_eq!(n0.len(), 2);
+        assert_eq!(n0.get(0, 0), 10);
+        assert_eq!(n0.get(5, 2), 7);
+        assert_eq!(n0.get(0, 1), 0, "peer's expert must not survive the filter");
+        assert_eq!(n0.total(), 17);
+        // The globally hottest expert (0,1) belongs to the peer, so node 0's ranking
+        // must not lead with it.
+        assert_eq!(n0.ranked().first().copied(), Some((0, 0)));
+
+        let n1 = h.filter_experts(|e| e % 2 == 1);
+        assert_eq!(n1.len(), 2);
+        assert_eq!(n1.ranked().first().copied(), Some((0, 1)));
+        assert_eq!(n1.total(), 149);
+
+        // The two shards partition the original history exactly.
+        assert_eq!(n0.total() + n1.total(), h.total());
+        assert_eq!(n0.len() + n1.len(), h.len());
+    }
+
+    #[test]
+    fn filter_experts_keep_all_is_identity() {
+        let mut h = UsageHistory::new();
+        h.add(1, 4, 3);
+        h.add(2, 9, 8);
+        let all = h.filter_experts(|_| true);
+        assert_eq!(all.len(), h.len());
+        assert_eq!(all.total(), h.total());
+        let none = h.filter_experts(|_| false);
+        assert!(none.is_empty());
     }
 
     #[test]

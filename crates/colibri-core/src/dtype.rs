@@ -14,8 +14,14 @@ pub enum DType {
     F16,
     /// float32
     F32,
-    /// raw bytes — quantized int4/int8 container (safetensors `U8`/`I8`)
+    /// raw bytes — quantized container codes: int8/int2, or nvfp4 nibbles / e4m3
+    /// (safetensors `U8`/`I8`)
     U8,
+    /// float8 e4m3 (`fn` finite variant) — block-scaled FP8 weights. Read-only:
+    /// used by the FP8/NVFP4 converter, never on the inference path.
+    F8E4M3,
+    /// float8 e5m2 — the other FP8 weight variant (has inf/nan). Converter-only.
+    F8E5M2,
 }
 
 impl DType {
@@ -27,7 +33,24 @@ impl DType {
             "F16" => Some(DType::F16),
             "F32" => Some(DType::F32),
             "U8" | "I8" => Some(DType::U8),
+            "F8_E4M3" | "F8_E4M3FN" => Some(DType::F8E4M3),
+            "F8_E5M2" => Some(DType::F8E5M2),
             _ => None,
+        }
+    }
+
+    /// The safetensors dtype string (inverse of [`parse`], round-tripping through
+    /// the reader). `U8` is emitted for the raw quantized-container variant (the
+    /// reader parses both `U8` and `I8` to `U8` and reads bytes verbatim, so the
+    /// distinction is immaterial). Used by the shard writer.
+    pub fn safetensors_str(self) -> &'static str {
+        match self {
+            DType::Bf16 => "BF16",
+            DType::F16 => "F16",
+            DType::F32 => "F32",
+            DType::U8 => "U8",
+            DType::F8E4M3 => "F8_E4M3",
+            DType::F8E5M2 => "F8_E5M2",
         }
     }
 
@@ -36,18 +59,64 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::Bf16 | DType::F16 => 2,
-            DType::U8 => 1,
+            DType::U8 | DType::F8E4M3 | DType::F8E5M2 => 1,
         }
     }
 
     /// Numeric code matching the C `st_tensor.dtype` field (0=BF16,1=F16,2=F32,3=U8/I8).
+    /// FP8 codes (4,5) extend past the C enum — FP8 is a converter-only input dtype
+    /// that never reaches the C-compatible inference path.
     pub fn code(self) -> i32 {
         match self {
             DType::Bf16 => 0,
             DType::F16 => 1,
             DType::F32 => 2,
             DType::U8 => 3,
+            DType::F8E4M3 => 4,
+            DType::F8E5M2 => 5,
         }
+    }
+}
+
+/// Decode a float8 **e4m3** (`e4m3fn`: finite, no infinities — the ML/safetensors
+/// `F8_E4M3` variant) bit pattern to f32. Layout: 1 sign / 4 exponent (bias 7) /
+/// 3 mantissa; `S.1111.111` is the sole NaN and max finite magnitude is 448.
+/// Every representable value is exact in f32.
+#[inline]
+pub fn f8e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((b >> 3) & 0x0F) as i32;
+    let man = (b & 0x07) as f32;
+    if exp == 0 {
+        // subnormal / zero: 2^(1-7) * (man/8) = man * 2^-9
+        sign * man * (1.0 / 512.0)
+    } else if exp == 0x0F && man == 7.0 {
+        f32::NAN
+    } else {
+        // normal: 2^(exp-7) * (1 + man/8)
+        sign * (1.0 + man / 8.0) * 2.0f32.powi(exp - 7)
+    }
+}
+
+/// Decode a float8 **e5m2** bit pattern to f32. Layout: 1 sign / 5 exponent
+/// (bias 15) / 2 mantissa; `S.11111.00` is ±inf and `S.11111.xx` (xx≠0) is NaN.
+#[inline]
+pub fn f8e5m2_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((b >> 2) & 0x1F) as i32;
+    let man = (b & 0x03) as f32;
+    if exp == 0 {
+        // subnormal / zero: 2^(1-15) * (man/4)
+        sign * man * (1.0 / 4.0) * 2.0f32.powi(-14)
+    } else if exp == 0x1F {
+        if man == 0.0 {
+            sign * f32::INFINITY
+        } else {
+            f32::NAN
+        }
+    } else {
+        // normal: 2^(exp-15) * (1 + man/4)
+        sign * (1.0 + man / 4.0) * 2.0f32.powi(exp - 15)
     }
 }
 
@@ -112,7 +181,38 @@ mod tests {
     fn dtype_parse() {
         assert_eq!(DType::parse("BF16"), Some(DType::Bf16));
         assert_eq!(DType::parse("I8"), Some(DType::U8));
+        assert_eq!(DType::parse("F8_E4M3"), Some(DType::F8E4M3));
+        assert_eq!(DType::parse("F8_E5M2"), Some(DType::F8E5M2));
         assert_eq!(DType::parse("garbage"), None);
         assert_eq!(DType::F32.elem_size(), 4);
+        assert_eq!(DType::F8E4M3.elem_size(), 1);
+    }
+
+    #[test]
+    fn f8e4m3_known_values() {
+        // sign(1) exp(4, bias 7) mantissa(3)
+        assert_eq!(f8e4m3_to_f32(0x00), 0.0); // +0
+        assert_eq!(f8e4m3_to_f32(0x38), 1.0); // exp7 man0 -> 1.0
+        assert_eq!(f8e4m3_to_f32(0x40), 2.0); // exp8 man0 -> 2.0
+        assert_eq!(f8e4m3_to_f32(0x30), 0.5); // exp6 man0 -> 0.5
+        assert_eq!(f8e4m3_to_f32(0x3C), 1.5); // exp7 man4 -> 1+0.5
+        assert_eq!(f8e4m3_to_f32(0xB8), -1.0); // sign + exp7 man0
+        assert_eq!(f8e4m3_to_f32(0x7E), 448.0); // exp15 man6 -> max finite
+        assert!(f8e4m3_to_f32(0x7F).is_nan()); // S.1111.111
+        // smallest positive subnormal: man1, exp0 -> 2^-9
+        assert_eq!(f8e4m3_to_f32(0x01), 2f32.powi(-9));
+        assert_eq!(f8e4m3_to_f32(0x80), 0.0); // -0 reads as 0.0 == -0.0
+    }
+
+    #[test]
+    fn f8e5m2_known_values() {
+        // sign(1) exp(5, bias 15) mantissa(2)
+        assert_eq!(f8e5m2_to_f32(0x00), 0.0);
+        assert_eq!(f8e5m2_to_f32(0x3C), 1.0); // exp15 man0 -> 1.0
+        assert_eq!(f8e5m2_to_f32(0x40), 2.0); // exp16 man0 -> 2.0
+        assert_eq!(f8e5m2_to_f32(0x3E), 1.5); // exp15 man2 -> 1+0.5
+        assert!(f8e5m2_to_f32(0x7C).is_infinite() && f8e5m2_to_f32(0x7C) > 0.0);
+        assert!(f8e5m2_to_f32(0x7D).is_nan());
+        assert_eq!(f8e5m2_to_f32(0x01), 2f32.powi(-16)); // smallest subnormal
     }
 }

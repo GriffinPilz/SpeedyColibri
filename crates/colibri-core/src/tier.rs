@@ -60,10 +60,49 @@ pub fn pick_swap(heat: &[u32], pinned: &[usize]) -> Option<Swap> {
 ///
 /// A recent access is worth at most 255 points; one frequency count is worth
 /// 256, so a merely-recent expert can never displace a genuinely hotter one.
+///
+/// **This is the right ranking for choosing a long-lived pinned hot-set from a
+/// cross-session usage histogram ([`pick_lfru`], AUTOPIN), and the wrong one for
+/// evicting a live cache — see [`evict_score`].**
 pub fn lfru_score(heat: u32, last: u32, clock: u32) -> u64 {
     let age = clock.wrapping_sub(last);
     let recent = if age < 255 { 255 - age } else { 0 };
     ((heat as u64) << 8) | recent as u64
+}
+
+/// Eviction score for a live resident cache — **recency primary**, frequency only
+/// as a tiebreak. Lowest score is evicted first.
+///
+/// [`lfru_score`] was used here and is catastrophic for the decode access pattern,
+/// because frequency dominates absolutely (one count = 256 points, max recency =
+/// 255) and the two phases enter the cache with *different* heats:
+///
+/// - Prefill touches every expert **twice** — the `prefetch` miss inserts at
+///   `heat = 1`, then the compute loop's `expert()` call hits and bumps it to 2 —
+///   so prefill ends leaving a full cache of `heat = 2` residents.
+/// - Every expert decode then loads enters at `heat = 1`, making it permanently the
+///   coldest entry in the cache. Decode's working set evicts *itself* while stale
+///   prefill leftovers, which will never be read again, sit immune forever.
+///
+/// Measured on a real 23-token decode trace with the shipped 1,136-expert budget:
+///
+/// | eviction policy | decode hit rate |
+/// |-----------------|-----------------|
+/// | `lfru_score` (frequency primary) | **5.8%** |
+/// | halve all heats on evict (aging) | 36.8% |
+/// | pure LRU | 44.8% |
+/// | **this function** | **44.8%** |
+///
+/// The 5.8% matches the ~4.8% observed in production (26,053 misses against ~26,400
+/// required loads), and the routing data says the locality is genuinely there:
+/// **40.3% of a decode step's experts recur at the next step**, against 3.1% by
+/// chance. Capping `heat` does not fix it — prefill's 2 still outranks decode's 1 at
+/// any window width. Recency has to lead.
+pub fn evict_score(heat: u32, last: u32, clock: u32) -> u64 {
+    // Work in age, not raw `last`, so a wrapped clock still orders correctly.
+    let age = clock.wrapping_sub(last);
+    let recency = u32::MAX - age; // larger = more recently used
+    ((recency as u64) << 16) | heat.min(0xffff) as u64
 }
 
 /// LFRU swap pick — port of `tier_pick_lfru`.

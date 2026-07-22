@@ -76,23 +76,50 @@ vols+=(-v "$host_hf:/root/.cache/huggingface")
 envs=()
 for v in HF_TOKEN COLI_RAM_GB COLI_VRAM_GB COLI_NGEN COLI_PROFILE COLI_TIMING \
          COLI_LOAD_THREADS COLI_GPU_EXPERTS COLI_NO_ZEROCOPY COLI_BUF_POOL \
-         COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP; do
+         COLI_MODEL_REPO COLI_NUM_NODES COLI_NODE_RANK COLI_PORT COLI_WARMUP \
+         COLI_CTX COLI_DISCOVER_SECS \
+         COLI_PEERS COLI_EXPERT_PORT COLI_SHARD \
+         COLI_PIN_GB COLI_USAGE COLI_PREFETCH COLI_PREFETCH_N COLI_EXPERT_LOG \
+         COLI_CONVERT_DIR COLI_EBITS COLI_IO_BITS COLI_XBITS COLI_NLAYERS \
+         COLI_XFP8 COLI_KEEP_INDEXER COLI_EXPERT_FP8 \
+         COLI_PREFETCH_AHEAD COLI_TC_ATTN COLI_NVFP4_TILED COLI_FFN_DEVCOPY; do
   [[ -n "${!v:-}" ]] && envs+=(-e "$v=${!v}")
 done
 
-# For `serve`, publish the listen port. Port precedence matches the server: a
-# bare integer right after `serve`, else COLI_PORT, else 8080.
+# Locate the coli subcommand: the entrypoint accepts an optional leading
+# `hf_TOKEN` and an optional `--model <spec>` before it, so the subcommand is not
+# necessarily $1 (getting this wrong silently skips the network mode for `serve`).
+_i=0
+_a=("$@")
+[[ "${_a[$_i]:-}" == hf_* ]] && _i=$((_i + 1))
+[[ "${_a[$_i]:-}" == "--model" || "${_a[$_i]:-}" == "-m" ]] && _i=$((_i + 2))
+_cmd="${_a[$_i]:-}"
+_next="${_a[$((_i + 1))]:-}"
+
+# `serve`, `worker` and `cluster` need to see the ConnectX/RoCE fabric — the RoCE
+# subnet, the kernel ARP table, and UDP broadcast — which the default bridge
+# namespace hides. `worker` in particular must be reachable by the driver at its
+# RoCE address, which bridge NAT would hide. Run them with host networking; the
+# listen port is then already on the host (no `-p` needed, and `-p` conflicts with
+# `--network host`). Other commands keep bridge networking.
+net=()
 ports=()
-if [[ "${1:-}" == serve ]]; then
-  port="${COLI_PORT:-8080}"
-  [[ "${2:-}" =~ ^[0-9]+$ ]] && port="$2"
-  ports+=(-p "${port}:${port}")
-  echo "[run-dgx] serving on host port ${port}" >&2
-fi
+case "$_cmd" in
+  serve | worker | cluster)
+    net+=(--network host)
+    port="${COLI_PORT:-8080}"
+    [[ "$_cmd" == worker ]] && port="${COLI_EXPERT_PORT:-48800}" # matches expert_port()
+    [[ "$_next" =~ ^[0-9]+$ ]] && port="$_next"
+    case "$_cmd" in
+      serve) echo "[run-dgx] host networking; serving on host port ${port}" >&2 ;;
+      worker) echo "[run-dgx] host networking; expert shard server on host port ${port}" >&2 ;;
+    esac
+    ;;
+esac
 
 tty=()
 [[ -t 0 && -t 1 ]] && tty=(-it)
 
 # shellcheck disable=SC2086
-exec docker run --rm "${tty[@]}" "${gpu[@]}" "${vols[@]}" "${envs[@]}" "${ports[@]}" \
+exec docker run --rm "${tty[@]}" "${gpu[@]}" "${net[@]}" "${vols[@]}" "${envs[@]}" "${ports[@]}" \
   ${COLI_DOCKER_ARGS:-} "$IMAGE" "$@"

@@ -53,6 +53,18 @@ extern "C" {
         o: c_int,
         device: c_int,
     ) -> c_int;
+    // Zero-copy wrap of an NVFP4 expert weight: `weights` = packed e2m1 nibbles
+    // [O, ceil(I/2)], `bscale` = ue4m3 per-16 block scales [O, ceil(I/16)], `gscale` =
+    // per-tensor global. Sets fmt=5.
+    fn coli_cuda_tensor_wrap_nvfp4(
+        tensor: *mut *mut ColiCudaTensor,
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        i: c_int,
+        o: c_int,
+        device: c_int,
+    ) -> c_int;
     fn coli_cuda_pageable_access(device: c_int) -> c_int;
     fn coli_cuda_matmul(
         tensor: *mut *mut ColiCudaTensor,
@@ -74,6 +86,39 @@ extern "C" {
         x: *const f32,
         s: c_int,
     ) -> c_int;
+    fn coli_cuda_expert_mlp_fp8(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
+    fn coli_cuda_expert_mlp_i8a16(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
+    fn coli_cuda_expert_mlp_nvfp4(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
+    fn coli_cuda_expert_group(
+        gates: *const *mut ColiCudaTensor,
+        ups: *const *mut ColiCudaTensor,
+        downs: *const *mut ColiCudaTensor,
+        rows: *const c_int,
+        count: c_int,
+        y: *mut f32,
+        x: *const f32,
+    ) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn coli_cuda_attention_absorb_batch(
         kv_b: *mut ColiCudaTensor,
@@ -81,6 +126,41 @@ extern "C" {
         q: *const f32,
         latent: *const f32,
         rope: *const f32,
+        s: c_int,
+        h: c_int,
+        q_nope: c_int,
+        r: c_int,
+        v: c_int,
+        k: c_int,
+        t: c_int,
+        scale: f32,
+    ) -> c_int;
+    // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
+    fn coli_cuda_dsa_indexer_scores(
+        scores: *mut f32,
+        qi: *const f32,
+        hw: *const f32,
+        keys: *const f32,
+        nsp: c_int,
+        s0: c_int,
+        nh: c_int,
+        hd: c_int,
+        t: c_int,
+        pos_base: c_int,
+        device: c_int,
+    ) -> c_int;
+    // DSA sparse prefill absorb: each query attends only to its indexer selection.
+    fn coli_cuda_attention_absorb_sparse(
+        kv_b: *mut ColiCudaTensor,
+        ctx: *mut f32,
+        q: *const f32,
+        latent: *const f32,
+        rope: *const f32,
+        sel_idx: *const c_int,
+        sel_cnt: *const c_int,
+        maxsel: c_int,
+        h0: c_int,
+        hc: c_int,
         s: c_int,
         h: c_int,
         q_nope: c_int,
@@ -157,7 +237,7 @@ pub struct ResidentTensor {
 }
 
 impl ResidentTensor {
-    /// Upload a quantized weight `[O, I]` (fmt: 0=f32, 1=int8, 2=int4, 3=int2)
+    /// Upload a quantized weight `[O, I]` (fmt: 0=f32, 1=int8, 3=int2)
     /// to `device`, so a later matmul reuses it. `weights` is the raw code bytes.
     pub fn upload(
         weights: &[u8],
@@ -209,9 +289,8 @@ impl ResidentTensor {
         }
     }
 
-    /// Zero-copy wrap of host buffers `[O, I]` (fmt: 0=f32, 1=int8, 2=int4). The
-    /// GPU reads the RAM copy in place — no device allocation, no memcpy. int4 must
-    /// be **offset-binary** (the on-disk / CPU form); the kernel handles it.
+    /// Zero-copy wrap of host buffers `[O, I]` (fmt: 0=f32, 1=int8). The GPU reads
+    /// the RAM copy in place — no device allocation, no memcpy.
     ///
     /// # Safety
     /// `weights`/`scales` must stay alive and valid for `[O, I]`/`fmt` for as long
@@ -226,6 +305,31 @@ impl ResidentTensor {
     ) -> Option<ResidentTensor> {
         let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
         if coli_cuda_tensor_wrap(&mut ptr, weights, scales, fmt, i, o, device) != 0
+            && !ptr.is_null()
+        {
+            Some(ResidentTensor { ptr })
+        } else {
+            None
+        }
+    }
+
+    /// Zero-copy wrap of an NVFP4 expert weight `[O, I]`: `weights` = packed e2m1
+    /// nibbles, `bscale` = ue4m3 per-16 block scales, `gscale` = per-tensor global.
+    /// Sets fmt=5; the GPU reads all three from host RAM in place.
+    ///
+    /// # Safety
+    /// `weights` (`O*ceil(I/2)` bytes) and `bscale` (`O*ceil(I/16)` bytes) must stay
+    /// alive and valid while this tensor is used in a kernel. Only when [`pageable_access`].
+    pub unsafe fn wrap_raw_nvfp4(
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        i: i32,
+        o: i32,
+        device: i32,
+    ) -> Option<ResidentTensor> {
+        let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
+        if coli_cuda_tensor_wrap_nvfp4(&mut ptr, weights, bscale, gscale, i, o, device) != 0
             && !ptr.is_null()
         {
             Some(ResidentTensor { ptr })
@@ -358,6 +462,86 @@ pub unsafe fn expert_mlp_raw(
     coli_cuda_expert_mlp(gate, up, down, y, x, s) != 0
 }
 
+/// Tiled FP8 (e4m3 weights, fp16 activations) fused expert FFN — the tensor-core
+/// replacement for [`expert_mlp_raw`]. Requires all three tensors at fmt==4.
+///
+/// # Safety
+/// Same contract as [`expert_mlp_raw`].
+pub unsafe fn expert_mlp_fp8_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_fp8(gate, up, down, y, x, s) != 0
+}
+
+/// NVFP4 (e2m1 nibbles + ue4m3 per-16 block scale + f32 global) fused expert FFN —
+/// GEMV at S==1 (decode; reads half the bytes of e4m3), tiled tensor-core at S>1
+/// (prefill). Requires all three tensors at fmt==5.
+///
+/// # Safety
+/// Same contract as [`expert_mlp_raw`].
+pub unsafe fn expert_mlp_nvfp4_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_nvfp4(gate, up, down, y, x, s) != 0
+}
+
+/// Tiled int8 (W8A16) fused expert/MLP FFN — tensor-core replacement for the naive
+/// `quant_matmul` on resident int8 weights (the shared expert). Requires fmt==1.
+///
+/// # Safety
+/// Same contract as [`expert_mlp_raw`].
+pub unsafe fn expert_mlp_i8a16_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_i8a16(gate, up, down, y, x, s) != 0
+}
+
+/// Batched fused expert FFN: all `count` (≤64) experts computed with ONE H2D + ONE
+/// D2H and async kernels on the stream — pays the upload/download round-trip once for
+/// the whole group instead of once per expert. `x`/`y` hold `sum(rows)` consecutive
+/// `[I]`/`[O]` rows in expert order; `rows[c]` is expert `c`'s row count.
+///
+/// # Safety
+/// The three slices are `count`-long arrays of resident handles on one device; `x`/`y`
+/// hold `sum(rows)*I` / `sum(rows)*O` floats. Handles must outlive the call.
+pub unsafe fn expert_group_raw(
+    gates: &[*mut ColiCudaTensor],
+    ups: &[*mut ColiCudaTensor],
+    downs: &[*mut ColiCudaTensor],
+    rows: &[i32],
+    y: *mut f32,
+    x: *const f32,
+) -> bool {
+    let count = gates.len();
+    if count == 0 || ups.len() != count || downs.len() != count || rows.len() != count {
+        return false;
+    }
+    coli_cuda_expert_group(
+        gates.as_ptr(),
+        ups.as_ptr(),
+        downs.as_ptr(),
+        rows.as_ptr(),
+        count as c_int,
+        y,
+        x,
+    ) != 0
+}
+
 /// Causal MLA weight-absorption attention on the GPU: computes `ctx[S, H*V]` from
 /// query `q[S, H*(Q+R)]`, the compressed KV cache (`latent[T, K]` + `rope[T, R]`),
 /// and the resident `kv_b` `[H*(Q+V), K]`. Twin of the CPU `absorb_core`.
@@ -382,6 +566,64 @@ pub unsafe fn attention_absorb_batch_raw(
 ) -> bool {
     coli_cuda_attention_absorb_batch(kv_b, ctx, q, latent, rope, s, h, q_nope, r, v, k, t, scale)
         != 0
+}
+
+/// DSA sparse MLA attention: like [`attention_absorb_batch_raw`] but each query
+/// attends only to its indexer selection. `sel_idx` is `[S, maxsel]` (row s = the
+/// query's chosen cache rows, relative to the latent's first row), `sel_cnt` is `[S]`
+/// (count per query; `<= 0` = the is_dense case → attend causally). Twin of the CPU
+/// `reconstruct_core` sparse path.
+///
+/// # Safety
+/// `kv_b` resident; `ctx`/`q`/`latent`/`rope` sized per the dims; `sel_idx` has
+/// `s*maxsel` ints and `sel_cnt` has `s` ints.
+#[allow(clippy::too_many_arguments)]
+/// DSA indexer scores for the selecting queries — `scores[nsp, t]`, row `si` valid
+/// for `t < pos_base+s0+si+1`.
+///
+/// # Safety
+/// `qi` has `nsp*nh*hd` floats, `hw` `nsp*nh`, `keys` `t*hd`, `scores` `nsp*t`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsa_indexer_scores_raw(
+    scores: *mut f32,
+    qi: *const f32,
+    hw: *const f32,
+    keys: *const f32,
+    nsp: i32,
+    s0: i32,
+    nh: i32,
+    hd: i32,
+    t: i32,
+    pos_base: i32,
+    device: i32,
+) -> bool {
+    coli_cuda_dsa_indexer_scores(scores, qi, hw, keys, nsp, s0, nh, hd, t, pos_base, device) != 0
+}
+
+pub unsafe fn attention_absorb_sparse_raw(
+    kv_b: *mut ColiCudaTensor,
+    ctx: *mut f32,
+    q: *const f32,
+    latent: *const f32,
+    rope: *const f32,
+    sel_idx: *const i32,
+    sel_cnt: *const i32,
+    maxsel: i32,
+    h0: i32,
+    hc: i32,
+    s: i32,
+    h: i32,
+    q_nope: i32,
+    r: i32,
+    v: i32,
+    k: i32,
+    t: i32,
+    scale: f32,
+) -> bool {
+    coli_cuda_attention_absorb_sparse(
+        kv_b, ctx, q, latent, rope, sel_idx, sel_cnt, maxsel, h0, hc, s, h, q_nope, r, v, k, t,
+        scale,
+    ) != 0
 }
 
 /// Single-token MLA absorb reading the KV cache from **device** memory (the

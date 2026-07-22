@@ -7,11 +7,13 @@ name = "coli"
 version = "0.1.0"
 dependencies = [
  "colibri-backend",
+ "colibri-cluster",
  "colibri-core",
  "colibri-engine",
  "colibri-json",
  "colibri-safetensors",
  "colibri-tokenizer",
+ "libc",
 ]
 
 [[package]]
@@ -73,6 +75,7 @@ version = "0.1.0"
 dependencies = [
  "colibri-core",
  "colibri-json",
+ "libc",
 ]
 
 [[package]]
@@ -81,3 +84,9 @@ version = "0.1.0"
 dependencies = [
  "colibri-json",
 ]
+
+[[package]]
+name = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"

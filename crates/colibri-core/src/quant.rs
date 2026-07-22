@@ -1,17 +1,17 @@
 //! Quantized-tensor representation — port of the `QT` struct and `qt_bytes`
 //! from `c/glm.c`.
 //!
-//! A weight tensor `[O, I]` is stored in one of four formats. int4 is what keeps
-//! the dense part resident in ~10 GB (0.5 byte/param); the router weights stay
-//! f32 because they are numerically sensitive.
+//! A weight tensor `[O, I]` is stored in one of several formats. int8 keeps the
+//! dense part resident (~1 byte/param); the router weights stay f32 because they
+//! are numerically sensitive. e4m3(4)/nvfp4(5) experts are handled by raw
+//! `fmt_code` checks elsewhere, not by this enum.
 
 /// Storage format of a quantized tensor. The discriminants match the C `fmt`
-/// field (0 F32, 1 INT8, 2 INT4 packed 2/byte, 3 INT2 packed 4/byte).
+/// field (0 F32, 1 INT8, 3 INT2 packed 4/byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QFormat {
     F32 = 0,
     Int8 = 1,
-    Int4 = 2,
     Int2 = 3,
 }
 
@@ -20,7 +20,6 @@ impl QFormat {
         match fmt {
             0 => Some(QFormat::F32),
             1 => Some(QFormat::Int8),
-            2 => Some(QFormat::Int4),
             3 => Some(QFormat::Int2),
             _ => None,
         }
@@ -31,7 +30,6 @@ impl QFormat {
         match self {
             QFormat::F32 => 32,
             QFormat::Int8 => 8,
-            QFormat::Int4 => 4,
             QFormat::Int2 => 2,
         }
     }
@@ -179,7 +177,6 @@ impl PartialEq for Bytes {
 /// Exactly one of the payload buffers is populated per `fmt`:
 ///   - `F32`  → `qf`
 ///   - `Int8` → `q8` (1 byte/param) + per-row scale `s`
-///   - `Int4` → `q4` (2 values/byte, packed) + per-row scale `s`
 ///   - `Int2` → `q4` (4 values/byte, packed) + per-row scale `s`
 ///
 /// The heavy `unsafe`/SIMD matmul kernels that consume this live in
@@ -192,6 +189,13 @@ pub struct QTensor {
     pub q4: Bytes,
     /// per-row scales (length `O`), empty for `F32`
     pub s: Vec<f32>,
+    /// NVFP4 (`fmt_code == 5`) only: ue4m3 per-16-input block scales, `O × ceil(I/16)`
+    /// bytes row-major. The effective scale of the 16-wide block containing column `c`
+    /// of row `r` is `f8e4m3_to_f32(bs[r*ceil(I/16) + c/16]) * g`. Empty otherwise.
+    pub bs: Bytes,
+    /// NVFP4 (`fmt_code == 5`) only: per-tensor global scale (modelopt-style; the block
+    /// scales above are multiplied by it). `0.0` / unused for every other format.
+    pub g: f32,
     /// rows (output dim)
     pub o: i32,
     /// cols (input dim)
@@ -214,8 +218,17 @@ impl QTensor {
         match self.fmt_code {
             0 => n * 4,
             1 => n + self.o as i64 * 4,
+            4 => n + self.o as i64 * 4, // e4m3 fp8: 1 byte/weight + scales
+            // NVFP4: ceil(I/2) nibbles + ceil(I/16) ue4m3 block scales per row + 1 global.
+            5 => {
+                self.o as i64 * ((self.i as i64 + 1) / 2)
+                    + self.o as i64 * ((self.i as i64 + 15) / 16)
+                    + 4
+            }
             3 => self.o as i64 * ((self.i as i64 + 3) / 4) + self.o as i64 * 4,
-            _ => self.o as i64 * ((self.i as i64 + 1) / 2) + self.o as i64 * 4, // int4
+            // Every real format (0,1,3,4,5) has an explicit arm above; an unknown
+            // code contributes no resident bytes.
+            _ => 0,
         }
     }
 }
@@ -239,16 +252,17 @@ mod tests {
         assert_eq!(qt(0, 10, 20).bytes(), 10 * 20 * 4);
         // int8: O*I + O*4
         assert_eq!(qt(1, 10, 20).bytes(), 10 * 20 + 10 * 4);
-        // int4: O*ceil(I/2) + O*4
-        assert_eq!(qt(2, 10, 21).bytes(), 10 * 11 + 10 * 4);
         // int2: O*ceil(I/4) + O*4
         assert_eq!(qt(3, 10, 21).bytes(), 10 * 6 + 10 * 4);
     }
 
     #[test]
     fn format_bits() {
-        assert_eq!(QFormat::from_code(2), Some(QFormat::Int4));
-        assert_eq!(QFormat::Int4.bits(), 4);
+        assert_eq!(QFormat::from_code(1), Some(QFormat::Int8));
+        assert_eq!(QFormat::Int8.bits(), 8);
+        assert_eq!(QFormat::from_code(3), Some(QFormat::Int2));
+        assert_eq!(QFormat::Int2.bits(), 2);
+        assert_eq!(QFormat::from_code(2), None); // int4 removed
         assert_eq!(QFormat::from_code(9), None);
     }
 

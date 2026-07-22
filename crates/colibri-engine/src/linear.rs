@@ -11,7 +11,7 @@
 use colibri_core::QTensor;
 
 /// `y[S, O] = x[S, I] @ W^T`, exact (f32 activations). Ports `matmul` /
-/// `matmul_q` / `matmul_i4` / `matmul_i2` under `matmul_qt_ex(..., allow_idot=0)`.
+/// `matmul_q` / `matmul_i2` under `matmul_qt_ex(..., allow_idot=0)`.
 ///
 /// `x` is row-major `[S, I]`, `y` is row-major `[S, O]`. Panics if the shapes
 /// don't line up with `w.o`/`w.i`.
@@ -53,19 +53,6 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
                 }
             }
         }
-        2 => {
-            // int4 packed 2/byte, value = nibble - 8  — NEON dot on aarch64
-            let q4 = &w.q4;
-            let rb = (i + 1) / 2;
-            for row in 0..o {
-                let wr = &q4[row * rb..(row + 1) * rb];
-                let sc = w.s[row];
-                for si in 0..s {
-                    let xs = &x[si * i..(si + 1) * i];
-                    y[si * o + row] = colibri_kernels::dot_i4_f32(wr, xs, i) * sc;
-                }
-            }
-        }
         3 => {
             // int2 packed 4/byte, value = field - 2
             let q2 = &w.q4;
@@ -85,7 +72,67 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
                 }
             }
         }
+        4 => {
+            // e4m3 fp8, 1 byte/weight, per-row scale. CPU reference / fallback for
+            // the tiled GPU kernel.
+            let q = &w.q4;
+            for row in 0..o {
+                let wr = &q[row * i..(row + 1) * i];
+                let sc = w.s[row];
+                for si in 0..s {
+                    let xs = &x[si * i..(si + 1) * i];
+                    let mut a = 0f32;
+                    for k in 0..i {
+                        a += e4m3_to_f32(wr[k]) * xs[k];
+                    }
+                    y[si * o + row] = a * sc;
+                }
+            }
+        }
+        5 => {
+            // NVFP4: e2m1 nibbles (2/byte, low=even col) × per-16 ue4m3 block scale ×
+            // per-tensor global. W[o,k] = E2M1[nib] · e4m3(bs[o*nb + k/16]) · g. CPU
+            // reference / fallback for the tiled+GEMV GPU nvfp4 kernels.
+            let q4 = &w.q4;
+            let bs = &w.bs;
+            let g = w.g;
+            let rb = (i + 1) / 2;
+            let nb = (i + 15) / 16;
+            for row in 0..o {
+                let wr = &q4[row * rb..(row + 1) * rb];
+                let br = &bs[row * nb..(row + 1) * nb];
+                for si in 0..s {
+                    let xs = &x[si * i..(si + 1) * i];
+                    let mut a = 0f32;
+                    for k in 0..i {
+                        let byte = wr[k >> 1];
+                        let nib = if k & 1 == 1 { byte >> 4 } else { byte & 0x0f } as usize;
+                        a += E2M1[nib] * e4m3_to_f32(br[k >> 4]) * xs[k];
+                    }
+                    y[si * o + row] = a * g;
+                }
+            }
+        }
         other => panic!("matmul_qt: unknown QTensor format {other}"),
+    }
+}
+
+/// FP4 `e2m1` codebook (1 sign / 2 exp / 1 mantissa): 16 non-uniform levels, bit 3 =
+/// sign. Indexed by the 4-bit nibble. Matches `convert::E2M1` and the CUDA device LUT.
+const E2M1: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Decode one e4m3 byte (OCP FP8: 1 sign, 4 exp bias-7, 3 mantissa; no infinity,
+/// S.1111.111 = NaN) to f32. Used for the fp8 expert CPU reference/fallback.
+fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let e = ((b >> 3) & 0x0f) as i32;
+    let m = (b & 0x07) as f32;
+    if e == 0 {
+        sign * (m / 8.0) * 2f32.powi(-6) // subnormal
+    } else {
+        sign * (1.0 + m / 8.0) * 2f32.powi(e - 7)
     }
 }
 
@@ -125,20 +172,6 @@ pub fn qt_row_dequant(w: &QTensor, row: usize) -> Vec<f32> {
             let s = w.s[row];
             for (dst, &c) in out.iter_mut().zip(q) {
                 *dst = c as f32 * s;
-            }
-        }
-        2 => {
-            let rb = (i + 1) / 2;
-            let q = &w.q4[row * rb..(row + 1) * rb];
-            let s = w.s[row];
-            let mut k = 0;
-            while k < i {
-                let byte = q[k >> 1];
-                out[k] = ((byte & 0x0F) as i32 - 8) as f32 * s;
-                if k + 1 < i {
-                    out[k + 1] = ((byte >> 4) as i32 - 8) as f32 * s;
-                }
-                k += 2;
             }
         }
         3 => {
@@ -184,20 +217,6 @@ pub fn embed_row(embed: &QTensor, tok: usize, out: &mut [f32]) {
             let s = embed.s[tok];
             for (dst, &c) in out.iter_mut().zip(q) {
                 *dst = c as f32 * s;
-            }
-        }
-        2 => {
-            let rb = (d + 1) / 2;
-            let q = &embed.q4[tok * rb..(tok + 1) * rb];
-            let s = embed.s[tok];
-            let mut k = 0;
-            while k < d {
-                let byte = q[k >> 1];
-                out[k] = ((byte & 0x0F) as i32 - 8) as f32 * s;
-                if k + 1 < d {
-                    out[k + 1] = ((byte >> 4) as i32 - 8) as f32 * s;
-                }
-                k += 2;
             }
         }
         3 => {
@@ -258,15 +277,16 @@ mod tests {
     }
 
     #[test]
-    fn int4_matmul_close_to_f32() {
-        let w: Vec<f32> = (0..8).map(|k| ((k % 5) as f32 - 2.0) * 0.3).collect(); // O=2,I=4
+    fn int2_matmul_close_to_f32() {
+        let w: Vec<f32> = (0..8).map(|k| ((k % 3) as f32 - 1.0) * 0.5).collect(); // O=2,I=4
         let x = vec![1.0f32, 1.0, 1.0, 1.0];
-        let qt = qtensor_from_f32(&w, 2, 4, 4);
+        let qt = qtensor_from_f32(&w, 2, 4, 2);
+        assert_eq!(qt.fmt_code, 3); // int2
         let mut y = vec![0f32; 2];
         matmul_qt(&mut y, &x, &qt, 1);
         let exact = f32_matmul(&x, &w, 1, 4, 2);
         for (a, b) in y.iter().zip(&exact) {
-            assert!((a - b).abs() < 0.3, "int4 {a} vs f32 {b}");
+            assert!((a - b).abs() < 0.6, "int2 {a} vs f32 {b}");
         }
     }
 

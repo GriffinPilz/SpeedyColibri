@@ -42,6 +42,8 @@ colibri-kernels = { path = "crates/colibri-kernels" }
 colibri-engine = { path = "crates/colibri-engine" }
 colibri-backend = { path = "crates/colibri-backend" }
 colibri-cluster = { path = "crates/colibri-cluster" }
+# Unix signal handling for `coli serve` graceful shutdown. std has no signal API.
+libc = "0.2"
 
 # Optimized profile mirrors the C build (`-O3 -march=native` in c/Makefile).
 # Build hot crates with `RUSTFLAGS="-C target-cpu=native"` for the SIMD paths.

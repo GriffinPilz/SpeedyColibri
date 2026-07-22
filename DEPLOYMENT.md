@@ -39,7 +39,52 @@ The model resolves in this order: a snapshot mounted at `/model`
 (`COLI_MODEL_DIR=<dir> docker/run-dgx.sh ...`), the HF cache (the launcher
 mounts the host's `~/.cache/huggingface`, so the 358 GB download happens at most
 once and is shared with non-container runs), else `hf download
-$COLI_MODEL_REPO` (default `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
+$COLI_MODEL_REPO` (default `nvidia/GLM-5.2-NVFP4`).
+
+### Any model: `--model <repo | url | path>`
+
+Point the container at a model with `--model` (or `$COLI_MODEL_REPO`). It takes an
+HF repo id, an HF URL, or a local path — and the model may be an
+**already-converted colibrì container** *or* a source checkpoint in block-scaled
+**FP8** or modelopt **NVFP4**. A source checkpoint is converted to the NVFP4
+container automatically on first run (`COLI_XFP8=1` for 8-bit e4m3 experts instead):
+
+```bash
+# already-converted container (default) — served directly
+docker/run-dgx.sh serve 8080
+
+# an FP8 checkpoint — downloaded, then converted once, then served
+docker/run-dgx.sh --model unsloth/GLM-5.2-FP8 serve 8080
+
+# an NVFP4 checkpoint, given as a URL
+docker/run-dgx.sh --model https://huggingface.co/nvidia/GLM-5.2-NVFP4 serve 8080
+
+# a local checkpoint you already have
+docker/run-dgx.sh --model /data/my-glm-fp8 serve 8080
+```
+
+`coli probe <snap>` decides which path is taken (`container` → serve as-is;
+`fp8`/`nvfp4` → convert first). The conversion is the slow part — **~1h+ and
+~350 GB** for GLM-5.2 — so it is cached under `$COLI_CONVERT_DIR`
+(default `<HF cache>/colibri-int4/<repo-slug>-x<xfmt>-e<ebits>io<iobits>`, where
+`xfmt` is `nvfp4` (default) or `e4m3` (`COLI_XFP8=1`)), i.e. inside the mounted host
+cache, so it survives container restarts and is only ever done once per
+model+format. The expert format (`xfmt`), resident bits (`COLI_EBITS`, 8) and I/O
+bits (`COLI_IO_BITS`, 8) are part of the cache key. You can
+also run the conversion yourself:
+
+```bash
+coli probe   <src-snapshot>              # container | fp8 | nvfp4 | unknown
+coli convert <src-snapshot> <out-snapshot>
+```
+
+Supported source layouts: FP8 with 128×128 `weight_scale_inv` block scales
+(DeepSeek/GLM style), FP8 with a per-tensor `weight_scale` (modelopt), and
+modelopt NVFP4 (`weight_scale` per-16-block + `weight_scale_2` global). NVFP4 in
+**compressed-tensors/llm-compressor** form is *rejected* rather than silently
+mis-scaled — it stores the reciprocal global scale and divides, where modelopt
+multiplies. The DSA indexer and the MTP head are dropped by the conversion, so the
+container loads with `has_dsa=false has_mtp=false` (exact dense attention).
 
 `run-dgx.sh` picks the GPU passthrough that the host supports: CDI
 (`--device nvidia.com/gpu=all`), the nvidia runtime (`--gpus all`), or — on a
@@ -71,7 +116,7 @@ Generation is served **one request at a time** — a single GPU streaming a 744B
 model runs one forward pass anyway, so connections are handled sequentially.
 
 ```bash
-COLI_RAM_GB=85 docker/run-dgx.sh serve 8080 "warm up the expert cache"
+docker/run-dgx.sh serve 8080 "warm up the expert cache"
 curl -N localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -103,7 +148,7 @@ to probe).
 ```bash
 docker run --rm -it --gpus all -p 8080:8080 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -e HF_TOKEN -e COLI_RAM_GB=85 \
+  -e HF_TOKEN \
   speedycolibri:latest serve 8080
 ```
 
@@ -121,11 +166,12 @@ HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm -p 8080:808
 | `COLI_PORT` | `serve` listen port (a positional arg after `serve` overrides) | `8080` |
 | `COLI_WARMUP` | `serve` warm-up prompts, `\|`-separated | unset |
 | `COLI_CTX` | `serve` context length (prompt + completion), e.g. `64k`. Clamped to the model max (`max_position_embeddings`, 1M for GLM-5.2). KV is ~175 KB/token (~5.6 GB at 32K, ~22 GB at 128K), so raise it within your RAM budget. Requests over the limit get a `context_length_exceeded` 400. | `32768` |
-| `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
+| `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
 | `COLI_MODEL_DIR` | host path to a pre-resolved snapshot → mounted at `/model` | unset |
-| `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budgets (cap on a shared box to avoid the OOM killer) | available RAM / VRAM |
+| `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budget overrides. The RAM default auto-caps at `MemTotal/3` and is safe; overriding *higher* is measured to swap and lose throughput (85 → ~0.11 tok/s vs ~0.46 at default on a 121 GB Spark). | auto: `MemTotal/3` RAM |
 | `COLI_NUM_NODES` | cluster size (expert-parallel) | `1` |
-| `COLI_NODE_RANK` | this node's rank `0..NUM_NODES` | `0` |
+| `COLI_NODE_RANK` | this node's rank `0..NUM_NODES` (advertised in the discovery beacon) | `0` |
+| `COLI_DISCOVER_SECS` | `serve` startup ConnectX fabric-scan window in seconds (`0` disables) | `3` |
 | `COLI_CACHE_DIR` | writable path for `.coli_kv` / `.coli_usage` (compose) | `./.coli-cache` |
 | `COLI_IMAGE` | image tag used by `run-dgx.sh` | `speedycolibri:latest` |
 | `COLI_DOCKER_ARGS` | extra `docker run` flags injected by `run-dgx.sh` | unset |
@@ -141,24 +187,45 @@ token's chosen experts to their owner. The dense part (attention, shared expert,
 embeddings — ~10 GB int4) is replicated per node so attention stays local and
 only expert I/O crosses the wire.
 
-Transport target: **RDMA/RoCE over the ConnectX-7 200 GbE link**, ideally with
-GPUDirect RDMA so the Blackwell GPU DMAs activations straight to the wire
-(`colibri-cluster::transport`, `--features rdma`). This is designed but not
-wired — single node comes first.
+Transport: **TCP over the RoCE Ethernet** today (RoCE is Ethernet, so TCP on the
+192.168.100.0/24 fabric already gets the ConnectX-7's 200 GbE). A future
+`RdmaTransport` (verbs + GPUDirect) can drop in behind the same `Transport` trait
+to cut latency; the engine above is unchanged.
 
-To bring up two nodes later:
+### Bring up two nodes (working today)
 
-1. Build the split model layout so each node has its expert shard on local NVMe.
-2. Launch node 0 with `COLI_NUM_NODES=2 COLI_NODE_RANK=0`, node 1 with rank `1`.
-3. Wire `RdmaTransport::connect` (queue pairs + registered MRs over ConnectX).
+Only the exchanged **activations** cross the wire (~24 KB/expert-group per token,
+sent to the owner, weighted partial sum returned) — not expert weights. First,
+**find the peers** (verify the fabric): `docker/run-dgx.sh cluster` on each node.
 
-On real hardware the two Sparks talk over the direct 200 GbE link with host
-networking, not a compose bridge (the disabled `node1` service in the compose
-file is only a placeholder for the topology).
+One node **drives** (HTTP + the forward pass, owning half the experts); the other
+runs a headless **worker** (an expert server for its half). Each node only loads
+and caches *its* shard, so the working set is split across the fabric.
+
+```bash
+# Node 1 (rank 1) — worker for experts 128..256, on the RoCE port:
+COLI_NUM_NODES=2 COLI_NODE_RANK=1 \
+  coli worker <snap> 48800        # binds 0.0.0.0:48800
+
+# Node 0 (rank 0) — driver: HTTP on :8080, owns 0..128, fetches 128..256 from node 1
+COLI_NUM_NODES=2 COLI_NODE_RANK=0 \
+  COLI_PEERS="1=192.168.100.10:48800" \
+  coli serve <snap> 8080 "warm up"
+```
+
+Start the worker first (the driver connects to it at startup). `COLI_PEERS` is a
+comma-separated `rank=host:port` map of the other nodes' worker addresses;
+`COLI_EXPERT_PORT` sets the default worker port (48800). Verified on two GB10
+Sparks: output is bit-identical to single-node, and each node's RSS drops to
+~65 GB (half the experts) from ~95 GB.
+
+**Status:** the split-model on-disk layout (each node stores only its shard, not
+the full 358 GB) and the GPUDirect `RdmaTransport` are the remaining optimizations;
+both nodes currently keep the full model on disk but load only their shard.
 
 ## CUDA (Blackwell) backend
 
-`colibri-backend` binds the reference CUDA kernels (`c/backend_cuda.cu`) over FFI.
+`colibri-backend` binds the CUDA kernels (`crates/colibri-backend/cuda/backend_cuda.cu`) over FFI.
 It is **off by default**; enable it on a CUDA host:
 
 ```bash
@@ -182,7 +249,7 @@ a GPU matmul smoke test passes (`cargo test -p colibri-backend --features cuda`)
 `matmul_qt` routes resident weights (dense + preloaded experts) to
 `coli_cuda_matmul`, CPU fallback otherwise. Validated on the GB10 —
 `COLI_PRELOAD=1 coli gen` runs matmuls on the GPU with output identical to the CPU
-path, and an int4 `[8192,6144]` matmul measured **~18× faster** than one Grace
+path, and a quantized `[8192,6144]` matmul measured **~18× faster** than one Grace
 core (429–448 vs 24 GFLOP/s). The expert / shared / dense FFN is **fused** onto
 the GPU (`coli_cuda_expert_mlp`, one on-device `down(silu(gate·x)⊙up·x)`) —
 measured **19.2×** vs one Grace core (165 µs vs 3171 µs per expert at hidden 6144

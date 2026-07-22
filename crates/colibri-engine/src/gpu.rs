@@ -134,6 +134,42 @@ pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
     cuda::set_activation(oai, alpha, limit);
 }
 
+/// Standard GQA prefill attention on the GPU (MiniMax-M3 dense core). `ctx`/`q` are
+/// `[S, H, D]`; `k`/`v` are the full causal cache `[T, Hkv, D]`. Returns false (→ the
+/// CPU core) when CUDA is unavailable or the dims are outside the kernel's range.
+#[allow(clippy::too_many_arguments)]
+pub fn try_gqa_attn(
+    ctx: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    s: usize,
+    h: usize,
+    hkv: usize,
+    d: usize,
+    t: usize,
+    scale: f32,
+) -> bool {
+    if !available() {
+        return false;
+    }
+    // SAFETY: the caller (attention_gqa) sizes ctx/q as [S,H,D] and k/v as [T,Hkv,D].
+    unsafe {
+        cuda::gqa_attn_raw(
+            ctx.as_mut_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            s as i32,
+            h as i32,
+            hkv as i32,
+            d as i32,
+            t as i32,
+            scale,
+        )
+    }
+}
+
 /// How many matmuls actually ran on the GPU this thread (proof the path fired).
 pub fn matmul_count() -> u64 {
     GPU_MATMULS.with(|c| c.get())

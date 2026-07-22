@@ -262,10 +262,33 @@ pub fn attention_gqa(
     let _tc = std::time::Instant::now();
     let st0 = kv.kv_start[layer];
     let mut ctx = vec![0f32; s_len * h * hd];
-    // Buffers reused across every (query, head) to avoid per-head allocation.
-    let mut scores: Vec<f32> = Vec::new();
-    let mut skeys: Vec<usize> = Vec::new();
-    for s in 0..s_len {
+
+    // GPU dense prefill core (MiniMax-M3): fresh-cache single-shot prefill only. The
+    // block-sparse path and decode (S=1) stay on the CPU core below.
+    let mut gpu_done = false;
+    #[cfg(feature = "cuda")]
+    if block_sel.is_none() && s_len > 1 && st0 == 0 {
+        let t_full = pos_base + s_len;
+        gpu_done = crate::gpu::try_gqa_attn(
+            &mut ctx,
+            &q,
+            kv.k_full_rows(layer, st0, t_full),
+            kv.v_full_rows(layer, st0, t_full),
+            s_len,
+            h,
+            kvh,
+            hd,
+            t_full,
+            scale,
+        );
+    }
+
+    // CPU core (dense or block-sparse), used unless the GPU handled it above.
+    if !gpu_done {
+        // Buffers reused across every (query, head) to avoid per-head allocation.
+        let mut scores: Vec<f32> = Vec::new();
+        let mut skeys: Vec<usize> = Vec::new();
+        for s in 0..s_len {
         let pos = pos_base + s;
         let tk = pos + 1; // attend to cached positions [st0, pos]
         let krows = kv.k_full_rows(layer, st0, tk);
@@ -303,6 +326,7 @@ pub fn attention_gqa(
                     *c += sc * vv;
                 }
             }
+        }
         }
     }
     atime(&crate::forward::ATTN_CORE_US, _tc);

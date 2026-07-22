@@ -136,6 +136,19 @@ extern "C" {
         t: c_int,
         scale: f32,
     ) -> c_int;
+    fn coli_cuda_gqa_attn(
+        device: c_int,
+        ctx: *mut f32,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        s: c_int,
+        h: c_int,
+        hkv: c_int,
+        d: c_int,
+        t: c_int,
+        scale: f32,
+    ) -> c_int;
     // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
     fn coli_cuda_dsa_indexer_scores(
         scores: *mut f32,
@@ -574,6 +587,28 @@ pub unsafe fn attention_absorb_batch_raw(
 ) -> bool {
     coli_cuda_attention_absorb_batch(kv_b, ctx, q, latent, rope, s, h, q_nope, r, v, k, t, scale)
         != 0
+}
+
+/// Standard grouped-query attention prefill on the GPU (MiniMax-M3): `ctx[S,H,D]` from
+/// `q[S,H,D]` and the full KV cache `k`/`v` `[T,Hkv,D]`, causal. Twin of the CPU core in
+/// `attention_gqa`.
+///
+/// # Safety
+/// `ctx`/`q`/`k`/`v` must be sized per the dims; `H % Hkv == 0`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gqa_attn_raw(
+    ctx: *mut f32,
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    s: i32,
+    h: i32,
+    hkv: i32,
+    d: i32,
+    t: i32,
+    scale: f32,
+) -> bool {
+    coli_cuda_gqa_attn(0, ctx, q, k, v, s, h, hkv, d, t, scale) != 0
 }
 
 /// DSA sparse MLA attention: like [`attention_absorb_batch_raw`] but each query

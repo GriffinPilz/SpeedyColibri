@@ -100,6 +100,9 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,fl
                                      const float *latent,const float *rope,int S,
                                      int H,int Q,int R,int V,int K,int T,
                                      float attention_scale);
+/* Standard GQA prefill (MiniMax-M3): q[S,H,D], full k/v[T,Hkv,D], ctx[S,H,D] out. */
+COLI_CUDA_DLLEXPORT int coli_cuda_gqa_attn(int device,float *ctx,const float *q,const float *k,
+                                     const float *v,int S,int H,int Hkv,int D,int T,float scale);
 
 /* DSA sparse prefill attention: like the batch variant but each query attends only
  * to its indexer selection. sel_idx is [S, maxsel] int (row s holds the chosen

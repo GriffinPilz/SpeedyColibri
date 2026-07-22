@@ -515,6 +515,43 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* Standard grouped-query attention prefill (MiniMax-M3): Q[S,H,D], full K/V[T,Hkv,D]
+ * (no MLA absorption). One block per (query s, head h); a query head maps to KV head
+ * h/(H/Hkv). Causal over [0, T-S+s]. Shared-mem softmax, mirroring the absorb batch
+ * kernel's reductions. sm = qs[D] ++ scores[T] ++ red[ATTN_TPB]. */
+__global__ static void gqa_attn_kernel(float *ctx, const float *Q, const float *K,
+        const float *V, int S, int H, int Hkv, int D, int T, float scale) {
+    int s = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, nt = T - S + s + 1;
+    if (s >= S || nt < 1) return;
+    int kvh = h / (H / Hkv);
+    extern __shared__ float sm[];
+    float *qs = sm, *scores = qs + D, *red = scores + T;
+    const float *qrow = Q + ((size_t)s * H + h) * D;
+    for (int d = tid; d < D; d += blockDim.x) qs[d] = qrow[d];
+    __syncthreads();
+    for (int t = tid; t < nt; t += blockDim.x) {
+        const float *kt = K + ((size_t)t * Hkv + kvh) * D;
+        float a = 0; for (int d = 0; d < D; d++) a += qs[d] * kt[d];
+        scores[t] = a * scale;
+    }
+    __syncthreads();
+    float local = -3.402823466e+38F;
+    for (int t = tid; t < nt; t += blockDim.x) local = fmaxf(local, scores[t]);
+    red[tid] = local; __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) { if (tid < n) red[tid] = fmaxf(red[tid], red[tid + n]); __syncthreads(); }
+    float mx = red[0];
+    local = 0; for (int t = tid; t < nt; t += blockDim.x) { float e = expf(scores[t] - mx); scores[t] = e; local += e; }
+    red[tid] = local; __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) { if (tid < n) red[tid] += red[tid + n]; __syncthreads(); }
+    float inv = 1.f / red[0];
+    __syncthreads();
+    for (int d = tid; d < D; d += blockDim.x) {
+        float a = 0;
+        for (int t = 0; t < nt; t++) a += scores[t] * V[((size_t)t * Hkv + kvh) * D + d];
+        ctx[((size_t)s * H + h) * D + d] = a * inv;
+    }
+}
+
 /* DSA sparse prefill attention. Identical to attention_absorb_batch_kernel except
  * each query attends only to its indexer selection instead of all `nt` causal
  * positions: `sel_idx[s*maxsel + j]` (j < sel_cnt[s]) are the chosen cache rows.
@@ -1326,6 +1363,32 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
         const float *latent,const float *rope,int S,int H,int Q,int R,int V,int K,int T,
         float scale){
     return attention_absorb_batch_run(w,nullptr,ctx,q,latent,rope,S,H,Q,R,V,K,T,scale);
+}
+
+/* Standard GQA prefill on the GPU (MiniMax-M3): q[S,H,D], full k/v[T,Hkv,D], ctx[S,H,D]
+ * out. Reuses the attention scratch (aq=q, al=k, ar=v, ac=ctx). Caller's layouts match
+ * directly (q is [S,H,D]; a KV cache row is [Hkv*D]; ctx is [S,H,D]). */
+extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const float *k,
+        const float *v, int S, int H, int Hkv, int D, int T, float scale) {
+    if (!ctx || !q || !k || !v || S < 1 || H < 1 || Hkv < 1 || D < 1 || D > 1024 ||
+        H % Hkv || T < S || T > 8192)
+        return 0;
+    DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
+    size_t qb = (size_t)S * H * D * sizeof(float), kb = (size_t)T * Hkv * D * sizeof(float);
+    if (!reserve(&dc->aq, &dc->aq_cap, qb) || !reserve(&dc->al, &dc->al_cap, kb) ||
+        !reserve(&dc->ar, &dc->ar_cap, kb) || !reserve(&dc->ac, &dc->ac_cap, qb))
+        return 0;
+    if (!cuda_ok(cudaMemcpyAsync(dc->aq, q, qb, cudaMemcpyHostToDevice, dc->stream), "gqa q upload") ||
+        !cuda_ok(cudaMemcpyAsync(dc->al, k, kb, cudaMemcpyHostToDevice, dc->stream), "gqa k upload") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ar, v, kb, cudaMemcpyHostToDevice, dc->stream), "gqa v upload"))
+        return 0;
+    size_t shared = (size_t)(D + T + ATTN_TPB) * sizeof(float);
+    gqa_attn_kernel<<<dim3(H, S), ATTN_TPB, shared, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale);
+    if (!cuda_ok(cudaGetLastError(), "gqa launch")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(ctx, dc->ac, qb, cudaMemcpyDeviceToHost, dc->stream), "gqa ctx download") ||
+        !cuda_ok(cudaStreamSynchronize(dc->stream), "gqa sync"))
+        return 0;
+    return 1;
 }
 
 /* DSA sparse prefill attention. Mirrors attention_absorb_batch_run but uploads the

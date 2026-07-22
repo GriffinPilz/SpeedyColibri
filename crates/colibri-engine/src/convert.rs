@@ -8,16 +8,24 @@
 //! `name.qs` `F32` tensor of per-row scales — exactly what [`crate::loader::qt_load`]
 //! reads. Norms, the MoE router, biases, and embeddings-passthrough stay `F32`.
 //!
+//! The MTP speculative head (layer `n_layers`: `eh_proj`/`enorm`/`hnorm`/
+//! `shared_head` plus its own attention + MoE block) is **kept by default**, so every
+//! container ships MTP-ready and the engine auto-detects `has_mtp = true`. Drafting is
+//! still opt-in at runtime (`DRAFT=n`; `MTP=0` forces the head off), so a container
+//! with the head is byte-identical to one without it whenever drafting is disabled —
+//! the head only costs one extra MoE layer on disk (~one layer's worth of experts).
+//!
 //! What is dropped by default (matching the reference): the DSA lightning indexer
-//! (`self_attn.indexer.*`) and the MTP head (layer `n_layers`,
-//! `eh_proj`/`enorm`/`hnorm`/`shared_head`). The engine then auto-detects
-//! `has_dsa = false` / `has_mtp = false` from the absent tensors, so attention is
-//! exact dense MLA.
+//! (`self_attn.indexer.*`). The engine then auto-detects `has_dsa = false` from the
+//! absent tensors, so attention is exact dense MLA.
 //!
 //! Set `ConvertOpts::keep_indexer` (`COLI_KEEP_INDEXER=1`) to retain the indexer
 //! weights instead — the wk/wq_b/weights_proj matrices quantize at `ebits`, k_norm
 //! stays f32 — so the resulting container has `has_dsa = true` and runs DSA sparse
-//! attention above `index_topk` context. The MTP head is still dropped.
+//! attention above `index_topk` context.
+//!
+//! `COLI_MTP_ONLY=1` emits *only* the head (into `mtp-NNNNN.safetensors` shards), to
+//! augment an already-converted head-less container without re-converting the model.
 //!
 //! The quantizer math is the shared, C-exact [`crate::quantize`] code, so a
 //! converted weight is byte-identical to a runtime-quantized one.
@@ -143,16 +151,18 @@ fn classify(name: &str, n_layers: usize, keep_idx: bool, mtp_only: bool) -> Kind
     }
     let li = layer_idx(name);
     let is_mtp = li >= 0 && li as usize == n_layers;
-    if mtp_only {
-        // MTP-only pass: emit *just* the speculative head at layer index `n_layers`.
-        // Everything else (base layers, embeddings, lm_head, final norm) already lives
-        // in the container being augmented, so re-emitting it would mean re-converting
-        // the whole model to obtain one extra layer.
-        if !is_mtp {
-            return Kind::Skip;
-        }
-    } else if li >= 0 && li as usize >= n_layers {
-        return Kind::Skip; // MTP head lives at layer index n_layers
+    // The MTP speculative head lives at layer index `n_layers` (the single
+    // `num_nextn_predict_layers` block). It is KEPT by default so every container ships
+    // MTP-ready — drafting stays opt-in at runtime (`DRAFT=n`; `MTP=0` forces it off).
+    // Only layers ABOVE the head (not part of this architecture) are dropped.
+    if li >= 0 && li as usize > n_layers {
+        return Kind::Skip;
+    }
+    if mtp_only && !is_mtp {
+        // `COLI_MTP_ONLY`: emit *just* the head, to augment an existing head-less
+        // container (base layers, embeddings, lm_head, final norm already live there)
+        // without re-converting the whole model.
+        return Kind::Skip;
     }
     // DSA lightning indexer (`self_attn.indexer.{wk,wq_b,weights_proj,k_norm}`). Dropped
     // by default; kept when `keep_idx` so the container can run DSA — the wk/wq_b/
@@ -165,11 +175,12 @@ fn classify(name: &str, n_layers: usize, keep_idx: bool, mtp_only: bool) -> Kind
     }
     for k in ["indexers_proj", "eh_proj", "enorm", "hnorm", "shared_head"] {
         if name.contains(k) {
-            // These are dropped for the base model, but `eh_proj`/`enorm`/`hnorm`/
-            // `shared_head.norm` ARE the MTP head's own inputs (see `load_mtp`'s
-            // required set), so keep them on the MTP pass. `shared_head.head` is a
-            // duplicate of lm_head and `indexers_proj` is unused — still skipped.
-            if mtp_only && is_mtp {
+            // `eh_proj`/`enorm`/`hnorm`/`shared_head.norm` ARE the MTP head's own fusion
+            // inputs (see `load_mtp`'s required set), so keep them for the head (layer
+            // `n_layers`) and drop them for the base model. These names only ever occur
+            // on the head, so `is_mtp` selects them exactly. `shared_head.head`
+            // duplicates lm_head and `indexers_proj` is unused — always dropped.
+            if is_mtp {
                 if name.contains("eh_proj") {
                     return Kind::Q;
                 }
@@ -1216,7 +1227,14 @@ pub fn convert_snapshot(
         }
         if !codes.is_empty() || !floats.is_empty() {
             codes.extend(floats); // code block first, then all F32 tensors
-            let path = outdir.join(format!("out-{fi:05}.safetensors"));
+            // `mtp_only` emits `mtp-NNNNN` so its head shards can be dropped straight
+            // into an existing head-less container without colliding with its
+            // `out-NNNNN` shards (the loader globs every `*.safetensors`).
+            let path = if opts.mtp_only {
+                outdir.join(format!("mtp-{fi:05}.safetensors"))
+            } else {
+                outdir.join(format!("out-{fi:05}.safetensors"))
+            };
             write_shard(&path, &codes)?;
             stats.shards_written += 1;
             stats.bytes_out += codes.iter().map(|t| t.bytes.len() as u64).sum::<u64>();
@@ -1224,17 +1242,21 @@ pub fn convert_snapshot(
         progress(fi, nfiles, &stats);
     }
 
-    // Copy config + tokenizer through so the output is a self-contained snapshot.
-    for fname in [
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "generation_config.json",
-        "special_tokens_map.json",
-    ] {
-        let src = indir.join(fname);
-        if src.exists() {
-            std::fs::copy(&src, outdir.join(fname))?;
+    // Copy config + tokenizer through so the output is a self-contained snapshot. The
+    // `mtp_only` augment pass writes only head shards into an EXISTING container, whose
+    // config/tokenizer are already present — leave them untouched.
+    if !opts.mtp_only {
+        for fname in [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "special_tokens_map.json",
+        ] {
+            let src = indir.join(fname);
+            if src.exists() {
+                std::fs::copy(&src, outdir.join(fname))?;
+            }
         }
     }
 
@@ -1718,10 +1740,58 @@ mod tests {
             classify("model.layers.0.self_attn.indexer.wk.weight", 78, false, false),
             Kind::Skip
         );
-        assert_eq!(classify("model.layers.78.eh_proj.weight", 78, false, false), Kind::Skip);
+
+        // MTP head (layer index n_layers) is KEPT by default so the container ships
+        // MTP-ready. Its own fusion inputs, attention, router, norms, and experts all
+        // classify as they would for a normal layer.
+        assert_eq!(classify("model.layers.78.eh_proj.weight", 78, false, false), Kind::Q);
+        assert_eq!(classify("model.layers.78.enorm.weight", 78, false, false), Kind::F32);
+        assert_eq!(classify("model.layers.78.hnorm.weight", 78, false, false), Kind::F32);
+        assert_eq!(
+            classify("model.layers.78.shared_head.norm.weight", 78, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify("model.layers.78.input_layernorm.weight", 78, false, false),
+            Kind::F32
+        );
+        assert_eq!(classify("model.layers.78.mlp.gate.weight", 78, false, false), Kind::F32);
+        assert_eq!(
+            classify("model.layers.78.self_attn.kv_b_proj.weight", 78, false, false),
+            Kind::Q
+        );
+        assert_eq!(
+            classify("model.layers.78.mlp.shared_experts.gate_proj.weight", 78, false, false),
+            Kind::Q
+        );
         assert_eq!(
             classify("model.layers.78.mlp.experts.0.gate_proj.weight", 78, false, false),
-            Kind::Skip // MTP layer
+            Kind::X // routed expert, streamed (NVFP4 by default)
+        );
+        // The duplicate lm_head inside the head is still dropped (we reuse lm_head).
+        assert_eq!(
+            classify("model.layers.78.shared_head.head.weight", 78, false, false),
+            Kind::Skip
+        );
+        // Anything above the single nextn head is not part of the architecture.
+        assert_eq!(classify("model.layers.79.eh_proj.weight", 78, false, false), Kind::Skip);
+    }
+
+    #[test]
+    fn mtp_only_emits_just_the_head() {
+        // The augment pass keeps ONLY layer n_layers; every base tensor is skipped.
+        assert_eq!(classify("model.layers.78.eh_proj.weight", 78, false, true), Kind::Q);
+        assert_eq!(
+            classify("model.layers.78.mlp.experts.5.up_proj.weight", 78, false, true),
+            Kind::X
+        );
+        assert_eq!(classify("model.layers.78.mlp.gate.weight", 78, false, true), Kind::F32);
+        // Base-model tensors dropped on the augment pass (they already live in the container).
+        assert_eq!(classify("lm_head.weight", 78, false, true), Kind::Skip);
+        assert_eq!(classify("model.embed_tokens.weight", 78, false, true), Kind::Skip);
+        assert_eq!(
+            classify("model.layers.3.self_attn.kv_b_proj.weight", 78, false, true),
+            Kind::Skip
         );
     }
 

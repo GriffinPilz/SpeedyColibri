@@ -285,35 +285,58 @@ fn dequant(shards: &Shards, name: &str) -> io::Result<(Vec<f32>, Vec<i64>)> {
             Ok((w, t.shape.clone()))
         }
         DType::F8E4M3 | DType::F8E5M2 => {
-            // Block-scaled FP8: W[o,i] = fp8(o,i) * scale_inv[o/128, i/128].
-            // The scale sidecar is the weight name (…proj.weight) with `_scale_inv`
-            // appended → …proj.weight_scale_inv (NOT a further `.weight_scale_inv`).
+            // Block-scaled FP8. Two layouts, distinguished by the scale dtype:
+            //   * F32 `[⌈O/128⌉, ⌈I/128⌉]` — modelopt 128×128 blocks (GLM-5.2).
+            //   * U8  `[nbo, nbi]`           — OCP MX-FP8 E8M0 power-of-2 scales
+            //     (MiniMax-M3): one exponent per `[O/nbo × I/nbi]` block (per-row ×
+            //     block-32 in practice). scale = 2^(e − 127).
+            // Both MULTIPLY: W[o,i] = fp8(o,i) · scale(block of (o,i)). The scale
+            // sidecar is the weight name with `_scale_inv` appended.
             let (o, i) = two_dims(&t.shape, name)?;
             let sname = format!("{name}_scale_inv");
             let st = shards.find(&sname).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "FP8 weight {name} has neither {sname} (128x128 block scales) \
+                        "FP8 weight {name} has neither {sname} (block scales) \
                          nor {name}_scale (per-tensor scale)"
                     ),
                 )
             })?;
             let (nbo, nbi) = two_dims(&st.shape, &sname)?;
-            debug_assert_eq!(nbo, o.div_ceil(BLOCK));
-            debug_assert_eq!(nbi, i.div_ceil(BLOCK));
 
             // fp8 codes → f32 (byte-per-element), then scale by block.
             let mut w = vec![0f32; o * i];
             shards.read_f32(name, &mut w)?; // convert_to_f32 decodes F8_E4M3/E5M2
-            let mut scale = vec![0f32; nbo * nbi];
-            shards.read_f32(&sname, &mut scale)?;
 
-            for oo in 0..o {
-                let srow = (oo / BLOCK) * nbi;
-                let wrow = &mut w[oo * i..(oo + 1) * i];
-                for (ii, wv) in wrow.iter_mut().enumerate() {
-                    *wv *= scale[srow + ii / BLOCK];
+            match st.dtype {
+                DType::U8 => {
+                    // MX-FP8: read the raw E8M0 exponent bytes (read_f32 would mangle
+                    // them). Block extent = O/nbo along rows, I/nbi along inputs.
+                    let bo = (o / nbo.max(1)).max(1);
+                    let bi = (i / nbi.max(1)).max(1);
+                    let mut raw = vec![0u8; st.nbytes as usize];
+                    shards.read_raw(&sname, &mut raw)?;
+                    for oo in 0..o {
+                        let srow = (oo / bo) * nbi;
+                        let wrow = &mut w[oo * i..(oo + 1) * i];
+                        for (ii, wv) in wrow.iter_mut().enumerate() {
+                            let e = raw[srow + ii / bi] as i32;
+                            *wv *= f32::exp2((e - 127) as f32);
+                        }
+                    }
+                }
+                _ => {
+                    // modelopt 128×128 F32 block grid.
+                    let mut scale = vec![0f32; nbo * nbi];
+                    shards.read_f32(&sname, &mut scale)?;
+                    for oo in 0..o {
+                        let srow = (oo / BLOCK) * nbi;
+                        let wrow = &mut w[oo * i..(oo + 1) * i];
+                        for (ii, wv) in wrow.iter_mut().enumerate() {
+                            *wv *= scale[srow + ii / BLOCK];
+                        }
+                    }
                 }
             }
             Ok((w, t.shape.clone()))

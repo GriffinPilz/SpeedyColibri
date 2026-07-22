@@ -135,44 +135,58 @@ fn load_layer(
     let mut l = Layer::default();
     l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
     l.post_ln = ld(shards, &p("post_attention_layernorm.weight"))?;
-    // MLA attention projections
-    l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), cfg.q_lora as usize, d, dbits)?;
-    l.q_a_ln = ld(shards, &p("self_attn.q_a_layernorm.weight"))?;
-    l.q_b = qt_load(
-        shards,
-        &p("self_attn.q_b_proj.weight"),
-        h * cfg.qk_head as usize,
-        cfg.q_lora as usize,
-        dbits,
-    )?;
-    l.kv_a = qt_load(
-        shards,
-        &p("self_attn.kv_a_proj_with_mqa.weight"),
-        (cfg.kv_lora + cfg.qk_rope) as usize,
-        d,
-        dbits,
-    )?;
-    l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
-    l.kv_b = qt_load(
-        shards,
-        &p("self_attn.kv_b_proj.weight"),
-        h * (cfg.qk_nope + cfg.v_head) as usize,
-        cfg.kv_lora as usize,
-        dbits,
-    )?;
+    // Output projection is shared by both attention flavours (`[hidden, n_heads*head_dim]`).
     l.o = qt_load(shards, &p("self_attn.o_proj.weight"), d, h * cfg.v_head as usize, dbits)?;
 
-    // DSA lightning indexer — present only when the checkpoint was converted with the
-    // indexer weights (`--indexer`). Load per layer that carries them; a model without
-    // these tensors leaves the fields `None` and attention runs dense. Names/dims match
-    // the C loader (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`).
-    if cfg.index_hd > 0 && cfg.index_nh > 0 && shards.has(&p("self_attn.indexer.wq_b.weight")) {
-        let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
-        l.ix_wq = Some(qt_load(shards, &p("self_attn.indexer.wq_b.weight"), nh * hd, cfg.q_lora as usize, dbits)?);
-        l.ix_wk = Some(qt_load(shards, &p("self_attn.indexer.wk.weight"), hd, d, dbits)?);
-        l.ix_wp = Some(qt_load(shards, &p("self_attn.indexer.weights_proj.weight"), nh, d, dbits)?);
-        l.ix_knorm_w = ld(shards, &p("self_attn.indexer.k_norm.weight"))?;
-        l.ix_knorm_b = ld(shards, &p("self_attn.indexer.k_norm.bias"))?;
+    if cfg.arch == colibri_core::Arch::MinimaxM3 {
+        // GQA attention (MiniMax-M3): q/k/v projections + per-head QK-norm. `qk_head`
+        // is the head dim; K/V carry `n_kv_heads` heads.
+        let hd = cfg.qk_head as usize;
+        let kvh = cfg.n_kv_heads as usize;
+        l.q_proj = Some(qt_load(shards, &p("self_attn.q_proj.weight"), h * hd, d, dbits)?);
+        l.k_proj = Some(qt_load(shards, &p("self_attn.k_proj.weight"), kvh * hd, d, dbits)?);
+        l.v_proj = Some(qt_load(shards, &p("self_attn.v_proj.weight"), kvh * hd, d, dbits)?);
+        l.q_norm = ld(shards, &p("self_attn.q_norm.weight"))?;
+        l.k_norm = ld(shards, &p("self_attn.k_norm.weight"))?;
+    } else {
+        // MLA attention projections (GLM)
+        l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), cfg.q_lora as usize, d, dbits)?;
+        l.q_a_ln = ld(shards, &p("self_attn.q_a_layernorm.weight"))?;
+        l.q_b = qt_load(
+            shards,
+            &p("self_attn.q_b_proj.weight"),
+            h * cfg.qk_head as usize,
+            cfg.q_lora as usize,
+            dbits,
+        )?;
+        l.kv_a = qt_load(
+            shards,
+            &p("self_attn.kv_a_proj_with_mqa.weight"),
+            (cfg.kv_lora + cfg.qk_rope) as usize,
+            d,
+            dbits,
+        )?;
+        l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
+        l.kv_b = qt_load(
+            shards,
+            &p("self_attn.kv_b_proj.weight"),
+            h * (cfg.qk_nope + cfg.v_head) as usize,
+            cfg.kv_lora as usize,
+            dbits,
+        )?;
+
+        // DSA lightning indexer — present only when the checkpoint was converted with the
+        // indexer weights (`--indexer`). Load per layer that carries them; a model without
+        // these tensors leaves the fields `None` and attention runs dense. Names/dims match
+        // the C loader (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`).
+        if cfg.index_hd > 0 && cfg.index_nh > 0 && shards.has(&p("self_attn.indexer.wq_b.weight")) {
+            let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
+            l.ix_wq = Some(qt_load(shards, &p("self_attn.indexer.wq_b.weight"), nh * hd, cfg.q_lora as usize, dbits)?);
+            l.ix_wk = Some(qt_load(shards, &p("self_attn.indexer.wk.weight"), hd, d, dbits)?);
+            l.ix_wp = Some(qt_load(shards, &p("self_attn.indexer.weights_proj.weight"), nh, d, dbits)?);
+            l.ix_knorm_w = ld(shards, &p("self_attn.indexer.k_norm.weight"))?;
+            l.ix_knorm_b = ld(shards, &p("self_attn.indexer.k_norm.bias"))?;
+        }
     }
 
     l.sparse = sparse;

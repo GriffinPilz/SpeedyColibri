@@ -95,6 +95,109 @@ pub fn attention(
     attention_with(cfg, l, layer, kv, x, s_len, pos_base, out, AttnCore::Reconstruct, None);
 }
 
+/// Grouped-query attention (MiniMax-M3, `arch == MinimaxM3`) over `S` new tokens
+/// `x[S, hidden]` starting at `pos_base`, writing `out[S, hidden]`. CPU reference:
+/// projects q/k/v, applies per-head QK-norm and partial RoPE, appends the full K/V
+/// to the cache, then runs causal scaled-dot-product attention with `n_heads` query
+/// heads sharing `n_kv_heads` key/value heads (`group = n_heads / n_kv_heads`).
+///
+/// Head geometry reuses the Config fields: `qk_head` is the head dim, `qk_rope` the
+/// rotary sub-dim (RoPE rotates only the first `qk_rope` of each head). NOTE: the
+/// RoPE layout (interleaved here) and the exact QK-norm/RoPE order are to be
+/// confirmed against the reference at end-to-end validation (task #56).
+pub fn attention_gqa(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    kv: &mut KvCache,
+    x: &[f32],
+    s_len: usize,
+    pos_base: usize,
+    out: &mut [f32],
+) {
+    let h = cfg.n_heads as usize;
+    let kvh = cfg.n_kv_heads as usize;
+    let hd = cfg.qk_head as usize; // head_dim
+    let rot = cfg.qk_rope as usize; // rotary sub-dim
+    let group = (h / kvh).max(1); // query heads per kv head
+    let kv_dim = kvh * hd;
+    let eps = cfg.eps;
+    let theta = cfg.theta;
+    let scale = cfg.attn_scale;
+    let q_proj = l.q_proj.as_ref().expect("GQA layer missing q_proj");
+    let k_proj = l.k_proj.as_ref().expect("GQA layer missing k_proj");
+    let v_proj = l.v_proj.as_ref().expect("GQA layer missing v_proj");
+
+    // ---- 1) project q, k, v (batched over all S rows) ----------------------
+    let _tp = std::time::Instant::now();
+    let mut q = vec![0f32; s_len * h * hd];
+    let mut k = vec![0f32; s_len * kv_dim];
+    let mut v = vec![0f32; s_len * kv_dim];
+    matmul_qt(&mut q, x, q_proj, s_len);
+    matmul_qt(&mut k, x, k_proj, s_len);
+    matmul_qt(&mut v, x, v_proj, s_len);
+    atime(&crate::forward::ATTN_PROJ_US, _tp);
+
+    // ---- 2) per-head QK-norm + partial RoPE; append K/V to the cache -------
+    let _tr = std::time::Instant::now();
+    for s in 0..s_len {
+        let pos = pos_base + s;
+        for hh in 0..h {
+            let qs = &mut q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
+            rmsnorm_inplace(qs, &l.q_norm, eps);
+            rope_interleave(&mut qs[..rot], pos, rot, theta);
+        }
+        for hh in 0..kvh {
+            let ks = &mut k[s * kv_dim + hh * hd..s * kv_dim + hh * hd + hd];
+            rmsnorm_inplace(ks, &l.k_norm, eps);
+            rope_interleave(&mut ks[..rot], pos, rot, theta);
+        }
+        kv.k_full_row_mut(layer, pos)
+            .copy_from_slice(&k[s * kv_dim..(s + 1) * kv_dim]);
+        kv.v_full_row_mut(layer, pos)
+            .copy_from_slice(&v[s * kv_dim..(s + 1) * kv_dim]);
+    }
+    atime(&crate::forward::ATTN_ROPE_US, _tr);
+
+    // ---- 3) causal GQA attention core -------------------------------------
+    let _tc = std::time::Instant::now();
+    let st0 = kv.kv_start[layer];
+    let mut ctx = vec![0f32; s_len * h * hd];
+    for s in 0..s_len {
+        let pos = pos_base + s;
+        let tk = pos + 1; // attend to cached positions [st0, pos]
+        let nkeys = tk - st0;
+        let krows = kv.k_full_rows(layer, st0, tk);
+        let vrows = kv.v_full_rows(layer, st0, tk);
+        for hh in 0..h {
+            let kvhh = hh / group;
+            let qvec = &q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
+            let mut scores = vec![0f32; nkeys];
+            for (ti, sc) in scores.iter_mut().enumerate() {
+                let base = ti * kv_dim + kvhh * hd;
+                let krow = &krows[base..base + hd];
+                let dot: f32 = qvec.iter().zip(krow).map(|(&a, &b)| a * b).sum();
+                *sc = dot * scale;
+            }
+            softmax(&mut scores);
+            let cvec = &mut ctx[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
+            for (ti, &sc) in scores.iter().enumerate() {
+                let base = ti * kv_dim + kvhh * hd;
+                let vrow = &vrows[base..base + hd];
+                for (c, &vv) in cvec.iter_mut().zip(vrow) {
+                    *c += sc * vv;
+                }
+            }
+        }
+    }
+    atime(&crate::forward::ATTN_CORE_US, _tc);
+
+    // ---- 4) output projection: ctx[S, n_heads*head_dim] -> out[S, hidden] --
+    let _to = std::time::Instant::now();
+    matmul_qt(out, &ctx, &l.o, s_len);
+    atime(&crate::forward::ATTN_OPROJ_US, _to);
+}
+
 /// As [`attention`], but selecting the core explicitly and optionally restricting each
 /// query to a DSA sparse selection (`sel[s]` = the cached positions query `s` attends
 /// to). `sel == None` (or an empty per-query list) is dense — full causal attention.
@@ -765,6 +868,69 @@ mod tests {
         l.kv_b = weights(h * (c.qk_nope + c.v_head) as usize, c.kv_lora as usize, 4);
         l.o = weights(d, h * c.v_head as usize, 5);
         l
+    }
+
+    fn gqa_cfg() -> Config {
+        let json = colibri_json::Json::parse(
+            r#"{"model_type":"minimax_m3_vl","text_config":{
+                "hidden_size":8,"intermediate_size":6,"num_hidden_layers":1,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+                "vocab_size":16,"max_position_embeddings":128,"rms_norm_eps":1e-6,
+                "use_gemma_norm":true,"rope_theta":10000.0,"rotary_dim":2,
+                "hidden_act":"swigluoai","use_qk_norm":true,"dense_intermediate_size":8,
+                "shared_intermediate_size":6,"num_local_experts":4,"num_experts_per_tok":2,
+                "n_shared_experts":1,"scoring_func":"sigmoid","use_routing_bias":true,
+                "moe_layer_freq":[1],"swiglu_alpha":1.702,"swiglu_limit":7.0,
+                "routed_scaling_factor":2.0,"eos_token_id":[15]}}"#,
+        )
+        .unwrap();
+        Config::from_json(&json).unwrap()
+    }
+
+    fn make_gqa_layer(c: &Config) -> Layer {
+        let h = c.n_heads as usize;
+        let kvh = c.n_kv_heads as usize;
+        let hd = c.qk_head as usize;
+        let d = c.hidden as usize;
+        let mut l = Layer::default();
+        l.q_proj = Some(weights(h * hd, d, 1));
+        l.k_proj = Some(weights(kvh * hd, d, 2));
+        l.v_proj = Some(weights(kvh * hd, d, 3));
+        l.o = weights(d, h * hd, 4);
+        l.q_norm = vec![1.0; hd];
+        l.k_norm = vec![1.0; hd];
+        l
+    }
+
+    #[test]
+    fn gqa_attention_is_causal() {
+        let c = gqa_cfg();
+        let l = make_gqa_layer(&c);
+        let d = c.hidden as usize;
+        let mk_kv = || {
+            let mut kv = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 8);
+            kv.enable_gqa(c.n_kv_heads as usize * c.qk_head as usize);
+            kv
+        };
+        // Two-token prefill.
+        let x2 = vecf(2 * d, 7);
+        let mut kv2 = mk_kv();
+        let mut out2 = vec![0f32; 2 * d];
+        attention_gqa(&c, &l, 0, &mut kv2, &x2, 2, 0, &mut out2);
+        // One-token prefill of just the first token, fresh cache.
+        let mut kv1 = mk_kv();
+        let mut out1 = vec![0f32; d];
+        attention_gqa(&c, &l, 0, &mut kv1, &x2[..d], 1, 0, &mut out1);
+        // Causality: position 0's output must not depend on position 1's presence.
+        for j in 0..d {
+            assert!(
+                (out2[j] - out1[j]).abs() < 1e-5,
+                "row0 differs at {j}: {} vs {}",
+                out2[j],
+                out1[j]
+            );
+        }
+        assert!(out2.iter().all(|v| v.is_finite()));
     }
 
     // GPU vs CPU MLA absorb core at GLM dims (H=64, kv_lora=512) over a 2048-token

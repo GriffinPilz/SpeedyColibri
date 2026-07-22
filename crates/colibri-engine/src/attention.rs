@@ -262,6 +262,9 @@ pub fn attention_gqa(
     let _tc = std::time::Instant::now();
     let st0 = kv.kv_start[layer];
     let mut ctx = vec![0f32; s_len * h * hd];
+    // Buffers reused across every (query, head) to avoid per-head allocation.
+    let mut scores: Vec<f32> = Vec::new();
+    let mut skeys: Vec<usize> = Vec::new();
     for s in 0..s_len {
         let pos = pos_base + s;
         let tk = pos + 1; // attend to cached positions [st0, pos]
@@ -270,32 +273,32 @@ pub fn attention_gqa(
         for hh in 0..h {
             let kvhh = hh / group;
             let qvec = &q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
-            // Allowed causal key positions: every key (dense), or only those in the
-            // indexer-selected blocks for this query's GQA group (block-sparse).
-            let keys: Vec<usize> = match &block_sel {
-                Some(sel) => {
-                    let mut ks = Vec::new();
-                    for &b in &sel[kvhh * s_len + s] {
-                        let lo = ((b as usize) * bsize).max(st0);
-                        let hi = ((b as usize + 1) * bsize).min(tk);
-                        ks.extend(lo..hi);
-                    }
-                    ks
+            // Key set: dense = the contiguous causal range [st0, tk); block-sparse =
+            // the keys in this query/GQA-group's indexer-selected blocks (gathered once).
+            let sparse = block_sel.is_some();
+            if sparse {
+                skeys.clear();
+                for &b in &block_sel.as_ref().unwrap()[kvhh * s_len + s] {
+                    let lo = ((b as usize) * bsize).max(st0);
+                    let hi = ((b as usize + 1) * bsize).min(tk);
+                    skeys.extend(lo..hi);
                 }
-                None => (st0..tk).collect(),
-            };
-            let mut scores = vec![0f32; keys.len()];
-            for (i, &t) in keys.iter().enumerate() {
-                let base = (t - st0) * kv_dim + kvhh * hd;
+            }
+            let nk = if sparse { skeys.len() } else { tk - st0 };
+            let key = |i: usize| if sparse { skeys[i] } else { st0 + i };
+            scores.clear();
+            scores.resize(nk, 0.0);
+            for (i, sc) in scores.iter_mut().enumerate() {
+                let base = (key(i) - st0) * kv_dim + kvhh * hd;
                 let krow = &krows[base..base + hd];
-                let dot: f32 = qvec.iter().zip(krow).map(|(&a, &b)| a * b).sum();
-                scores[i] = dot * scale;
+                *sc = qvec.iter().zip(krow).map(|(&a, &b)| a * b).sum::<f32>() * scale;
             }
             softmax(&mut scores);
             let cvec = &mut ctx[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
-            for (i, &sc) in scores.iter().enumerate() {
-                let base = (keys[i] - st0) * kv_dim + kvhh * hd;
+            for i in 0..nk {
+                let base = (key(i) - st0) * kv_dim + kvhh * hd;
                 let vrow = &vrows[base..base + hd];
+                let sc = scores[i];
                 for (c, &vv) in cvec.iter_mut().zip(vrow) {
                     *c += sc * vv;
                 }

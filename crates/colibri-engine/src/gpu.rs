@@ -724,11 +724,14 @@ pub fn try_matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) -> bool {
     if !w.gpu_eligible || !available() {
         return false;
     }
-    // weight bytes + a stable address key, per format
+    // This dense-upload GPU matmul handles only the resident formats: f32 (0) and
+    // int8 (1). Packed formats (e4m3/NVFP4) store fewer bytes than a dense `o*i`
+    // buffer, so uploading them here reads out of bounds — they have their own fused
+    // kernel (`try_expert_ffn`) or fall to the CPU reference in `matmul_qt`.
     let (wptr, key): (*const c_void, usize) = match w.fmt_code {
         0 => (w.qf.as_ptr() as *const c_void, w.qf.as_ptr() as usize),
         1 => (w.q8.as_ptr() as *const c_void, w.q8.as_ptr() as usize),
-        _ => (w.q4.as_ptr() as *const c_void, w.q4.as_ptr() as usize),
+        _ => return false,
     };
     let sptr = w.s.as_ptr();
     RESIDENT.with(|r| {

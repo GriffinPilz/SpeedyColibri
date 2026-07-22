@@ -148,6 +148,17 @@ fn load_layer(
         l.v_proj = Some(qt_load(shards, &p("self_attn.v_proj.weight"), kvh * hd, d, dbits)?);
         l.q_norm = ld(shards, &p("self_attn.q_norm.weight"))?;
         l.k_norm = ld(shards, &p("self_attn.k_norm.weight"))?;
+        // Block-sparse Lightning Indexer weights on sparse attention layers.
+        if cfg.idx_type.get(i).copied().unwrap_or(false)
+            && cfg.index_hd > 0
+            && shards.has(&p("self_attn.index_q_proj.weight"))
+        {
+            let (inh, ihd) = (cfg.index_nh as usize, cfg.index_hd as usize);
+            l.idx_q_proj = Some(qt_load(shards, &p("self_attn.index_q_proj.weight"), inh * ihd, d, dbits)?);
+            l.idx_k_proj = Some(qt_load(shards, &p("self_attn.index_k_proj.weight"), ihd, d, dbits)?);
+            l.idx_q_norm = ld(shards, &p("self_attn.index_q_norm.weight"))?;
+            l.idx_k_norm = ld(shards, &p("self_attn.index_k_norm.weight"))?;
+        }
     } else {
         // MLA attention projections (GLM)
         l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), cfg.q_lora as usize, d, dbits)?;

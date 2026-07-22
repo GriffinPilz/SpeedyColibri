@@ -60,7 +60,14 @@ pub struct Config {
     pub index_topk: i32,
     pub index_nh: i32,
     pub index_hd: i32,
-    /// per-layer indexer type: `true` = full (compute), `false` = shared (reuse)
+    /// MiniMax-M3 block-sparse indexer: keys are max-pooled into `index_block_size`
+    /// blocks; each query keeps the top `index_topk_blocks` scored blocks plus the
+    /// last `index_local_blocks` blocks (always visible). 0 = no block-sparse (GLM).
+    pub index_block_size: i32,
+    pub index_topk_blocks: i32,
+    pub index_local_blocks: i32,
+    /// per-layer indexer type: GLM `true` = FULL DSA layer; MiniMax-M3 `true` = a
+    /// block-sparse attention layer (from `sparse_attention_freq`).
     pub idx_type: Vec<bool>,
     pub eps: f32,
     pub theta: f32,
@@ -211,6 +218,9 @@ impl Config {
             index_topk: gi("index_topk"),
             index_nh: gi("index_n_heads"),
             index_hd: gi("index_head_dim"),
+            index_block_size: 0,
+            index_topk_blocks: 0,
+            index_local_blocks: 0,
             idx_type: Vec::new(),
             eps: r.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-5) as f32,
             theta: 10000.0,
@@ -315,6 +325,27 @@ impl Config {
         let act = t.get("hidden_act").and_then(Json::as_str).unwrap_or("");
         let scoring = t.get("scoring_func").and_then(Json::as_str).unwrap_or("");
 
+        // Block-sparse attention (Lightning Indexer). `sparse_attention_config` carries the
+        // indexer geometry and the per-layer on/off list (`sparse_attention_freq`; the
+        // leading dense layers are 0). Absent config → dense everywhere.
+        let sac = t.get("sparse_attention_config");
+        let sg = |k: &str, d: i32| {
+            sac.and_then(|s| s.get(k)).and_then(Json::as_i64).map(|v| v as i32).unwrap_or(d)
+        };
+        let index_nh = sg("sparse_num_index_heads", 0);
+        let index_hd = sg("sparse_index_dim", 0);
+        let index_block_size = sg("sparse_block_size", 0);
+        let index_topk_blocks = sg("sparse_topk_blocks", 0);
+        let index_local_blocks = sg("sparse_local_block", 0);
+        let nlc = (gt("num_hidden_layers").max(0) as usize).min(MAX_LAYERS_IDX);
+        let idx_type: Vec<bool> =
+            match sac.and_then(|s| s.get("sparse_attention_freq")).and_then(Json::as_array) {
+                Some(arr) => {
+                    (0..nlc).map(|i| arr.get(i).and_then(Json::as_i64).unwrap_or(0) != 0).collect()
+                }
+                None => vec![false; nlc],
+            };
+
         let mut c = Config {
             hidden: gt("hidden_size"),
             n_layers: gt("num_hidden_layers"),
@@ -338,11 +369,15 @@ impl Config {
             // MiniMax normalizes the top-k gate weights before `routed_scaling`.
             norm_topk: true,
             stop_ids: Vec::new(),
-            // Sparse attention is deferred (dense GQA for the MVP): no DSA indexer.
-            index_topk: 0,
-            index_nh: 0,
-            index_hd: 0,
-            idx_type: vec![false; (gt("num_hidden_layers").max(0) as usize).min(MAX_LAYERS_IDX)],
+            // Block-sparse Lightning Indexer (see the parse above); `index_topk` is the
+            // effective per-query token budget (topk_blocks * block_size), 0 if dense.
+            index_topk: index_topk_blocks * index_block_size,
+            index_nh,
+            index_hd,
+            index_block_size,
+            index_topk_blocks,
+            index_local_blocks,
+            idx_type,
             eps: t.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
             theta: t.get("rope_theta").and_then(Json::as_f64).unwrap_or(10000.0) as f32,
             attn_scale: if head_dim > 0 { 1.0 / (head_dim as f32).sqrt() } else { 0.0 },
@@ -460,7 +495,16 @@ mod tests {
                 "swiglu_alpha": 1.702,
                 "swiglu_limit": 7.0,
                 "routed_scaling_factor": 2.0,
-                "eos_token_id": [200020]
+                "eos_token_id": [200020],
+                "sparse_attention_config": {
+                    "use_sparse_attention": true,
+                    "sparse_index_dim": 128,
+                    "sparse_num_index_heads": 4,
+                    "sparse_topk_blocks": 16,
+                    "sparse_block_size": 128,
+                    "sparse_local_block": 1,
+                    "sparse_attention_freq": [0,0,0,1,1,1]
+                }
             }
         }"#;
         Json::parse(text).unwrap()
@@ -502,14 +546,20 @@ mod tests {
         assert_eq!(c.vocab, 200064);
         assert_eq!(c.max_ctx, 1048576);
         assert!(c.qk_norm && c.gemma_norm && c.swiglu_oai && c.sigmoid_route);
+        // Block-sparse Lightning Indexer geometry + per-layer flags.
+        assert_eq!(c.index_nh, 4);
+        assert_eq!(c.index_hd, 128);
+        assert_eq!(c.index_block_size, 128);
+        assert_eq!(c.index_topk_blocks, 16);
+        assert_eq!(c.index_local_blocks, 1);
+        assert_eq!(c.index_topk, 16 * 128); // effective token budget
+        assert_eq!(&c.idx_type[..6], &[false, false, false, true, true, true]); // first 3 dense
         assert!((c.swiglu_alpha - 1.702).abs() < 1e-6);
         assert!((c.swiglu_limit - 7.0).abs() < 1e-6);
         assert!((c.routed_scale - 2.0).abs() < 1e-6);
         assert!((c.attn_scale - 1.0 / (128f32).sqrt()).abs() < 1e-6);
         assert!((c.theta - 5_000_000.0).abs() < 1.0);
         assert_eq!(c.stop_ids, vec![200020]);
-        // Sparse attention deferred: no DSA indexer for the MVP.
-        assert_eq!(c.index_topk, 0);
         assert_eq!(c.idx_type.len(), 60);
     }
 

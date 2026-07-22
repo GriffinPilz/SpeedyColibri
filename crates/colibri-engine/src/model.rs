@@ -35,6 +35,13 @@ pub struct Layer {
     pub q_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
     pub k_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
 
+    // MiniMax-M3 block-sparse Lightning Indexer (present only on sparse attention
+    // layers; see `Config::idx_type` for M3). Empty/None on GLM and on M3 dense layers.
+    pub idx_q_proj: Option<QTensor>, // hidden -> index_n_heads * index_head_dim
+    pub idx_k_proj: Option<QTensor>, // hidden -> index_head_dim (MQA: one key head)
+    pub idx_q_norm: Vec<f32>,        // per-head index RMSNorm [index_head_dim] (gemma-folded)
+    pub idx_k_norm: Vec<f32>,        // index-key RMSNorm [index_head_dim] (gemma-folded)
+
     pub sparse: bool,
 
     // dense mlp (sparse == false)

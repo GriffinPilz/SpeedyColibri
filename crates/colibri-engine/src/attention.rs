@@ -95,6 +95,101 @@ pub fn attention(
     attention_with(cfg, l, layer, kv, x, s_len, pos_base, out, AttnCore::Reconstruct, None);
 }
 
+/// `COLI_M3_SPARSE=1` enables the MiniMax-M3 block-sparse Lightning Indexer (off by
+/// default → dense GQA, which is what llama.cpp ships too). Prefill-only.
+fn m3_sparse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_M3_SPARSE").ok().as_deref() == Some("1"))
+}
+
+/// The `keep` highest-scoring block ids, returned sorted ascending (the key set is
+/// then read in position order). Ties resolve by lower block id.
+fn topk_blocks(scores: &[f32], keep: usize) -> Vec<u32> {
+    let n = scores.len();
+    let keep = keep.min(n);
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+    });
+    let mut sel: Vec<u32> = idx[..keep].iter().map(|&i| i as u32).collect();
+    sel.sort_unstable();
+    sel
+}
+
+/// MiniMax-M3 Lightning Indexer block selection for a sparse attention layer. Returns,
+/// per (index head `g`, query `s`) at flat index `g * s_len + s`, the sorted key-block
+/// ids to attend: the top `index_topk_blocks` by max-pooled index score, plus the local
+/// (query-containing) block. Port of `MiniMaxM3VLIndexer`. `None` when the layer is
+/// dense, the indexer is off, weights are absent, or the causal context fits inside the
+/// top-k budget (every block kept = dense — nothing to gain). Prefill only.
+fn m3_block_select(
+    cfg: &Config,
+    l: &Layer,
+    x: &[f32],
+    s_len: usize,
+    pos_base: usize,
+) -> Option<Vec<Vec<u32>>> {
+    if !m3_sparse_enabled() || pos_base != 0 || s_len <= 1 {
+        return None;
+    }
+    let q_proj = l.idx_q_proj.as_ref()?;
+    let k_proj = l.idx_k_proj.as_ref()?;
+    let inh = cfg.index_nh as usize; // index heads (== n_kv_heads)
+    let ihd = cfg.index_hd as usize; // index head dim
+    let bs = (cfg.index_block_size as usize).max(1);
+    let topk = cfg.index_topk_blocks as usize;
+    let local = cfg.index_local_blocks as usize;
+    let rot = (cfg.qk_rope as usize).min(ihd); // same NeoX first-`rotary_dim` rope
+    if s_len.div_ceil(bs) <= topk {
+        return None; // context ≤ top-k budget → selects every block = dense
+    }
+
+    // idx_q [s, inh, ihd], idx_k [s, ihd] (MQA); per-head gemma RMSNorm + partial RoPE.
+    let mut iq = vec![0f32; s_len * inh * ihd];
+    let mut ik = vec![0f32; s_len * ihd];
+    matmul_qt(&mut iq, x, q_proj, s_len);
+    matmul_qt(&mut ik, x, k_proj, s_len);
+    for s in 0..s_len {
+        let pos = pos_base + s;
+        for g in 0..inh {
+            let q = &mut iq[s * inh * ihd + g * ihd..s * inh * ihd + g * ihd + ihd];
+            rmsnorm_inplace(q, &l.idx_q_norm, cfg.eps);
+            rope_neox(&mut q[..rot], pos, rot, cfg.theta);
+        }
+        let k = &mut ik[s * ihd..(s + 1) * ihd];
+        rmsnorm_inplace(k, &l.idx_k_norm, cfg.eps);
+        rope_neox(&mut k[..rot], pos, rot, cfg.theta);
+    }
+
+    // Per (index head, query): max-pool causal key scores into blocks, force the local
+    // block, take the top-k blocks.
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); inh * s_len];
+    for g in 0..inh {
+        for s in 0..s_len {
+            let pos = pos_base + s;
+            let tk = pos + 1; // causal keys [0, pos]
+            let nb = tk.div_ceil(bs);
+            let qv = &iq[s * inh * ihd + g * ihd..s * inh * ihd + g * ihd + ihd];
+            let mut bscore = vec![f32::NEG_INFINITY; nb];
+            for t in 0..tk {
+                let kvec = &ik[t * ihd..(t + 1) * ihd];
+                let dot: f32 = qv.iter().zip(kvec).map(|(&a, &b)| a * b).sum();
+                let b = t / bs;
+                if dot > bscore[b] {
+                    bscore[b] = dot;
+                }
+            }
+            // local blocks (the query's own block and the `local-1` before it) always kept
+            let q_block = pos / bs;
+            for lb in 0..local {
+                bscore[q_block.saturating_sub(lb)] = f32::INFINITY;
+            }
+            out[g * s_len + s] = topk_blocks(&bscore, topk);
+        }
+    }
+    Some(out)
+}
+
 /// Grouped-query attention (MiniMax-M3, `arch == MinimaxM3`) over `S` new tokens
 /// `x[S, hidden]` starting at `pos_base`, writing `out[S, hidden]`. CPU reference:
 /// projects q/k/v, applies per-head QK-norm and partial RoPE, appends the full K/V
@@ -160,29 +255,46 @@ pub fn attention_gqa(
     atime(&crate::forward::ATTN_ROPE_US, _tr);
 
     // ---- 3) causal GQA attention core -------------------------------------
+    // Block-sparse Lightning Indexer selection (MiniMax-M3, COLI_M3_SPARSE); None → dense.
+    let block_sel = m3_block_select(cfg, l, x, s_len, pos_base);
+    let bsize = (cfg.index_block_size as usize).max(1);
+
     let _tc = std::time::Instant::now();
     let st0 = kv.kv_start[layer];
     let mut ctx = vec![0f32; s_len * h * hd];
     for s in 0..s_len {
         let pos = pos_base + s;
         let tk = pos + 1; // attend to cached positions [st0, pos]
-        let nkeys = tk - st0;
         let krows = kv.k_full_rows(layer, st0, tk);
         let vrows = kv.v_full_rows(layer, st0, tk);
         for hh in 0..h {
             let kvhh = hh / group;
             let qvec = &q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
-            let mut scores = vec![0f32; nkeys];
-            for (ti, sc) in scores.iter_mut().enumerate() {
-                let base = ti * kv_dim + kvhh * hd;
+            // Allowed causal key positions: every key (dense), or only those in the
+            // indexer-selected blocks for this query's GQA group (block-sparse).
+            let keys: Vec<usize> = match &block_sel {
+                Some(sel) => {
+                    let mut ks = Vec::new();
+                    for &b in &sel[kvhh * s_len + s] {
+                        let lo = ((b as usize) * bsize).max(st0);
+                        let hi = ((b as usize + 1) * bsize).min(tk);
+                        ks.extend(lo..hi);
+                    }
+                    ks
+                }
+                None => (st0..tk).collect(),
+            };
+            let mut scores = vec![0f32; keys.len()];
+            for (i, &t) in keys.iter().enumerate() {
+                let base = (t - st0) * kv_dim + kvhh * hd;
                 let krow = &krows[base..base + hd];
                 let dot: f32 = qvec.iter().zip(krow).map(|(&a, &b)| a * b).sum();
-                *sc = dot * scale;
+                scores[i] = dot * scale;
             }
             softmax(&mut scores);
             let cvec = &mut ctx[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
-            for (ti, &sc) in scores.iter().enumerate() {
-                let base = ti * kv_dim + kvhh * hd;
+            for (i, &sc) in scores.iter().enumerate() {
+                let base = (keys[i] - st0) * kv_dim + kvhh * hd;
                 let vrow = &vrows[base..base + hd];
                 for (c, &vv) in cvec.iter_mut().zip(vrow) {
                     *c += sc * vv;
@@ -900,6 +1012,17 @@ mod tests {
         l.q_norm = vec![1.0; hd];
         l.k_norm = vec![1.0; hd];
         l
+    }
+
+    #[test]
+    fn topk_blocks_picks_highest_sorted() {
+        let scores = [1.0f32, 5.0, 3.0, f32::INFINITY, 2.0];
+        // top-3 = {inf@3, 5@1, 3@2}, returned sorted ascending.
+        assert_eq!(topk_blocks(&scores, 3), vec![1, 2, 3]);
+        assert_eq!(topk_blocks(&scores, 1), vec![3]); // the local (+inf) block
+        assert_eq!(topk_blocks(&scores, 10).len(), 5); // keep clamps to n
+        // ties resolve to the lower block id.
+        assert_eq!(topk_blocks(&[2.0f32, 2.0, 1.0], 1), vec![0]);
     }
 
     #[test]

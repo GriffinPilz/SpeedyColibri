@@ -28,9 +28,9 @@ the GB10 Grace-Blackwell superchip, with the whole hot path on the GPU.
 
 colibrì's insight: a 744B Mixture-of-Experts model activates only ~40B parameters
 per token, and only ~11 GB of those (the routed experts) change from token to
-token. So the **dense part** (attention, shared expert, embeddings — ~10 GB at
-int4) stays resident in RAM, and the **19,456 routed experts** (~358 GB) live on
-disk and are **streamed on demand**.
+token. So the **dense part** (attention, shared expert, embeddings — ~19 GB at
+int8) stays resident in RAM, and the **19,456 routed experts** (NVFP4, ~436 GB) live
+on disk and are **streamed on demand**.
 
 SpeedyColibri takes that design and specializes it for **one box: the DGX Spark**
 (GB10, aarch64 Grace CPU + Blackwell GPU, 128 GB coherent unified memory,
@@ -85,7 +85,7 @@ docker/run-dgx.sh serve 8080 "warm up the cache"
 Wait for this line before sending requests:
 
 ```
-[serve] OpenAI-compatible server on http://0.0.0.0:8080  (model: mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp)
+[serve] OpenAI-compatible server on http://0.0.0.0:8080  (model: nvidia/GLM-5.2-NVFP4)
 ```
 
 **Command shape:** `docker/run-dgx.sh [hf_TOKEN] serve [port] [warm-up prompt...]`
@@ -143,7 +143,7 @@ mount (`COLI_MODEL_DIR=<host-dir> docker/run-dgx.sh serve ...` → `/model`) →
 Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so the
 358 GB download happens **at most once** and is shared with non-container runs) →
 `hf download` of `$COLI_MODEL_REPO` (default
-`mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp`).
+`nvidia/GLM-5.2-NVFP4`).
 
 **Environment variables** (all optional; pass as `VAR=value docker/run-dgx.sh ...`):
 
@@ -155,7 +155,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
 | `COLI_CTX` | served context length (prompt + completion), e.g. `64k`; bounded by the model max (1M) and by RAM (~175 KB/token of KV) | `32768` |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
-| `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` |
+| `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
 | `COLI_VRAM_GB` | cap the VRAM expert store | all free VRAM |
 | `COLI_PIN_GB` | pin the hottest experts resident from the usage history so they never churn out of the cache. A number = that many GB; `auto` = size it to the knee of the usage curve (capped at 80% of the cache, leaving room for the cold tail to stream). Costs a one-time warm-up that reads every pinned expert — minutes, at `auto` scale | off |
 | `COLI_PROFILE` | `1` → print the attention/MoE/expert-load time breakdown | off |
@@ -191,9 +191,9 @@ NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
 # Serve: serve <snapshot-dir> [port] [warm-up prompt...]
 ./target/release/coli serve /path/to/snapshot 8080 "warm-up prompt"
 
-# Convert an HF FP8/NVFP4 checkpoint into a colibrì container (int4 experts by default;
-# COLI_XFP8=1 for e4m3 experts):
-./target/release/coli convert /path/to/hf-snapshot /path/to/container
+# Convert an HF FP8/NVFP4 checkpoint into a colibrì container. Experts are NVFP4 by
+# default (4-bit block-scaled); COLI_XFP8=1 for 8-bit e4m3 experts instead:
+./target/release/coli convert nvidia/GLM-5.2-NVFP4 /path/to/container
 
 # Re-quantize an existing e4m3 container's experts to NVFP4 (in place, ~18 min, ~2× faster
 # decode + prefill at <1% perplexity — see the Expert quantization section below):
@@ -253,18 +253,22 @@ optimization does:
 - Output is **bit-identical** across node counts, so **quality is node-independent** —
   it's tracked once, not per size.
 
-Config: GLM-5.2 744B MoE, **8/4** (int8 resident / int4 experts), GB10 Grace-Blackwell,
-greedy decode. Last updated **2026-07-17**.
+Config: GLM-5.2 744B MoE, **int8 resident + NVFP4 experts** (int4 experts are no longer
+produced), GB10 Grace-Blackwell, greedy decode. The 2026-07-17 rows below were on the
+earlier int4-experts build and establish the *resident* bit-width choice; the NVFP4-vs-e4m3
+*expert*-format A/B is in [Expert quantization](#expert-quantization-nvfp4-default-e4m3-opt-out).
 
 ### Quality (model-level, all node sizes)
 
 | | perplexity ↓ | top-1 ↑ | when |
 |---|---|---|---|
 | starting — int4 resident (reference 4/4) | 48.665 | 32.1% | baseline |
-| **current — int8 resident (shipped 8/4)** | **6.189** | **57.9%** | 2026-07-17 |
+| **int8 resident (shipped)** | **6.189** | **57.9%** | 2026-07-17 |
 
-int4 attention was wrecking the model; int8 resident recovers it for +~7 GB RAM. The
-routed experts stay int4 in both. Perplexity from `coli ppl`; lower is better.
+int4 attention was wrecking the model; int8 resident recovers it for +~7 GB RAM. Perplexity
+from `coli ppl`; lower is better. These rows fix the resident format; the experts were int4
+here and are NVFP4 now — the same-text NVFP4-vs-e4m3 expert A/B (4.707 vs 4.670, +0.8%) is
+in the Expert quantization section (a different held-out text, so not comparable to 6.189).
 
 ### Throughput — decode, diverse prompts, short context
 
@@ -292,22 +296,32 @@ case for the multi-node work below: sharding experts cuts per-node prefill strea
 The 32k/64k rows are **extrapolations from the two measured points**, not measurements
 — they will be replaced with real numbers or struck out.
 
-### Expert quantization: int4 → e4m3 → NVFP4
+### Expert quantization: NVFP4 (default), e4m3 opt-out
 
-The routed experts (97% of the weights, and what every token streams) can be stored in
-three formats. Resident weights (attention / dense / shared) stay 8-bit int throughout.
+The routed experts (97% of the weights, and what every token streams) are stored as
+**NVFP4** — 4-bit block-scaled. Resident weights (attention / dense / shared) stay 8-bit
+int. Two source checkpoints feed the experts: modelopt **NVFP4**
+[`nvidia/GLM-5.2-NVFP4`](https://huggingface.co/nvidia/GLM-5.2-NVFP4) (the default) and
+block-scaled **FP8** [`unsloth/GLM-5.2-FP8`](https://huggingface.co/unsloth/GLM-5.2-FP8).
 
-| expert format | bytes/wt | experts on disk | build |
+| expert format | bytes/wt | experts on disk | build (from source checkpoint) |
 |---|---|---|---|
-| int4 (per-row) | 0.5 | ~368 GB | `coli convert` (default) |
-| e4m3 fp8 (per-row) | 1.0 | ~735 GB | `coli convert … COLI_XFP8=1` |
-| **NVFP4** (e2m1 + per-16 ue4m3 block scale + global) | **0.5625** | **~436 GB** | `coli requant-nvfp4 <e4m3-dir> <out-dir>` |
+| **NVFP4** (e2m1 + per-16 ue4m3 block scale + global) — **default** | **0.5625** | **~436 GB** | `coli convert nvidia/GLM-5.2-NVFP4 <out>` |
+| e4m3 fp8 (per-row) — 8-bit opt-out | 1.0 | ~735 GB | `COLI_XFP8=1 coli convert unsloth/GLM-5.2-FP8 <out>` |
 
 **NVFP4 is a 4-bit block-scaled format** — 4-bit weights with a shared scale per 16
-inputs, so it keeps int4's size while recovering most of e4m3's accuracy. Switching is
-just pointing the server at a different container (the formats are auto-detected; the fp8
-path is unchanged, so `e4m3` + `COLI_EXPERT_FP8=1` still works). `requant-nvfp4`
-re-quantizes an existing e4m3 container in place (~18 min for the 744B model, no re-download).
+inputs, so it is int4-small while nearly matching e4m3's accuracy. It is the default output
+of `coli convert` for **any** source (a modelopt NVFP4 source stays NVFP4 with no
+dequant/requant loss; an FP8 source is quantized straight to NVFP4). **int4 experts are no
+longer produced.** The one command:
+
+```bash
+docker/run-dgx.sh <hf_token> serve 8080 "warm up"   # defaults to nvidia/GLM-5.2-NVFP4 → NVFP4
+```
+
+Switching to the 8-bit e4m3 experts is `--model unsloth/GLM-5.2-FP8 COLI_XFP8=1`. To turn
+an existing e4m3 container into NVFP4 without a re-download, `coli requant-nvfp4 <e4m3-dir>
+<out-dir>` (~18 min for the 744B model).
 
 **Measured NVFP4 vs e4m3, single node GB10, GPU, warm cache** (2026-07-21; a same-session
 A/B — the *ratio* is the robust result, the absolute tok/s uses a short warm prompt and

@@ -46,7 +46,10 @@ fi
 
 : "${COLI_NUM_NODES:=1}"
 : "${COLI_NODE_RANK:=0}"
-: "${COLI_MODEL_REPO:=mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp}"
+# Default model: NVIDIA's modelopt NVFP4 GLM-5.2, converted to an NVFP4 container on
+# first run (4-bit block-scaled experts — the standard format; int4 is no longer served).
+# Override with `--model unsloth/GLM-5.2-FP8` (+ COLI_XFP8=1 for e4m3), a container, or a path.
+: "${COLI_MODEL_REPO:=nvidia/GLM-5.2-NVFP4}"
 # Where auto-converted int4 containers are cached. Defaults under the HF cache so
 # a mounted host cache persists conversions across container runs.
 : "${COLI_CONVERT_DIR:=${HF_HOME:-/root/.cache/huggingface}/colibri-int4}"
@@ -149,22 +152,15 @@ ensure_container() {
       ;;
   esac
 
-  # Preserve NVFP4: a modelopt NVFP4 source (nvidia/GLM-5.2-NVFP4) is converted to an
-  # NVFP4 container by default — 4-bit block-scaled experts, ~2x faster prefill+decode
-  # than e4m3 at <1% perplexity — instead of being DOWNGRADED to int4. The user can still
-  # force int4 (COLI_XNVFP4=0 COLI_XFP8=0) or e4m3 (COLI_XFP8=1).
-  if [[ "$fmt" == "nvfp4" && -z "${COLI_XFP8:-}" && -z "${COLI_XNVFP4:-}" ]]; then
-    export COLI_XNVFP4=1
-  fi
-
-  # Human-readable expert-format tag for the cache key + logs, so nvfp4 / e4m3 / int4
-  # conversions of the same source don't collide.
-  local xfmt="int${COLI_XBITS:-4}"
+  # Expert format: NVFP4 (default, 4-bit block-scaled — ~2x faster prefill+decode than
+  # e4m3 at <1% perplexity) or e4m3 (COLI_XFP8=1). Works for either source (a modelopt
+  # NVFP4 source stays NVFP4 with no requant loss; an FP8 source is quantized to NVFP4).
+  # int4 experts are no longer produced.
+  local xfmt="nvfp4"
   [[ "${COLI_XFP8:-0}" == 1 ]] && xfmt="e4m3"
-  [[ "${COLI_XNVFP4:-0}" == 1 ]] && xfmt="nvfp4"
 
   # Cache key: the model spec, flattened, plus the expert format + resident bit-widths so
-  # a different COLI_XNVFP4/COLI_XFP8/COLI_EBITS doesn't silently reuse the wrong container.
+  # a different COLI_XFP8/COLI_EBITS doesn't silently reuse the wrong container.
   slug="${COLI_MODEL_REPO//\//--}"
   slug="${slug//[^A-Za-z0-9._-]/_}"
   dest="${COLI_CONVERT_DIR}/${slug}-x${xfmt}-e${COLI_EBITS:-8}io${COLI_IO_BITS:-8}"

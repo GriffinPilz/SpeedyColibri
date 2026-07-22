@@ -86,22 +86,16 @@ pub struct ConvertOpts {
     /// Produces a small shard you drop into an existing container to enable drafting
     /// without re-converting the whole model. See `classify`.
     pub mtp_only: bool,
-    /// emit routed experts as per-row-scaled e4m3 fp8 (1 byte/weight) instead of
-    /// `xbits`-bit int — `--xfp8`. Preserves the source FP8's 8-bit weight precision
-    /// (vs int4's 4) at 2× the streamed bytes; consumed by the tiled FP8 expert kernel.
+    /// emit routed experts as per-row-scaled e4m3 fp8 (1 byte/weight) — `COLI_XFP8=1` —
+    /// the 8-bit opt-out from the NVFP4 default. 2× the streamed bytes of NVFP4; consumed
+    /// by the tiled FP8 expert kernel. Experts are **NVFP4 by default** (see [`quantize_nvfp4`]);
+    /// int4 experts are no longer produced.
     pub xfp8: bool,
-    /// emit routed experts as **NVFP4** (e2m1 nibbles + per-16 ue4m3 block scale +
-    /// per-tensor global) — `COLI_XNVFP4=1`. The weight is one U8 blob (nibbles ++
-    /// block-scales) plus a `{name}.g` F32 global; consumed by the `nvfp4_gemv`/tiled
-    /// kernels. 0.5625 B/wt (vs int4 0.5, e4m3 1.0) at ~e4m3 quality; the natural
-    /// output when the SOURCE is already modelopt NVFP4 (no dequant/requant loss).
-    /// Takes precedence over `xfp8`. See [`quantize_nvfp4`].
-    pub xnvfp4: bool,
 }
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, xnvfp4: false, mtp_only: false }
+        ConvertOpts { ebits: 8, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false }
     }
 }
 
@@ -1109,11 +1103,18 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
                 _ => opts.ebits,
             };
             let (o, i) = (shape[0] as usize, shape[1] as usize);
-            let (codes_t, scale_t) = if matches!(kind, Kind::X) && opts.xnvfp4 {
-                quantize_nvfp4_out(name, &w, o, i)
-            } else if matches!(kind, Kind::X) && opts.xfp8 {
-                quantize_e4m3(name, &w, o, i)
+            let (codes_t, scale_t) = if matches!(kind, Kind::X) {
+                // Routed experts are **NVFP4** by default (4-bit block-scaled, ~2× faster
+                // than e4m3 at <1% perplexity); `COLI_XFP8=1` opts into 8-bit e4m3.
+                // **int4 experts are no longer produced** — NVFP4 supersedes them.
+                if opts.xfp8 {
+                    quantize_e4m3(name, &w, o, i)
+                } else {
+                    quantize_nvfp4_out(name, &w, o, i)
+                }
             } else {
+                // Resident weights (attention/dense/shared) at `ebits`, embeddings/lm_head
+                // at `io_bits` — int8 by default.
                 quantize(name, &w, o, i, bits)
             };
             Ok(TensorOut::Quant(codes_t, scale_t))
@@ -1786,7 +1787,7 @@ mod tests {
         drop(f);
 
         let outdir = tmp();
-        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, xnvfp4: false, mtp_only: false };
+        let opts = ConvertOpts { ebits: 4, io_bits: 8, xbits: 4, n_layers: 78, keep_indexer: false, xfp8: false, mtp_only: false };
         let stats = convert_snapshot(&indir, &outdir, opts, |_, _, _| {}).unwrap();
         assert_eq!(stats.tensors_quantized, 1); // o_proj
         assert_eq!(stats.tensors_f32, 1); // norm

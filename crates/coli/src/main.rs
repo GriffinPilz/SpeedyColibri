@@ -386,13 +386,9 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // COLI_KEEP_INDEXER=1 keeps the DSA lightning-indexer weights so the container
         // can run DSA sparse attention (dropped by default, matching the reference).
         keep_indexer: env_u32("COLI_KEEP_INDEXER", 0) != 0,
-        // COLI_XFP8=1 emits routed experts as per-row e4m3 fp8 (8-bit) instead of xbits
-        // int — preserves the source FP8 precision for the tiled FP8 expert kernel.
+        // Experts are NVFP4 (4-bit block-scaled) by default; COLI_XFP8=1 opts into 8-bit
+        // e4m3 instead. int4 experts are no longer produced.
         xfp8: env_u32("COLI_XFP8", 0) != 0,
-        // COLI_XNVFP4=1 emits routed experts as NVFP4 (4-bit block-scaled) — the natural,
-        // ~lossless output when the source is already modelopt NVFP4 (nvidia/GLM-5.2-NVFP4).
-        // ~2x faster prefill+decode than e4m3 at <1% perplexity. Takes precedence over xfp8.
-        xnvfp4: env_u32("COLI_XNVFP4", 0) != 0,
         // COLI_MTP_ONLY=1 converts ONLY the MTP speculative head (layer n_layers).
         // Drop the resulting shard into an existing container (Shards::open indexes
         // every *.safetensors in the dir) to enable drafting without re-converting.
@@ -400,8 +396,9 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     };
 
     eprintln!(
-        "[convert] {indir} -> {outdir}  (ebits={} io_bits={} xbits={} xfp8={} xnvfp4={} n_layers={})",
-        opts.ebits, opts.io_bits, opts.xbits, opts.xfp8, opts.xnvfp4, opts.n_layers
+        "[convert] {indir} -> {outdir}  (experts={} ebits={} io_bits={} n_layers={})",
+        if opts.xfp8 { "e4m3" } else { "nvfp4" },
+        opts.ebits, opts.io_bits, opts.n_layers
     );
     let t0 = std::time::Instant::now();
     let res = colibri_engine::convert_snapshot(indir, outdir, opts, |fi, n, st| {

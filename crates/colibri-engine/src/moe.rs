@@ -26,6 +26,35 @@ use colibri_safetensors::Shards;
 use std::io;
 use std::sync::{Arc, OnceLock};
 
+/// The model's SwiGLU variant, recorded once at load by [`set_activation`].
+/// GLM uses plain SiLU-gated SwiGLU (the default); MiniMax-M3 uses the clamped
+/// OpenAI-SwiGLU. Held as a process global so the FFN choke point ([`ffn`]) can
+/// read it without threading `cfg` through the expert-parallel boundary.
+#[derive(Clone, Copy)]
+struct ActCfg {
+    oai: bool,
+    alpha: f32,
+    limit: f32,
+}
+
+static ACTIVATION: OnceLock<ActCfg> = OnceLock::new();
+
+/// Record the model's SwiGLU variant for the FFN path. Call once after building
+/// the [`Config`] (first value wins — one model per process).
+pub fn set_activation(cfg: &Config) {
+    let _ = ACTIVATION.set(ActCfg {
+        oai: cfg.swiglu_oai,
+        alpha: cfg.swiglu_alpha,
+        limit: cfg.swiglu_limit,
+    });
+}
+
+/// The active SwiGLU variant (defaults to SiLU when unset — the GLM path and
+/// unit tests that never call [`set_activation`]).
+fn activation() -> ActCfg {
+    *ACTIVATION.get().unwrap_or(&ActCfg { oai: false, alpha: 0.0, limit: 0.0 })
+}
+
 /// Process-wide expert-parallel context. `serve`/`worker` set this once at startup
 /// when `COLI_NUM_NODES > 1`; while present, [`moe`] transparently dispatches to
 /// [`moe_sharded`] so the forward pass needs no signature change. Left unset on a
@@ -648,25 +677,33 @@ pub fn route(cfg: &Config, logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32
 /// Apply a SwiGLU FFN over `x[nr, D]` into `out[nr, D]`:
 /// `out = down(silu(gate·x) ⊙ up·x)`. Port of the expert compute in `moe()`.
 fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
-    // Fused GPU expert pipeline (one host round-trip) for resident weights.
+    // Fused GPU expert pipeline (one host round-trip) for resident weights. The
+    // fused kernels bake in SiLU-SwiGLU; the clamped OpenAI-SwiGLU (MiniMax-M3)
+    // has no kernel yet, so it takes the CPU reference below.
     #[cfg(feature = "cuda")]
     {
-        if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
+        if !activation().oai && crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
             return;
         }
     }
     ffn_cpu(gate, up, down, x, nr, out);
 }
 
-/// CPU SwiGLU FFN (the reference / fallback path).
+/// CPU SwiGLU FFN (the reference / fallback path). Applies the model's SwiGLU
+/// variant ([`activation`]): SiLU-gated (GLM) or clamped OpenAI-SwiGLU (M3).
 fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
     let inter = gate.o as usize; // moe_inter (or shared intermediate)
     let mut gg = vec![0f32; nr * inter];
     let mut uu = vec![0f32; nr * inter];
     matmul_qt(&mut gg, x, gate, nr);
     matmul_qt(&mut uu, x, up, nr);
+    let a = activation();
     for (g, &u) in gg.iter_mut().zip(uu.iter()) {
-        *g = silu(*g) * u;
+        *g = if a.oai {
+            crate::math::swiglu_oai(*g, u, a.alpha, a.limit)
+        } else {
+            silu(*g) * u
+        };
     }
     matmul_qt(out, &gg, down, nr);
 }
@@ -763,7 +800,7 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     // instead of a synchronous upload/kernel/download per expert — the per-expert
     // round-trip is what dominates moe-compute. Falls through per-expert if it can't run.
     #[cfg(feature = "cuda")]
-    if crate::gpu::expert_group_enabled() {
+    if crate::gpu::expert_group_enabled() && !activation().oai {
         let mut active = Vec::with_capacity(per_expert.len());
         for (e, rows, rw) in &per_expert {
             active.push((provider.expert(layer, *e)?, rows.clone(), rw.clone()));

@@ -264,6 +264,9 @@ pub fn load_model_with(
 ) -> Result<Model, EngineError> {
     let snap = snap.as_ref();
     let cfg = Config::load(snap)?;
+    // Record the SwiGLU variant for the FFN choke point (SiLU for GLM, clamped
+    // OpenAI-SwiGLU for MiniMax-M3) before any forward pass runs.
+    crate::moe::set_activation(&cfg);
     let shards = colibri_safetensors::Shards::open(snap)?;
 
     // Fail fast with an actionable message on a partial download. An interrupted HF

@@ -162,6 +162,8 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_TIMING` | `1` → print per-token latency + steady-state tok/s | off |
 | `COLI_EXPERT_LOG` | path → log every routing decision (`step layer pos e0..e7`) for `scripts/expert_hotset_analysis.py` | off |
 | `COLI_PREFETCH` | speculative next-layer expert prefetch. **Leave off**: measured *slower* at every degree (0.82–0.99 vs 1.01 tok/s) — speculative loads evict the working set and contend for an already-saturated NVMe | off |
+| `DRAFT` | MTP speculative decoding: draft this many tokens per step with the model's own next-token (MTP) head, then verify them in one main-model forward. Output is **bit-identical** to `DRAFT=0` (only accepted-if-they-match drafts are kept) — a decode-latency lever, never a quality change. Needs a container carrying the MTP head (kept by default; see [MTP](#mtp-speculative-decoding)). Auto-disables if acceptance falls below 10%. | off (`0`) |
+| `MTP` | `0` force-disables the MTP head even if the container ships one (equivalent to `DRAFT=0`) | on when present |
 
 Multi-node variables (`COLI_NUM_NODES`, `COLI_PEERS`, …) are in
 [Multi-Spark](#multi-spark-expert-parallel) below.

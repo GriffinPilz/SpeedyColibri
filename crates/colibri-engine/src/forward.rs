@@ -193,6 +193,26 @@ pub fn forward<P: ExpertProvider>(
         }
     });
 
+    // COLI_DEBUG_ACT=1: print the hidden-state L2 norm (first + last position) after
+    // embedding and the first few layers, to localize where a forward pass degenerates.
+    let dbg_act = std::env::var("COLI_DEBUG_ACT").ok().as_deref() == Some("1");
+    let pnorm = |tag: &str, x: &[f32]| {
+        if s == 0 {
+            return;
+        }
+        let n = |r: &[f32]| r.iter().map(|v| v * v).sum::<f32>().sqrt();
+        eprintln!(
+            "[act] {tag}: |x[0]|={:.4} |x[{}]|={:.4} x[0][..4]={:?}",
+            n(&x[..d]),
+            s - 1,
+            n(&x[(s - 1) * d..s * d]),
+            &x[..4.min(d)]
+        );
+    };
+    if dbg_act {
+        pnorm("embed", &x);
+    }
+
     let mut nrm = vec![0f32; s * d];
     let mut tmp = vec![0f32; s * d];
     // Carries the current DSA selection from each FULL indexer layer to the SHARED
@@ -213,6 +233,9 @@ pub fn forward<P: ExpertProvider>(
             &mut tmp,
             &mut dsa_sel,
         )?;
+        if dbg_act && li < 5 {
+            pnorm(&format!("layer{li}"), &x);
+        }
     }
 
     hidden_out.copy_from_slice(&x);

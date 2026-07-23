@@ -187,7 +187,7 @@ impl KvCache {
         if model.has_mtp {
             kv.kv_start[n_layers] = KV_UNSET;
         }
-        if model.cfg.arch == colibri_core::Arch::MinimaxM3 {
+        if model.cfg.arch.is_gqa() {
             kv.enable_gqa(model.cfg.n_kv_heads as usize * model.cfg.qk_head as usize);
         }
         kv

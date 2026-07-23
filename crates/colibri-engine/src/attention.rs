@@ -263,18 +263,34 @@ pub fn attention_gqa(
     }
     atime(&crate::forward::ATTN_PROJ_US, _tp);
 
-    // ---- 2) per-head QK-norm + partial RoPE; append K/V to the cache -------
+    // ---- 2) QK-norm + partial RoPE; append K/V to the cache ---------------
+    // Two QK-norm variants, told apart by the loaded weight's length:
+    //   * per-head (MiniMax-M3): `q_norm`/`k_norm` are `[head_dim]` — normalize each
+    //     head's slice independently.
+    //   * per-layer (MiniMax-M2, `qk_norm_type=per_layer`): they are
+    //     `[n_heads*head_dim]` / `[n_kv_heads*head_dim]` — normalize the whole q/k
+    //     vector once, before the head split (matches the HF reference, which norms
+    //     q_proj/k_proj output pre-reshape). RoPE is always per-head over the first `rot`.
+    let qk_per_layer = l.q_norm.len() > hd;
     let _tr = std::time::Instant::now();
     for s in 0..s_len {
         let pos = pos_base + s;
+        if qk_per_layer {
+            rmsnorm_inplace(&mut q[s * h * hd..(s + 1) * h * hd], &l.q_norm, eps);
+            rmsnorm_inplace(&mut k[s * kv_dim..(s + 1) * kv_dim], &l.k_norm, eps);
+        }
         for hh in 0..h {
             let qs = &mut q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
-            rmsnorm_inplace(qs, &l.q_norm, eps);
+            if !qk_per_layer {
+                rmsnorm_inplace(qs, &l.q_norm, eps);
+            }
             rope_neox(&mut qs[..rot], pos, rot, theta);
         }
         for hh in 0..kvh {
             let ks = &mut k[s * kv_dim + hh * hd..s * kv_dim + hh * hd + hd];
-            rmsnorm_inplace(ks, &l.k_norm, eps);
+            if !qk_per_layer {
+                rmsnorm_inplace(ks, &l.k_norm, eps);
+            }
             rope_neox(&mut ks[..rot], pos, rot, theta);
         }
         kv.k_full_row_mut(layer, pos)

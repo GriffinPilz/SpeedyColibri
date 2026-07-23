@@ -33,6 +33,16 @@ pub enum Arch {
     MinimaxM2,
 }
 
+impl Arch {
+    /// The GQA family (MiniMax M3/M2): standard q/k/v projections + a KV cache of
+    /// `n_kv_heads`, as opposed to GLM's MLA latent attention + DSA indexer. The
+    /// engine's attention/KV/loader paths branch on this rather than a specific
+    /// variant so every GQA model shares one code path.
+    pub fn is_gqa(&self) -> bool {
+        matches!(self, Arch::MinimaxM3 | Arch::MinimaxM2)
+    }
+}
+
 /// GLM-5.2 / MiniMax-M3 hyperparameters.
 #[derive(Debug, Clone)]
 pub struct Config {

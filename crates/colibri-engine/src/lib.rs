@@ -138,9 +138,10 @@ fn load_layer(
     // Output projection is shared by both attention flavours (`[hidden, n_heads*head_dim]`).
     l.o = qt_load(shards, &p("self_attn.o_proj.weight"), d, h * cfg.v_head as usize, dbits)?;
 
-    if cfg.arch == colibri_core::Arch::MinimaxM3 {
-        // GQA attention (MiniMax-M3): q/k/v projections + per-head QK-norm. `qk_head`
-        // is the head dim; K/V carry `n_kv_heads` heads.
+    if cfg.arch.is_gqa() {
+        // GQA attention (MiniMax M3/M2): q/k/v projections + QK-norm. `qk_head` is the
+        // head dim; K/V carry `n_kv_heads` heads. Sparse-indexer weights below load
+        // only on M3's sparse layers (idx_type all-false for M2 → dense everywhere).
         let hd = cfg.qk_head as usize;
         let kvh = cfg.n_kv_heads as usize;
         l.q_proj = Some(qt_load(shards, &p("self_attn.q_proj.weight"), h * hd, d, dbits)?);
@@ -226,10 +227,15 @@ fn load_layer(
         // `mlp.e_score_correction_bias`); accept either.
         l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))
             .or_else(|_| ld(shards, &p("mlp.e_score_correction_bias")))?;
+        // Shared expert — GLM/M3 have one; MiniMax-M2 has none (n_shared 0). Only load
+        // (and later compute) it when present, else the tensors are absent from the
+        // container and the fields stay at their empty default.
         let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
-        l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?;
-        l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?;
-        l.sh_down = qt_load(shards, &p("mlp.shared_experts.down_proj.weight"), d, s_i, dbits)?;
+        if s_i > 0 {
+            l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?;
+            l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?;
+            l.sh_down = qt_load(shards, &p("mlp.shared_experts.down_proj.weight"), d, s_i, dbits)?;
+        }
     }
     Ok(l)
 }

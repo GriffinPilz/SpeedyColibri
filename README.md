@@ -351,6 +351,13 @@ practical high-throughput context is lower. The default `COLI_CTX` stays **32,76
 keeps the most RAM for resident experts and the lowest latency. `max_tokens` defaults to 128 and
 is bounded only by the remaining context (no fixed cap).
 
+**The KV grows on demand.** The cache is sized to the window in *address space* but committed
+lazily (zero-on-demand pages) — its resident RAM tracks the tokens actually produced, not
+`max_tokens`. So a request that sets a large `max_tokens` but stops early never pays for the
+tail: only the prompt's KV is reserved up front, and the generation grows a token at a time
+while the expert cache evicts against it. A prompt that can't fit is still rejected (507)
+rather than OOM'd.
+
 ## Where it stands
 
 Running the real 358 GB model on **one** DGX Spark (GB10). The bottleneck is

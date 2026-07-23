@@ -4,23 +4,30 @@
 
 <h1 align="center">SpeedyColibri</h1>
 
-**Run GLM-5.2 (744B-parameter MoE) on a single NVIDIA DGX Spark** — a Rust port
-of the [colibrì](https://github.com/JustVugg/colibri) streaming engine, tuned for
-the GB10 Grace-Blackwell superchip, with the whole hot path on the GPU.
+**Run huge Mixture-of-Experts models on a single NVIDIA DGX Spark** — GLM-5.2
+(744B), MiniMax-M3, and MiniMax-M2.7 today — with a Rust engine tuned for the GB10
+Grace-Blackwell superchip and the whole hot path on the GPU. Experts stream from
+disk on demand; the dense part stays resident in low precision; add a second Spark
+and the experts split across both.
 
-> ### Built on colibrì — with gratitude
+> ### Rooted in colibrì — with gratitude
 >
-> SpeedyColibri exists because of **[JustVugg](https://github.com/JustVugg)** and
-> the **[colibrì](https://github.com/JustVugg/colibri)** project. Every idea that
-> makes this work — treating VRAM, RAM, and disk as one managed memory hierarchy;
-> streaming a 744B model's routed experts on demand while keeping the dense part
-> resident in low precision; the faithful, quality-preserving GLM-5.2 forward pass — is
-> theirs. This repository is a Rust rewrite of that engine — now the engine in its
-> own right; the original C sources have been retired from the tree, and correctness
-> is carried by the port's own test suite. None of this would
-> be possible without JustVugg's original work. **Thank you.** If you want the
-> mature, portable, multi-platform engine, start there — colibrì is the real thing;
-> SpeedyColibri is one deployment target taken deep.
+> SpeedyColibri began as a Rust port of **[JustVugg](https://github.com/JustVugg)**'s
+> **[colibrì](https://github.com/JustVugg/colibri)**, and the foundation is theirs:
+> the core insight of treating VRAM, RAM, and disk as one managed memory hierarchy —
+> streaming a MoE model's routed experts on demand while keeping the dense part
+> resident in low precision — and the original, quality-preserving GLM-5.2 forward
+> pass. That idea is what everything here is built on. **Thank you.**
+>
+> It has since grown into its own engine. The C sources have been retired, correctness
+> is carried by the port's own Rust test suite, and the work has gone well past a GLM
+> port: on-GPU zero-copy experts on unified memory, flash- and tensor-core attention
+> kernels, a NVFP4 4-bit expert format, adaptive RAM residency, multi-Spark
+> expert-parallel over RoCE/RDMA, and support for model families colibrì doesn't
+> cover — the MiniMax GQA models (M3, M2.7), each a different attention shape, norm,
+> activation, and router. If you want the mature, portable, multi-platform original,
+> start with colibrì; SpeedyColibri is the DGX-Spark line taken deep and broadened to
+> more models.
 
 ---
 
@@ -43,6 +50,29 @@ The result runs the real model end-to-end today. On one Spark it is
 **disk-streaming-bound**, not compute-bound — which is exactly what
 [multi-Spark](#multi-spark-expert-parallel) solves: splitting the experts across two
 Sparks measured **2.6× faster** decode, with bit-identical output.
+
+The engine is **model-general** across MoE families — the streaming/residency machinery
+is shared, and each model plugs in its own attention shape, norms, activation, and
+router. GLM-5.2 is the original and largest target; the MiniMax GQA models were added
+on top of the same core.
+
+## Supported models
+
+Registered in [`scripts/models.toml`](scripts/models.toml) — serve any by name
+(`scripts/serve.sh <name>`) or list them with `scripts/model.py list`.
+
+| name | params | attention | experts | routed format | notes |
+|---|---|---|---|---|---|
+| **`glm-5.2`** | 744B | MLA + DSA lightning indexer | 256, top-8 | NVFP4 | the original target; ≫ RAM, streams from disk |
+| **`minimax-m3`** | — | GQA (64Q/4KV, head_dim 128, partial rope 64) | 128, top-4 | NVFP4 | gemma-norm, swigluoai, per-head QK-norm; ~229 GB |
+| **`minimax-m2.7`** | — | GQA (48Q/8KV, head_dim 128, partial rope 64) | 256, top-8 | NVFP4 | per-layer QK-norm, plain SwiGLU, no shared expert, all-MoE; ~122 GB (**fits RAM**) |
+
+**Which one loads** is chosen by the container you point `serve` at — one model per
+process. With Docker, set `COLI_MODEL_REPO` (and `COLI_MODEL_DIR` for a local snapshot);
+without Docker, pass a registry name to `scripts/serve.sh` (it resolves the container
+path). See [Switching models](#switching-models). Adding a new model is an `Arch`
+variant + a convert mapping + one registry block — the checklist is in
+[scripts/README.md](scripts/README.md).
 
 ## Quick start (DGX Spark)
 
@@ -126,7 +156,7 @@ curl http://localhost:8080/v1/completions -H 'Content-Type: application/json' -d
 
 | Field | Applies to | Meaning | Default |
 |---|---|---|---|
-| `messages` | `/v1/chat/completions` | array of `{"role": "user"\|"assistant"\|"system", "content": "..."}`; assembled with the GLM-5.2 chat template | required |
+| `messages` | `/v1/chat/completions` | array of `{"role": "user"\|"assistant"\|"system", "content": "..."}`; assembled with the **served model's** chat template (GLM-5.2's, or MiniMax's `<think>`-reasoning format for M3/M2.7), stopping at that model's own end-of-turn token | required |
 | `prompt` | `/v1/completions` | raw text, tokenized and continued verbatim | required |
 | `max_tokens` | both | tokens to generate (capped at 2048) | `128` |
 | `stream` | both | `true` → SSE token stream ending in `data: [DONE]`; `false` → one JSON object | `false` |
@@ -150,7 +180,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | Var | Meaning | Default |
 |---|---|---|
 | `HF_TOKEN` | Hugging Face token for the first download (alt. to the `hf_...` arg) | none |
-| `COLI_RAM_GB` | expert-cache budget override. **The default is already safe — you rarely need this.** Setting it *higher* than the default hurts: measured on a 121 GB Spark, 85 drives the box into swap at ~0.11 tok/s vs ~0.46 at the default. | auto: `MemTotal/3` (~41 GB on a Spark) |
+| `COLI_RAM_GB` | **manual override** of the adaptive default ([RAM residency](#ram-residency-adaptive-by-default) below). Forces a fixed expert-cache budget and disables the adaptive monitor. Rarely needed; on a ≫-RAM model, setting it *higher* drives the box into swap (measured on GLM: 85 GB → ~0.11 tok/s vs ~0.46 at the safe budget). | adaptive (see below) |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
 | `COLI_CTX` | served context length (prompt + completion), e.g. `64k`; bounded by the model max (1M) and by RAM (~175 KB/token of KV) | `32768` |
@@ -240,6 +270,60 @@ token-identical to decoding it alone. See [the measured curve](#speculative-deco
 COLI_BATCH_VERIFY=1 ./target/release/coli genbatch /path/to/container 64 16 785 6722 315
 ```
 
+## Switching models
+
+One `coli` process serves one model — the model is the container you point it at.
+
+**Docker.** Set the repo (and, for a local snapshot, the directory); everything else is
+the same command:
+
+```bash
+# GLM-5.2 (default) — nothing extra needed
+docker/run-dgx.sh <hf_token> serve 8080 "warm up"
+
+# MiniMax-M3
+COLI_MODEL_REPO=nvidia/MiniMax-M3-NVFP4 docker/run-dgx.sh <hf_token> serve 8080
+
+# MiniMax-M2.7
+COLI_MODEL_REPO=nvidia/MiniMax-M2.7-NVFP4 docker/run-dgx.sh <hf_token> serve 8080
+
+# A snapshot you already downloaded/converted
+COLI_MODEL_DIR=/path/to/container docker/run-dgx.sh serve 8080
+```
+
+**Without Docker.** The registry ([`scripts/models.toml`](scripts/models.toml)) maps a
+short name to its container path, so `serve.sh` takes the name directly:
+
+```bash
+scripts/model.py list                      # what's registered
+scripts/serve.sh minimax-m2.7 8081         # resolves the container, waits until ready
+scripts/serve.sh glm-5.2 8080
+```
+
+The startup banner echoes which model loaded (`(model: MiniMax-M2.7-container)`) and its
+arch, so it's obvious if the wrong one is up. `GET /v1/models` reports it at runtime.
+
+## RAM residency (adaptive by default)
+
+The expert cache **sizes itself to the model and the box** — no flag. At startup the
+engine compares total routed-expert bytes against RAM and picks one of two regimes,
+printing which and why:
+
+- **Near-fit** (experts ≈ RAM — e.g. MiniMax-M2.7, ~122 GB on a 121 GB Spark): fill RAM
+  with resident experts and hold them there, dropping the page-cache double-copy
+  (`fadvise`) so `MemAvailable` is honest, and evicting **only** under sustained
+  *external* memory pressure. Measured **1.94×** over the old static default on M2.7
+  (median 4.83 vs 2.49 tok/s, diverse-prompt serving) — the whole working set stays
+  resident instead of streaming from disk.
+- **≫ RAM** (experts far larger than RAM — e.g. GLM-5.2 ~436 GB, MiniMax-M3 ~216 GB):
+  stay on the OS page cache. A whole-expert cache would cover too little to help, and the
+  page cache's 4 KB granularity holds the hot working set better — forcing max-residency
+  here *regresses*. The engine detects this (`coverage < 80%`) and leaves it alone.
+
+`COLI_RAM_GB=<n>` overrides both with a fixed budget and turns the monitor off (for
+reproducible benchmarks or an unusual box). The old behavior — static `MemTotal/3`
+(~41 GB) — is what you get with any `COLI_RAM_GB` value.
+
 ## Where it stands
 
 Running the real 358 GB model on **one** DGX Spark (GB10). The bottleneck is
@@ -305,6 +389,25 @@ in the Expert quantization section (a different held-out text, so not comparable
 The single-node number is flat from a 20 GB to a 55 GB cache (diverse traffic barely
 reuses experts), so cache size is not a throughput lever here — headroom and avoiding
 swap are.
+
+### RAM residency by model (adaptive default) — 2026-07-23
+
+The [adaptive default](#ram-residency-adaptive-by-default) picks a regime per model.
+Measured on a 121 GiB Spark, `bench_serve.py` diverse prompts, single node — the win is
+**only** for the model that fits, and the auto-decline for the others is *load-bearing*,
+not just conservative:
+
+| model | routed experts vs RAM | regime chosen (auto) | serving throughput |
+|---|---|---|---|
+| **MiniMax-M2.7** | ~122 GB ≈ 121 GB (**near-fit**) | adaptive max-residency (fill ~101 GB, fadvise) | **4.83 tok/s** median — **1.94×** over the old 41 GB static default (2.49) |
+| **MiniMax-M3** | ~216 GB (1.8× RAM) | static page-cache (46% coverage < 80%) | 1.68 tok/s — unchanged; *forcing* `COLI_RAM_GB=100` **ran the box out of memory and crashed** (GB10 unified pool), so the decline is a safety guard, not just a perf call |
+| **GLM-5.2** | ~436 GB (3.6× RAM) | static page-cache (~23% coverage) | ≫-RAM regime unchanged; not re-run (container offloaded to HF). Forcing a bigger budget swaps (`COLI_RAM_GB=85` → ~0.11 tok/s) |
+
+Takeaway: RAM-maxing is a **near-fit** lever. When the experts fit RAM it holds the whole
+working set resident (~2× on M2.7); when they don't, the page cache serves the hot set
+better at 4 KB granularity, and forcing residency ranges from a regression (GLM) to an
+OOM crash (M3). The engine detects which case it's in and does the safe, fast thing with
+no flag.
 
 ### Long context — single node, 8/4, varied input (in progress)
 
@@ -502,10 +605,13 @@ DEPLOYMENT.md    DGX Spark deployment guide
 
 ## Credits & license
 
-- **Original engine, design, and model runtime:**
-  [colibrì](https://github.com/JustVugg/colibri) by
-  [JustVugg](https://github.com/JustVugg). SpeedyColibri is a derivative work —
-  the architecture, the streaming approach, and the GLM-5.2 forward pass are all
-  from the upstream project. Please star and follow the original.
+- **Foundation:** [colibrì](https://github.com/JustVugg/colibri) by
+  [JustVugg](https://github.com/JustVugg). SpeedyColibri is a derivative work — the
+  managed memory hierarchy, the on-demand expert-streaming approach, and the original
+  GLM-5.2 forward pass come from the upstream project. The Rust engine, DGX-Spark
+  specialization, GPU kernels, multi-Spark expert-parallel, adaptive RAM residency,
+  NVFP4 experts, and the MiniMax GQA model support were built here on that foundation.
+  Please star and follow the original.
 - **License:** Apache 2.0, inherited from colibrì (see [LICENSE](LICENSE)).
-- GLM-5.2 is a model by Zhipu AI / Z.ai; this is an independent runtime for it.
+- Models are by their respective authors — GLM-5.2 by Zhipu AI / Z.ai, MiniMax-M3 /
+  M2.7 by MiniMax; this is an independent runtime for them.

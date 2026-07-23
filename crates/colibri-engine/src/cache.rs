@@ -506,36 +506,38 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
         });
     }
 
-    /// Make the byte ceiling **adaptive**: fill RAM up to `fill_target` and hold it,
-    /// ceding memory (evicting LRU experts) only when a *different* tenant creates
-    /// genuine, sustained pressure — `MemAvailable` staying under `danger_floor`.
+    /// Manage the byte ceiling to **fill RAM safely**: grow toward `fill_target`, but
+    /// continuously evict LRU experts so `MemAvailable` never crosses `hard_floor`. This
+    /// runs for **every** model and every budget (near-fit *or* ≫ RAM) — the eviction is
+    /// what makes filling RAM safe: a cache that gives memory back under pressure cannot
+    /// OOM, so there is no model too large to point it at. `fill_target` is aspirational
+    /// (fill RAM); `hard_floor` is the real guarantee (never touch the last few GB).
     ///
-    /// `fill_target` is the standing budget: `total − reserve`, where the reserve is
-    /// sized for the serving process's own peak runtime (KV cache, prefill activations,
-    /// GPU host staging, expert read buffers). The cache grows to it through the insert
-    /// path; we set it once here.
+    /// Two thresholds, deliberately separated:
+    /// - **`hard_floor`** — the OOM guard. Checked every tick with **no hysteresis**: if
+    ///   `MemAvailable` is below it (our own growth *or* another tenant, incl. the GPU on
+    ///   GB10's unified pool), evict immediately, down to a few GB of slack above it. This
+    ///   is what a fixed `COLI_RAM_GB` lacked — a static budget with no feedback grows into
+    ///   the wall (measured: forcing 100 GB on the 216 GB M3 drove avail→0 and OOM-killed
+    ///   the server). With this, that same budget just caps itself where the box stays safe.
+    /// - **`danger_floor`** (< `hard_floor` is wrong; it sits *above* `hard_floor`) — the
+    ///   soft line for a *sustained external* tenant. Only after `SUSTAIN` ticks below it do
+    ///   we cede gradually, so a momentary dip (our own request's activation/staging spike)
+    ///   is ignored and we don't churn the resident near-fit working set (that symmetric
+    ///   `budget = resident + (avail − floor)` law regressed M2.7 to 2.06 vs 4.35 tok/s).
     ///
-    /// Why we do NOT track `MemAvailable` symmetrically (the old `budget = resident +
-    /// (avail − floor)` law): once RAM is filled, `avail` sits low *by design*, and every
-    /// request transiently allocates activations/staging on top for its whole duration
-    /// (seconds). A law that shrinks on any dip below the floor evicts the exact working
-    /// set it just made resident — and with fadvise on, each false eviction is a cold
-    /// re-read, so throughput *degrades* under sustained diverse load (measured: median
-    /// 2.06 vs the static-budget 4.35 tok/s on M2.7). The correct separation: the reserve
-    /// (baked into `fill_target`) absorbs our own request runtime so `avail` never reaches
-    /// `danger_floor` on our account; only an external tenant pushes it there, and only
-    /// then — after `SUSTAIN` ticks, so a momentary blip is ignored — do we evict, down to
-    /// just off the swap line. When the pressure clears we reclaim back up to `fill_target`.
-    ///
-    /// SAFETY: `MemAvailable` is only honest once expert reads don't double-hold in the
-    /// page cache (fadvise or O_DIRECT). Enable this only alongside one of those. Off-Linux
+    /// The insert path also enforces `budget`, so between ticks the cache never grows past
+    /// the last value we set. Fast `TICK_MS` keeps the reaction window small. Off-Linux
     /// (no `/proc/meminfo`) it no-ops after setting the standing budget.
-    pub fn spawn_adaptive_budget(self: &Arc<Self>, fill_target: u64, danger_floor: u64) {
-        const TICK_MS: u64 = 250;
-        const SUSTAIN: u32 = 3; // ~750 ms below the danger floor before we cede memory
+    pub fn spawn_adaptive_budget(self: &Arc<Self>, fill_target: u64, danger_floor: u64, hard_floor: u64) {
+        const TICK_MS: u64 = 100; // poll ~2.5× faster than before — react before OOM, not after
+        const SUSTAIN: u32 = 6; // ~600 ms below the danger floor before we cede memory
+        const HARD_SLACK: u64 = 3 << 30; // when the OOM guard fires, evict back to this much headroom
         const FLOOR_MIN: u64 = 2 << 30; // never target < 2 GiB resident
         let fill_target = fill_target.max(FLOOR_MIN);
-        let danger_floor = danger_floor.max(FLOOR_MIN);
+        // hard_floor is the emergency line; danger_floor the softer one above it.
+        let hard_floor = hard_floor.max(FLOOR_MIN);
+        let danger_floor = danger_floor.max(hard_floor);
         let cache = Arc::clone(self);
         // Grow to the standing fill target immediately (the insert path enforces it).
         cache.budget.store(fill_target, Ordering::Relaxed);
@@ -547,18 +549,29 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                     Some(a) => a,
                     None => return, // non-Linux: no live signal, keep the standing budget
                 };
+                let resident = cache.state.lock().unwrap().bytes;
+
+                // OOM guard (immediate, no hysteresis): never let avail cross hard_floor,
+                // whatever ate the memory. Evict back to a few GB of slack above it.
+                if avail < hard_floor {
+                    let reclaim = (hard_floor - avail).saturating_add(HARD_SLACK);
+                    let new_budget = resident.saturating_sub(reclaim).max(FLOOR_MIN);
+                    cache.budget.store(new_budget, Ordering::Relaxed);
+                    cache.state.lock().unwrap().evict_to(new_budget);
+                    low_ticks = 0;
+                    continue;
+                }
+
+                // Sustained external pressure (soft): cede gradually toward the danger line.
                 low_ticks = if avail < danger_floor {
                     low_ticks.saturating_add(1)
                 } else {
                     0
                 };
-                let resident = cache.state.lock().unwrap().bytes;
                 let new_budget = if low_ticks >= SUSTAIN {
-                    // Sustained external pressure: cede RAM to just clear the swap line.
                     resident.saturating_sub(danger_floor - avail).max(FLOOR_MIN)
                 } else {
-                    // Normal (incl. our own transient request spikes): hold the target.
-                    fill_target
+                    fill_target // hold; our own transient spikes don't evict
                 };
                 cache.budget.store(new_budget, Ordering::Relaxed);
                 if new_budget < resident {

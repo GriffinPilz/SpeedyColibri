@@ -12,6 +12,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# A non-interactive ssh shell doesn't source the login profile, so cargo/rustup are
+# often off PATH (`cargo: command not found`, exit 127). Pull them in explicitly.
+if ! command -v cargo >/dev/null 2>&1; then
+  [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "[build] ERROR: cargo not found (looked at PATH and \$HOME/.cargo/env)." >&2
+  echo "        Install rustup or run from a shell where cargo is on PATH." >&2
+  exit 1
+fi
+
 if [[ "${COLI_NO_CUDA:-0}" == "1" ]]; then
   echo "[build] CPU-only build (COLI_NO_CUDA=1) — no GPU backend"
   cargo build --release -p coli

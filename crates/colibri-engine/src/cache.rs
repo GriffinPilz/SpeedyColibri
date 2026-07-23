@@ -401,12 +401,15 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
 /// prefill (routes to ~all `n_experts`) from decode (top-k per token, ~8).
 const PREFETCH_AHEAD_MIN: usize = 64;
 
-/// `COLI_PREFETCH_AHEAD=1` — during prefill, unconditionally background-load the next
-/// layer's experts (they overlap the current layer's GPU compute). Off by default;
-/// decode is never affected (gated by [`PREFETCH_AHEAD_MIN`]).
+/// Prefill prefetch-ahead: during prefill, unconditionally background-load the next
+/// layer's experts (they overlap the current layer's GPU compute). **On by default**
+/// — measured token-identical and a clean prefill win on both models (GLM@4096 1.58×,
+/// M3@512 1.26×; the hidden fraction grows with context). Set `COLI_PREFETCH_AHEAD=0`
+/// to disable. Decode is never affected (gated by [`PREFETCH_AHEAD_MIN`]: a decode
+/// step's per-layer union is ~top-k ≪ 64, so the ahead path never fires there).
 fn prefetch_ahead_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_PREFETCH_AHEAD").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| std::env::var("COLI_PREFETCH_AHEAD").ok().as_deref() != Some("0"))
 }
 
 impl<P: ExpertProvider + Sync> ExpertCache<P> {

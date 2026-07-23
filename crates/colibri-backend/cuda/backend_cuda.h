@@ -26,6 +26,9 @@ typedef struct ColiCudaTensor ColiCudaTensor;
 /* Devices are CUDA ordinals, not positions in the input list. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
+/* Select the FFN gate/up activation-combine for every expert/shared/dense kernel:
+ * oai=0 -> SiLU-SwiGLU (GLM, default), oai=1 -> clamped OpenAI-SwiGLU (MiniMax-M3). */
+COLI_CUDA_DLLEXPORT void coli_cuda_set_activation(int oai, float alpha, float limit);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
@@ -97,6 +100,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,fl
                                      const float *latent,const float *rope,int S,
                                      int H,int Q,int R,int V,int K,int T,
                                      float attention_scale);
+/* Standard GQA prefill (MiniMax-M3): q[S,H,D], full k/v[T,Hkv,D], ctx[S,H,D] out.
+ * mode 0 = scalar gqa_attn_kernel; mode 1 = WMMA flash tc_gqa_attn (D%16==0). */
+COLI_CUDA_DLLEXPORT int coli_cuda_gqa_attn(int device,float *ctx,const float *q,const float *k,
+                                     const float *v,int S,int H,int Hkv,int D,int T,float scale,int mode);
 
 /* DSA sparse prefill attention: like the batch variant but each query attends only
  * to its indexer selection. sel_idx is [S, maxsel] int (row s holds the chosen

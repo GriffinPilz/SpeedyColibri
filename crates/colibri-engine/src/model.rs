@@ -17,7 +17,7 @@ pub struct Layer {
     pub in_ln: Vec<f32>,
     pub post_ln: Vec<f32>,
 
-    // MLA (dense, quantized)
+    // MLA (dense, quantized) — GLM (arch == GlmMoeDsa). `o` is shared with GQA.
     pub q_a: QTensor,
     pub q_b: QTensor,
     pub kv_a: QTensor,
@@ -25,6 +25,26 @@ pub struct Layer {
     pub o: QTensor,
     pub q_a_ln: Vec<f32>,
     pub kv_a_ln: Vec<f32>,
+
+    // GQA (MiniMax-M3, arch == MinimaxM3): standard q/k/v projections with per-head
+    // QK-norm; RoPE is partial (see Config::qk_rope). `None`/empty on GLM, which
+    // uses the MLA fields above instead. `o` (above) is the shared output proj.
+    pub q_proj: Option<QTensor>, // hidden -> n_heads * head_dim
+    pub k_proj: Option<QTensor>, // hidden -> n_kv_heads * head_dim
+    pub v_proj: Option<QTensor>, // hidden -> n_kv_heads * head_dim
+    /// q/k/v concatenated row-wise (`[n_heads*head_dim + 2*n_kv_heads*head_dim, hidden]`),
+    /// built at load time so `attention_gqa` runs ONE fused matmul per layer instead of
+    /// three (q/k/v share the same input). When set, `q_proj`/`k_proj`/`v_proj` are dropped.
+    pub qkv_proj: Option<QTensor>,
+    pub q_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
+    pub k_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
+
+    // MiniMax-M3 block-sparse Lightning Indexer (present only on sparse attention
+    // layers; see `Config::idx_type` for M3). Empty/None on GLM and on M3 dense layers.
+    pub idx_q_proj: Option<QTensor>, // hidden -> index_n_heads * index_head_dim
+    pub idx_k_proj: Option<QTensor>, // hidden -> index_head_dim (MQA: one key head)
+    pub idx_q_norm: Vec<f32>,        // per-head index RMSNorm [index_head_dim] (gemma-folded)
+    pub idx_k_norm: Vec<f32>,        // index-key RMSNorm [index_head_dim] (gemma-folded)
 
     pub sparse: bool,
 
@@ -96,6 +116,12 @@ pub struct KvCache {
     latent: Vec<Vec<f32>>,
     /// per-layer rotary-key buffer, each `[max_t * qk_rope]`
     k_rot: Vec<Vec<f32>>,
+    /// GQA full-KV width (`n_kv_heads * head_dim`); 0 on the MLA (GLM) path.
+    kv_dim: usize,
+    /// per-layer full key buffer, each `[max_t * kv_dim]` — GQA only (else empty).
+    k_full: Vec<Vec<f32>>,
+    /// per-layer full value buffer, each `[max_t * kv_dim]` — GQA only (else empty).
+    v_full: Vec<Vec<f32>>,
     /// first valid position per layer (MTP partial caches start mid-sequence)
     pub kv_start: Vec<usize>,
     /// device-side KV shadow (persistent-KV GPU decode path); lazily allocated
@@ -123,10 +149,22 @@ impl KvCache {
             qk_rope,
             latent: vec![vec![0.0; max_t * kv_lora]; n_rows],
             k_rot: vec![vec![0.0; max_t * qk_rope]; n_rows],
+            kv_dim: 0,
+            k_full: vec![Vec::new(); n_rows],
+            v_full: vec![Vec::new(); n_rows],
             kv_start: vec![0; n_rows],
             #[cfg(feature = "cuda")]
             dev: None,
         }
+    }
+
+    /// Enable the GQA full-KV cache (MiniMax-M3): allocate per-layer key/value
+    /// buffers of width `kv_dim = n_kv_heads * head_dim`. No-op for the MLA path.
+    pub(crate) fn enable_gqa(&mut self, kv_dim: usize) {
+        self.kv_dim = kv_dim;
+        let rows = self.k_full.len();
+        self.k_full = vec![vec![0.0; self.max_t * kv_dim]; rows];
+        self.v_full = vec![vec![0.0; self.max_t * kv_dim]; rows];
     }
 
     /// Allocate a cache sized for `model`, holding up to `max_t` tokens.
@@ -148,6 +186,9 @@ impl KvCache {
         );
         if model.has_mtp {
             kv.kv_start[n_layers] = KV_UNSET;
+        }
+        if model.cfg.arch == colibri_core::Arch::MinimaxM3 {
+            kv.enable_gqa(model.cfg.n_kv_heads as usize * model.cfg.qk_head as usize);
         }
         kv
     }
@@ -211,6 +252,28 @@ impl KvCache {
     /// Contiguous roped-key rows `[start, end)` for a layer.
     pub fn krot_rows(&self, layer: usize, start: usize, end: usize) -> &[f32] {
         &self.k_rot[layer][start * self.qk_rope..end * self.qk_rope]
+    }
+
+    // ---- GQA full-KV accessors (MiniMax-M3) ----
+    /// GQA full-KV width (`n_kv_heads * head_dim`), 0 on the MLA path.
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+    /// Writable full-key row for `(layer, pos)` (`[kv_dim]`).
+    pub fn k_full_row_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
+        &mut self.k_full[layer][pos * self.kv_dim..(pos + 1) * self.kv_dim]
+    }
+    /// Writable full-value row for `(layer, pos)` (`[kv_dim]`).
+    pub fn v_full_row_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
+        &mut self.v_full[layer][pos * self.kv_dim..(pos + 1) * self.kv_dim]
+    }
+    /// Contiguous full-key rows `[start, end)` for a layer.
+    pub fn k_full_rows(&self, layer: usize, start: usize, end: usize) -> &[f32] {
+        &self.k_full[layer][start * self.kv_dim..end * self.kv_dim]
+    }
+    /// Contiguous full-value rows `[start, end)` for a layer.
+    pub fn v_full_rows(&self, layer: usize, start: usize, end: usize) -> &[f32] {
+        &self.v_full[layer][start * self.kv_dim..end * self.kv_dim]
     }
 }
 

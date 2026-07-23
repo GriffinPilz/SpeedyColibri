@@ -32,6 +32,7 @@ pub struct ColiCudaTensor {
 extern "C" {
     fn coli_cuda_init(devices: *const c_int, count: c_int) -> c_int;
     fn coli_cuda_shutdown();
+    fn coli_cuda_set_activation(oai: c_int, alpha: f32, limit: f32);
     fn coli_cuda_device_count() -> c_int;
     fn coli_cuda_mem_info(device: c_int, free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
 
@@ -135,6 +136,20 @@ extern "C" {
         t: c_int,
         scale: f32,
     ) -> c_int;
+    fn coli_cuda_gqa_attn(
+        device: c_int,
+        ctx: *mut f32,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        s: c_int,
+        h: c_int,
+        hkv: c_int,
+        d: c_int,
+        t: c_int,
+        scale: f32,
+        mode: c_int,
+    ) -> c_int;
     // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
     fn coli_cuda_dsa_indexer_scores(
         scores: *mut f32,
@@ -210,6 +225,13 @@ pub fn init(devices: &[i32]) -> bool {
 /// Release all CUDA resources.
 pub fn shutdown() {
     unsafe { coli_cuda_shutdown() }
+}
+
+/// Select the FFN gate/up activation-combine used by every expert/shared/dense
+/// kernel: `oai = false` → SiLU-SwiGLU (GLM), `oai = true` → clamped OpenAI-SwiGLU
+/// (MiniMax-M3, with `alpha`/`limit`). A per-model constant; set once at load.
+pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
+    unsafe { coli_cuda_set_activation(oai as c_int, alpha, limit) }
 }
 
 /// Whether `device` can read pageable host memory directly (coherent unified
@@ -566,6 +588,29 @@ pub unsafe fn attention_absorb_batch_raw(
 ) -> bool {
     coli_cuda_attention_absorb_batch(kv_b, ctx, q, latent, rope, s, h, q_nope, r, v, k, t, scale)
         != 0
+}
+
+/// Standard grouped-query attention prefill on the GPU (MiniMax-M3): `ctx[S,H,D]` from
+/// `q[S,H,D]` and the full KV cache `k`/`v` `[T,Hkv,D]`, causal. Twin of the CPU core in
+/// `attention_gqa`.
+///
+/// # Safety
+/// `ctx`/`q`/`k`/`v` must be sized per the dims; `H % Hkv == 0`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gqa_attn_raw(
+    ctx: *mut f32,
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    s: i32,
+    h: i32,
+    hkv: i32,
+    d: i32,
+    t: i32,
+    scale: f32,
+    mode: i32,
+) -> bool {
+    coli_cuda_gqa_attn(0, ctx, q, k, v, s, h, hkv, d, t, scale, mode) != 0
 }
 
 /// DSA sparse MLA attention: like [`attention_absorb_batch_raw`] but each query

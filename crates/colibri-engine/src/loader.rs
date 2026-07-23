@@ -75,6 +75,35 @@ fn missing(name: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}"))
 }
 
+/// Concatenate several `[Oⱼ, I]` weights row-wise into one `[ΣOⱼ, I]` QTensor, so a set
+/// of projections that share the same input `x` can run as ONE matmul instead of N. Used
+/// to fuse MiniMax-M3's q/k/v projections: at S=1 decode each was a separate synchronized
+/// GPU dispatch (measured ~25% of decode across q/k/v/o × 60 layers), and one fused
+/// matmul cuts the q/k/v three into one. All parts must share `i` and `fmt_code`; supports
+/// the resident formats f32 (0) and int8 (1) — the only ones projections ship as.
+pub fn concat_rows(parts: &[&QTensor]) -> QTensor {
+    assert!(!parts.is_empty(), "concat_rows: no parts");
+    let (i, fmt) = (parts[0].i, parts[0].fmt_code);
+    assert!(
+        parts.iter().all(|p| p.i == i && p.fmt_code == fmt),
+        "concat_rows: all parts must share i and fmt_code"
+    );
+    let mut out = parts[0].clone();
+    out.o = parts.iter().map(|p| p.o).sum();
+    match fmt {
+        0 => {
+            out.qf = parts.iter().flat_map(|p| p.qf.iter().copied()).collect();
+        }
+        1 => {
+            out.q8 = parts.iter().flat_map(|p| p.q8.iter().copied()).collect();
+            out.s = parts.iter().flat_map(|p| p.s.iter().copied()).collect();
+        }
+        _ => panic!("concat_rows: unsupported fmt_code {fmt} (projections ship f32/int8)"),
+    }
+    out.gpu_eligible = parts.iter().all(|p| p.gpu_eligible);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

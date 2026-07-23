@@ -26,6 +26,39 @@ use colibri_safetensors::Shards;
 use std::io;
 use std::sync::{Arc, OnceLock};
 
+/// The model's SwiGLU variant, recorded once at load by [`set_activation`].
+/// GLM uses plain SiLU-gated SwiGLU (the default); MiniMax-M3 uses the clamped
+/// OpenAI-SwiGLU. Held as a process global so the FFN choke point ([`ffn`]) can
+/// read it without threading `cfg` through the expert-parallel boundary.
+#[derive(Clone, Copy)]
+struct ActCfg {
+    oai: bool,
+    alpha: f32,
+    limit: f32,
+}
+
+static ACTIVATION: OnceLock<ActCfg> = OnceLock::new();
+
+/// Record the model's SwiGLU variant for the FFN path. Call once after building
+/// the [`Config`] (first value wins — one model per process).
+pub fn set_activation(cfg: &Config) {
+    let _ = ACTIVATION.set(ActCfg {
+        oai: cfg.swiglu_oai,
+        alpha: cfg.swiglu_alpha,
+        limit: cfg.swiglu_limit,
+    });
+    // Mirror the choice into the CUDA backend so the fused FFN kernels apply the
+    // same SwiGLU variant (host-side globals; safe to set before device init).
+    #[cfg(feature = "cuda")]
+    crate::gpu::set_activation(cfg.swiglu_oai, cfg.swiglu_alpha, cfg.swiglu_limit);
+}
+
+/// The active SwiGLU variant (defaults to SiLU when unset — the GLM path and
+/// unit tests that never call [`set_activation`]).
+fn activation() -> ActCfg {
+    *ACTIVATION.get().unwrap_or(&ActCfg { oai: false, alpha: 0.0, limit: 0.0 })
+}
+
 /// Process-wide expert-parallel context. `serve`/`worker` set this once at startup
 /// when `COLI_NUM_NODES > 1`; while present, [`moe`] transparently dispatches to
 /// [`moe_sharded`] so the forward pass needs no signature change. Left unset on a
@@ -648,7 +681,10 @@ pub fn route(cfg: &Config, logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32
 /// Apply a SwiGLU FFN over `x[nr, D]` into `out[nr, D]`:
 /// `out = down(silu(gate·x) ⊙ up·x)`. Port of the expert compute in `moe()`.
 fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
-    // Fused GPU expert pipeline (one host round-trip) for resident weights.
+    // Fused GPU expert pipeline (one host round-trip) for resident weights. The
+    // fused kernels apply the model's SwiGLU variant (set via gpu::set_activation),
+    // so this path is correct for both GLM (SiLU) and MiniMax-M3 (swigluoai). CPU
+    // reference below on decline.
     #[cfg(feature = "cuda")]
     {
         if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
@@ -658,15 +694,21 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
     ffn_cpu(gate, up, down, x, nr, out);
 }
 
-/// CPU SwiGLU FFN (the reference / fallback path).
+/// CPU SwiGLU FFN (the reference / fallback path). Applies the model's SwiGLU
+/// variant ([`activation`]): SiLU-gated (GLM) or clamped OpenAI-SwiGLU (M3).
 fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
     let inter = gate.o as usize; // moe_inter (or shared intermediate)
     let mut gg = vec![0f32; nr * inter];
     let mut uu = vec![0f32; nr * inter];
     matmul_qt(&mut gg, x, gate, nr);
     matmul_qt(&mut uu, x, up, nr);
+    let a = activation();
     for (g, &u) in gg.iter_mut().zip(uu.iter()) {
-        *g = silu(*g) * u;
+        *g = if a.oai {
+            crate::math::swiglu_oai(*g, u, a.alpha, a.limit)
+        } else {
+            silu(*g) * u
+        };
     }
     matmul_qt(out, &gg, down, nr);
 }
@@ -1081,6 +1123,39 @@ mod tests {
         )
         .unwrap();
         Config::from_json(&json).unwrap()
+    }
+
+    // MiniMax-M3 (and GLM) routing: sigmoid scoring, additive selection bias,
+    // top-k by (sigmoid + bias), weights = normalized raw sigmoids × routed_scale.
+    #[test]
+    fn route_sigmoid_bias_topk_normalized_scaled() {
+        let json = colibri_json::Json::parse(
+            r#"{"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,
+                "n_routed_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":3,
+                "intermediate_size":4,"first_k_dense_replace":0,"q_lora_rank":2,
+                "kv_lora_rank":2,"qk_nope_head_dim":2,"qk_rope_head_dim":2,"v_head_dim":2,
+                "n_shared_experts":1,"vocab_size":8,"n_group":1,"topk_group":1,
+                "norm_topk_prob":true,"rms_norm_eps":1e-5,"routed_scaling_factor":2.0,
+                "rope_parameters":{"rope_theta":10000.0},"eos_token_id":[7],
+                "index_topk":0,"index_n_heads":0,"index_head_dim":0}"#,
+        )
+        .unwrap();
+        let cfg = Config::from_json(&json).unwrap();
+        // Expert 0 has the lowest logit but a large selection bias → it must be
+        // chosen; expert 1 has the highest logit. 2 and 3 lose on sigmoid+bias.
+        let logits = [0.0f32, 2.0, -1.0, 0.3];
+        let bias = [5.0f32, 0.0, 0.0, 0.0];
+        let (idx, w) = route(&cfg, &logits, &bias);
+        assert_eq!(idx.len(), 2);
+        assert!(idx.contains(&0) && idx.contains(&1), "chosen {idx:?}");
+        // Weights are the *raw* sigmoid(logit) (bias affects selection only),
+        // normalized over the chosen set, then scaled by routed_scaling_factor.
+        let (s0, s1) = (crate::math::sigmoid(0.0), crate::math::sigmoid(2.0));
+        let sum = s0 + s1;
+        let wmap: std::collections::HashMap<usize, f32> =
+            idx.iter().copied().zip(w.iter().copied()).collect();
+        assert!((wmap[&0] - s0 / sum * 2.0).abs() < 1e-5);
+        assert!((wmap[&1] - s1 / sum * 2.0).abs() < 1e-5);
     }
 
     fn expert(seed: usize, inter: usize, d: usize) -> Expert {

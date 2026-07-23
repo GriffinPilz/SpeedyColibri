@@ -143,6 +143,44 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
+/* Clamped OpenAI-SwiGLU (MiniMax-M3 "swigluoai"): gate clamped to <= limit, up
+ * clamped to [-limit, limit], out = (up + 1) * gate * sigmoid(alpha * gate).
+ * Mirrors the CPU `swiglu_oai` reference so the GPU expert path is token-identical. */
+__global__ static void swiglu_oai_mul(float *gate, const float *up, size_t n,
+                                      float alpha, float limit) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        if (g > limit) g = limit;                    // clamp upper only
+        float u = fminf(fmaxf(up[i], -limit), limit); // clamp [-limit, limit]
+        float gated = g / (1.0f + expf(-alpha * g));  // g * sigmoid(alpha * g)
+        gate[i] = gated * (u + 1.0f);
+    }
+}
+
+/* FFN gate/up activation-combine variant, set once from the host by
+ * coli_cuda_set_activation: 0 = SiLU-SwiGLU (GLM, the default), 1 = clamped
+ * OpenAI-SwiGLU (MiniMax-M3). Applies to every FFN kernel (routed experts, shared
+ * expert, dense MLP) since the activation is a per-model constant. */
+static int   g_act_oai   = 0;
+static float g_act_alpha = 1.702f;
+static float g_act_limit = 7.0f;
+
+extern "C" void coli_cuda_set_activation(int oai, float alpha, float limit) {
+    g_act_oai = oai;
+    g_act_alpha = alpha;
+    g_act_limit = limit;
+}
+
+/* Launch the selected gate*up activation-combine over `n` elements on `stream`. */
+static inline void act_mul(float *gate, const float *up, size_t n, cudaStream_t stream) {
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    if (g_act_oai)
+        swiglu_oai_mul<<<blocks, 256, 0, stream>>>(gate, up, n, g_act_alpha, g_act_limit);
+    else
+        silu_mul<<<blocks, 256, 0, stream>>>(gate, up, n);
+}
+
 /* FP8 (e4m3) tiled tensor-core expert matmuls (1 byte/weight, direct K stride).
  * Weights are FP8, activations FP16, MMA runs in f16 (W8A16). This is the tiled
  * path that replaces the naive quant_matmul's M-fold weight re-reads. */
@@ -475,6 +513,132 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+}
+
+/* Standard grouped-query attention prefill (MiniMax-M3): Q[S,H,D], full K/V[T,Hkv,D]
+ * (no MLA absorption). One block per (query s, head h); a query head maps to KV head
+ * h/(H/Hkv). Causal over [0, T-S+s]. Shared-mem softmax, mirroring the absorb batch
+ * kernel's reductions. sm = qs[D] ++ scores[T] ++ red[ATTN_TPB]. */
+__global__ static void gqa_attn_kernel(float *ctx, const float *Q, const float *K,
+        const float *V, int S, int H, int Hkv, int D, int T, float scale) {
+    int s = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, nt = T - S + s + 1;
+    if (s >= S || nt < 1) return;
+    int kvh = h / (H / Hkv);
+    extern __shared__ float sm[];
+    float *qs = sm, *scores = qs + D, *red = scores + T;
+    const float *qrow = Q + ((size_t)s * H + h) * D;
+    for (int d = tid; d < D; d += blockDim.x) qs[d] = qrow[d];
+    __syncthreads();
+    for (int t = tid; t < nt; t += blockDim.x) {
+        const float *kt = K + ((size_t)t * Hkv + kvh) * D;
+        float a = 0; for (int d = 0; d < D; d++) a += qs[d] * kt[d];
+        scores[t] = a * scale;
+    }
+    __syncthreads();
+    float local = -3.402823466e+38F;
+    for (int t = tid; t < nt; t += blockDim.x) local = fmaxf(local, scores[t]);
+    red[tid] = local; __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) { if (tid < n) red[tid] = fmaxf(red[tid], red[tid + n]); __syncthreads(); }
+    float mx = red[0];
+    local = 0; for (int t = tid; t < nt; t += blockDim.x) { float e = expf(scores[t] - mx); scores[t] = e; local += e; }
+    red[tid] = local; __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) { if (tid < n) red[tid] += red[tid + n]; __syncthreads(); }
+    float inv = 1.f / red[0];
+    __syncthreads();
+    for (int d = tid; d < D; d += blockDim.x) {
+        float a = 0;
+        for (int t = 0; t < nt; t++) a += scores[t] * V[((size_t)t * Hkv + kvh) * D + d];
+        ctx[((size_t)s * H + h) * D + d] = a * inv;
+    }
+}
+
+/* ==== Tensor-core (WMMA) flash GQA prefill core (MiniMax-M3) ==================
+ * The scalar gqa_attn_kernel serializes the T loop with only D-way parallelism in
+ * the V accumulation, and holds all T scores in shared memory (caps T, thrashes).
+ * This is a flash kernel: block = (head h, query-tile of 16 tokens), tiles over key
+ * blocks of 16 with online softmax, and runs BOTH GEMMs on tensor cores — QK^T over
+ * the D contraction and P@V over the 16-key tile — in fp16 with f32 accumulation.
+ * Structure mirrors tc_sparse_attn, minus the MLA W_K/W_V absorption and the DSA
+ * mask: standard Q·K^T with causal masking only. Q[S,H,D], K/V[T,Hkv,D] indexed by
+ * kvh = h/(H/Hkv), ctx[S,H,D]. `scale` is folded into Q so Scores come out scaled.
+ * Requires D % 16 == 0. Launch 256 threads (8 warps); shared = GQA_QT*8*D bytes. */
+#define GQA_QT 16
+__global__ static void tc_gqa_attn(float *ctx, const float *Q, const float *K,
+        const float *V, int S, int H, int Hkv, int D, int T, float scale) {
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    int h = blockIdx.x, qt = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    int q0 = qt * GQA_QT, kvh = h / (H / Hkv), nwarp = blockDim.x >> 5;
+    int base = T - S;                            // causal: query row r attends to keys <= base+q0+r
+    extern __shared__ char smem[];
+    __half *QA = (__half*)smem;                  // [GQA_QT][D] fp16 query tile (scale folded)
+    __half *KB = QA + GQA_QT * D;                // [GQA_QT][D] fp16 key tile, then reused for V
+    float *acc = (float*)(KB + GQA_QT * D);      // [GQA_QT][D] f32 running output
+    __shared__ __half Pt[GQA_QT * GQA_QT];       // fp16 softmax-prob tile (P)
+    __shared__ __half ah[256], ah8[8][256], bh8[8][256];
+    __shared__ float scpart[8 * 256], sc[GQA_QT * GQA_QT], mrow[GQA_QT], lrow[GQA_QT], corr[GQA_QT];
+    for (int z = tid; z < GQA_QT * D; z += blockDim.x) { int r = z / D, c = z % D; int s = q0 + r;
+        QA[z] = (s < S) ? __float2half(Q[((size_t)s * H + h) * D + c] * scale) : __float2half(0.f); }
+    for (int r = tid; r < GQA_QT; r += blockDim.x) { mrow[r] = -3.4e38f; lrow[r] = 0.f; }
+    for (int z = tid; z < GQA_QT * D; z += blockDim.x) acc[z] = 0.f;
+    __syncthreads();
+    int ktmax = base + q0 + GQA_QT; if (ktmax > T) ktmax = T;     // last valid row's causal bound
+    for (int kt = 0; kt < ktmax; kt += GQA_QT) {
+        // Scores[16,16] = QA @ K_tile^T, split-K over D across warps.
+        for (int z = tid; z < GQA_QT * D; z += blockDim.x) { int r = z / D, c = z % D; int t = kt + r;
+            KB[z] = (t < T) ? __float2half(K[((size_t)t * Hkv + kvh) * D + c]) : __float2half(0.f); }
+        __syncthreads();
+        { __half *myah = ah8[warp], *mybh = bh8[warp];
+          wmma::fragment<wmma::accumulator,16,16,16,float> accS; wmma::fill_fragment(accS, 0.f);
+          for (int k0 = warp * 16; k0 < D; k0 += nwarp * 16) {
+            for (int z = lane; z < 256; z += 32) { int m = z / 16, k = z % 16; myah[z] = QA[m * D + (k0 + k)]; mybh[z] = KB[m * D + (k0 + k)]; }
+            __syncwarp();
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+            wmma::load_matrix_sync(af, myah, 16); wmma::load_matrix_sync(bf, mybh, 16);
+            wmma::mma_sync(accS, af, bf, accS); __syncwarp(); }
+          wmma::store_matrix_sync(&scpart[warp * 256], accS, 16, wmma::mem_row_major); }
+        __syncthreads();
+        for (int z = tid; z < GQA_QT * GQA_QT; z += blockDim.x) { float a = 0; for (int wr = 0; wr < nwarp; wr++) a += scpart[wr * 256 + z]; sc[z] = a; }
+        __syncthreads();
+        // Causal mask + online softmax, one warp per query row.
+        for (int r = warp; r < GQA_QT; r += nwarp) { int s = q0 + r; int pos = base + s;
+            float tmax = -3.4e38f;
+            for (int c = lane; c < GQA_QT; c += 32) { int t = kt + c;
+                int keep = (s < S && t < T && t <= pos);
+                float v = keep ? sc[r * GQA_QT + c] : -3.4e38f; sc[r * GQA_QT + c] = v; tmax = fmaxf(tmax, v); }
+            for (int o = 16; o; o >>= 1) tmax = fmaxf(tmax, __shfl_down_sync(0xffffffff, tmax, o));
+            tmax = __shfl_sync(0xffffffff, tmax, 0);
+            float mold = mrow[r], mnew = fmaxf(mold, tmax), cr = expf(mold - mnew), lsum = 0.f;
+            for (int c = lane; c < GQA_QT; c += 32) { float e = (sc[r * GQA_QT + c] > -1e30f) ? expf(sc[r * GQA_QT + c] - mnew) : 0.f; Pt[r * GQA_QT + c] = __float2half(e); lsum += e; }
+            for (int o = 16; o; o >>= 1) lsum += __shfl_down_sync(0xffffffff, lsum, o);
+            lsum = __shfl_sync(0xffffffff, lsum, 0);
+            if (lane == 0) { mrow[r] = mnew; corr[r] = cr; lrow[r] = lrow[r] * cr + lsum; } }
+        __syncthreads();
+        // acc = acc*corr + P @ V_tile. Reload KB with V (K no longer needed).
+        for (int z = tid; z < GQA_QT * D; z += blockDim.x) { int r = z / D; acc[z] *= corr[r]; }
+        for (int z = tid; z < 256; z += blockDim.x) ah[z] = Pt[z];
+        for (int z = tid; z < GQA_QT * D; z += blockDim.x) { int r = z / D, c = z % D; int t = kt + r;
+            KB[z] = (t < T) ? __float2half(V[((size_t)t * Hkv + kvh) * D + c]) : __float2half(0.f); }
+        __syncthreads();
+        { __half *mybh = bh8[warp];
+          for (int dn = warp * 16; dn < D; dn += nwarp * 16) {
+            wmma::fragment<wmma::accumulator,16,16,16,float> accP;
+            wmma::load_matrix_sync(accP, &acc[dn], D, wmma::mem_row_major);
+            for (int z = lane; z < 256; z += 32) { int n = z / 16, key = z % 16; mybh[z] = KB[key * D + (dn + n)]; }
+            __syncwarp();
+            wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+            wmma::load_matrix_sync(af, ah, 16); wmma::load_matrix_sync(bf, mybh, 16);
+            wmma::mma_sync(accP, af, bf, accP);
+            wmma::store_matrix_sync(&acc[dn], accP, D, wmma::mem_row_major); __syncwarp(); } }
+        __syncthreads();
+    }
+    // ctx[s,h,:] = acc[r,:] / l[r]
+    for (int r = 0; r < GQA_QT; r++) { int s = q0 + r; if (s >= S) continue; float inv = 1.f / lrow[r];
+        for (int d = tid; d < D; d += blockDim.x) ctx[((size_t)s * H + h) * D + d] = acc[r * D + d] * inv;
+        __syncthreads(); }
+#endif
 }
 
 /* DSA sparse prefill attention. Identical to attention_absorb_batch_kernel except
@@ -958,7 +1122,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
         up->fmt,S,D,I,row_bytes(up->fmt,D),up->wrapped);
     size_t n=(size_t)S*I;
-    silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
+    act_mul(ctx->gate,ctx->up,n,0);
     quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
         down->fmt,S,I,D,row_bytes(down->fmt,I),down->wrapped);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
@@ -1027,11 +1191,11 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
         int tpb=256,wpb=tpb>>5;
         fp8a16_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gsc,D,I);
         fp8a16_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,usc,D,I);
-        silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I);
+        act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
         fp8a16_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dsc,I,D);
     }else{
         fp8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gsc,usc,S,D,I);
-        silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+        act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
         fp8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dsc,S,I,D);
     }
     if(s_evt) cudaEventRecord(s_e1,ctx->stream);
@@ -1094,13 +1258,13 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
         int tpb=256,wpb=tpb>>5;
         nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
         nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
-        silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I);
+        act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
         nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
     }else{
         dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
         dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
         nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
-        silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+        act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
         nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
     }
     if(!cuda_ok(cudaGetLastError(),"expert nvfp4 launch")||
@@ -1132,7 +1296,7 @@ extern "C" int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate,ColiCudaTensor *u
     dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
     i8a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
         (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I);
-    silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+    act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
     i8a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
     if(!cuda_ok(cudaGetLastError(),"expert i8 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -1198,7 +1362,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
             dim3 og8((unsigned)((D+63)/64),(unsigned)((r+15)/16));
             fp8a16_gate_up<<<hg8,256,0,ctx->stream>>>(g8,u8,x8,
                 (const uint8_t*)host[c].g,(const uint8_t*)host[c].u,host[c].gs,host[c].us,r,D,I);
-            silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g8,u8,(size_t)r*I);
+            act_mul(g8,u8,(size_t)r*I,ctx->stream);
             fp8a16_matmul<<<og8,128,0,ctx->stream>>>(y8,g8,
                 (const uint8_t*)host[c].d,host[c].ds,r,I,D);
             off8+=r;
@@ -1207,7 +1371,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        act_mul(ctx->gate,ctx->up,(size_t)total*I,ctx->stream);
         grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }
     if(profile) cudaEventRecord(ev[2],ctx->stream);
@@ -1288,6 +1452,41 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
         const float *latent,const float *rope,int S,int H,int Q,int R,int V,int K,int T,
         float scale){
     return attention_absorb_batch_run(w,nullptr,ctx,q,latent,rope,S,H,Q,R,V,K,T,scale);
+}
+
+/* Standard GQA prefill on the GPU (MiniMax-M3): q[S,H,D], full k/v[T,Hkv,D], ctx[S,H,D]
+ * out. Reuses the attention scratch (aq=q, al=k, ar=v, ac=ctx). Caller's layouts match
+ * directly (q is [S,H,D]; a KV cache row is [Hkv*D]; ctx is [S,H,D]). */
+extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const float *k,
+        const float *v, int S, int H, int Hkv, int D, int T, float scale, int mode) {
+    if (!ctx || !q || !k || !v || S < 1 || H < 1 || Hkv < 1 || D < 1 || D > 1024 ||
+        H % Hkv || T < S || T > 8192)
+        return 0;
+    // mode 1 = WMMA flash (tc_gqa_attn); requires D a multiple of 16. Anything else,
+    // or D not tile-aligned, falls back to the scalar gqa_attn_kernel (mode 0).
+    int flash = (mode == 1 && D % 16 == 0);
+    DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
+    size_t qb = (size_t)S * H * D * sizeof(float), kb = (size_t)T * Hkv * D * sizeof(float);
+    if (!reserve(&dc->aq, &dc->aq_cap, qb) || !reserve(&dc->al, &dc->al_cap, kb) ||
+        !reserve(&dc->ar, &dc->ar_cap, kb) || !reserve(&dc->ac, &dc->ac_cap, qb))
+        return 0;
+    if (!cuda_ok(cudaMemcpyAsync(dc->aq, q, qb, cudaMemcpyHostToDevice, dc->stream), "gqa q upload") ||
+        !cuda_ok(cudaMemcpyAsync(dc->al, k, kb, cudaMemcpyHostToDevice, dc->stream), "gqa k upload") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ar, v, kb, cudaMemcpyHostToDevice, dc->stream), "gqa v upload"))
+        return 0;
+    if (flash) {
+        size_t shW = (size_t)GQA_QT * 8 * D;   // QA+KB (fp16, 4D) + acc (f32, 4D) per 16 rows
+        if (!cuda_ok(cudaFuncSetAttribute(tc_gqa_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shW), "gqa flash shared attr")) return 0;
+        tc_gqa_attn<<<dim3(H, (S + GQA_QT - 1) / GQA_QT), 256, shW, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale);
+    } else {
+        size_t shared = (size_t)(D + T + ATTN_TPB) * sizeof(float);
+        gqa_attn_kernel<<<dim3(H, S), ATTN_TPB, shared, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale);
+    }
+    if (!cuda_ok(cudaGetLastError(), "gqa launch")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(ctx, dc->ac, qb, cudaMemcpyDeviceToHost, dc->stream), "gqa ctx download") ||
+        !cuda_ok(cudaStreamSynchronize(dc->stream), "gqa sync"))
+        return 0;
+    return 1;
 }
 
 /* DSA sparse prefill attention. Mirrors attention_absorb_batch_run but uploads the
@@ -1623,7 +1822,7 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
 extern "C" int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *up_dev,
                                        size_t n){
     DeviceContext *ctx=find_ctx(device); if(!n||!select_ctx(ctx)) return 0;
-    silu_mul<<<(unsigned)((n+255)/256),256>>>(gate_dev,up_dev,n);
+    act_mul(gate_dev,up_dev,n,0);
     return cuda_ok(cudaGetLastError(),"pipe silu mul");
 }
 extern "C" int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){

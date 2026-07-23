@@ -6,7 +6,7 @@
 //! layers) → residual add. Then a final RMSNorm and the `lm_head` produce
 //! logits, and greedy decoding feeds the argmax back in one token at a time.
 
-use crate::attention::{attention_sharded, attention_with, AttnCore};
+use crate::attention::{attention_gqa, attention_sharded, attention_with, AttnCore};
 use crate::linear::{embed_row, matmul_qt};
 use crate::math::rmsnorm;
 use crate::model::{KvCache, Layer, Model};
@@ -115,32 +115,36 @@ pub fn layer_forward<P: ExpertProvider>(
     for si in 0..s {
         rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
     }
-    // DSA selection sharing: a FULL indexer layer (idx_type == true) computes its own
-    // top-k selection; SHARED layers (false) reuse the most recent FULL layer's — the
-    // `indexer_types` pattern. Without this the 57 shared layers fell back to dense
-    // O(n²) attention, forfeiting most of DSA's long-context speedup. `attention_with`
-    // returns the selection it computed so we can carry it forward across the stack.
-    let is_full = cfg.idx_type.get(li).copied().unwrap_or(false);
-    let reused = if is_full { None } else { dsa_sel.as_deref() };
-    let computed = timed(&ATTN_US, || -> io::Result<Option<Vec<Vec<u32>>>> {
-        // Tensor-parallel attention: split the heads across nodes so every box's GPU
-        // runs part of the core. Only for a multi-node cluster during single-shot
-        // prefill (`pos_base == 0`, `s > 1`) — peers build a fresh KV from the shipped
-        // activations, so there is no cross-step state. Decode and the single-node
-        // build keep the driver computing all heads via `attention_with`.
-        if pos_base == 0 && s > 1 && tp_attn_enabled() {
-            if let Some(cc) = cluster_ctx() {
-                if cc.sharding.num_nodes() > 1 {
-                    return attention_sharded(
-                        cfg, l, li, kv, nrm, s, pos_base, tmp, reused, &cc.sharding, &*cc.transport,
-                    );
+    if cfg.arch == colibri_core::Arch::MinimaxM3 {
+        // MiniMax-M3: grouped-query attention (no MLA latent, no DSA indexer).
+        timed(&ATTN_US, || attention_gqa(cfg, l, li, kv, nrm, s, pos_base, tmp));
+    } else {
+        // GLM DSA selection sharing: a FULL indexer layer (idx_type == true) computes
+        // its own top-k selection; SHARED layers (false) reuse the most recent FULL
+        // layer's — the `indexer_types` pattern. `attention_with` returns the selection
+        // it computed so we can carry it forward across the stack.
+        let is_full = cfg.idx_type.get(li).copied().unwrap_or(false);
+        let reused = if is_full { None } else { dsa_sel.as_deref() };
+        let computed = timed(&ATTN_US, || -> io::Result<Option<Vec<Vec<u32>>>> {
+            // Tensor-parallel attention: split the heads across nodes so every box's GPU
+            // runs part of the core. Only for a multi-node cluster during single-shot
+            // prefill (`pos_base == 0`, `s > 1`) — peers build a fresh KV from the shipped
+            // activations, so there is no cross-step state. Decode and the single-node
+            // build keep the driver computing all heads via `attention_with`.
+            if pos_base == 0 && s > 1 && tp_attn_enabled() {
+                if let Some(cc) = cluster_ctx() {
+                    if cc.sharding.num_nodes() > 1 {
+                        return attention_sharded(
+                            cfg, l, li, kv, nrm, s, pos_base, tmp, reused, &cc.sharding, &*cc.transport,
+                        );
+                    }
                 }
             }
+            Ok(attention_with(cfg, l, li, kv, nrm, s, pos_base, tmp, AttnCore::Reconstruct, reused))
+        })?;
+        if is_full {
+            *dsa_sel = computed;
         }
-        Ok(attention_with(cfg, l, li, kv, nrm, s, pos_base, tmp, AttnCore::Reconstruct, reused))
-    })?;
-    if is_full {
-        *dsa_sel = computed;
     }
     for j in 0..s * d {
         x[j] += tmp[j];
@@ -189,6 +193,26 @@ pub fn forward<P: ExpertProvider>(
         }
     });
 
+    // COLI_DEBUG_ACT=1: print the hidden-state L2 norm (first + last position) after
+    // embedding and the first few layers, to localize where a forward pass degenerates.
+    let dbg_act = std::env::var("COLI_DEBUG_ACT").ok().as_deref() == Some("1");
+    let pnorm = |tag: &str, x: &[f32]| {
+        if s == 0 {
+            return;
+        }
+        let n = |r: &[f32]| r.iter().map(|v| v * v).sum::<f32>().sqrt();
+        eprintln!(
+            "[act] {tag}: |x[0]|={:.4} |x[{}]|={:.4} x[0][..4]={:?}",
+            n(&x[..d]),
+            s - 1,
+            n(&x[(s - 1) * d..s * d]),
+            &x[..4.min(d)]
+        );
+    };
+    if dbg_act {
+        pnorm("embed", &x);
+    }
+
     let mut nrm = vec![0f32; s * d];
     let mut tmp = vec![0f32; s * d];
     // Carries the current DSA selection from each FULL indexer layer to the SHARED
@@ -209,6 +233,9 @@ pub fn forward<P: ExpertProvider>(
             &mut tmp,
             &mut dsa_sel,
         )?;
+        if dbg_act && li < 5 {
+            pnorm(&format!("layer{li}"), &x);
+        }
     }
 
     hidden_out.copy_from_slice(&x);
@@ -245,20 +272,35 @@ fn layer_forward_batched<P: ExpertProvider>(
     }
     timed(&ATTN_US, || {
         for si in 0..n {
-            // S=1, its own KV, its own position; decode never fires DSA (pos_base>0),
-            // so there is no selection to carry — same core as single-sequence decode.
-            attention_with(
-                cfg,
-                l,
-                li,
-                &mut kvs[si],
-                &nrm[si * d..(si + 1) * d],
-                1,
-                positions[si],
-                &mut tmp[si * d..(si + 1) * d],
-                AttnCore::Reconstruct,
-                None,
-            );
+            // Per sequence: S=1, its own KV, its own position — identical to a lone decode
+            // step, so batching cannot change any sequence's output (only shares the MoE
+            // expert reads below). MiniMax-M3 uses the GQA core; GLM uses MLA reconstruct
+            // (decode never fires DSA at pos_base>0, so there is no selection to carry).
+            if cfg.arch == colibri_core::Arch::MinimaxM3 {
+                attention_gqa(
+                    cfg,
+                    l,
+                    li,
+                    &mut kvs[si],
+                    &nrm[si * d..(si + 1) * d],
+                    1,
+                    positions[si],
+                    &mut tmp[si * d..(si + 1) * d],
+                );
+            } else {
+                attention_with(
+                    cfg,
+                    l,
+                    li,
+                    &mut kvs[si],
+                    &nrm[si * d..(si + 1) * d],
+                    1,
+                    positions[si],
+                    &mut tmp[si * d..(si + 1) * d],
+                    AttnCore::Reconstruct,
+                    None,
+                );
+            }
         }
     });
     for j in 0..n * d {

@@ -135,44 +135,80 @@ fn load_layer(
     let mut l = Layer::default();
     l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
     l.post_ln = ld(shards, &p("post_attention_layernorm.weight"))?;
-    // MLA attention projections
-    l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), cfg.q_lora as usize, d, dbits)?;
-    l.q_a_ln = ld(shards, &p("self_attn.q_a_layernorm.weight"))?;
-    l.q_b = qt_load(
-        shards,
-        &p("self_attn.q_b_proj.weight"),
-        h * cfg.qk_head as usize,
-        cfg.q_lora as usize,
-        dbits,
-    )?;
-    l.kv_a = qt_load(
-        shards,
-        &p("self_attn.kv_a_proj_with_mqa.weight"),
-        (cfg.kv_lora + cfg.qk_rope) as usize,
-        d,
-        dbits,
-    )?;
-    l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
-    l.kv_b = qt_load(
-        shards,
-        &p("self_attn.kv_b_proj.weight"),
-        h * (cfg.qk_nope + cfg.v_head) as usize,
-        cfg.kv_lora as usize,
-        dbits,
-    )?;
+    // Output projection is shared by both attention flavours (`[hidden, n_heads*head_dim]`).
     l.o = qt_load(shards, &p("self_attn.o_proj.weight"), d, h * cfg.v_head as usize, dbits)?;
 
-    // DSA lightning indexer — present only when the checkpoint was converted with the
-    // indexer weights (`--indexer`). Load per layer that carries them; a model without
-    // these tensors leaves the fields `None` and attention runs dense. Names/dims match
-    // the C loader (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`).
-    if cfg.index_hd > 0 && cfg.index_nh > 0 && shards.has(&p("self_attn.indexer.wq_b.weight")) {
-        let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
-        l.ix_wq = Some(qt_load(shards, &p("self_attn.indexer.wq_b.weight"), nh * hd, cfg.q_lora as usize, dbits)?);
-        l.ix_wk = Some(qt_load(shards, &p("self_attn.indexer.wk.weight"), hd, d, dbits)?);
-        l.ix_wp = Some(qt_load(shards, &p("self_attn.indexer.weights_proj.weight"), nh, d, dbits)?);
-        l.ix_knorm_w = ld(shards, &p("self_attn.indexer.k_norm.weight"))?;
-        l.ix_knorm_b = ld(shards, &p("self_attn.indexer.k_norm.bias"))?;
+    if cfg.arch == colibri_core::Arch::MinimaxM3 {
+        // GQA attention (MiniMax-M3): q/k/v projections + per-head QK-norm. `qk_head`
+        // is the head dim; K/V carry `n_kv_heads` heads.
+        let hd = cfg.qk_head as usize;
+        let kvh = cfg.n_kv_heads as usize;
+        l.q_proj = Some(qt_load(shards, &p("self_attn.q_proj.weight"), h * hd, d, dbits)?);
+        l.k_proj = Some(qt_load(shards, &p("self_attn.k_proj.weight"), kvh * hd, d, dbits)?);
+        l.v_proj = Some(qt_load(shards, &p("self_attn.v_proj.weight"), kvh * hd, d, dbits)?);
+        // Fuse q/k/v (they share the input x) into ONE matmul per layer: at S=1 decode
+        // each was a separate synchronized GPU dispatch, ~25% of decode across the
+        // projections. Drop the separate three — `attention_gqa` uses the fused tensor.
+        l.qkv_proj = Some(crate::loader::concat_rows(&[
+            l.q_proj.as_ref().unwrap(),
+            l.k_proj.as_ref().unwrap(),
+            l.v_proj.as_ref().unwrap(),
+        ]));
+        l.q_proj = None;
+        l.k_proj = None;
+        l.v_proj = None;
+        l.q_norm = ld(shards, &p("self_attn.q_norm.weight"))?;
+        l.k_norm = ld(shards, &p("self_attn.k_norm.weight"))?;
+        // Block-sparse Lightning Indexer weights on sparse attention layers.
+        if cfg.idx_type.get(i).copied().unwrap_or(false)
+            && cfg.index_hd > 0
+            && shards.has(&p("self_attn.index_q_proj.weight"))
+        {
+            let (inh, ihd) = (cfg.index_nh as usize, cfg.index_hd as usize);
+            l.idx_q_proj = Some(qt_load(shards, &p("self_attn.index_q_proj.weight"), inh * ihd, d, dbits)?);
+            l.idx_k_proj = Some(qt_load(shards, &p("self_attn.index_k_proj.weight"), ihd, d, dbits)?);
+            l.idx_q_norm = ld(shards, &p("self_attn.index_q_norm.weight"))?;
+            l.idx_k_norm = ld(shards, &p("self_attn.index_k_norm.weight"))?;
+        }
+    } else {
+        // MLA attention projections (GLM)
+        l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), cfg.q_lora as usize, d, dbits)?;
+        l.q_a_ln = ld(shards, &p("self_attn.q_a_layernorm.weight"))?;
+        l.q_b = qt_load(
+            shards,
+            &p("self_attn.q_b_proj.weight"),
+            h * cfg.qk_head as usize,
+            cfg.q_lora as usize,
+            dbits,
+        )?;
+        l.kv_a = qt_load(
+            shards,
+            &p("self_attn.kv_a_proj_with_mqa.weight"),
+            (cfg.kv_lora + cfg.qk_rope) as usize,
+            d,
+            dbits,
+        )?;
+        l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
+        l.kv_b = qt_load(
+            shards,
+            &p("self_attn.kv_b_proj.weight"),
+            h * (cfg.qk_nope + cfg.v_head) as usize,
+            cfg.kv_lora as usize,
+            dbits,
+        )?;
+
+        // DSA lightning indexer — present only when the checkpoint was converted with the
+        // indexer weights (`--indexer`). Load per layer that carries them; a model without
+        // these tensors leaves the fields `None` and attention runs dense. Names/dims match
+        // the C loader (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`).
+        if cfg.index_hd > 0 && cfg.index_nh > 0 && shards.has(&p("self_attn.indexer.wq_b.weight")) {
+            let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
+            l.ix_wq = Some(qt_load(shards, &p("self_attn.indexer.wq_b.weight"), nh * hd, cfg.q_lora as usize, dbits)?);
+            l.ix_wk = Some(qt_load(shards, &p("self_attn.indexer.wk.weight"), hd, d, dbits)?);
+            l.ix_wp = Some(qt_load(shards, &p("self_attn.indexer.weights_proj.weight"), nh, d, dbits)?);
+            l.ix_knorm_w = ld(shards, &p("self_attn.indexer.k_norm.weight"))?;
+            l.ix_knorm_b = ld(shards, &p("self_attn.indexer.k_norm.bias"))?;
+        }
     }
 
     l.sparse = sparse;
@@ -185,7 +221,11 @@ fn load_layer(
     } else {
         // MoE: router (f32) + shared expert. Routed experts stream on demand.
         l.router = ld(shards, &p("mlp.gate.weight"))?;
-        l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))?;
+        // The router selection bias sits under `.gate.` on GLM but directly under the
+        // MoE block on MiniMax-M3 (`block_sparse_moe.e_score_correction_bias` →
+        // `mlp.e_score_correction_bias`); accept either.
+        l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))
+            .or_else(|_| ld(shards, &p("mlp.e_score_correction_bias")))?;
         let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
         l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?;
         l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?;
@@ -264,6 +304,9 @@ pub fn load_model_with(
 ) -> Result<Model, EngineError> {
     let snap = snap.as_ref();
     let cfg = Config::load(snap)?;
+    // Record the SwiGLU variant for the FFN choke point (SiLU for GLM, clamped
+    // OpenAI-SwiGLU for MiniMax-M3) before any forward pass runs.
+    crate::moe::set_activation(&cfg);
     let shards = colibri_safetensors::Shards::open(snap)?;
 
     // Fail fast with an actionable message on a partial download. An interrupted HF
@@ -358,6 +401,18 @@ pub fn load_model_with(
         // *slower* than the old per-query GEMVs spread across the indexer's worker
         // threads (measured: 46s -> 81s). On the GPU the batched form is the fast one.
         for t in [&mut l.ix_wk, &mut l.ix_wq, &mut l.ix_wp] {
+            if let Some(t) = t {
+                t.gpu_eligible = true;
+            }
+        }
+        // MiniMax-M3 GQA attention projections (Option; absent on the GLM path). These
+        // are the resident q/k/v projections and the block-sparse indexer projections —
+        // dense int8 weights that route through `matmul_qt`. WITHOUT this they fall to
+        // the single-threaded CPU path: the COLI_PROFILE breakdown measured the q/k/v
+        // projections at 197 s of a 236 s / 512-tok prefill (84%!) — dwarfing both the
+        // attention core (5.6 s) and expert I/O (31 s). `l.o` (o_proj) is already marked
+        // above via the GLM list, which is why it was fast; these were simply omitted.
+        for t in [&mut l.qkv_proj, &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.idx_q_proj, &mut l.idx_k_proj] {
             if let Some(t) = t {
                 t.gpu_eligible = true;
             }

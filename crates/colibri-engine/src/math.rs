@@ -99,6 +99,26 @@ pub fn rope_interleave(v: &mut [f32], pos: usize, qk_rope: usize, theta: f32) {
     }
 }
 
+/// NeoX "rotate-half" partial RoPE on a `dim`-length vector at position `pos`
+/// (the HF `rotate_half` convention used by MiniMax-M3, GPT-NeoX, Llama, etc.).
+///
+/// Pairs dimension `j` with `j + dim/2` (contiguous halves), NOT the interleaved
+/// `(2j, 2j+1)` pairs of [`rope_interleave`]. `q_embed[j] = q[j]·cos − q[half+j]·sin`,
+/// `q_embed[half+j] = q[half+j]·cos + q[j]·sin`, with `freq_j = theta^(-2j/dim)`.
+pub fn rope_neox(v: &mut [f32], pos: usize, dim: usize, theta: f32) {
+    let half = dim / 2;
+    debug_assert!(v.len() >= dim);
+    for j in 0..half {
+        let inv = theta.powf(-2.0 * j as f32 / dim as f32);
+        let ang = pos as f32 * inv;
+        let (sn, cs) = ang.sin_cos();
+        let a = v[j];
+        let b = v[half + j];
+        v[j] = a * cs - b * sn;
+        v[half + j] = b * cs + a * sn;
+    }
+}
+
 /// Sigmoid. Port of `sigmoidf`.
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {
@@ -109,6 +129,22 @@ pub fn sigmoid(x: f32) -> f32 {
 #[inline]
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// Clamped OpenAI-SwiGLU (`swigluoai`, MiniMax-M3 / gpt-oss). Combines the gate
+/// and up projections of one element:
+///   `gate` is clamped to `max = limit`; `up` is clamped to `[-limit, limit]`;
+///   the gated term is `gate · sigmoid(alpha · gate)` (SiLU with an `alpha`
+///   pre-scale), and the result is `(up + 1) · gated`.
+/// Reduces to standard SwiGLU as `alpha → 1`, `limit → ∞`, minus the `up + 1`
+/// shift. NOTE: verify the exact formulation against the reference at end-to-end
+/// validation (task #56) before trusting generations.
+#[inline]
+pub fn swiglu_oai(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
+    let g = gate.min(limit); // clamp upper only
+    let u = up.clamp(-limit, limit);
+    let gated = g / (1.0 + (-alpha * g).exp()); // g * sigmoid(alpha * g)
+    gated * (u + 1.0)
 }
 
 #[cfg(test)]
@@ -165,5 +201,26 @@ mod tests {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
         assert!((silu(0.0)).abs() < 1e-6);
         assert!((silu(1.0) - 1.0 * sigmoid(1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn swiglu_oai_shape() {
+        let (alpha, limit) = (1.702f32, 7.0f32);
+        // At gate=0: gated term is 0, so the whole product is 0 regardless of up.
+        assert!(swiglu_oai(0.0, 3.0, alpha, limit).abs() < 1e-6);
+        // Unclamped mid-range matches the definition exactly.
+        let g = 1.5f32;
+        let u = 2.0f32;
+        let expect = (g / (1.0 + (-alpha * g).exp())) * (u + 1.0);
+        assert!((swiglu_oai(g, u, alpha, limit) - expect).abs() < 1e-6);
+        // Clamping: gate clamps at max=limit, up clamps to [-limit, limit].
+        let big = swiglu_oai(100.0, 100.0, alpha, limit);
+        let clamped = (limit / (1.0 + (-alpha * limit).exp())) * (limit + 1.0);
+        assert!((big - clamped).abs() < 1e-4, "got {big}, want {clamped}");
+        // up clamps on the negative side too.
+        let neg = swiglu_oai(2.0, -50.0, alpha, limit);
+        let g2 = 2.0f32;
+        let expect_neg = (g2 / (1.0 + (-alpha * g2).exp())) * (-limit + 1.0);
+        assert!((neg - expect_neg).abs() < 1e-5);
     }
 }

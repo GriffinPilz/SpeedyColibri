@@ -1,0 +1,41 @@
+# Model registry — the single source of truth for the convert/build/bench harness.
+#
+# Adding a model is three edits:
+#   1. crates/colibri-core/src/config.rs  — a new `Arch` variant + config.json detection
+#   2. crates/colibri-engine/src/convert.rs — the per-arch tensor mapping
+#   3. this file                            — one [<name>] block
+# After that, `scripts/pipeline.sh <name>` (convert -> build -> bench) just works,
+# and every measurement script takes <name> instead of a hardcoded path.
+#
+# Paths are joined under `models_root` unless they start with "/". Override the root
+# per host with the COLI_MODELS_ROOT env var (so the same registry works on any box).
+# `prompt` is the canonical benchmark prompt as token ids: either an inclusive range
+# "A..B" (expands to seq A..B) or an explicit space-separated list. `[<name>.convert_env]`
+# holds the COLI_* flags `coli convert` needs for that model (empty = defaults).
+
+models_root = "/home/dgx1/models"
+
+# ---------------------------------------------------------------------------
+[minimax-m3]
+container = "MiniMax-M3-container"
+source    = "MiniMax-M3-NVFP4-src"
+arch      = "minimax-m3"
+prompt    = "100..611"   # 512-token canonical prefill/decode/batch prompt
+notes     = "GQA (64Q/4KV, head_dim 128, partial rope 64), 128 experts top-4, sigmoid+bias router, NVFP4 routed experts. Live on 42b2."
+
+[minimax-m3.convert_env]
+# NVFP4 experts + int8 resident are the convert defaults — nothing to override.
+
+# ---------------------------------------------------------------------------
+# NOTE: the name is quoted — TOML reads an unquoted dot as table nesting, so
+# [glm-5.2] would parse as glm-5 → 2. Quote any model name containing a dot.
+["glm-5.2"]
+container = "GLM-5.2-container"
+source    = "GLM-5.2-NVFP4-src"
+arch      = "glm-moe-dsa"
+prompt    = "100..611"
+hf_repo   = "Kanposer/GLM-5.2-speedy-colibri-nvfp4"   # complete NVFP4 container (56 files, incl. MTP head) — pull here to re-materialize
+notes     = "MLA + DSA lightning indexer, 256 experts top-8, NVFP4 routed. NOT resident on 42b2 right now (disk); container is on HF (hf_repo) — `huggingface-cli download <hf_repo> --local-dir <container>` to restore."
+
+["glm-5.2".convert_env]
+COLI_KEEP_INDEXER = "1"   # keep the DSA indexer weights so the container can run sparse attention

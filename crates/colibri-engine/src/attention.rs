@@ -22,7 +22,7 @@
 //! a no-op for context ≤ `index_topk` and a strict speedup above it.
 
 use crate::linear::{matmul_qt, qt_addrow, qt_matvec_rows};
-use crate::math::{rmsnorm_inplace, rope_interleave, softmax};
+use crate::math::{rmsnorm_inplace, rope_interleave, rope_neox, softmax};
 use crate::model::{KvCache, Layer};
 use colibri_cluster::{AttnRequest, ExpertSharding, NodeId, Transport};
 use colibri_core::Config;
@@ -93,6 +93,279 @@ pub fn attention(
     out: &mut [f32],
 ) {
     attention_with(cfg, l, layer, kv, x, s_len, pos_base, out, AttnCore::Reconstruct, None);
+}
+
+/// `COLI_M3_SPARSE=1` enables the MiniMax-M3 block-sparse Lightning Indexer (off by
+/// default → dense GQA, which is what llama.cpp ships too). Prefill-only.
+fn m3_sparse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_M3_SPARSE").ok().as_deref() == Some("1"))
+}
+
+/// Which GPU GQA prefill kernel to use: 1 = WMMA flash `tc_gqa_attn` (fp16 tensor
+/// cores, the default — ~8× the scalar core at long context and token-identical on
+/// validation, max|Δ| vs f32 ~1e-5), 0 = scalar `gqa_attn_kernel` (f32, bit-exact
+/// reference). `COLI_GQA_KERNEL=naive|scalar|0` forces the reference kernel; anything
+/// else (or unset) uses flash. Read once.
+#[cfg(feature = "cuda")]
+fn gqa_kernel_mode() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("COLI_GQA_KERNEL").ok().as_deref() {
+        Some("naive") | Some("scalar") | Some("0") => 0,
+        _ => 1,
+    })
+}
+
+/// The `keep` highest-scoring block ids, returned sorted ascending (the key set is
+/// then read in position order). Ties resolve by lower block id.
+fn topk_blocks(scores: &[f32], keep: usize) -> Vec<u32> {
+    let n = scores.len();
+    let keep = keep.min(n);
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+    });
+    let mut sel: Vec<u32> = idx[..keep].iter().map(|&i| i as u32).collect();
+    sel.sort_unstable();
+    sel
+}
+
+/// MiniMax-M3 Lightning Indexer block selection for a sparse attention layer. Returns,
+/// per (index head `g`, query `s`) at flat index `g * s_len + s`, the sorted key-block
+/// ids to attend: the top `index_topk_blocks` by max-pooled index score, plus the local
+/// (query-containing) block. Port of `MiniMaxM3VLIndexer`. `None` when the layer is
+/// dense, the indexer is off, weights are absent, or the causal context fits inside the
+/// top-k budget (every block kept = dense — nothing to gain). Prefill only.
+fn m3_block_select(
+    cfg: &Config,
+    l: &Layer,
+    x: &[f32],
+    s_len: usize,
+    pos_base: usize,
+) -> Option<Vec<Vec<u32>>> {
+    if !m3_sparse_enabled() || pos_base != 0 || s_len <= 1 {
+        return None;
+    }
+    let q_proj = l.idx_q_proj.as_ref()?;
+    let k_proj = l.idx_k_proj.as_ref()?;
+    let inh = cfg.index_nh as usize; // index heads (== n_kv_heads)
+    let ihd = cfg.index_hd as usize; // index head dim
+    let bs = (cfg.index_block_size as usize).max(1);
+    let topk = cfg.index_topk_blocks as usize;
+    let local = cfg.index_local_blocks as usize;
+    let rot = (cfg.qk_rope as usize).min(ihd); // same NeoX first-`rotary_dim` rope
+    if s_len.div_ceil(bs) <= topk {
+        return None; // context ≤ top-k budget → selects every block = dense
+    }
+
+    // idx_q [s, inh, ihd], idx_k [s, ihd] (MQA); per-head gemma RMSNorm + partial RoPE.
+    let mut iq = vec![0f32; s_len * inh * ihd];
+    let mut ik = vec![0f32; s_len * ihd];
+    matmul_qt(&mut iq, x, q_proj, s_len);
+    matmul_qt(&mut ik, x, k_proj, s_len);
+    for s in 0..s_len {
+        let pos = pos_base + s;
+        for g in 0..inh {
+            let q = &mut iq[s * inh * ihd + g * ihd..s * inh * ihd + g * ihd + ihd];
+            rmsnorm_inplace(q, &l.idx_q_norm, cfg.eps);
+            rope_neox(&mut q[..rot], pos, rot, cfg.theta);
+        }
+        let k = &mut ik[s * ihd..(s + 1) * ihd];
+        rmsnorm_inplace(k, &l.idx_k_norm, cfg.eps);
+        rope_neox(&mut k[..rot], pos, rot, cfg.theta);
+    }
+
+    // Per (index head, query): max-pool causal key scores into blocks, force the local
+    // block, take the top-k blocks.
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); inh * s_len];
+    for g in 0..inh {
+        for s in 0..s_len {
+            let pos = pos_base + s;
+            let tk = pos + 1; // causal keys [0, pos]
+            let nb = tk.div_ceil(bs);
+            let qv = &iq[s * inh * ihd + g * ihd..s * inh * ihd + g * ihd + ihd];
+            let mut bscore = vec![f32::NEG_INFINITY; nb];
+            for t in 0..tk {
+                let kvec = &ik[t * ihd..(t + 1) * ihd];
+                let dot: f32 = qv.iter().zip(kvec).map(|(&a, &b)| a * b).sum();
+                let b = t / bs;
+                if dot > bscore[b] {
+                    bscore[b] = dot;
+                }
+            }
+            // local blocks (the query's own block and the `local-1` before it) always kept
+            let q_block = pos / bs;
+            for lb in 0..local {
+                bscore[q_block.saturating_sub(lb)] = f32::INFINITY;
+            }
+            out[g * s_len + s] = topk_blocks(&bscore, topk);
+        }
+    }
+    Some(out)
+}
+
+/// Grouped-query attention (MiniMax-M3, `arch == MinimaxM3`) over `S` new tokens
+/// `x[S, hidden]` starting at `pos_base`, writing `out[S, hidden]`. CPU reference:
+/// projects q/k/v, applies per-head QK-norm and partial RoPE, appends the full K/V
+/// to the cache, then runs causal scaled-dot-product attention with `n_heads` query
+/// heads sharing `n_kv_heads` key/value heads (`group = n_heads / n_kv_heads`).
+///
+/// Head geometry reuses the Config fields: `qk_head` is the head dim, `qk_rope` the
+/// rotary sub-dim (RoPE rotates only the first `qk_rope` of each head). NOTE: the
+/// RoPE layout (interleaved here) and the exact QK-norm/RoPE order are to be
+/// confirmed against the reference at end-to-end validation (task #56).
+pub fn attention_gqa(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    kv: &mut KvCache,
+    x: &[f32],
+    s_len: usize,
+    pos_base: usize,
+    out: &mut [f32],
+) {
+    let h = cfg.n_heads as usize;
+    let kvh = cfg.n_kv_heads as usize;
+    let hd = cfg.qk_head as usize; // head_dim
+    let rot = cfg.qk_rope as usize; // rotary sub-dim
+    let group = (h / kvh).max(1); // query heads per kv head
+    let kv_dim = kvh * hd;
+    let eps = cfg.eps;
+    let theta = cfg.theta;
+    let scale = cfg.attn_scale;
+    // ---- 1) project q, k, v (batched over all S rows) ----------------------
+    // Production uses the fused `qkv_proj` (q/k/v concatenated row-wise at load time) so
+    // this is ONE matmul per layer instead of three — at S=1 decode each projection was a
+    // separate synchronized GPU dispatch (~25% of decode across q/k/v/o × 60 layers). The
+    // separate-proj path is the fallback for unit tests that build q/k/v_proj directly.
+    let _tp = std::time::Instant::now();
+    let mut q = vec![0f32; s_len * h * hd];
+    let mut k = vec![0f32; s_len * kv_dim];
+    let mut v = vec![0f32; s_len * kv_dim];
+    if let Some(qkv) = l.qkv_proj.as_ref() {
+        let qsz = h * hd;
+        let width = qsz + 2 * kv_dim;
+        let mut qkv_out = vec![0f32; s_len * width];
+        matmul_qt(&mut qkv_out, x, qkv, s_len);
+        for s in 0..s_len {
+            let b = s * width;
+            q[s * qsz..(s + 1) * qsz].copy_from_slice(&qkv_out[b..b + qsz]);
+            k[s * kv_dim..(s + 1) * kv_dim].copy_from_slice(&qkv_out[b + qsz..b + qsz + kv_dim]);
+            v[s * kv_dim..(s + 1) * kv_dim].copy_from_slice(&qkv_out[b + qsz + kv_dim..b + width]);
+        }
+    } else {
+        let q_proj = l.q_proj.as_ref().expect("GQA layer missing qkv_proj and q_proj");
+        let k_proj = l.k_proj.as_ref().expect("GQA layer missing k_proj");
+        let v_proj = l.v_proj.as_ref().expect("GQA layer missing v_proj");
+        matmul_qt(&mut q, x, q_proj, s_len);
+        matmul_qt(&mut k, x, k_proj, s_len);
+        matmul_qt(&mut v, x, v_proj, s_len);
+    }
+    atime(&crate::forward::ATTN_PROJ_US, _tp);
+
+    // ---- 2) per-head QK-norm + partial RoPE; append K/V to the cache -------
+    let _tr = std::time::Instant::now();
+    for s in 0..s_len {
+        let pos = pos_base + s;
+        for hh in 0..h {
+            let qs = &mut q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
+            rmsnorm_inplace(qs, &l.q_norm, eps);
+            rope_neox(&mut qs[..rot], pos, rot, theta);
+        }
+        for hh in 0..kvh {
+            let ks = &mut k[s * kv_dim + hh * hd..s * kv_dim + hh * hd + hd];
+            rmsnorm_inplace(ks, &l.k_norm, eps);
+            rope_neox(&mut ks[..rot], pos, rot, theta);
+        }
+        kv.k_full_row_mut(layer, pos)
+            .copy_from_slice(&k[s * kv_dim..(s + 1) * kv_dim]);
+        kv.v_full_row_mut(layer, pos)
+            .copy_from_slice(&v[s * kv_dim..(s + 1) * kv_dim]);
+    }
+    atime(&crate::forward::ATTN_ROPE_US, _tr);
+
+    // ---- 3) causal GQA attention core -------------------------------------
+    // Block-sparse Lightning Indexer selection (MiniMax-M3, COLI_M3_SPARSE); None → dense.
+    let block_sel = m3_block_select(cfg, l, x, s_len, pos_base);
+    let bsize = (cfg.index_block_size as usize).max(1);
+
+    let _tc = std::time::Instant::now();
+    let st0 = kv.kv_start[layer];
+    let mut ctx = vec![0f32; s_len * h * hd];
+
+    // GPU dense prefill core (MiniMax-M3): fresh-cache single-shot prefill only. The
+    // block-sparse path and decode (S=1) stay on the CPU core below.
+    let mut gpu_done = false;
+    #[cfg(feature = "cuda")]
+    if block_sel.is_none() && s_len > 1 && st0 == 0 {
+        let t_full = pos_base + s_len;
+        gpu_done = crate::gpu::try_gqa_attn(
+            &mut ctx,
+            &q,
+            kv.k_full_rows(layer, st0, t_full),
+            kv.v_full_rows(layer, st0, t_full),
+            s_len,
+            h,
+            kvh,
+            hd,
+            t_full,
+            scale,
+            gqa_kernel_mode(),
+        );
+    }
+
+    // CPU core (dense or block-sparse), used unless the GPU handled it above.
+    if !gpu_done {
+        // Buffers reused across every (query, head) to avoid per-head allocation.
+        let mut scores: Vec<f32> = Vec::new();
+        let mut skeys: Vec<usize> = Vec::new();
+        for s in 0..s_len {
+        let pos = pos_base + s;
+        let tk = pos + 1; // attend to cached positions [st0, pos]
+        let krows = kv.k_full_rows(layer, st0, tk);
+        let vrows = kv.v_full_rows(layer, st0, tk);
+        for hh in 0..h {
+            let kvhh = hh / group;
+            let qvec = &q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
+            // Key set: dense = the contiguous causal range [st0, tk); block-sparse =
+            // the keys in this query/GQA-group's indexer-selected blocks (gathered once).
+            let sparse = block_sel.is_some();
+            if sparse {
+                skeys.clear();
+                for &b in &block_sel.as_ref().unwrap()[kvhh * s_len + s] {
+                    let lo = ((b as usize) * bsize).max(st0);
+                    let hi = ((b as usize + 1) * bsize).min(tk);
+                    skeys.extend(lo..hi);
+                }
+            }
+            let nk = if sparse { skeys.len() } else { tk - st0 };
+            let key = |i: usize| if sparse { skeys[i] } else { st0 + i };
+            scores.clear();
+            scores.resize(nk, 0.0);
+            for (i, sc) in scores.iter_mut().enumerate() {
+                let base = (key(i) - st0) * kv_dim + kvhh * hd;
+                let krow = &krows[base..base + hd];
+                *sc = qvec.iter().zip(krow).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+            }
+            softmax(&mut scores);
+            let cvec = &mut ctx[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
+            for i in 0..nk {
+                let base = (key(i) - st0) * kv_dim + kvhh * hd;
+                let vrow = &vrows[base..base + hd];
+                let sc = scores[i];
+                for (c, &vv) in cvec.iter_mut().zip(vrow) {
+                    *c += sc * vv;
+                }
+            }
+        }
+        }
+    }
+    atime(&crate::forward::ATTN_CORE_US, _tc);
+
+    // ---- 4) output projection: ctx[S, n_heads*head_dim] -> out[S, hidden] --
+    let _to = std::time::Instant::now();
+    matmul_qt(out, &ctx, &l.o, s_len);
+    atime(&crate::forward::ATTN_OPROJ_US, _to);
 }
 
 /// As [`attention`], but selecting the core explicitly and optionally restricting each
@@ -767,6 +1040,117 @@ mod tests {
         l
     }
 
+    fn gqa_cfg() -> Config {
+        let json = colibri_json::Json::parse(
+            r#"{"model_type":"minimax_m3_vl","text_config":{
+                "hidden_size":8,"intermediate_size":6,"num_hidden_layers":1,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+                "vocab_size":16,"max_position_embeddings":128,"rms_norm_eps":1e-6,
+                "use_gemma_norm":true,"rope_theta":10000.0,"rotary_dim":2,
+                "hidden_act":"swigluoai","use_qk_norm":true,"dense_intermediate_size":8,
+                "shared_intermediate_size":6,"num_local_experts":4,"num_experts_per_tok":2,
+                "n_shared_experts":1,"scoring_func":"sigmoid","use_routing_bias":true,
+                "moe_layer_freq":[1],"swiglu_alpha":1.702,"swiglu_limit":7.0,
+                "routed_scaling_factor":2.0,"eos_token_id":[15]}}"#,
+        )
+        .unwrap();
+        Config::from_json(&json).unwrap()
+    }
+
+    fn make_gqa_layer(c: &Config) -> Layer {
+        let h = c.n_heads as usize;
+        let kvh = c.n_kv_heads as usize;
+        let hd = c.qk_head as usize;
+        let d = c.hidden as usize;
+        let mut l = Layer::default();
+        l.q_proj = Some(weights(h * hd, d, 1));
+        l.k_proj = Some(weights(kvh * hd, d, 2));
+        l.v_proj = Some(weights(kvh * hd, d, 3));
+        l.o = weights(d, h * hd, 4);
+        l.q_norm = vec![1.0; hd];
+        l.k_norm = vec![1.0; hd];
+        l
+    }
+
+    #[test]
+    fn topk_blocks_picks_highest_sorted() {
+        let scores = [1.0f32, 5.0, 3.0, f32::INFINITY, 2.0];
+        // top-3 = {inf@3, 5@1, 3@2}, returned sorted ascending.
+        assert_eq!(topk_blocks(&scores, 3), vec![1, 2, 3]);
+        assert_eq!(topk_blocks(&scores, 1), vec![3]); // the local (+inf) block
+        assert_eq!(topk_blocks(&scores, 10).len(), 5); // keep clamps to n
+        // ties resolve to the lower block id.
+        assert_eq!(topk_blocks(&[2.0f32, 2.0, 1.0], 1), vec![0]);
+    }
+
+    #[test]
+    fn gqa_attention_is_causal() {
+        let c = gqa_cfg();
+        let l = make_gqa_layer(&c);
+        let d = c.hidden as usize;
+        let mk_kv = || {
+            let mut kv = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 8);
+            kv.enable_gqa(c.n_kv_heads as usize * c.qk_head as usize);
+            kv
+        };
+        // Two-token prefill.
+        let x2 = vecf(2 * d, 7);
+        let mut kv2 = mk_kv();
+        let mut out2 = vec![0f32; 2 * d];
+        attention_gqa(&c, &l, 0, &mut kv2, &x2, 2, 0, &mut out2);
+        // One-token prefill of just the first token, fresh cache.
+        let mut kv1 = mk_kv();
+        let mut out1 = vec![0f32; d];
+        attention_gqa(&c, &l, 0, &mut kv1, &x2[..d], 1, 0, &mut out1);
+        // Causality: position 0's output must not depend on position 1's presence.
+        for j in 0..d {
+            assert!(
+                (out2[j] - out1[j]).abs() < 1e-5,
+                "row0 differs at {j}: {} vs {}",
+                out2[j],
+                out1[j]
+            );
+        }
+        assert!(out2.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn gqa_fused_qkv_matches_separate() {
+        // The fused qkv_proj path (production) must produce the SAME attention output as
+        // three separate q/k/v matmuls (the test/reference path) — same weights, just one
+        // matmul + a slice instead of three.
+        let c = gqa_cfg();
+        let d = c.hidden as usize;
+        let x = vecf(3 * d, 7);
+        let mk_kv = || {
+            let mut kv = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 8);
+            kv.enable_gqa(c.n_kv_heads as usize * c.qk_head as usize);
+            kv
+        };
+        // separate q/k/v
+        let l_sep = make_gqa_layer(&c);
+        let mut kv1 = mk_kv();
+        let mut o_sep = vec![0f32; 3 * d];
+        attention_gqa(&c, &l_sep, 0, &mut kv1, &x, 3, 0, &mut o_sep);
+        // fused: concat the same q/k/v into qkv_proj, drop the separates
+        let mut l_fused = make_gqa_layer(&c);
+        l_fused.qkv_proj = Some(crate::loader::concat_rows(&[
+            l_fused.q_proj.as_ref().unwrap(),
+            l_fused.k_proj.as_ref().unwrap(),
+            l_fused.v_proj.as_ref().unwrap(),
+        ]));
+        l_fused.q_proj = None;
+        l_fused.k_proj = None;
+        l_fused.v_proj = None;
+        let mut kv2 = mk_kv();
+        let mut o_fused = vec![0f32; 3 * d];
+        attention_gqa(&c, &l_fused, 0, &mut kv2, &x, 3, 0, &mut o_fused);
+        for (a, b) in o_sep.iter().zip(&o_fused) {
+            assert!((a - b).abs() < 1e-5, "fused {b} != separate {a}");
+        }
+        assert!(o_sep.iter().any(|v| v.abs() > 1e-6));
+    }
+
     // GPU vs CPU MLA absorb core at GLM dims (H=64, kv_lora=512) over a 2048-token
     // context. `cargo test -p colibri-engine --features cuda --release -- --ignored
     // --nocapture bench_attention`
@@ -958,6 +1342,102 @@ mod tests {
             gpu_host / gpu_dev,
             cpu / gpu_dev,
         );
+    }
+
+    // Isolated GQA attention microbench at real MiniMax-M3 dims (H=64, Hkv=4, D=128),
+    // single-shot prefill (S == T). A/Bs the two GPU kernels (mode 0 scalar, mode 1
+    // WMMA flash) against a CPU reference, reporting per-call ms, max|Δ| vs CPU, and
+    // the kernel time SAVED (Δ ms) — the transfer cost is identical in both modes and
+    // cancels in the difference, so `naive_ms - flash_ms` is the true kernel speedup,
+    // isolated from the cold expert I/O that dominates a real `coli gen` prefill.
+    // Run: `cargo test -p colibri-engine --features cuda --release -- --ignored
+    // bench_gqa_attention_gpu --nocapture` (COLI_BENCH_T=512,2048,4096 COLI_BENCH_ITERS=50).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_gqa_attention_gpu() {
+        if !crate::gpu::available() {
+            eprintln!("skip: no CUDA device");
+            return;
+        }
+        let (h, hkv, d) = (64usize, 4usize, 128usize); // MiniMax-M3 attention geometry
+        let group = h / hkv;
+        let scale = 1.0 / (d as f32).sqrt();
+        let ts: Vec<usize> = std::env::var("COLI_BENCH_T")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![512, 1024, 2048, 4096]);
+        let iters: u64 =
+            std::env::var("COLI_BENCH_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+
+        for &t in &ts {
+            let s = t; // single-shot prefill: every position is new, context == S
+            let q: Vec<f32> = (0..s * h * d).map(|k| (((k * 7) % 13) as f32 - 6.0) * 0.02).collect();
+            let kk: Vec<f32> = (0..t * hkv * d).map(|k| (((k * 5) % 11) as f32 - 5.0) * 0.02).collect();
+            let vv: Vec<f32> = (0..t * hkv * d).map(|k| (((k * 3) % 7) as f32 - 3.0) * 0.02).collect();
+
+            // CPU reference: causal grouped-query attention core.
+            let mut cref = vec![0f32; s * h * d];
+            for si in 0..s {
+                let nt = si + 1; // causal keys [0, si]
+                for hh in 0..h {
+                    let kvh = hh / group;
+                    let qv = &q[(si * h + hh) * d..(si * h + hh) * d + d];
+                    let mut sceff = vec![0f32; nt];
+                    for (tt, sc) in sceff.iter_mut().enumerate() {
+                        let kr = &kk[(tt * hkv + kvh) * d..(tt * hkv + kvh) * d + d];
+                        *sc = qv.iter().zip(kr).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                    }
+                    let mx = sceff.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut den = 0f32;
+                    for x in sceff.iter_mut() {
+                        *x = (*x - mx).exp();
+                        den += *x;
+                    }
+                    let c = &mut cref[(si * h + hh) * d..(si * h + hh) * d + d];
+                    for (tt, &sc) in sceff.iter().enumerate() {
+                        let vr = &vv[(tt * hkv + kvh) * d..(tt * hkv + kvh) * d + d];
+                        let w = sc / den;
+                        for (o, &x) in c.iter_mut().zip(vr) {
+                            *o += w * x;
+                        }
+                    }
+                }
+            }
+
+            let mut c0 = vec![0f32; s * h * d];
+            let mut c1 = vec![0f32; s * h * d];
+            // Correctness + warm-up for both kernels.
+            let ok0 = crate::gpu::try_gqa_attn(&mut c0, &q, &kk, &vv, s, h, hkv, d, t, scale, 0);
+            let ok1 = crate::gpu::try_gqa_attn(&mut c1, &q, &kk, &vv, s, h, hkv, d, t, scale, 1);
+            assert!(ok0, "scalar GQA kernel must run when a device is present");
+            let e0 = c0.iter().zip(&cref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let e1 = if ok1 {
+                c1.iter().zip(&cref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+            } else {
+                f32::NAN
+            };
+
+            let tm = std::time::Instant::now();
+            for _ in 0..iters {
+                crate::gpu::try_gqa_attn(&mut c0, &q, &kk, &vv, s, h, hkv, d, t, scale, 0);
+            }
+            let naive = tm.elapsed().as_secs_f64() / iters as f64 * 1e3;
+            let flash = if ok1 {
+                let tm = std::time::Instant::now();
+                for _ in 0..iters {
+                    crate::gpu::try_gqa_attn(&mut c1, &q, &kk, &vv, s, h, hkv, d, t, scale, 1);
+                }
+                tm.elapsed().as_secs_f64() / iters as f64 * 1e3
+            } else {
+                f32::NAN as f64
+            };
+            eprintln!(
+                "GQA T={t} S={s} H={h} Hkv={hkv} D={d} x{iters}: scalar {naive:.3} ms (err {e0:.1e}) | flash {flash:.3} ms (err {e1:.1e}) | kernel saved {:.3} ms ({:.2}x)",
+                naive - flash,
+                naive / flash,
+            );
+        }
     }
 
     #[test]

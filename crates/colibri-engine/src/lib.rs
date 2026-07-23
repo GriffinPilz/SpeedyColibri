@@ -394,6 +394,18 @@ pub fn load_model_with(
                 t.gpu_eligible = true;
             }
         }
+        // MiniMax-M3 GQA attention projections (Option; absent on the GLM path). These
+        // are the resident q/k/v projections and the block-sparse indexer projections —
+        // dense int8 weights that route through `matmul_qt`. WITHOUT this they fall to
+        // the single-threaded CPU path: the COLI_PROFILE breakdown measured the q/k/v
+        // projections at 197 s of a 236 s / 512-tok prefill (84%!) — dwarfing both the
+        // attention core (5.6 s) and expert I/O (31 s). `l.o` (o_proj) is already marked
+        // above via the GLM list, which is why it was fast; these were simply omitted.
+        for t in [&mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.idx_q_proj, &mut l.idx_k_proj] {
+            if let Some(t) = t {
+                t.gpu_eligible = true;
+            }
+        }
     }
     Ok(model)
 }

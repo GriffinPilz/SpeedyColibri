@@ -27,6 +27,10 @@ pub enum Arch {
     /// MiniMax-M3: grouped-query attention (partial RoPE, per-head QK-norm),
     /// Gemma-style RMSNorm, clamped OpenAI-SwiGLU, sigmoid+bias top-k router.
     MinimaxM3,
+    /// MiniMax-M2: same GQA family as M3 but a flat (non-VL) config — plain SwiGLU
+    /// (silu), standard RMSNorm, no shared expert, all-MoE, per-layer QK-norm,
+    /// sigmoid+bias top-k router. Shares the M3 GQA forward path (dims differ).
+    MinimaxM2,
 }
 
 /// GLM-5.2 / MiniMax-M3 hyperparameters.
@@ -181,10 +185,23 @@ impl Config {
     /// `text_config` and advertises `model_type == "minimax_m3_vl"`; everything
     /// else is treated as GLM-5.2.
     pub fn from_json(r: &Json) -> Result<Config, ConfigError> {
-        let is_minimax = r.get("model_type").and_then(Json::as_str) == Some("minimax_m3_vl")
-            || r.get("text_config").is_some();
-        if is_minimax {
-            Config::from_json_minimax(r)
+        let model_type = r.get("model_type").and_then(Json::as_str);
+        let arch_is = |name: &str| {
+            r.get("architectures")
+                .and_then(Json::as_array)
+                .map(|a| a.iter().any(|v| v.as_str() == Some(name)))
+                .unwrap_or(false)
+        };
+        // MiniMax-M2: flat config (hyperparameters at the root, no vision tower),
+        // same GQA family as M3. Parse from the root object.
+        if model_type == Some("minimax_m2") || arch_is("MiniMaxM2ForCausalLM") {
+            return Config::from_json_minimax(r, r, Arch::MinimaxM2);
+        }
+        // MiniMax-M3 VL: hyperparameters nested under `text_config`.
+        let is_m3 = model_type == Some("minimax_m3_vl") || r.get("text_config").is_some();
+        if is_m3 {
+            let t = r.get("text_config").unwrap_or(r);
+            Config::from_json_minimax(r, t, Arch::MinimaxM3)
         } else {
             Config::from_json_glm(r)
         }
@@ -296,14 +313,12 @@ impl Config {
         Ok(c)
     }
 
-    /// MiniMax-M3 (`minimax_m3_vl`) parse. Hyperparameters live under
-    /// `text_config`; the vision tower is ignored (text-only inference). The GQA
-    /// head geometry is folded onto `qk_nope`/`qk_rope`/`v_head`: `qk_rope` is the
-    /// rotary sub-dimension (`rotary_dim`) and `qk_nope = head_dim − rotary_dim`.
-    fn from_json_minimax(r: &Json) -> Result<Config, ConfigError> {
-        let t = r
-            .get("text_config")
-            .ok_or_else(|| ConfigError::Parse("minimax_m3: missing text_config".into()))?;
+    /// MiniMax GQA parse, shared by M3 and M2. `t` holds the hyperparameters —
+    /// `text_config` for the M3 VL config, the root for the flat M2 config — and `r`
+    /// is the root (stop-id fallback). `arch` selects the variant. The GQA head
+    /// geometry is folded onto `qk_nope`/`qk_rope`/`v_head`: `qk_rope` is the rotary
+    /// sub-dimension (`rotary_dim`), `qk_nope = head_dim − rotary_dim`.
+    fn from_json_minimax(r: &Json, t: &Json, arch: Arch) -> Result<Config, ConfigError> {
         let gt = |k: &str| gi_in(t, k);
 
         let head_dim = gt("head_dim");
@@ -385,7 +400,7 @@ impl Config {
                 .get("routed_scaling_factor")
                 .and_then(Json::as_f64)
                 .unwrap_or(1.0) as f32,
-            arch: Arch::MinimaxM3,
+            arch,
             n_kv_heads: gt("num_key_value_heads"),
             shared_inter: gt("shared_intermediate_size"),
             qk_norm: t.get("use_qk_norm").and_then(Json::as_bool).unwrap_or(false),
@@ -419,7 +434,13 @@ impl Config {
         ckr!("n_routed_experts", self.n_experts, 1, 4096);
         ckr!("num_experts_per_tok", self.topk, 1, 64);
         ckr!("moe_intermediate_size", self.moe_inter, 1, 1 << 20);
-        ckr!("intermediate_size", self.dense_inter, 1, 1 << 24);
+        // The dense FFN width is only used by leading dense layers; an all-MoE model
+        // (e.g. MiniMax-M2, first_dense == 0) legitimately omits it → 0.
+        if self.first_dense > 0 {
+            ckr!("intermediate_size", self.dense_inter, 1, 1 << 24);
+        } else {
+            ckr!("intermediate_size", self.dense_inter, 0, 1 << 24);
+        }
         ckr!("first_k_dense_replace", self.first_dense, 0, self.n_layers);
         ckr!("v_head_dim", self.v_head, 1, 1 << 16);
         ckr!("n_shared_experts", self.n_shared, 0, 64);
@@ -561,6 +582,74 @@ mod tests {
         assert!((c.theta - 5_000_000.0).abs() < 1.0);
         assert_eq!(c.stop_ids, vec![200020]);
         assert_eq!(c.idx_type.len(), 60);
+    }
+
+    // A minimal MiniMax-M2-shaped config (flat, values from nvidia/MiniMax-M2.7-NVFP4).
+    // Note: no `text_config` nesting, `hidden_act` silu, no gemma-norm, no shared
+    // expert, no dense layers, no sparse-attention config, scalar eos.
+    fn minimax_m2_json() -> Json {
+        let text = r#"{
+            "model_type": "minimax_m2",
+            "architectures": ["MiniMaxM2ForCausalLM"],
+            "hidden_size": 3072,
+            "intermediate_size": 1536,
+            "num_hidden_layers": 62,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 200064,
+            "max_position_embeddings": 196608,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 5000000,
+            "rotary_dim": 64,
+            "partial_rotary_factor": 0.5,
+            "hidden_act": "silu",
+            "use_qk_norm": true,
+            "qk_norm_type": "per_layer",
+            "num_local_experts": 256,
+            "num_experts_per_tok": 8,
+            "shared_intermediate_size": 0,
+            "scoring_func": "sigmoid",
+            "use_routing_bias": true,
+            "eos_token_id": 2
+        }"#;
+        Json::parse(text).unwrap()
+    }
+
+    #[test]
+    fn loads_minimax_m2_shape() {
+        let c = Config::from_json(&minimax_m2_json()).unwrap();
+        assert_eq!(c.arch, Arch::MinimaxM2);
+        assert_eq!(c.hidden, 3072);
+        assert_eq!(c.n_layers, 62);
+        assert_eq!(c.n_heads, 48);
+        assert_eq!(c.n_kv_heads, 8);
+        // GQA head geometry: head_dim 128, rotary 64 → nope 64.
+        assert_eq!(c.qk_head, 128);
+        assert_eq!(c.qk_rope, 64);
+        assert_eq!(c.qk_nope, 64);
+        assert_eq!(c.v_head, 128);
+        assert_eq!(c.n_experts, 256);
+        assert_eq!(c.topk, 8);
+        assert_eq!(c.moe_inter, 1536);
+        // No shared expert, no dense layers.
+        assert_eq!(c.shared_inter, 0);
+        assert_eq!(c.n_shared, 0);
+        assert_eq!(c.first_dense, 0);
+        assert_eq!(c.vocab, 200064);
+        assert_eq!(c.max_ctx, 196608);
+        // Flag-driven forward diffs vs M3: qk-norm on, but plain SwiGLU + standard
+        // RMSNorm (no gemma), sigmoid+bias router.
+        assert!(c.qk_norm && c.sigmoid_route);
+        assert!(!c.gemma_norm, "M2 uses standard RMSNorm, not gemma-norm");
+        assert!(!c.swiglu_oai, "M2 uses plain SwiGLU (silu), not swigluoai");
+        // Dense attention everywhere (no Lightning Indexer).
+        assert_eq!(c.index_topk, 0);
+        assert_eq!(c.idx_type.len(), 62);
+        assert!(c.idx_type.iter().all(|&x| !x));
+        assert!((c.theta - 5_000_000.0).abs() < 1.0);
+        assert!((c.attn_scale - 1.0 / (128f32).sqrt()).abs() < 1e-6);
+        assert_eq!(c.stop_ids, vec![2]); // scalar eos_token_id
     }
 
     #[test]

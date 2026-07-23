@@ -146,6 +146,17 @@ fn load_layer(
         l.q_proj = Some(qt_load(shards, &p("self_attn.q_proj.weight"), h * hd, d, dbits)?);
         l.k_proj = Some(qt_load(shards, &p("self_attn.k_proj.weight"), kvh * hd, d, dbits)?);
         l.v_proj = Some(qt_load(shards, &p("self_attn.v_proj.weight"), kvh * hd, d, dbits)?);
+        // Fuse q/k/v (they share the input x) into ONE matmul per layer: at S=1 decode
+        // each was a separate synchronized GPU dispatch, ~25% of decode across the
+        // projections. Drop the separate three — `attention_gqa` uses the fused tensor.
+        l.qkv_proj = Some(crate::loader::concat_rows(&[
+            l.q_proj.as_ref().unwrap(),
+            l.k_proj.as_ref().unwrap(),
+            l.v_proj.as_ref().unwrap(),
+        ]));
+        l.q_proj = None;
+        l.k_proj = None;
+        l.v_proj = None;
         l.q_norm = ld(shards, &p("self_attn.q_norm.weight"))?;
         l.k_norm = ld(shards, &p("self_attn.k_norm.weight"))?;
         // Block-sparse Lightning Indexer weights on sparse attention layers.
@@ -401,7 +412,7 @@ pub fn load_model_with(
         // projections at 197 s of a 236 s / 512-tok prefill (84%!) — dwarfing both the
         // attention core (5.6 s) and expert I/O (31 s). `l.o` (o_proj) is already marked
         // above via the GLM list, which is why it was fast; these were simply omitted.
-        for t in [&mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.idx_q_proj, &mut l.idx_k_proj] {
+        for t in [&mut l.qkv_proj, &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.idx_q_proj, &mut l.idx_k_proj] {
             if let Some(t) = t {
                 t.gpu_eligible = true;
             }

@@ -32,6 +32,10 @@ pub struct Layer {
     pub q_proj: Option<QTensor>, // hidden -> n_heads * head_dim
     pub k_proj: Option<QTensor>, // hidden -> n_kv_heads * head_dim
     pub v_proj: Option<QTensor>, // hidden -> n_kv_heads * head_dim
+    /// q/k/v concatenated row-wise (`[n_heads*head_dim + 2*n_kv_heads*head_dim, hidden]`),
+    /// built at load time so `attention_gqa` runs ONE fused matmul per layer instead of
+    /// three (q/k/v share the same input). When set, `q_proj`/`k_proj`/`v_proj` are dropped.
+    pub qkv_proj: Option<QTensor>,
     pub q_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
     pub k_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
 

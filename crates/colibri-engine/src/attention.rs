@@ -233,18 +233,34 @@ pub fn attention_gqa(
     let eps = cfg.eps;
     let theta = cfg.theta;
     let scale = cfg.attn_scale;
-    let q_proj = l.q_proj.as_ref().expect("GQA layer missing q_proj");
-    let k_proj = l.k_proj.as_ref().expect("GQA layer missing k_proj");
-    let v_proj = l.v_proj.as_ref().expect("GQA layer missing v_proj");
-
     // ---- 1) project q, k, v (batched over all S rows) ----------------------
+    // Production uses the fused `qkv_proj` (q/k/v concatenated row-wise at load time) so
+    // this is ONE matmul per layer instead of three — at S=1 decode each projection was a
+    // separate synchronized GPU dispatch (~25% of decode across q/k/v/o × 60 layers). The
+    // separate-proj path is the fallback for unit tests that build q/k/v_proj directly.
     let _tp = std::time::Instant::now();
     let mut q = vec![0f32; s_len * h * hd];
     let mut k = vec![0f32; s_len * kv_dim];
     let mut v = vec![0f32; s_len * kv_dim];
-    matmul_qt(&mut q, x, q_proj, s_len);
-    matmul_qt(&mut k, x, k_proj, s_len);
-    matmul_qt(&mut v, x, v_proj, s_len);
+    if let Some(qkv) = l.qkv_proj.as_ref() {
+        let qsz = h * hd;
+        let width = qsz + 2 * kv_dim;
+        let mut qkv_out = vec![0f32; s_len * width];
+        matmul_qt(&mut qkv_out, x, qkv, s_len);
+        for s in 0..s_len {
+            let b = s * width;
+            q[s * qsz..(s + 1) * qsz].copy_from_slice(&qkv_out[b..b + qsz]);
+            k[s * kv_dim..(s + 1) * kv_dim].copy_from_slice(&qkv_out[b + qsz..b + qsz + kv_dim]);
+            v[s * kv_dim..(s + 1) * kv_dim].copy_from_slice(&qkv_out[b + qsz + kv_dim..b + width]);
+        }
+    } else {
+        let q_proj = l.q_proj.as_ref().expect("GQA layer missing qkv_proj and q_proj");
+        let k_proj = l.k_proj.as_ref().expect("GQA layer missing k_proj");
+        let v_proj = l.v_proj.as_ref().expect("GQA layer missing v_proj");
+        matmul_qt(&mut q, x, q_proj, s_len);
+        matmul_qt(&mut k, x, k_proj, s_len);
+        matmul_qt(&mut v, x, v_proj, s_len);
+    }
     atime(&crate::forward::ATTN_PROJ_US, _tp);
 
     // ---- 2) per-head QK-norm + partial RoPE; append K/V to the cache -------
@@ -1096,6 +1112,43 @@ mod tests {
             );
         }
         assert!(out2.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn gqa_fused_qkv_matches_separate() {
+        // The fused qkv_proj path (production) must produce the SAME attention output as
+        // three separate q/k/v matmuls (the test/reference path) — same weights, just one
+        // matmul + a slice instead of three.
+        let c = gqa_cfg();
+        let d = c.hidden as usize;
+        let x = vecf(3 * d, 7);
+        let mk_kv = || {
+            let mut kv = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 8);
+            kv.enable_gqa(c.n_kv_heads as usize * c.qk_head as usize);
+            kv
+        };
+        // separate q/k/v
+        let l_sep = make_gqa_layer(&c);
+        let mut kv1 = mk_kv();
+        let mut o_sep = vec![0f32; 3 * d];
+        attention_gqa(&c, &l_sep, 0, &mut kv1, &x, 3, 0, &mut o_sep);
+        // fused: concat the same q/k/v into qkv_proj, drop the separates
+        let mut l_fused = make_gqa_layer(&c);
+        l_fused.qkv_proj = Some(crate::loader::concat_rows(&[
+            l_fused.q_proj.as_ref().unwrap(),
+            l_fused.k_proj.as_ref().unwrap(),
+            l_fused.v_proj.as_ref().unwrap(),
+        ]));
+        l_fused.q_proj = None;
+        l_fused.k_proj = None;
+        l_fused.v_proj = None;
+        let mut kv2 = mk_kv();
+        let mut o_fused = vec![0f32; 3 * d];
+        attention_gqa(&c, &l_fused, 0, &mut kv2, &x, 3, 0, &mut o_fused);
+        for (a, b) in o_sep.iter().zip(&o_fused) {
+            assert!((a - b).abs() < 1e-5, "fused {b} != separate {a}");
+        }
+        assert!(o_sep.iter().any(|v| v.abs() > 1e-6));
     }
 
     // GPU vs CPU MLA absorb core at GLM dims (H=64, kv_lora=512) over a 2048-token

@@ -272,20 +272,35 @@ fn layer_forward_batched<P: ExpertProvider>(
     }
     timed(&ATTN_US, || {
         for si in 0..n {
-            // S=1, its own KV, its own position; decode never fires DSA (pos_base>0),
-            // so there is no selection to carry — same core as single-sequence decode.
-            attention_with(
-                cfg,
-                l,
-                li,
-                &mut kvs[si],
-                &nrm[si * d..(si + 1) * d],
-                1,
-                positions[si],
-                &mut tmp[si * d..(si + 1) * d],
-                AttnCore::Reconstruct,
-                None,
-            );
+            // Per sequence: S=1, its own KV, its own position — identical to a lone decode
+            // step, so batching cannot change any sequence's output (only shares the MoE
+            // expert reads below). MiniMax-M3 uses the GQA core; GLM uses MLA reconstruct
+            // (decode never fires DSA at pos_base>0, so there is no selection to carry).
+            if cfg.arch == colibri_core::Arch::MinimaxM3 {
+                attention_gqa(
+                    cfg,
+                    l,
+                    li,
+                    &mut kvs[si],
+                    &nrm[si * d..(si + 1) * d],
+                    1,
+                    positions[si],
+                    &mut tmp[si * d..(si + 1) * d],
+                );
+            } else {
+                attention_with(
+                    cfg,
+                    l,
+                    li,
+                    &mut kvs[si],
+                    &nrm[si * d..(si + 1) * d],
+                    1,
+                    positions[si],
+                    &mut tmp[si * d..(si + 1) * d],
+                    AttnCore::Reconstruct,
+                    None,
+                );
+            }
         }
     });
     for j in 0..n * d {

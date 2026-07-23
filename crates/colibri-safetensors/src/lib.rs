@@ -51,9 +51,21 @@ use std::sync::{Arc, Mutex};
 /// despite winning the raw-bandwidth microbenchmark; and raising `COLI_RAM_GB` hurts
 /// for the same reason, since it moves RAM from a tier that caches at 4 KB page
 /// granularity into one that caches whole 38.3 MB experts.
+/// Runtime fadvise toggle. The adaptive max-residency path ([`ExpertCache::spawn_adaptive_budget`])
+/// turns this on so the explicit cache is the single tier and `MemAvailable` reflects
+/// true free RAM (no page-cache double-hold of the model). Distinct from the
+/// `COLI_FADVISE=1` env opt-in; either enables it.
+static FADVISE_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable `fadvise(DONTNEED)`-after-read at runtime (set during cache setup).
+pub fn set_fadvise(on: bool) {
+    FADVISE_RUNTIME.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn fadvise_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_FADVISE").ok().as_deref() == Some("1"))
+    static ENV_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let env = *ENV_ON.get_or_init(|| std::env::var("COLI_FADVISE").ok().as_deref() == Some("1"));
+    env || FADVISE_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// One tensor located within a shard file.

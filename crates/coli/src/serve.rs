@@ -32,21 +32,15 @@ const DEFAULT_PORT: u16 = 8080;
 /// Default number of tokens generated when a request omits `max_tokens`.
 const DEFAULT_MAX_TOKENS: usize = 128;
 /// Default served context length (prompt + completion) when `COLI_CTX` is unset.
-/// GLM-5.2 supports up to 1M positions, but the KV cache is ~175 KB/token
-/// (~5.6 GB at 32K), so we cap to a memory-safe default and let `COLI_CTX` raise
-/// it as far as the model max.
+/// A small default keeps the KV reservation tiny so the most RAM goes to resident
+/// experts (and latency is lowest). `COLI_CTX` can be raised to the model max safely:
+/// the adaptive expert cache's OOM guard evicts experts to fit a larger KV, so a big
+/// window can't drive the box into swap (GLM-5.2's MLA KV, ~175 KB/token, becomes the
+/// practical ceiling before the 1M architectural max; the GQA models' KV is far smaller).
 const DEFAULT_CTX: usize = 32_768;
 /// Tokens generated per warm-up prompt (enough to route a spread of experts).
 const WARMUP_TOKENS: usize = 8;
 
-/// How many copies of the KV cache to reserve for. `KvCache` lazily allocates a
-/// full-size device-side shadow per layer (`model.rs`'s `DeviceKv`) on the GPU decode
-/// path — and on GB10's unified memory that shadow comes out of the *same* pool as
-/// the host copy, so under CUDA the KV genuinely costs twice.
-#[cfg(feature = "cuda")]
-const KV_COPIES: u64 = 2;
-#[cfg(not(feature = "cuda"))]
-const KV_COPIES: u64 = 1;
 
 /// Parse a token count like `32k`, `1m`, or `131072`.
 fn parse_ctx(s: &str) -> Option<usize> {
@@ -62,8 +56,26 @@ fn parse_ctx(s: &str) -> Option<usize> {
 }
 
 /// KV-cache bytes per token: two f32 latent/rotary buffers per layer.
+/// Total resident KV bytes per token — the host cache **plus** the CUDA device shadow.
+///
+/// Host (`KvCache::for_model`): latent (`kv_lora`) + roped key (`qk_rope`) per layer, and —
+/// for GQA — the full K and V at `kv_dim = n_kv_heads * head_dim` each. The device shadow
+/// (`DeviceKv`, CUDA only) mirrors **only** latent + rope, not `k_full`/`v_full` (those are
+/// read from host over GB10's unified memory), so it doubles just the MLA-style terms.
+///
+/// Two accounting bugs this fixes: the original omitted the GQA `k_full`/`v_full` entirely
+/// (~17× undercount); the interim fix then multiplied the *whole* host figure by 2, which
+/// over-counted GQA ~2× by doubling `k_full`/`v_full` that have no device copy. The net —
+/// e.g. M3: `60·(2·64 + 2·512)·4 ≈ 270 KB/token`.
 fn kv_bytes_per_token(cfg: &colibri_core::Config) -> usize {
-    cfg.n_layers as usize * (cfg.kv_lora as usize + cfg.qk_rope as usize) * 4
+    let mla = cfg.kv_lora as usize + cfg.qk_rope as usize; // latent + rope: mirrored on device
+    let gqa_full = if cfg.arch.is_gqa() {
+        2 * cfg.n_kv_heads as usize * cfg.qk_head as usize // k_full + v_full: host only
+    } else {
+        0
+    };
+    let device_shadow = if cfg!(feature = "cuda") { mla } else { 0 };
+    cfg.n_layers as usize * (mla + gqa_full + device_shadow) * 4
 }
 
 type Provider<'a> = ExpertCache<ShardsExpertProvider<'a>>;
@@ -128,18 +140,38 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // Computed *before* the expert-cache budget: the budget has to reserve the KV
     // this window can allocate, and KV is sized from ctx_len.
     let model_max = if model.cfg.max_ctx > 0 { model.cfg.max_ctx as usize } else { usize::MAX };
-    let ctx_len = std::env::var("COLI_CTX")
+    let requested_ctx = std::env::var("COLI_CTX")
         .ok()
         .and_then(|s| parse_ctx(&s))
         .unwrap_or(DEFAULT_CTX)
         .clamp(1, model_max);
+    // Also clamp to what RAM can actually hold: a full-window request's KV
+    // (`kv_bytes_per_token * ctx * copies`, non-evictable) must fit alongside the dense
+    // tier + a minimal streaming expert cache + the OOM floor. Reserve ~18 GB for those;
+    // the rest is available to KV (experts evict to make room). This is the real ceiling —
+    // for the GQA models it lands well below their architectural max, because full K/V is
+    // stored per kv-head. Without this a big `COLI_CTX` looks fine at startup and only OOMs
+    // when a large request finally allocates its KV.
+    const CTX_RAM_RESERVE: u64 = 18 << 30;
+    let kv_pt = (kv_bytes_per_token(&model.cfg) as u64).max(1); // already includes device shadow
+    let ram_ctx = colibri_engine::total_ram_bytes()
+        .map(|t| (t.saturating_sub(CTX_RAM_RESERVE) / kv_pt) as usize)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let ctx_len = requested_ctx.min(ram_ctx);
+    if requested_ctx > ctx_len {
+        eprintln!(
+            "[serve] COLI_CTX {requested_ctx} exceeds what RAM can hold as KV; clamped to \
+             {ctx_len} tokens (a full-window KV would not fit alongside the model)."
+        );
+    }
 
-    // Worst-case KV for the served window — a single full-context request allocates
-    // exactly this, and the expert cache must not have already eaten it.
-    let kv_reserve = (kv_bytes_per_token(&model.cfg) as u64)
-        .saturating_mul(ctx_len as u64)
-        .saturating_mul(KV_COPIES);
-    let budget = crate::ram_budget_reserving(kv_reserve);
+    // Worst-case KV for the served window (a single full-context request). No longer
+    // reserved up front: each request reserves *its own* KV dynamically (evicting experts
+    // just-in-time — see `ExpertCache::reserve_ram`), so this is only the ceiling we quote.
+    // The initial expert budget leaves a modest base for it; the adaptive monitor takes over.
+    let kv_worst_case = (kv_bytes_per_token(&model.cfg) as u64).saturating_mul(ctx_len as u64);
+    let budget = crate::ram_budget_reserving(kv_worst_case.min(8 << 30));
     let gib = (1u64 << 30) as f64;
     if budget == u64::MAX {
         // No /proc/meminfo (non-Linux dev box): the budget is unbounded, and printing
@@ -150,12 +182,12 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         );
     } else {
         println!(
-            "[serve] expert cache: {:.0} GB budget (reserved {:.1} GB KV for {} ctx{}) \
-             — set COLI_RAM_GB to override",
+            "[serve] expert cache: {:.0} GB initial budget; KV reserved per request \
+             (≤ {:.1} GB at the full {} ctx{}) — set COLI_RAM_GB to override",
             budget as f64 / gib,
-            kv_reserve as f64 / gib,
+            kv_worst_case as f64 / gib,
             ctx_len,
-            if KV_COPIES > 1 { ", incl. device shadow" } else { "" }
+            if cfg!(feature = "cuda") { ", incl. device shadow" } else { "" }
         );
     }
 
@@ -185,6 +217,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         cluster.this_node,
     );
     let provider = std::sync::Arc::new(ExpertCache::new(base, budget));
+    crate::wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
     if let Some(topn) = crate::prefetch_topn() {
         provider.enable_prefetch(topn);
         println!("[serve] speculative next-layer prefetch on (top-{topn}/layer)");
@@ -478,7 +511,7 @@ fn complete(
     let ids = if chat {
         let msgs = obj.get("messages").and_then(|v| v.as_array());
         match msgs {
-            Some(m) => build_chat_prompt(tok, m),
+            Some(m) => build_chat_prompt(tok, m, model.cfg.arch),
             None => {
                 send_json(stream, 400, "{\"error\":{\"message\":\"missing 'messages'\",\"type\":\"invalid_request_error\"}}");
                 return;
@@ -517,6 +550,27 @@ fn complete(
 
     let object = if chat { "chat.completion" } else { "text_completion" };
     let id = format!("cmpl-{}", ids.len().wrapping_mul(2654435761) ^ max_tokens);
+    // The KV cache commits lazily (grows with tokens produced), so we reserve only the
+    // PROMPT's KV — what prefill commits at once. The generation tail grows one token at a
+    // time (~KB/token), which the adaptive monitor evicts experts against gradually; no
+    // giant eager allocation to race, so short generations never pay for a big `max_tokens`.
+    // If even the prompt's KV can't fit after evicting every expert, reject rather than OOM.
+    let kv_bytes = (kv_bytes_per_token(&model.cfg) as u64).saturating_mul(ids.len() as u64);
+    if !provider.reserve_ram(kv_bytes) {
+        let gib = (1u64 << 30) as f64;
+        let msg = format!(
+            "Not enough memory for this prompt: {} tokens need ~{:.1} GB of KV cache, \
+             which does not fit right now. Use a shorter prompt.",
+            ids.len(),
+            kv_bytes as f64 / gib
+        );
+        send_json(
+            stream,
+            507,
+            &format!("{{\"error\":{{\"message\":{},\"type\":\"insufficient_memory\",\"code\":\"kv_cache_too_large\"}}}}", jstr(&msg)),
+        );
+        return;
+    }
     let mut kv = mk_kv(model, ids.len() + max_tokens);
 
     if stream_mode {
@@ -524,6 +578,8 @@ fn complete(
     } else {
         block_completion(stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv);
     }
+    drop(kv); // free the KV before releasing the reservation
+    provider.release_ram(kv_bytes);
 }
 
 /// Official GLM-5.2 chat template (byte-matches `chat_template.jinja`, mirrored
@@ -532,8 +588,49 @@ fn complete(
 /// block disables reasoning so the model answers directly. The control tokens
 /// (`<|user|>`, `<|assistant|>`, …) are added-vocab entries, so encoding the
 /// assembled string resolves them to their ids exactly as the C engine does.
-fn build_chat_prompt(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
-    let mut s = String::from("[gMASK]<sop>");
+fn build_chat_prompt(tok: &Tokenizer, messages: &[Json], arch: colibri_core::Arch) -> Vec<i32> {
+    match arch {
+        colibri_core::Arch::MinimaxM2 => build_chat_prompt_minimax(tok, messages),
+        // GLM-5.2 / MiniMax-M3: GLM-style chat markers.
+        _ => {
+            let mut s = String::from("[gMASK]<sop>");
+            for m in messages {
+                let o = match m.as_object() {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let role = o.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                let content = o.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                s.push_str(&format!("<|{role}|>{content}"));
+            }
+            s.push_str("<|assistant|><think></think>");
+            tok.encode(&s)
+        }
+    }
+}
+
+/// MiniMax-M2 chat format (from its `chat_template.jinja`): `]~!b[` opens the
+/// conversation, each turn is `]~b]<role>\n<content>[e~[` with roles
+/// system/user/ai, and the trailing `]~b]ai\n` is the generation prompt. M2 is a
+/// reasoning model — it emits `<think>…</think>` before its answer on its own, so we
+/// do not force an empty think block. Generation halts at `[e~[` (200020), which
+/// `Config::load` folds into `stop_ids` from `generation_config.json`.
+fn build_chat_prompt_minimax(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
+    let role_tag = |r: &str| match r {
+        "system" => "system",
+        "assistant" => "ai",
+        _ => "user",
+    };
+    let mut s = String::from("]~!b[");
+    let first_is_system = messages
+        .first()
+        .and_then(|m| m.as_object())
+        .and_then(|o| o.get("role"))
+        .and_then(|v| v.as_str())
+        == Some("system");
+    if !first_is_system {
+        s.push_str("]~b]system\nYou are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax.[e~[\n");
+    }
     for m in messages {
         let o = match m.as_object() {
             Some(o) => o,
@@ -541,9 +638,9 @@ fn build_chat_prompt(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
         };
         let role = o.get("role").and_then(|v| v.as_str()).unwrap_or("user");
         let content = o.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        s.push_str(&format!("<|{role}|>{content}"));
+        s.push_str(&format!("]~b]{}\n{}[e~[\n", role_tag(role), content));
     }
-    s.push_str("<|assistant|><think></think>");
+    s.push_str("]~b]ai\n");
     tok.encode(&s)
 }
 

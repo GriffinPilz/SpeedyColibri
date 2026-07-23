@@ -377,11 +377,12 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     let env_u32 = |k: &str, d: u32| {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     };
-    // Detect the source architecture from its config: MiniMax-M3 needs name remapping
-    // + Gemma-norm folding, and its layer count comes from `text_config` (env
-    // COLI_NLAYERS still overrides for GLM). A missing/unreadable config falls back to GLM.
+    // Detect the source architecture from its config: the MiniMax GQA family (M3/M2)
+    // needs the block_sparse_moe→mlp / w1w2w3 name remapping, its layer count comes from
+    // the config (env COLI_NLAYERS still overrides for GLM), and Gemma-norm folding is
+    // per-model (M3 yes, M2 no — read from the config). Missing config → falls back to GLM.
     let src_cfg = colibri_core::Config::load(indir).ok();
-    let minimax = src_cfg.as_ref().map(|c| c.arch == colibri_core::Arch::MinimaxM3).unwrap_or(false);
+    let minimax = src_cfg.as_ref().map(|c| c.arch.is_gqa()).unwrap_or(false);
     let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
     let n_layers = if minimax {
         src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)
@@ -563,6 +564,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
+    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
@@ -812,6 +814,7 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
+    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
     }
@@ -2033,6 +2036,25 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
 /// resident, so any small constant still yields a budget far past the cliff.
 const WORKING_RESERVE: u64 = 10 << 30;
 
+/// Adaptive max-residency reserve: RAM held back from the expert fill for the serving
+/// process's own peak runtime — KV cache, prefill activations, GPU host staging, expert
+/// read buffers. `fill_target = total − this`. Sized from the validated static-100 GB
+/// config on a 121 GiB Spark (M2.7), which left ~21 GB and was rock-stable at 4.35 tok/s;
+/// a 10 GB reserve thrashed (own-request spikes tripped eviction). Must exceed peak
+/// per-request runtime so `MemAvailable` never nears [`ADAPTIVE_DANGER_FLOOR`] on our own
+/// account — only an *external* tenant should push it there.
+const ADAPTIVE_FILL_RESERVE: u64 = 20 << 30;
+
+/// Adaptive max-residency danger line: only when `MemAvailable` stays under this (a real
+/// other tenant, since the reserve absorbs our own runtime) does the monitor cede gradually.
+const ADAPTIVE_DANGER_FLOOR: u64 = 4 << 30;
+
+/// Hard OOM-guard line: the monitor evicts LRU experts *immediately* (no hysteresis) whenever
+/// `MemAvailable` falls below this — whatever consumed the memory, including the GPU on GB10's
+/// unified pool. This is the guarantee that filling RAM can never OOM the box; it sits below
+/// [`ADAPTIVE_DANGER_FLOOR`] (the softer, external-tenant line).
+const ADAPTIVE_HARD_FLOOR: u64 = 3 << 30;
+
 /// The expert cache is capped at `MemTotal / CACHE_CAP_DIVISOR`.
 ///
 /// **Measured on a 121 GiB Spark, 8/4 model (~19 GiB resident), 12 diverse prompts,
@@ -2131,6 +2153,89 @@ fn budget_from(avail: u64, reserve: u64, total: Option<u64>) -> u64 {
 /// Expert-cache byte budget for callers with nothing extra to reserve.
 fn ram_budget() -> u64 {
     ram_budget_reserving(0)
+}
+
+/// A model whose experts fit in the achievable cache (RAM − reserve) to at least this %
+/// is "near-fit": it gets `fadvise` on top of the fill (collapse the page-cache double-hold
+/// so the whole working set stays resident — measured 1.94× on MiniMax-M2.7). A ≫-RAM model
+/// (GLM ~23%, M3 ~46%) is *also* filled and pressure-managed, but keeps the page cache
+/// (fadvise off) as a reclaimable second tier the kernel serves at 4 KB granularity.
+const NEARFIT_COVERAGE_PCT: u64 = 80;
+
+/// Wire the expert cache to **fill RAM safely, for every model**. It grows toward a fill
+/// target and a background monitor evicts LRU experts under memory pressure so the box can
+/// never OOM — which is what lets us point a fill-RAM policy at a model of *any* size:
+///
+/// - **`COLI_RAM_GB=n`** → fill target is the fixed `n` GB (respecting the user's cap), but
+///   the pressure monitor still runs. This is the fix for the old behavior where a fixed
+///   budget had no feedback and grew into the wall (forcing 100 GB on the 216 GB M3 OOM-
+///   killed the server); now that same budget simply caps itself where the box stays safe.
+/// - **near-fit** (experts ≈ RAM) → fill to `total − reserve` **plus fadvise** — the whole
+///   working set resident, no page-cache double-hold.
+/// - **≫ RAM** (experts ≫ RAM) → fill to `total − reserve` with **fadvise off**: hold as many
+///   experts as fit, keep the page cache as a second tier, and let the monitor evict the LRU
+///   tail under pressure. No OOM, and more resident than the old static `MemTotal/3`.
+///
+/// Off-Linux (no `/proc/meminfo`) it no-ops — there is no live pressure signal to evict on.
+fn wire_adaptive_cache<P>(
+    provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
+    cfg: &colibri_core::Config,
+    ebits: u32,
+) where
+    P: colibri_engine::ExpertProvider + Send + Sync + 'static,
+{
+    use colibri_engine::ExpertProvider as _; // bring `.expert()` into method scope
+    let total = match colibri_engine::total_ram_bytes() {
+        Some(t) => t,
+        None => return, // non-Linux: no live pressure signal, leave the static budget
+    };
+    let n_moe = (cfg.n_layers - cfg.first_dense).max(0) as u64;
+    // Size an expert from a real one on disk — its QTensors carry the true format
+    // (NVFP4 fmt=5, e4m3 fmt=4, …), so block-scale overhead and the actual bit-width
+    // are exact. The `ebits` estimate is only a fallback: it reflects the *requested*
+    // resident dense width (default 8), not the streamed experts' real format, and
+    // would overcount NVFP4 experts ~1.7× (int8 vs 4-bit) and mis-decide coverage.
+    let per = match provider.expert(cfg.first_dense as usize, 0) {
+        Ok(e) => (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64,
+        Err(_) => {
+            colibri_engine::capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, ebits)
+        }
+    };
+    let total_expert_bytes = per.saturating_mul(cfg.n_experts as u64).saturating_mul(n_moe);
+    // Achievable fill without an explicit cap: hold back the process's own peak runtime
+    // (KV/activations/staging/read buffers). Coverage is model-intrinsic (does it fit RAM?).
+    let natural_fill = total.saturating_sub(ADAPTIVE_FILL_RESERVE);
+    let covers_pct = if total_expert_bytes > 0 {
+        natural_fill.saturating_mul(100) / total_expert_bytes
+    } else {
+        0
+    };
+    let near_fit = covers_pct >= NEARFIT_COVERAGE_PCT;
+    // An explicit COLI_RAM_GB caps the fill target; the monitor still protects the floor.
+    let explicit = std::env::var("COLI_RAM_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|g| g << 30);
+    let fill_target = explicit.unwrap_or(natural_fill);
+    // fadvise only auto-engages for a near-fit model on the automatic path; an explicit
+    // budget leaves fadvise to the COLI_FADVISE env, and ≫-RAM keeps the page cache.
+    if near_fit && explicit.is_none() {
+        colibri_safetensors::set_fadvise(true);
+    }
+    provider.spawn_adaptive_budget(fill_target, ADAPTIVE_DANGER_FLOOR, ADAPTIVE_HARD_FLOOR);
+    let regime = match (explicit.is_some(), near_fit) {
+        (true, _) => "fixed budget (COLI_RAM_GB)",
+        (false, true) => "near-fit max-residency, fadvise on",
+        (false, false) => "≫-RAM fill, page cache kept",
+    };
+    eprintln!(
+        "[cache] {regime}: ~{} GB experts / {} GB RAM ({covers_pct}% coverage) → fill to ~{} GB, \
+         LRU-evict under pressure (hard floor {} GB) — never OOM",
+        total_expert_bytes >> 30,
+        total >> 30,
+        fill_target >> 30,
+        ADAPTIVE_HARD_FLOOR >> 30
+    );
 }
 
 /// Speculative-prefetch setting from `COLI_PREFETCH`: unset/`0` → off; `1` → on

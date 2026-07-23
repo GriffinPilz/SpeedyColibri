@@ -115,7 +115,7 @@ pub fn layer_forward<P: ExpertProvider>(
     for si in 0..s {
         rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
     }
-    if cfg.arch == colibri_core::Arch::MinimaxM3 {
+    if cfg.arch.is_gqa() {
         // MiniMax-M3: grouped-query attention (no MLA latent, no DSA indexer).
         timed(&ATTN_US, || attention_gqa(cfg, l, li, kv, nrm, s, pos_base, tmp));
     } else {
@@ -154,7 +154,9 @@ pub fn layer_forward<P: ExpertProvider>(
         rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
     }
     if l.sparse {
-        timed(&MOE_US, || moe(cfg, l, li, nrm, s, tmp, true, provider))?;
+        // with_shared only when the model actually has a shared expert (GLM/M3 do;
+        // MiniMax-M2 has none — n_shared 0, shared_intermediate_size 0).
+        timed(&MOE_US, || moe(cfg, l, li, nrm, s, tmp, cfg.n_shared > 0, provider))?;
     } else {
         timed(&DENSE_US, || dense_mlp(l, nrm, s, tmp));
     }
@@ -276,7 +278,7 @@ fn layer_forward_batched<P: ExpertProvider>(
             // step, so batching cannot change any sequence's output (only shares the MoE
             // expert reads below). MiniMax-M3 uses the GQA core; GLM uses MLA reconstruct
             // (decode never fires DSA at pos_base>0, so there is no selection to carry).
-            if cfg.arch == colibri_core::Arch::MinimaxM3 {
+            if cfg.arch.is_gqa() {
                 attention_gqa(
                     cfg,
                     l,
@@ -311,7 +313,7 @@ fn layer_forward_batched<P: ExpertProvider>(
         rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
     }
     if l.sparse {
-        timed(&MOE_US, || moe(cfg, l, li, nrm, n, tmp, true, provider))?;
+        timed(&MOE_US, || moe(cfg, l, li, nrm, n, tmp, cfg.n_shared > 0, provider))?;
     } else {
         timed(&DENSE_US, || dense_mlp(l, nrm, n, tmp));
     }

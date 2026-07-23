@@ -17,6 +17,7 @@ use crate::usage::UsageHistory;
 use colibri_core::tier::evict_score;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 /// Online next-layer expert predictor for speculative prefetch (`COLI_PREFETCH`).
@@ -142,7 +143,20 @@ pub struct CacheStats {
 /// A resident, budget-bounded cache in front of any [`ExpertProvider`].
 pub struct ExpertCache<P: ExpertProvider> {
     inner: P,
-    budget: u64,
+    /// Cache byte ceiling. Atomic because the adaptive-budget monitor
+    /// ([`spawn_adaptive_budget`]) rewrites it live to track free RAM; the static
+    /// path just sets it once. Read on every insert's eviction pass.
+    budget: AtomicU64,
+    /// Standing fill target the monitor grows toward (`0` = unmanaged). Held so
+    /// [`reserve_ram`](ExpertCache::reserve_ram) and the monitor agree on the ceiling.
+    fill_target: AtomicU64,
+    /// Hard OOM-guard line (`MemAvailable` must stay above this); shared with
+    /// [`reserve_ram`](ExpertCache::reserve_ram) so a KV reservation leaves the same margin.
+    hard_floor: AtomicU64,
+    /// RAM (bytes) reserved by callers for non-expert allocations about to happen —
+    /// chiefly a request's KV cache. The monitor holds experts to `fill_target − reserved`,
+    /// and [`reserve_ram`](ExpertCache::reserve_ram) evicts to free it up front.
+    reserved: AtomicU64,
     state: Mutex<State>,
     /// Speculative-prefetch predictor + background-loader channel, present only
     /// when [`enable_prefetch`](ExpertCache::enable_prefetch) was called.
@@ -156,7 +170,10 @@ impl<P: ExpertProvider> ExpertCache<P> {
     pub fn new(inner: P, budget_bytes: u64) -> ExpertCache<P> {
         ExpertCache {
             inner,
-            budget: budget_bytes,
+            budget: AtomicU64::new(budget_bytes),
+            fill_target: AtomicU64::new(0),
+            hard_floor: AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 pinned: HashSet::new(),
@@ -260,7 +277,7 @@ impl<P: ExpertProvider> ExpertCache<P> {
             evictions: s.evictions,
             resident: s.entries.len(),
             bytes: s.bytes,
-            budget: self.budget,
+            budget: self.budget.load(Ordering::Relaxed),
         }
     }
 }
@@ -345,7 +362,7 @@ impl<P: ExpertProvider> ExpertCache<P> {
             },
         );
         s.bytes += bytes;
-        let budget = self.budget;
+        let budget = self.budget.load(Ordering::Relaxed);
         s.evict_to(budget);
         Ok(ex)
     }
@@ -463,7 +480,7 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
             s.bytes += bytes;
             s.misses += 1;
         }
-        let budget = self.budget;
+        let budget = self.budget.load(Ordering::Relaxed);
         s.evict_to_protecting(budget, &batch);
         Ok(())
     }
@@ -500,6 +517,142 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 let _ = cache.load_batch(layer, &eids);
             }
         });
+    }
+
+    /// Manage the byte ceiling to **fill RAM safely**: grow toward `fill_target`, but
+    /// continuously evict LRU experts so `MemAvailable` never crosses `hard_floor`. This
+    /// runs for **every** model and every budget (near-fit *or* ≫ RAM) — the eviction is
+    /// what makes filling RAM safe: a cache that gives memory back under pressure cannot
+    /// OOM, so there is no model too large to point it at. `fill_target` is aspirational
+    /// (fill RAM); `hard_floor` is the real guarantee (never touch the last few GB).
+    ///
+    /// Two thresholds, deliberately separated:
+    /// - **`hard_floor`** — the OOM guard. Checked every tick with **no hysteresis**: if
+    ///   `MemAvailable` is below it (our own growth *or* another tenant, incl. the GPU on
+    ///   GB10's unified pool), evict immediately, down to a few GB of slack above it. This
+    ///   is what a fixed `COLI_RAM_GB` lacked — a static budget with no feedback grows into
+    ///   the wall (measured: forcing 100 GB on the 216 GB M3 drove avail→0 and OOM-killed
+    ///   the server). With this, that same budget just caps itself where the box stays safe.
+    /// - **`danger_floor`** (< `hard_floor` is wrong; it sits *above* `hard_floor`) — the
+    ///   soft line for a *sustained external* tenant. Only after `SUSTAIN` ticks below it do
+    ///   we cede gradually, so a momentary dip (our own request's activation/staging spike)
+    ///   is ignored and we don't churn the resident near-fit working set (that symmetric
+    ///   `budget = resident + (avail − floor)` law regressed M2.7 to 2.06 vs 4.35 tok/s).
+    ///
+    /// The insert path also enforces `budget`, so between ticks the cache never grows past
+    /// the last value we set. Fast `TICK_MS` keeps the reaction window small. Off-Linux
+    /// (no `/proc/meminfo`) it no-ops after setting the standing budget.
+    pub fn spawn_adaptive_budget(self: &Arc<Self>, fill_target: u64, danger_floor: u64, hard_floor: u64) {
+        const TICK_MS: u64 = 100; // poll ~2.5× faster than before — react before OOM, not after
+        const SUSTAIN: u32 = 6; // ~600 ms below the danger floor before we cede memory
+        const HARD_SLACK: u64 = 3 << 30; // when the OOM guard fires, evict back to this much headroom
+        const FLOOR_MIN: u64 = 2 << 30; // never target < 2 GiB resident
+        let fill_target = fill_target.max(FLOOR_MIN);
+        // hard_floor is the emergency line; danger_floor the softer one above it.
+        let hard_floor = hard_floor.max(FLOOR_MIN);
+        let danger_floor = danger_floor.max(hard_floor);
+        // Publish the ceiling + floor so `reserve_ram` agrees with the monitor.
+        self.fill_target.store(fill_target, Ordering::Relaxed);
+        self.hard_floor.store(hard_floor, Ordering::Relaxed);
+        let cache = Arc::clone(self);
+        // Grow to the standing fill target immediately (the insert path enforces it).
+        cache.budget.store(fill_target, Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let mut low_ticks: u32 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+                let avail = match available_ram_bytes() {
+                    Some(a) => a,
+                    None => return, // non-Linux: no live signal, keep the standing budget
+                };
+                let resident = cache.state.lock().unwrap().bytes;
+
+                // OOM guard (immediate, no hysteresis): never let avail cross hard_floor,
+                // whatever ate the memory. Evict back to a few GB of slack above it.
+                if avail < hard_floor {
+                    let reclaim = (hard_floor - avail).saturating_add(HARD_SLACK);
+                    let new_budget = resident.saturating_sub(reclaim).max(FLOOR_MIN);
+                    cache.budget.store(new_budget, Ordering::Relaxed);
+                    cache.state.lock().unwrap().evict_to(new_budget);
+                    low_ticks = 0;
+                    continue;
+                }
+
+                // Sustained external pressure (soft): cede gradually toward the danger line.
+                low_ticks = if avail < danger_floor {
+                    low_ticks.saturating_add(1)
+                } else {
+                    0
+                };
+                // Hold `fill_target` minus whatever callers have reserved (e.g. live KV
+                // caches), so the monitor never refills experts into space a request needs.
+                let held = fill_target.saturating_sub(cache.reserved.load(Ordering::Relaxed));
+                let new_budget = if low_ticks >= SUSTAIN {
+                    resident.saturating_sub(danger_floor - avail).max(FLOOR_MIN)
+                } else {
+                    held.max(FLOOR_MIN) // hold; our own transient spikes don't evict
+                };
+                cache.budget.store(new_budget, Ordering::Relaxed);
+                if new_budget < resident {
+                    cache.state.lock().unwrap().evict_to(new_budget);
+                }
+            }
+        });
+    }
+}
+
+impl<P: ExpertProvider> ExpertCache<P> {
+    /// Reserve `bytes` of RAM for a non-expert allocation about to happen — a request's
+    /// KV cache, sized to *that request's* prompt + completion (not the worst-case window).
+    /// Evicts LRU experts **now** so the allocation has room, instead of pre-reserving the
+    /// full context statically or racing the async monitor when the KV is allocated eagerly
+    /// (a large-`COLI_CTX` request allocs its whole KV in one shot). Balance with
+    /// [`release_ram`](ExpertCache::release_ram) once the request's KV is dropped.
+    ///
+    /// Returns `true` if the room now exists (or the cache is unmanaged and can't tell),
+    /// `false` if even evicting every expert down to the floor cannot free enough — the
+    /// caller must then **not** allocate (reject the request) rather than OOM the box. On
+    /// `false` the reservation is rolled back.
+    #[must_use]
+    pub fn reserve_ram(&self, bytes: u64) -> bool {
+        const FLOOR_MIN: u64 = 2 << 30;
+        self.reserved.fetch_add(bytes, Ordering::Relaxed);
+        if self.fill_target.load(Ordering::Relaxed) == 0 {
+            return true; // unmanaged: no live signal; the static budget left headroom
+        }
+        let hard = self.hard_floor.load(Ordering::Relaxed);
+        let avail = match available_ram_bytes() {
+            Some(a) => a,
+            None => return true, // no /proc/meminfo: can't evict-to-fit, assume OK
+        };
+        // Want `bytes` free for the KV *and* still clear the hard floor afterward.
+        let need = bytes.saturating_add(hard);
+        if avail >= need {
+            return true; // already enough headroom
+        }
+        let mut s = self.state.lock().unwrap();
+        let target = s.bytes.saturating_sub(need - avail).max(FLOOR_MIN);
+        if target < s.bytes {
+            s.evict_to(target);
+            self.budget.store(target, Ordering::Relaxed);
+        }
+        drop(s);
+        // Re-check: eviction returns mmap'd expert buffers to the OS, so `MemAvailable`
+        // should have risen. If it still can't cover the allocation, we're out of room.
+        let ok = available_ram_bytes().map(|a| a >= need).unwrap_or(true);
+        if !ok {
+            self.release_ram(bytes); // roll back — the caller will reject
+        }
+        ok
+    }
+
+    /// Release a prior [`reserve_ram`](ExpertCache::reserve_ram). Only drops the counter;
+    /// the monitor grows experts back into the freed room on its next tick (avoiding a
+    /// thundering refill race between concurrent requests).
+    pub fn release_ram(&self, bytes: u64) {
+        let prev = self.reserved.load(Ordering::Relaxed);
+        self.reserved
+            .store(prev.saturating_sub(bytes), Ordering::Relaxed);
     }
 }
 

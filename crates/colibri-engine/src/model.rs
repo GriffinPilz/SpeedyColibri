@@ -137,18 +137,36 @@ pub struct KvCache {
 /// greater than every real position — same semantics, no signed type needed.
 pub const KV_UNSET: usize = usize::MAX;
 
+/// `n_rows` independently-allocated zero buffers of `len` f32 each.
+///
+/// Deliberately NOT `vec![vec![0.0; len]; n_rows]`: that clones one buffer `n_rows`
+/// times, and each clone memcpies — faulting in (committing) every page. Here each row
+/// is a fresh `vec![0.0; len]`, which lowers to `alloc_zeroed`; on Linux that is a
+/// zero-on-demand `mmap`, so the pages stay uncommitted until written. The KV cache is
+/// then sized to `max_t` in *address space* but only resident for the tokens actually
+/// produced — a request that stops early never commits the tail.
+#[inline]
+fn lazy_zeros(n_rows: usize, len: usize) -> Vec<Vec<f32>> {
+    (0..n_rows).map(|_| vec![0.0f32; len]).collect()
+}
+
 impl KvCache {
     /// Allocate a cache for `n_rows` layer rows holding up to `max_t` tokens.
     ///
     /// Prefer [`KvCache::for_model`], which sizes the rows (including the MTP
     /// head's extra row) from the model itself.
+    ///
+    /// The row buffers are sized to `max_t` but **committed lazily** ([`lazy_zeros`]):
+    /// a full-window cache is virtual address space, not resident RAM, until tokens are
+    /// actually written. So a request's KV footprint grows with the tokens it produces,
+    /// not with `max_t` — one that stops early never pays for the unused tail.
     pub fn new(n_rows: usize, kv_lora: usize, qk_rope: usize, max_t: usize) -> KvCache {
         KvCache {
             max_t,
             kv_lora,
             qk_rope,
-            latent: vec![vec![0.0; max_t * kv_lora]; n_rows],
-            k_rot: vec![vec![0.0; max_t * qk_rope]; n_rows],
+            latent: lazy_zeros(n_rows, max_t * kv_lora),
+            k_rot: lazy_zeros(n_rows, max_t * qk_rope),
             kv_dim: 0,
             k_full: vec![Vec::new(); n_rows],
             v_full: vec![Vec::new(); n_rows],
@@ -160,11 +178,12 @@ impl KvCache {
 
     /// Enable the GQA full-KV cache (MiniMax-M3): allocate per-layer key/value
     /// buffers of width `kv_dim = n_kv_heads * head_dim`. No-op for the MLA path.
+    /// Lazily committed like the rest of the cache (see [`KvCache::new`]).
     pub(crate) fn enable_gqa(&mut self, kv_dim: usize) {
         self.kv_dim = kv_dim;
         let rows = self.k_full.len();
-        self.k_full = vec![vec![0.0; self.max_t * kv_dim]; rows];
-        self.v_full = vec![vec![0.0; self.max_t * kv_dim]; rows];
+        self.k_full = lazy_zeros(rows, self.max_t * kv_dim);
+        self.v_full = lazy_zeros(rows, self.max_t * kv_dim);
     }
 
     /// Allocate a cache sized for `model`, holding up to `max_t` tokens.
@@ -187,7 +206,7 @@ impl KvCache {
         if model.has_mtp {
             kv.kv_start[n_layers] = KV_UNSET;
         }
-        if model.cfg.arch == colibri_core::Arch::MinimaxM3 {
+        if model.cfg.arch.is_gqa() {
             kv.enable_gqa(model.cfg.n_kv_heads as usize * model.cfg.qk_head as usize);
         }
         kv

@@ -190,8 +190,18 @@ NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
   cargo build --release -p coli --features cuda
 # Always confirm: `coli backend` must print `backend: cuda (Cuda(0))`, not `cpu`.
 
-# Serve: serve <snapshot-dir> [port] [warm-up prompt...]
-./target/release/coli serve /path/to/snapshot 8080 "warm-up prompt"
+# Which models are registered (scripts/models.toml) — serve any of them by name:
+scripts/model.py list
+#   glm-5.2       MLA + DSA lightning indexer, 256 experts top-8
+#   minimax-m3    GQA (64Q/4KV), 128 experts top-4
+#   minimax-m2.7  GQA (48Q/8KV), 256 experts top-8
+
+# Serve a specific registered model by NAME — resolves its container from the
+# registry, waits until it's loaded + listening, and prints the client curl:
+SERVE_DETACH=1 scripts/serve.sh minimax-m2.7 8081     # any registered name, any free port
+
+# …or the raw form with an explicit container path (what serve.sh calls under the hood):
+./target/release/coli serve /path/to/container 8080 "warm-up prompt"
 
 # Convert an HF FP8/NVFP4 checkpoint into a colibrì container. Experts are NVFP4 by
 # default (4-bit block-scaled); COLI_XFP8=1 for 8-bit e4m3 experts instead:

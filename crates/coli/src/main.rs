@@ -2155,6 +2155,7 @@ fn wire_adaptive_cache<P>(
 ) where
     P: colibri_engine::ExpertProvider + Send + Sync + 'static,
 {
+    use colibri_engine::ExpertProvider as _; // bring `.expert()` into method scope
     if std::env::var("COLI_RAM_GB").is_ok() {
         return; // explicit static override
     }
@@ -2163,7 +2164,17 @@ fn wire_adaptive_cache<P>(
         None => return, // non-Linux: no live signal, stay static
     };
     let n_moe = (cfg.n_layers - cfg.first_dense).max(0) as u64;
-    let per = colibri_engine::capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, ebits);
+    // Size an expert from a real one on disk — its QTensors carry the true format
+    // (NVFP4 fmt=5, e4m3 fmt=4, …), so block-scale overhead and the actual bit-width
+    // are exact. The `ebits` estimate is only a fallback: it reflects the *requested*
+    // resident dense width (default 8), not the streamed experts' real format, and
+    // would overcount NVFP4 experts ~1.7× (int8 vs 4-bit) and mis-decide coverage.
+    let per = match provider.expert(cfg.first_dense as usize, 0) {
+        Ok(e) => (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64,
+        Err(_) => {
+            colibri_engine::capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, ebits)
+        }
+    };
     let total_expert_bytes = per.saturating_mul(cfg.n_experts as u64).saturating_mul(n_moe);
     // Reserve for activations / KV / GPU staging / read buffers before filling with experts.
     let floor = WORKING_RESERVE.max(total / 20);

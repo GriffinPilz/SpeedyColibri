@@ -478,7 +478,7 @@ fn complete(
     let ids = if chat {
         let msgs = obj.get("messages").and_then(|v| v.as_array());
         match msgs {
-            Some(m) => build_chat_prompt(tok, m),
+            Some(m) => build_chat_prompt(tok, m, model.cfg.arch),
             None => {
                 send_json(stream, 400, "{\"error\":{\"message\":\"missing 'messages'\",\"type\":\"invalid_request_error\"}}");
                 return;
@@ -532,8 +532,49 @@ fn complete(
 /// block disables reasoning so the model answers directly. The control tokens
 /// (`<|user|>`, `<|assistant|>`, …) are added-vocab entries, so encoding the
 /// assembled string resolves them to their ids exactly as the C engine does.
-fn build_chat_prompt(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
-    let mut s = String::from("[gMASK]<sop>");
+fn build_chat_prompt(tok: &Tokenizer, messages: &[Json], arch: colibri_core::Arch) -> Vec<i32> {
+    match arch {
+        colibri_core::Arch::MinimaxM2 => build_chat_prompt_minimax(tok, messages),
+        // GLM-5.2 / MiniMax-M3: GLM-style chat markers.
+        _ => {
+            let mut s = String::from("[gMASK]<sop>");
+            for m in messages {
+                let o = match m.as_object() {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let role = o.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                let content = o.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                s.push_str(&format!("<|{role}|>{content}"));
+            }
+            s.push_str("<|assistant|><think></think>");
+            tok.encode(&s)
+        }
+    }
+}
+
+/// MiniMax-M2 chat format (from its `chat_template.jinja`): `]~!b[` opens the
+/// conversation, each turn is `]~b]<role>\n<content>[e~[` with roles
+/// system/user/ai, and the trailing `]~b]ai\n` is the generation prompt. M2 is a
+/// reasoning model — it emits `<think>…</think>` before its answer on its own, so we
+/// do not force an empty think block. Generation halts at `[e~[` (200020), which
+/// `Config::load` folds into `stop_ids` from `generation_config.json`.
+fn build_chat_prompt_minimax(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
+    let role_tag = |r: &str| match r {
+        "system" => "system",
+        "assistant" => "ai",
+        _ => "user",
+    };
+    let mut s = String::from("]~!b[");
+    let first_is_system = messages
+        .first()
+        .and_then(|m| m.as_object())
+        .and_then(|o| o.get("role"))
+        .and_then(|v| v.as_str())
+        == Some("system");
+    if !first_is_system {
+        s.push_str("]~b]system\nYou are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax.[e~[\n");
+    }
     for m in messages {
         let o = match m.as_object() {
             Some(o) => o,
@@ -541,9 +582,9 @@ fn build_chat_prompt(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
         };
         let role = o.get("role").and_then(|v| v.as_str()).unwrap_or("user");
         let content = o.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        s.push_str(&format!("<|{role}|>{content}"));
+        s.push_str(&format!("]~b]{}\n{}[e~[\n", role_tag(role), content));
     }
-    s.push_str("<|assistant|><think></think>");
+    s.push_str("]~b]ai\n");
     tok.encode(&s)
 }
 

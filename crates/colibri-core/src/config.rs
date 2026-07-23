@@ -183,11 +183,31 @@ fn parse_stop_ids(r: &Json, out: &mut Vec<i32>) {
 impl Config {
     /// Load and validate `<snap>/config.json`.
     pub fn load(snap: impl AsRef<Path>) -> Result<Config, ConfigError> {
-        let path = snap.as_ref().join("config.json");
+        let snap = snap.as_ref();
+        let path = snap.join("config.json");
         let text = std::fs::read_to_string(&path).map_err(ConfigError::Io)?;
         let root = Json::parse(&text)
             .ok_or_else(|| ConfigError::Parse(format!("{}: empty or invalid", path.display())))?;
-        Config::from_json(&root)
+        let mut cfg = Config::from_json(&root)?;
+        // `generation_config.json` carries the inference-time eos, which is often a chat
+        // turn-end token distinct from `config.json`'s base eos — MiniMax-M2's is `[e~[`
+        // (200020) vs config.json's 2, and without it generation never halts at end of
+        // turn. Merge its eos into the stop set (dedup, respecting the MAX_STOP_IDS cap).
+        if let Ok(gtext) = std::fs::read_to_string(snap.join("generation_config.json")) {
+            if let Some(gc) = Json::parse(&gtext) {
+                let mut extra = Vec::new();
+                parse_stop_ids(&gc, &mut extra);
+                for id in extra {
+                    if cfg.stop_ids.len() >= MAX_STOP_IDS {
+                        break;
+                    }
+                    if !cfg.stop_ids.contains(&id) {
+                        cfg.stop_ids.push(id);
+                    }
+                }
+            }
+        }
+        Ok(cfg)
     }
 
     /// Build a `Config` from an already-parsed `config.json` root object,

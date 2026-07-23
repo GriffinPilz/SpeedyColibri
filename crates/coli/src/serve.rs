@@ -554,20 +554,20 @@ fn complete(
 
     let object = if chat { "chat.completion" } else { "text_completion" };
     let id = format!("cmpl-{}", ids.len().wrapping_mul(2654435761) ^ max_tokens);
-    // Reserve exactly THIS request's KV (prompt + completion, incl. device shadow) by
-    // evicting experts before `mk_kv` allocates it eagerly — so a large-context request
-    // can't race the async monitor into swap, and small requests don't pay the worst-case
-    // full-window reservation. Released after the response so experts refill.
+    // The KV cache commits lazily (grows with tokens produced), so we reserve only the
+    // PROMPT's KV — what prefill commits at once. The generation tail grows one token at a
+    // time (~KB/token), which the adaptive monitor evicts experts against gradually; no
+    // giant eager allocation to race, so short generations never pay for a big `max_tokens`.
+    // If even the prompt's KV can't fit after evicting every expert, reject rather than OOM.
     let kv_bytes = (kv_bytes_per_token(&model.cfg) as u64)
-        .saturating_mul((ids.len() + max_tokens) as u64)
+        .saturating_mul(ids.len() as u64)
         .saturating_mul(KV_COPIES);
     if !provider.reserve_ram(kv_bytes) {
-        // Even evicting every expert can't free room for this KV — reject rather than OOM.
         let gib = (1u64 << 30) as f64;
         let msg = format!(
-            "Not enough memory for this request's context: {} tokens need ~{:.1} GB of KV cache, \
-             which does not fit right now. Use a shorter prompt or smaller max_tokens.",
-            ids.len() + max_tokens,
+            "Not enough memory for this prompt: {} tokens need ~{:.1} GB of KV cache, \
+             which does not fit right now. Use a shorter prompt.",
+            ids.len(),
             kv_bytes as f64 / gib
         );
         send_json(

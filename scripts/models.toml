@@ -34,7 +34,8 @@ container = "GLM-5.2-container"
 source    = "GLM-5.2-NVFP4-src"
 arch      = "glm-moe-dsa"
 prompt    = "100..611"
-notes     = "MLA + DSA lightning indexer, 256 experts top-8, NVFP4 routed. NOT resident on 42b2 right now (disk); paths recorded for re-materialization."
+hf_repo   = "Kanposer/GLM-5.2-speedy-colibri-nvfp4"   # complete NVFP4 container (56 files, incl. MTP head) — pull here to re-materialize
+notes     = "MLA + DSA lightning indexer, 256 experts top-8, NVFP4 routed. NOT resident on 42b2 right now (disk); container is on HF (hf_repo) — `huggingface-cli download <hf_repo> --local-dir <container>` to restore."
 
 ["glm-5.2".convert_env]
 COLI_KEEP_INDEXER = "1"   # keep the DSA indexer weights so the container can run sparse attention

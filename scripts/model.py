@@ -74,6 +74,7 @@ def resolve(name):
         "source": _join(root, m.get("source", "")) if m.get("source") else "",
         "prompt": _expand_prompt(m.get("prompt", "1")),
         "prompt_spec": str(m.get("prompt", "1")),
+        "hf_repo": m.get("hf_repo", ""),  # HF container to re-materialize from (optional)
         "notes": m.get("notes", ""),
         "convert_env": {str(k): str(v) for k, v in (m.get("convert_env") or {}).items()},
     }
@@ -95,6 +96,7 @@ def _cmd_env(name):
         "PROMPT_TOKENS": r["prompt"],
         "PROMPT_SPEC": r["prompt_spec"],
         "CONVERT_ENV": convert_env,
+        "HF_REPO": r["hf_repo"],
         "NOTES": r["notes"],
     }
     for k, v in out.items():

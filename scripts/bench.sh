@@ -109,11 +109,15 @@ suite_serve() {
   # shellcheck disable=SC2064
   trap "kill $pid 2>/dev/null || true" RETURN
   echo "  waiting for serve (pid $pid) to load + listen…"
+  # coli serve loads the ENTIRE model before it binds, so the port is refused until
+  # loading finishes. Poll for a real HTTP code; "000" = not-listening-yet, keep waiting.
+  # (curl -w already prints 000 on connection-refused — do NOT also `echo 000`, or the
+  # code becomes "000000" != "000" and the loop falsely declares serve up on poll 1.)
   local i code up=0
   for i in $(seq 1 "${SERVE_WAIT:-180}"); do
     kill -0 "$pid" 2>/dev/null || { echo "  serve died during load — see $log" >&2; tail -5 "$log" >&2; return 1; }
-    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || echo 000)
-    [[ "$code" != "000" ]] && { up=1; break; }
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$port/" 2>/dev/null || true)
+    [[ -n "$code" && "$code" != "000" ]] && { up=1; break; }
     sleep 1
   done
   [[ "$up" == 1 ]] || { echo "  serve never answered on :$port — see $log" >&2; return 1; }

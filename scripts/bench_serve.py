@@ -25,6 +25,7 @@ Usage: bench_serve.py [host:port] [tokens_per_request] [--repeat N]
 """
 
 import json
+import os
 import statistics
 import sys
 import time
@@ -50,8 +51,12 @@ PROMPTS = [
 
 def one(url, prompt, n_tokens):
     """POST one completion; return (tok/s, tokens, seconds) or None on failure."""
+    # The served model is whichever container `coli serve` loaded; the API `model`
+    # field is just a label. The harness passes COLI_SERVE_MODEL so logs name the
+    # right model (default keeps the historical "glm").
+    model = os.environ.get("COLI_SERVE_MODEL", "glm")
     body = json.dumps(
-        {"model": "glm", "prompt": prompt, "max_tokens": n_tokens, "stream": False}
+        {"model": model, "prompt": prompt, "max_tokens": n_tokens, "stream": False}
     ).encode()
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}

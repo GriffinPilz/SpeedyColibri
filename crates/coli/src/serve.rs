@@ -64,8 +64,20 @@ fn parse_ctx(s: &str) -> Option<usize> {
 }
 
 /// KV-cache bytes per token: two f32 latent/rotary buffers per layer.
+/// Host KV bytes per token — must match what `KvCache::for_model` actually allocates.
+///
+/// MLA (GLM): a compressed latent (`kv_lora`) + roped key (`qk_rope`) per layer.
+/// GQA (MiniMax): the roped key (`qk_rope`) **plus the full K and V** at
+/// `kv_dim = n_kv_heads * head_dim` each — the big term the old formula omitted, which
+/// undercounted GQA KV ~17× (M3: 60·(64+2·512)·4 ≈ 255 KB/token, not 15 KB) and made
+/// large contexts look far cheaper than they are.
 fn kv_bytes_per_token(cfg: &colibri_core::Config) -> usize {
-    cfg.n_layers as usize * (cfg.kv_lora as usize + cfg.qk_rope as usize) * 4
+    let mut per_layer = cfg.kv_lora as usize + cfg.qk_rope as usize;
+    if cfg.arch.is_gqa() {
+        // k_full + v_full, each `kv_dim = n_kv_heads * head_dim` wide (model.rs `enable_gqa`).
+        per_layer += 2 * cfg.n_kv_heads as usize * cfg.qk_head as usize;
+    }
+    cfg.n_layers as usize * per_layer * 4
 }
 
 type Provider<'a> = ExpertCache<ShardsExpertProvider<'a>>;
@@ -130,18 +142,40 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // Computed *before* the expert-cache budget: the budget has to reserve the KV
     // this window can allocate, and KV is sized from ctx_len.
     let model_max = if model.cfg.max_ctx > 0 { model.cfg.max_ctx as usize } else { usize::MAX };
-    let ctx_len = std::env::var("COLI_CTX")
+    let requested_ctx = std::env::var("COLI_CTX")
         .ok()
         .and_then(|s| parse_ctx(&s))
         .unwrap_or(DEFAULT_CTX)
         .clamp(1, model_max);
+    // Also clamp to what RAM can actually hold: a full-window request's KV
+    // (`kv_bytes_per_token * ctx * copies`, non-evictable) must fit alongside the dense
+    // tier + a minimal streaming expert cache + the OOM floor. Reserve ~18 GB for those;
+    // the rest is available to KV (experts evict to make room). This is the real ceiling —
+    // for the GQA models it lands well below their architectural max, because full K/V is
+    // stored per kv-head. Without this a big `COLI_CTX` looks fine at startup and only OOMs
+    // when a large request finally allocates its KV.
+    const CTX_RAM_RESERVE: u64 = 18 << 30;
+    let kv_pt = (kv_bytes_per_token(&model.cfg) as u64).saturating_mul(KV_COPIES).max(1);
+    let ram_ctx = colibri_engine::total_ram_bytes()
+        .map(|t| (t.saturating_sub(CTX_RAM_RESERVE) / kv_pt) as usize)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let ctx_len = requested_ctx.min(ram_ctx);
+    if requested_ctx > ctx_len {
+        eprintln!(
+            "[serve] COLI_CTX {requested_ctx} exceeds what RAM can hold as KV; clamped to \
+             {ctx_len} tokens (a full-window KV would not fit alongside the model)."
+        );
+    }
 
-    // Worst-case KV for the served window — a single full-context request allocates
-    // exactly this, and the expert cache must not have already eaten it.
-    let kv_reserve = (kv_bytes_per_token(&model.cfg) as u64)
+    // Worst-case KV for the served window (a single full-context request). No longer
+    // reserved up front: each request reserves *its own* KV dynamically (evicting experts
+    // just-in-time — see `ExpertCache::reserve_ram`), so this is only the ceiling we quote.
+    // The initial expert budget leaves a modest base for it; the adaptive monitor takes over.
+    let kv_worst_case = (kv_bytes_per_token(&model.cfg) as u64)
         .saturating_mul(ctx_len as u64)
         .saturating_mul(KV_COPIES);
-    let budget = crate::ram_budget_reserving(kv_reserve);
+    let budget = crate::ram_budget_reserving(kv_worst_case.min(8 << 30));
     let gib = (1u64 << 30) as f64;
     if budget == u64::MAX {
         // No /proc/meminfo (non-Linux dev box): the budget is unbounded, and printing
@@ -152,10 +186,10 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         );
     } else {
         println!(
-            "[serve] expert cache: {:.0} GB budget (reserved {:.1} GB KV for {} ctx{}) \
-             — set COLI_RAM_GB to override",
+            "[serve] expert cache: {:.0} GB initial budget; KV reserved per request \
+             (≤ {:.1} GB at the full {} ctx{}) — set COLI_RAM_GB to override",
             budget as f64 / gib,
-            kv_reserve as f64 / gib,
+            kv_worst_case as f64 / gib,
             ctx_len,
             if KV_COPIES > 1 { ", incl. device shadow" } else { "" }
         );
@@ -520,6 +554,29 @@ fn complete(
 
     let object = if chat { "chat.completion" } else { "text_completion" };
     let id = format!("cmpl-{}", ids.len().wrapping_mul(2654435761) ^ max_tokens);
+    // Reserve exactly THIS request's KV (prompt + completion, incl. device shadow) by
+    // evicting experts before `mk_kv` allocates it eagerly — so a large-context request
+    // can't race the async monitor into swap, and small requests don't pay the worst-case
+    // full-window reservation. Released after the response so experts refill.
+    let kv_bytes = (kv_bytes_per_token(&model.cfg) as u64)
+        .saturating_mul((ids.len() + max_tokens) as u64)
+        .saturating_mul(KV_COPIES);
+    if !provider.reserve_ram(kv_bytes) {
+        // Even evicting every expert can't free room for this KV — reject rather than OOM.
+        let gib = (1u64 << 30) as f64;
+        let msg = format!(
+            "Not enough memory for this request's context: {} tokens need ~{:.1} GB of KV cache, \
+             which does not fit right now. Use a shorter prompt or smaller max_tokens.",
+            ids.len() + max_tokens,
+            kv_bytes as f64 / gib
+        );
+        send_json(
+            stream,
+            507,
+            &format!("{{\"error\":{{\"message\":{},\"type\":\"insufficient_memory\",\"code\":\"kv_cache_too_large\"}}}}", jstr(&msg)),
+        );
+        return;
+    }
     let mut kv = mk_kv(model, ids.len() + max_tokens);
 
     if stream_mode {
@@ -527,6 +584,8 @@ fn complete(
     } else {
         block_completion(stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv);
     }
+    drop(kv); // free the KV before releasing the reservation
+    provider.release_ram(kv_bytes);
 }
 
 /// Official GLM-5.2 chat template (byte-matches `chat_template.jinja`, mirrored

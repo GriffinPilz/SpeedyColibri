@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/colibri.svg" width="440" alt="SpeedyColibri — colibrì, in Rust, on the DGX Spark">
-</p>
-
 <h1 align="center">SpeedyColibri</h1>
 
 **Run GLM-5.2 (744B-parameter MoE) on a single NVIDIA DGX Spark** — a Rust port

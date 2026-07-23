@@ -32,9 +32,11 @@ const DEFAULT_PORT: u16 = 8080;
 /// Default number of tokens generated when a request omits `max_tokens`.
 const DEFAULT_MAX_TOKENS: usize = 128;
 /// Default served context length (prompt + completion) when `COLI_CTX` is unset.
-/// GLM-5.2 supports up to 1M positions, but the KV cache is ~175 KB/token
-/// (~5.6 GB at 32K), so we cap to a memory-safe default and let `COLI_CTX` raise
-/// it as far as the model max.
+/// A small default keeps the KV reservation tiny so the most RAM goes to resident
+/// experts (and latency is lowest). `COLI_CTX` can be raised to the model max safely:
+/// the adaptive expert cache's OOM guard evicts experts to fit a larger KV, so a big
+/// window can't drive the box into swap (GLM-5.2's MLA KV, ~175 KB/token, becomes the
+/// practical ceiling before the 1M architectural max; the GQA models' KV is far smaller).
 const DEFAULT_CTX: usize = 32_768;
 /// Tokens generated per warm-up prompt (enough to route a spread of experts).
 const WARMUP_TOKENS: usize = 8;

@@ -158,7 +158,7 @@ curl http://localhost:8080/v1/completions -H 'Content-Type: application/json' -d
 |---|---|---|---|
 | `messages` | `/v1/chat/completions` | array of `{"role": "user"\|"assistant"\|"system", "content": "..."}`; assembled with the **served model's** chat template (GLM-5.2's, or MiniMax's `<think>`-reasoning format for M3/M2.7), stopping at that model's own end-of-turn token | required |
 | `prompt` | `/v1/completions` | raw text, tokenized and continued verbatim | required |
-| `max_tokens` | both | tokens to generate (capped at 2048) | `128` |
+| `max_tokens` | both | tokens to generate; the only bound is that prompt + completion ≤ the served context (`COLI_CTX`) | `128` |
 | `stream` | both | `true` → SSE token stream ending in `data: [DONE]`; `false` → one JSON object | `false` |
 | `model` | both | accepted and echoed; ignored for routing (one model is served) | — |
 
@@ -183,7 +183,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_RAM_GB` | **manual override** of the adaptive default ([RAM residency](#ram-residency-adaptive-by-default) below). Forces a fixed expert-cache budget and disables the adaptive monitor. Rarely needed; on a ≫-RAM model, setting it *higher* drives the box into swap (measured on GLM: 85 GB → ~0.11 tok/s vs ~0.46 at the safe budget). | adaptive (see below) |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
-| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`; bounded by the model max (1M) and by RAM (~175 KB/token of KV) | `32768` |
+| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Safe up to each model's architectural max — the OOM guard evicts experts to fit the KV, so a large window can't crash the box (see [Context & output length](#context--output-length)): M2.7 196,608 · M3 1,048,576 · GLM-5.2 KV-bound ~200k | `32768` |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
 | `COLI_VRAM_GB` | cap the VRAM expert store | all free VRAM |
@@ -305,24 +305,43 @@ arch, so it's obvious if the wrong one is up. `GET /v1/models` reports it at run
 
 ## RAM residency (adaptive by default)
 
-The expert cache **sizes itself to the model and the box** — no flag. At startup the
-engine compares total routed-expert bytes against RAM and picks one of two regimes,
-printing which and why:
+The expert cache **fills RAM and defends it** — no flag, for every model. A background
+monitor polls `MemAvailable` every 100 ms and evicts LRU experts the moment free memory
+approaches a hard floor (~3 GB), *whatever* consumed it — more experts, a longer KV cache,
+the GPU's own working set on GB10's unified pool. A cache that gives memory back under
+pressure **cannot OOM**, which is what lets a fill-RAM policy point at a model of any size:
 
-- **Near-fit** (experts ≈ RAM — e.g. MiniMax-M2.7, ~122 GB on a 121 GB Spark): fill RAM
-  with resident experts and hold them there, dropping the page-cache double-copy
-  (`fadvise`) so `MemAvailable` is honest, and evicting **only** under sustained
-  *external* memory pressure. Measured **1.94×** over the old static default on M2.7
-  (median 4.83 vs 2.49 tok/s, diverse-prompt serving) — the whole working set stays
-  resident instead of streaming from disk.
-- **≫ RAM** (experts far larger than RAM — e.g. GLM-5.2 ~436 GB, MiniMax-M3 ~216 GB):
-  stay on the OS page cache. A whole-expert cache would cover too little to help, and the
-  page cache's 4 KB granularity holds the hot working set better — forcing max-residency
-  here *regresses*. The engine detects this (`coverage < 80%`) and leaves it alone.
+- **Near-fit** (experts ≈ RAM — e.g. MiniMax-M2.7, ~122 GB on a 121 GB Spark): fill RAM and
+  hold the whole working set resident, dropping the page-cache double-copy (`fadvise`) so
+  `MemAvailable` is honest. Measured **1.94×** over the old static default (median 4.83 vs
+  2.49 tok/s, diverse-prompt serving) — the working set stays resident instead of streaming.
+- **≫ RAM** (experts larger than RAM — e.g. MiniMax-M3 ~216 GB, GLM-5.2 ~436 GB): fill RAM
+  with as many experts as fit, keep the OS page cache as a reclaimable second tier, and let
+  the monitor evict the LRU tail under pressure. Measured **1.22×** on M3 (2.05 vs 1.68 tok/s)
+  — more resident experts, higher hit rate — and, crucially, **no crash**: the same box that
+  OOM-died under a fixed `COLI_RAM_GB=100` now fills to 121 GB used and holds `avail` at the
+  floor for the whole run.
 
-`COLI_RAM_GB=<n>` overrides both with a fixed budget and turns the monitor off (for
-reproducible benchmarks or an unusual box). The old behavior — static `MemTotal/3`
-(~41 GB) — is what you get with any `COLI_RAM_GB` value.
+`COLI_RAM_GB=<n>` sets a fixed fill *target* (e.g. a smaller per-node budget for
+[multi-Spark](#multi-spark-expert-parallel)); the pressure monitor still runs underneath it,
+so even an oversized value can no longer walk the box into swap.
+
+### Context & output length
+
+Because the monitor evicts experts to make room for the KV cache, **a longer context or a
+longer generation can't OOM the box** — the experts just stream a bit more. So the served
+window (`COLI_CTX`, prompt + completion) can be raised all the way to each model's
+architectural maximum, and output length is bounded only by `context − prompt` (no fixed cap):
+
+| model | max context (`COLI_CTX`) | KV at that max | notes |
+|---|---|---|---|
+| **MiniMax-M2.7** | **196,608** | ~5.8 GB | GQA KV is tiny; **validated** end-to-end at the full max |
+| **MiniMax-M3** | **1,048,576** | ~29 GB | GQA; KV fits RAM at the 1M max, experts evict to fit |
+| **GLM-5.2** | ~200k+ (KV-bound) | ~175 KB/token (MLA) | 1M architecturally, but at ~350 KB/token (incl. GB10 device shadow) the KV, not the model, is the ceiling on one node |
+
+The default `COLI_CTX` stays **32,768** (a small KV keeps the most RAM for experts and the
+lowest latency); raise it per request-mix. `max_tokens` defaults to 128 and may go up to the
+remaining context.
 
 ## Where it stands
 
@@ -390,24 +409,23 @@ The single-node number is flat from a 20 GB to a 55 GB cache (diverse traffic ba
 reuses experts), so cache size is not a throughput lever here — headroom and avoiding
 swap are.
 
-### RAM residency by model (adaptive default) — 2026-07-23
+### RAM residency by model (fill + OOM-safe eviction) — 2026-07-23
 
-The [adaptive default](#ram-residency-adaptive-by-default) picks a regime per model.
-Measured on a 121 GiB Spark, `bench_serve.py` diverse prompts, single node — the win is
-**only** for the model that fits, and the auto-decline for the others is *load-bearing*,
-not just conservative:
+Every model fills RAM and evicts LRU experts under pressure. Measured on a 121 GiB Spark,
+`bench_serve.py` diverse prompts, single node:
 
-| model | routed experts vs RAM | regime chosen (auto) | serving throughput |
+| model | routed experts vs RAM | policy (auto) | serving throughput |
 |---|---|---|---|
-| **MiniMax-M2.7** | ~122 GB ≈ 121 GB (**near-fit**) | adaptive max-residency (fill ~101 GB, fadvise) | **4.83 tok/s** median — **1.94×** over the old 41 GB static default (2.49) |
-| **MiniMax-M3** | ~216 GB (1.8× RAM) | static page-cache (46% coverage < 80%) | 1.68 tok/s — unchanged; *forcing* `COLI_RAM_GB=100` **ran the box out of memory and crashed** (GB10 unified pool), so the decline is a safety guard, not just a perf call |
-| **GLM-5.2** | ~436 GB (3.6× RAM) | static page-cache (~23% coverage) | ≫-RAM regime unchanged; not re-run (container offloaded to HF). Forcing a bigger budget swaps (`COLI_RAM_GB=85` → ~0.11 tok/s) |
+| **MiniMax-M2.7** | ~122 GB ≈ 121 GB (near-fit) | fill ~101 GB + fadvise, hold working set | **4.83 tok/s** median — **1.94×** over the old 41 GB static default (2.49) |
+| **MiniMax-M3** | ~216 GB (1.8× RAM) | fill RAM, keep page cache, LRU-evict | **2.05 tok/s** median — **1.22×** over the old static 1.68; box fills to 121 GB used and holds `avail` at the 3 GB floor for the whole run, **no OOM** |
+| **GLM-5.2** | ~436 GB (3.6× RAM) | fill RAM, keep page cache, LRU-evict | not re-run (container offloaded to HF); ≫-RAM, expect a small gain like M3 at most — the page cache already served the hot set |
 
-Takeaway: RAM-maxing is a **near-fit** lever. When the experts fit RAM it holds the whole
-working set resident (~2× on M2.7); when they don't, the page cache serves the hot set
-better at 4 KB granularity, and forcing residency ranges from a regression (GLM) to an
-OOM crash (M3). The engine detects which case it's in and does the safe, fast thing with
-no flag.
+Takeaway: filling RAM helps whenever more experts fit — a lot when the model fits (~2× on
+M2.7), modestly when it doesn't (~1.2× on M3). The **eviction is what makes it safe**: the
+earlier build OOM-crashed when a fixed 100 GB budget grew into the GPU's working set; the
+monitor now defends a hard floor, so filling RAM never crosses the swap line and the same
+config just caps itself. That safety is also what lets `COLI_CTX` reach each model's full
+context maximum — the KV cache grows, experts evict, the box stays up.
 
 ### Long context — single node, 8/4, varied input (in progress)
 

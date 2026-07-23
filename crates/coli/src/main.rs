@@ -377,11 +377,12 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     let env_u32 = |k: &str, d: u32| {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
     };
-    // Detect the source architecture from its config: MiniMax-M3 needs name remapping
-    // + Gemma-norm folding, and its layer count comes from `text_config` (env
-    // COLI_NLAYERS still overrides for GLM). A missing/unreadable config falls back to GLM.
+    // Detect the source architecture from its config: the MiniMax GQA family (M3/M2)
+    // needs the block_sparse_moe→mlp / w1w2w3 name remapping, its layer count comes from
+    // the config (env COLI_NLAYERS still overrides for GLM), and Gemma-norm folding is
+    // per-model (M3 yes, M2 no — read from the config). Missing config → falls back to GLM.
     let src_cfg = colibri_core::Config::load(indir).ok();
-    let minimax = src_cfg.as_ref().map(|c| c.arch == colibri_core::Arch::MinimaxM3).unwrap_or(false);
+    let minimax = src_cfg.as_ref().map(|c| c.arch.is_gqa()).unwrap_or(false);
     let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
     let n_layers = if minimax {
         src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)

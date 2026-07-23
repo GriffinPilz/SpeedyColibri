@@ -27,6 +27,19 @@ notes     = "GQA (64Q/4KV, head_dim 128, partial rope 64), 128 experts top-4, si
 # NVFP4 experts + int8 resident are the convert defaults — nothing to override.
 
 # ---------------------------------------------------------------------------
+# Quoted name (dot). Same GQA family as M3, so most infra is shared.
+["minimax-m2.7"]
+container = "MiniMax-M2.7-container"
+source    = "MiniMax-M2.7-NVFP4-src"
+arch      = "minimax-m2"
+prompt    = "100..611"
+hf_repo   = "nvidia/MiniMax-M2.7-NVFP4"
+notes     = "GQA (48Q/8KV, head_dim 128, partial rope 64), 256 experts top-8, plain SwiGLU (silu), per-layer QK-norm, standard RMSNorm, no shared expert, all-MoE. NVFP4 routed. 62 layers, no MTP head in this quant."
+
+["minimax-m2.7".convert_env]
+# NVFP4 experts + int8 resident are the convert defaults; no gemma-norm (auto-detected off).
+
+# ---------------------------------------------------------------------------
 # NOTE: the name is quoted — TOML reads an unquoted dot as table nesting, so
 # [glm-5.2] would parse as glm-5 → 2. Quote any model name containing a dot.
 ["glm-5.2"]

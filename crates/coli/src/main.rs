@@ -2036,6 +2036,19 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
 /// resident, so any small constant still yields a budget far past the cliff.
 const WORKING_RESERVE: u64 = 10 << 30;
 
+/// Adaptive max-residency reserve: RAM held back from the expert fill for the serving
+/// process's own peak runtime — KV cache, prefill activations, GPU host staging, expert
+/// read buffers. `fill_target = total − this`. Sized from the validated static-100 GB
+/// config on a 121 GiB Spark (M2.7), which left ~21 GB and was rock-stable at 4.35 tok/s;
+/// a 10 GB reserve thrashed (own-request spikes tripped eviction). Must exceed peak
+/// per-request runtime so `MemAvailable` never nears [`ADAPTIVE_DANGER_FLOOR`] on our own
+/// account — only an *external* tenant should push it there.
+const ADAPTIVE_FILL_RESERVE: u64 = 20 << 30;
+
+/// Adaptive max-residency danger line: only when `MemAvailable` stays under this (a real
+/// other tenant, since the reserve absorbs our own runtime) does the monitor evict experts.
+const ADAPTIVE_DANGER_FLOOR: u64 = 4 << 30;
+
 /// The expert cache is capped at `MemTotal / CACHE_CAP_DIVISOR`.
 ///
 /// **Measured on a 121 GiB Spark, 8/4 model (~19 GiB resident), 12 diverse prompts,
@@ -2176,21 +2189,21 @@ fn wire_adaptive_cache<P>(
         }
     };
     let total_expert_bytes = per.saturating_mul(cfg.n_experts as u64).saturating_mul(n_moe);
-    // Reserve for activations / KV / GPU staging / read buffers before filling with experts.
-    let floor = WORKING_RESERVE.max(total / 20);
-    let achievable = total.saturating_sub(floor);
+    // Hold back the process's own peak runtime (KV/activations/staging/read buffers);
+    // fill the rest with experts. `fill_target` is the standing budget.
+    let fill_target = total.saturating_sub(ADAPTIVE_FILL_RESERVE);
     let covers_pct = if total_expert_bytes > 0 {
-        achievable.saturating_mul(100) / total_expert_bytes
+        fill_target.saturating_mul(100) / total_expert_bytes
     } else {
         0
     };
     if covers_pct >= NEARFIT_COVERAGE_PCT {
         colibri_safetensors::set_fadvise(true);
-        provider.spawn_adaptive_budget(floor);
+        provider.spawn_adaptive_budget(fill_target, ADAPTIVE_DANGER_FLOOR);
         eprintln!(
             "[cache] adaptive max-residency: ~{} GB routed experts / {} GB RAM ({covers_pct}% coverage) \
-             → fill to ~{} GB, fadvise on, evict under pressure",
-            total_expert_bytes >> 30, total >> 30, achievable >> 30
+             → fill to ~{} GB (reserve {} GB), fadvise on, evict only under sustained external pressure",
+            total_expert_bytes >> 30, total >> 30, fill_target >> 30, ADAPTIVE_FILL_RESERVE >> 30
         );
     } else {
         eprintln!(

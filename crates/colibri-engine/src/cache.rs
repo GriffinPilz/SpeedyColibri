@@ -506,42 +506,64 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
         });
     }
 
-    /// Make the byte ceiling **adaptive**: a background thread rewrites `budget` to
-    /// fill free RAM down to `floor_bytes`, so the cache holds as many experts as
-    /// physically fit and shrinks (evicting LRU experts) the moment prefill, decode,
-    /// or another process claims memory.
+    /// Make the byte ceiling **adaptive**: fill RAM up to `fill_target` and hold it,
+    /// ceding memory (evicting LRU experts) only when a *different* tenant creates
+    /// genuine, sustained pressure — `MemAvailable` staying under `danger_floor`.
     ///
-    /// Each tick: `budget = resident + (MemAvailable − floor)` — grow by the slack
-    /// above the floor, or shrink below current residency and evict when MemAvailable
-    /// dips under it. At steady state MemAvailable settles at `floor`.
+    /// `fill_target` is the standing budget: `total − reserve`, where the reserve is
+    /// sized for the serving process's own peak runtime (KV cache, prefill activations,
+    /// GPU host staging, expert read buffers). The cache grows to it through the insert
+    /// path; we set it once here.
     ///
-    /// SAFETY / correctness: `MemAvailable` is only an honest "free RAM" signal once
-    /// expert reads bypass the page cache (O_DIRECT). With buffered reads it counts the
-    /// page cache holding the model as free, so the cache over-grows and pages itself
-    /// out — the trap documented on [`total_ram_bytes`]. Enable this only alongside the
-    /// O_DIRECT read path. Off-Linux (no `/proc/meminfo`) it no-ops.
-    pub fn spawn_adaptive_budget(self: &Arc<Self>, floor_bytes: u64) {
+    /// Why we do NOT track `MemAvailable` symmetrically (the old `budget = resident +
+    /// (avail − floor)` law): once RAM is filled, `avail` sits low *by design*, and every
+    /// request transiently allocates activations/staging on top for its whole duration
+    /// (seconds). A law that shrinks on any dip below the floor evicts the exact working
+    /// set it just made resident — and with fadvise on, each false eviction is a cold
+    /// re-read, so throughput *degrades* under sustained diverse load (measured: median
+    /// 2.06 vs the static-budget 4.35 tok/s on M2.7). The correct separation: the reserve
+    /// (baked into `fill_target`) absorbs our own request runtime so `avail` never reaches
+    /// `danger_floor` on our account; only an external tenant pushes it there, and only
+    /// then — after `SUSTAIN` ticks, so a momentary blip is ignored — do we evict, down to
+    /// just off the swap line. When the pressure clears we reclaim back up to `fill_target`.
+    ///
+    /// SAFETY: `MemAvailable` is only honest once expert reads don't double-hold in the
+    /// page cache (fadvise or O_DIRECT). Enable this only alongside one of those. Off-Linux
+    /// (no `/proc/meminfo`) it no-ops after setting the standing budget.
+    pub fn spawn_adaptive_budget(self: &Arc<Self>, fill_target: u64, danger_floor: u64) {
         const TICK_MS: u64 = 250;
-        const FLOOR_MIN: u64 = 2 << 30; // never target < 2 GiB free — burst headroom
-        let floor = floor_bytes.max(FLOOR_MIN);
+        const SUSTAIN: u32 = 3; // ~750 ms below the danger floor before we cede memory
+        const FLOOR_MIN: u64 = 2 << 30; // never target < 2 GiB resident
+        let fill_target = fill_target.max(FLOOR_MIN);
+        let danger_floor = danger_floor.max(FLOOR_MIN);
         let cache = Arc::clone(self);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
-            let avail = match available_ram_bytes() {
-                Some(a) => a,
-                None => return, // non-Linux: no live signal, leave the static budget
-            };
-            let resident = cache.state.lock().unwrap().bytes;
-            let new_budget = if avail >= floor {
-                resident.saturating_add(avail - floor)
-            } else {
-                resident.saturating_sub(floor - avail)
-            }
-            .max(FLOOR_MIN);
-            cache.budget.store(new_budget, Ordering::Relaxed);
-            // Shrink now under external pressure, without waiting for the next insert.
-            if new_budget < resident {
-                cache.state.lock().unwrap().evict_to(new_budget);
+        // Grow to the standing fill target immediately (the insert path enforces it).
+        cache.budget.store(fill_target, Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let mut low_ticks: u32 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+                let avail = match available_ram_bytes() {
+                    Some(a) => a,
+                    None => return, // non-Linux: no live signal, keep the standing budget
+                };
+                low_ticks = if avail < danger_floor {
+                    low_ticks.saturating_add(1)
+                } else {
+                    0
+                };
+                let resident = cache.state.lock().unwrap().bytes;
+                let new_budget = if low_ticks >= SUSTAIN {
+                    // Sustained external pressure: cede RAM to just clear the swap line.
+                    resident.saturating_sub(danger_floor - avail).max(FLOOR_MIN)
+                } else {
+                    // Normal (incl. our own transient request spikes): hold the target.
+                    fill_target
+                };
+                cache.budget.store(new_budget, Ordering::Relaxed);
+                if new_budget < resident {
+                    cache.state.lock().unwrap().evict_to(new_budget);
+                }
             }
         });
     }

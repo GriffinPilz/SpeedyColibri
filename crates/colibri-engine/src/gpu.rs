@@ -135,8 +135,9 @@ pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
 }
 
 /// Standard GQA prefill attention on the GPU (MiniMax-M3 dense core). `ctx`/`q` are
-/// `[S, H, D]`; `k`/`v` are the full causal cache `[T, Hkv, D]`. Returns false (→ the
-/// CPU core) when CUDA is unavailable or the dims are outside the kernel's range.
+/// `[S, H, D]`; `k`/`v` are the full causal cache `[T, Hkv, D]`. `mode` picks the
+/// kernel: 0 = scalar (f32, reference), 1 = WMMA flash (fp16, ~faster). Returns false
+/// (→ the CPU core) when CUDA is unavailable or the dims are outside the kernel's range.
 #[allow(clippy::too_many_arguments)]
 pub fn try_gqa_attn(
     ctx: &mut [f32],
@@ -149,6 +150,7 @@ pub fn try_gqa_attn(
     d: usize,
     t: usize,
     scale: f32,
+    mode: u32,
 ) -> bool {
     if !available() {
         return false;
@@ -166,6 +168,7 @@ pub fn try_gqa_attn(
             d as i32,
             t as i32,
             scale,
+            mode as i32,
         )
     }
 }

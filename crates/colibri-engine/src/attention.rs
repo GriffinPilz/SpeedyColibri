@@ -102,6 +102,20 @@ fn m3_sparse_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_M3_SPARSE").ok().as_deref() == Some("1"))
 }
 
+/// Which GPU GQA prefill kernel to use: 1 = WMMA flash `tc_gqa_attn` (fp16 tensor
+/// cores, the default — ~8× the scalar core at long context and token-identical on
+/// validation, max|Δ| vs f32 ~1e-5), 0 = scalar `gqa_attn_kernel` (f32, bit-exact
+/// reference). `COLI_GQA_KERNEL=naive|scalar|0` forces the reference kernel; anything
+/// else (or unset) uses flash. Read once.
+#[cfg(feature = "cuda")]
+fn gqa_kernel_mode() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("COLI_GQA_KERNEL").ok().as_deref() {
+        Some("naive") | Some("scalar") | Some("0") => 0,
+        _ => 1,
+    })
+}
+
 /// The `keep` highest-scoring block ids, returned sorted ascending (the key set is
 /// then read in position order). Ties resolve by lower block id.
 fn topk_blocks(scores: &[f32], keep: usize) -> Vec<u32> {
@@ -280,6 +294,7 @@ pub fn attention_gqa(
             hd,
             t_full,
             scale,
+            gqa_kernel_mode(),
         );
     }
 
@@ -1274,6 +1289,102 @@ mod tests {
             gpu_host / gpu_dev,
             cpu / gpu_dev,
         );
+    }
+
+    // Isolated GQA attention microbench at real MiniMax-M3 dims (H=64, Hkv=4, D=128),
+    // single-shot prefill (S == T). A/Bs the two GPU kernels (mode 0 scalar, mode 1
+    // WMMA flash) against a CPU reference, reporting per-call ms, max|Δ| vs CPU, and
+    // the kernel time SAVED (Δ ms) — the transfer cost is identical in both modes and
+    // cancels in the difference, so `naive_ms - flash_ms` is the true kernel speedup,
+    // isolated from the cold expert I/O that dominates a real `coli gen` prefill.
+    // Run: `cargo test -p colibri-engine --features cuda --release -- --ignored
+    // bench_gqa_attention_gpu --nocapture` (COLI_BENCH_T=512,2048,4096 COLI_BENCH_ITERS=50).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_gqa_attention_gpu() {
+        if !crate::gpu::available() {
+            eprintln!("skip: no CUDA device");
+            return;
+        }
+        let (h, hkv, d) = (64usize, 4usize, 128usize); // MiniMax-M3 attention geometry
+        let group = h / hkv;
+        let scale = 1.0 / (d as f32).sqrt();
+        let ts: Vec<usize> = std::env::var("COLI_BENCH_T")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![512, 1024, 2048, 4096]);
+        let iters: u64 =
+            std::env::var("COLI_BENCH_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+
+        for &t in &ts {
+            let s = t; // single-shot prefill: every position is new, context == S
+            let q: Vec<f32> = (0..s * h * d).map(|k| (((k * 7) % 13) as f32 - 6.0) * 0.02).collect();
+            let kk: Vec<f32> = (0..t * hkv * d).map(|k| (((k * 5) % 11) as f32 - 5.0) * 0.02).collect();
+            let vv: Vec<f32> = (0..t * hkv * d).map(|k| (((k * 3) % 7) as f32 - 3.0) * 0.02).collect();
+
+            // CPU reference: causal grouped-query attention core.
+            let mut cref = vec![0f32; s * h * d];
+            for si in 0..s {
+                let nt = si + 1; // causal keys [0, si]
+                for hh in 0..h {
+                    let kvh = hh / group;
+                    let qv = &q[(si * h + hh) * d..(si * h + hh) * d + d];
+                    let mut sceff = vec![0f32; nt];
+                    for (tt, sc) in sceff.iter_mut().enumerate() {
+                        let kr = &kk[(tt * hkv + kvh) * d..(tt * hkv + kvh) * d + d];
+                        *sc = qv.iter().zip(kr).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                    }
+                    let mx = sceff.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut den = 0f32;
+                    for x in sceff.iter_mut() {
+                        *x = (*x - mx).exp();
+                        den += *x;
+                    }
+                    let c = &mut cref[(si * h + hh) * d..(si * h + hh) * d + d];
+                    for (tt, &sc) in sceff.iter().enumerate() {
+                        let vr = &vv[(tt * hkv + kvh) * d..(tt * hkv + kvh) * d + d];
+                        let w = sc / den;
+                        for (o, &x) in c.iter_mut().zip(vr) {
+                            *o += w * x;
+                        }
+                    }
+                }
+            }
+
+            let mut c0 = vec![0f32; s * h * d];
+            let mut c1 = vec![0f32; s * h * d];
+            // Correctness + warm-up for both kernels.
+            let ok0 = crate::gpu::try_gqa_attn(&mut c0, &q, &kk, &vv, s, h, hkv, d, t, scale, 0);
+            let ok1 = crate::gpu::try_gqa_attn(&mut c1, &q, &kk, &vv, s, h, hkv, d, t, scale, 1);
+            assert!(ok0, "scalar GQA kernel must run when a device is present");
+            let e0 = c0.iter().zip(&cref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let e1 = if ok1 {
+                c1.iter().zip(&cref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+            } else {
+                f32::NAN
+            };
+
+            let tm = std::time::Instant::now();
+            for _ in 0..iters {
+                crate::gpu::try_gqa_attn(&mut c0, &q, &kk, &vv, s, h, hkv, d, t, scale, 0);
+            }
+            let naive = tm.elapsed().as_secs_f64() / iters as f64 * 1e3;
+            let flash = if ok1 {
+                let tm = std::time::Instant::now();
+                for _ in 0..iters {
+                    crate::gpu::try_gqa_attn(&mut c1, &q, &kk, &vv, s, h, hkv, d, t, scale, 1);
+                }
+                tm.elapsed().as_secs_f64() / iters as f64 * 1e3
+            } else {
+                f32::NAN as f64
+            };
+            eprintln!(
+                "GQA T={t} S={s} H={h} Hkv={hkv} D={d} x{iters}: scalar {naive:.3} ms (err {e0:.1e}) | flash {flash:.3} ms (err {e1:.1e}) | kernel saved {:.3} ms ({:.2}x)",
+                naive - flash,
+                naive / flash,
+            );
+        }
     }
 
     #[test]

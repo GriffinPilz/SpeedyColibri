@@ -148,6 +148,7 @@ extern "C" {
         d: c_int,
         t: c_int,
         scale: f32,
+        mode: c_int,
     ) -> c_int;
     // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
     fn coli_cuda_dsa_indexer_scores(
@@ -607,8 +608,9 @@ pub unsafe fn gqa_attn_raw(
     d: i32,
     t: i32,
     scale: f32,
+    mode: i32,
 ) -> bool {
-    coli_cuda_gqa_attn(0, ctx, q, k, v, s, h, hkv, d, t, scale) != 0
+    coli_cuda_gqa_attn(0, ctx, q, k, v, s, h, hkv, d, t, scale, mode) != 0
 }
 
 /// DSA sparse MLA attention: like [`attention_absorb_batch_raw`] but each query

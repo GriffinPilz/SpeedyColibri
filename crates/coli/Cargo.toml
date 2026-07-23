@@ -27,3 +27,7 @@ colibri-backend = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# io_uring read-engine microbench (`coli iobench`) — Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6"

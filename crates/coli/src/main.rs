@@ -152,6 +152,7 @@ fn main() -> ExitCode {
         "requant-nvfp4" => cmd_requant_nvfp4(&args),
         "probe" => cmd_probe(&args),
         "qerr" => cmd_qerr(&args),
+        "iobench" => cmd_iobench(&args),
         "bench" => {
             eprintln!("coli {cmd}: not yet ported. See PORTING.md for status.");
             ExitCode::from(2)
@@ -1611,6 +1612,209 @@ fn cmd_repack(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `coli iobench <file> [total_mb=2048] [bs_kb=2048] [qd=20]` — the atlas io_uring
+/// question, measured. Reads `total_mb` of **cold** data (page cache dropped via
+/// `posix_fadvise(DONTNEED)` before each pass) from `file` at random block-aligned
+/// offsets, block size `bs_kb`, comparing the read engines that matter for decode:
+///   (A) our model — `qd` threads each doing blocking `pread`,
+///   (B) io_uring with SQPOLL at depth `qd`, buffered (page-cache-served, like us),
+///   (C) io_uring + O_DIRECT at depth `qd` — the drive's ceiling (bypasses cache).
+/// If (A) already ≈ (C), the read engine is not the bottleneck and io_uring can't help.
+#[cfg(target_os = "linux")]
+fn cmd_iobench(args: &[String]) -> ExitCode {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let path = match args.get(2) {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("usage: coli iobench <file> [total_mb=2048] [bs_kb=2048] [qd=20]");
+            return ExitCode::from(2);
+        }
+    };
+    let total_mb: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let bs: usize = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048) * 1024;
+    let qd: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(20);
+
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("coli iobench: open {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let fd = file.as_raw_fd();
+    let flen = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if flen < bs as u64 * 2 {
+        eprintln!("coli iobench: file too small ({flen} B) for bs {bs}");
+        return ExitCode::FAILURE;
+    }
+    let nblocks = ((total_mb << 20) / bs as u64).max(1) as usize;
+    let maxblk = flen / bs as u64;
+    // deterministic block-aligned pseudo-random offsets (splitmix64)
+    let mut sm = 0x1234_5678_9abc_def0u64;
+    let offsets: Vec<u64> = (0..nblocks)
+        .map(|_| {
+            sm = sm.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = sm;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            (z % maxblk) * bs as u64
+        })
+        .collect();
+    let total_bytes = (nblocks * bs) as f64;
+    let drop_cache = || unsafe { libc::posix_fadvise(fd, 0, flen as libc::off_t, libc::POSIX_FADV_DONTNEED) };
+    println!(
+        "iobench {path}: {nblocks} × {} KiB = {:.2} GB cold random reads, qd={qd}",
+        bs / 1024,
+        total_bytes / 1e9
+    );
+
+    // (A) our model: `qd` threads, blocking pread.
+    drop_cache();
+    let ta = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for t in 0..qd {
+            let offsets = &offsets;
+            s.spawn(move || {
+                let mut buf = vec![0u8; bs];
+                let mut k = t;
+                while k < nblocks {
+                    let base = offsets[k] as libc::off_t;
+                    let mut done = 0usize;
+                    while done < bs {
+                        let r = unsafe {
+                            libc::pread(
+                                fd,
+                                buf.as_mut_ptr().add(done) as *mut libc::c_void,
+                                bs - done,
+                                base + done as libc::off_t,
+                            )
+                        };
+                        if r <= 0 {
+                            break;
+                        }
+                        done += r as usize;
+                    }
+                    k += qd;
+                }
+            });
+        }
+    });
+    let a = ta.elapsed().as_secs_f64();
+    println!("  (A) threaded pread ×{qd}   : {:.2} GB/s  ({a:.2}s)", total_bytes / a / 1e9);
+
+    // (B) io_uring, buffered.
+    drop_cache();
+    let tb = std::time::Instant::now();
+    match iouring_read(fd, bs, qd, &offsets, false) {
+        Ok(sqpoll) => {
+            let b = tb.elapsed().as_secs_f64();
+            println!(
+                "  (B) io_uring {} buffered: {:.2} GB/s  ({b:.2}s)",
+                if sqpoll { "SQPOLL" } else { "plain " },
+                total_bytes / b / 1e9
+            );
+        }
+        Err(e) => println!("  (B) io_uring buffered FAILED: {e}"),
+    }
+
+    // (C) io_uring + O_DIRECT — the drive ceiling (opens a second O_DIRECT fd).
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(&path)
+    {
+        Ok(df) => {
+            let dfd = df.as_raw_fd();
+            let tc = std::time::Instant::now();
+            match iouring_read(dfd, bs, qd, &offsets, true) {
+                Ok(sqpoll) => {
+                    let c = tc.elapsed().as_secs_f64();
+                    println!(
+                        "  (C) io_uring {} O_DIRECT: {:.2} GB/s  ({c:.2}s)  [drive ceiling]",
+                        if sqpoll { "SQPOLL" } else { "plain " },
+                        total_bytes / c / 1e9
+                    );
+                }
+                Err(e) => println!("  (C) io_uring O_DIRECT FAILED: {e}"),
+            }
+        }
+        Err(e) => println!("  (C) O_DIRECT open failed ({e}) — skipping ceiling"),
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cmd_iobench(_args: &[String]) -> ExitCode {
+    eprintln!("coli iobench: Linux only (io_uring)");
+    ExitCode::from(2)
+}
+
+/// Read every offset once through an io_uring of depth `qd`. `direct` requires the
+/// buffers and offsets to be 512-aligned (they are: block-aligned offsets, page-aligned
+/// buffers). Returns whether SQPOLL was successfully enabled.
+#[cfg(target_os = "linux")]
+fn iouring_read(fd: i32, bs: usize, qd: usize, offsets: &[u64], direct: bool) -> std::io::Result<bool> {
+    use io_uring::{opcode, types, IoUring};
+    let (mut ring, sqpoll) = match IoUring::builder().setup_sqpoll(2000).build(qd as u32) {
+        Ok(r) => (r, true),
+        Err(_) => (IoUring::new(qd as u32)?, false),
+    };
+    // Page-aligned buffers (required for O_DIRECT; harmless otherwise).
+    let align = 4096usize;
+    let mut bufs: Vec<Vec<u8>> = (0..qd)
+        .map(|_| {
+            let mut v = vec![0u8; bs + align];
+            let off = v.as_ptr() as usize % align;
+            if off != 0 {
+                v.drain(0..(align - off));
+            }
+            v
+        })
+        .collect();
+    let _ = direct;
+    let n = offsets.len();
+    let mut next = 0usize;
+    let mut inflight = 0usize;
+    let mk = |slot: usize, off: u64, bufs: &mut [Vec<u8>]| {
+        opcode::Read::new(types::Fd(fd), bufs[slot].as_mut_ptr(), bs as u32)
+            .offset(off)
+            .build()
+            .user_data(slot as u64)
+    };
+    while next < n && inflight < qd {
+        let e = mk(inflight, offsets[next], &mut bufs);
+        unsafe {
+            ring.submission()
+                .push(&e)
+                .map_err(|_| std::io::Error::other("sq push"))?;
+        }
+        next += 1;
+        inflight += 1;
+    }
+    ring.submit()?;
+    while inflight > 0 {
+        ring.submit_and_wait(1)?;
+        let done: Vec<usize> = ring.completion().map(|c| c.user_data() as usize).collect();
+        for slot in done {
+            inflight -= 1;
+            if next < n {
+                let e = mk(slot, offsets[next], &mut bufs);
+                unsafe {
+                    ring.submission()
+                        .push(&e)
+                        .map_err(|_| std::io::Error::other("sq push"))?;
+                }
+                next += 1;
+                inflight += 1;
+            }
+        }
+        ring.submit()?;
+    }
+    Ok(sqpoll)
 }
 
 /// `coli loadbench <snap> [n_experts] [layer]` — decompose the *warm* (page-cache

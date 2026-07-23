@@ -183,7 +183,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_RAM_GB` | **manual override** of the adaptive default ([RAM residency](#ram-residency-adaptive-by-default) below). Forces a fixed expert-cache budget and disables the adaptive monitor. Rarely needed; on a ≫-RAM model, setting it *higher* drives the box into swap (measured on GLM: 85 GB → ~0.11 tok/s vs ~0.46 at the safe budget). | adaptive (see below) |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
-| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Safe up to each model's architectural max — the OOM guard evicts experts to fit the KV, so a large window can't crash the box (see [Context & output length](#context--output-length)): M2.7 196,608 · M3 1,048,576 · GLM-5.2 KV-bound ~200k | `32768` |
+| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound well below the architectural max on one node — see [Context & output length](#context--output-length): GLM ~290k · M3 ~210k · M2.7 ~100k | `32768` |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
 | `COLI_VRAM_GB` | cap the VRAM expert store | all free VRAM |
@@ -328,20 +328,28 @@ so even an oversized value can no longer walk the box into swap.
 
 ### Context & output length
 
-Because the monitor evicts experts to make room for the KV cache, **a longer context or a
-longer generation can't OOM the box** — the experts just stream a bit more. So the served
-window (`COLI_CTX`, prompt + completion) can be raised all the way to each model's
-architectural maximum, and output length is bounded only by `context − prompt` (no fixed cap):
+Each request reserves *its own* KV cache dynamically — the expert cache evicts to make room
+before the allocation, and a request whose KV genuinely can't fit is **rejected with HTTP 507**
+rather than OOMing the box. So `COLI_CTX` (prompt + completion) can be raised safely, but the
+real ceiling is **memory, not the model's architectural max**: on one 121 GB Spark the KV cache
+must fit alongside the resident weights, so the server clamps `COLI_CTX` to what RAM can hold
+and prints the limit at startup.
 
-| model | max context (`COLI_CTX`) | KV at that max | notes |
+The KV per token differs sharply by attention type. GLM's **MLA** compresses K/V into a small
+latent (~175 KB/token); the MiniMax **GQA** models store *full* K and V per kv-head, which is
+much larger — so, counterintuitively, GLM holds the *longest* context:
+
+| model | attention | KV / token (incl. ×2 GB10 shadow) | max `COLI_CTX` on a 121 GB Spark |
 |---|---|---|---|
-| **MiniMax-M2.7** | **196,608** | ~5.8 GB | GQA KV is tiny; **validated** end-to-end at the full max |
-| **MiniMax-M3** | **1,048,576** | ~29 GB | GQA; KV fits RAM at the 1M max, experts evict to fit |
-| **GLM-5.2** | ~200k+ (KV-bound) | ~175 KB/token (MLA) | 1M architecturally, but at ~350 KB/token (incl. GB10 device shadow) the KV, not the model, is the ceiling on one node |
+| **GLM-5.2** | MLA (compressed) | ~350 KB | ~290k |
+| **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | ~500 KB | ~210k |
+| **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | ~1.0 MB | ~100k |
 
-The default `COLI_CTX` stays **32,768** (a small KV keeps the most RAM for experts and the
-lowest latency); raise it per request-mix. `max_tokens` defaults to 128 and may go up to the
-remaining context.
+(architectural maxima are 1M / 1M / 196,608 respectively — none is memory-reachable on one
+node.) These are ceilings where the experts are nearly all evicted, so throughput there is low;
+practical high-throughput context is lower. The default `COLI_CTX` stays **32,768** — a small KV
+keeps the most RAM for resident experts and the lowest latency. `max_tokens` defaults to 128 and
+is bounded only by the remaining context (no fixed cap).
 
 ## Where it stands
 

@@ -41,14 +41,6 @@ const DEFAULT_CTX: usize = 32_768;
 /// Tokens generated per warm-up prompt (enough to route a spread of experts).
 const WARMUP_TOKENS: usize = 8;
 
-/// How many copies of the KV cache to reserve for. `KvCache` lazily allocates a
-/// full-size device-side shadow per layer (`model.rs`'s `DeviceKv`) on the GPU decode
-/// path — and on GB10's unified memory that shadow comes out of the *same* pool as
-/// the host copy, so under CUDA the KV genuinely costs twice.
-#[cfg(feature = "cuda")]
-const KV_COPIES: u64 = 2;
-#[cfg(not(feature = "cuda"))]
-const KV_COPIES: u64 = 1;
 
 /// Parse a token count like `32k`, `1m`, or `131072`.
 fn parse_ctx(s: &str) -> Option<usize> {
@@ -64,20 +56,26 @@ fn parse_ctx(s: &str) -> Option<usize> {
 }
 
 /// KV-cache bytes per token: two f32 latent/rotary buffers per layer.
-/// Host KV bytes per token — must match what `KvCache::for_model` actually allocates.
+/// Total resident KV bytes per token — the host cache **plus** the CUDA device shadow.
 ///
-/// MLA (GLM): a compressed latent (`kv_lora`) + roped key (`qk_rope`) per layer.
-/// GQA (MiniMax): the roped key (`qk_rope`) **plus the full K and V** at
-/// `kv_dim = n_kv_heads * head_dim` each — the big term the old formula omitted, which
-/// undercounted GQA KV ~17× (M3: 60·(64+2·512)·4 ≈ 255 KB/token, not 15 KB) and made
-/// large contexts look far cheaper than they are.
+/// Host (`KvCache::for_model`): latent (`kv_lora`) + roped key (`qk_rope`) per layer, and —
+/// for GQA — the full K and V at `kv_dim = n_kv_heads * head_dim` each. The device shadow
+/// (`DeviceKv`, CUDA only) mirrors **only** latent + rope, not `k_full`/`v_full` (those are
+/// read from host over GB10's unified memory), so it doubles just the MLA-style terms.
+///
+/// Two accounting bugs this fixes: the original omitted the GQA `k_full`/`v_full` entirely
+/// (~17× undercount); the interim fix then multiplied the *whole* host figure by 2, which
+/// over-counted GQA ~2× by doubling `k_full`/`v_full` that have no device copy. The net —
+/// e.g. M3: `60·(2·64 + 2·512)·4 ≈ 270 KB/token`.
 fn kv_bytes_per_token(cfg: &colibri_core::Config) -> usize {
-    let mut per_layer = cfg.kv_lora as usize + cfg.qk_rope as usize;
-    if cfg.arch.is_gqa() {
-        // k_full + v_full, each `kv_dim = n_kv_heads * head_dim` wide (model.rs `enable_gqa`).
-        per_layer += 2 * cfg.n_kv_heads as usize * cfg.qk_head as usize;
-    }
-    cfg.n_layers as usize * per_layer * 4
+    let mla = cfg.kv_lora as usize + cfg.qk_rope as usize; // latent + rope: mirrored on device
+    let gqa_full = if cfg.arch.is_gqa() {
+        2 * cfg.n_kv_heads as usize * cfg.qk_head as usize // k_full + v_full: host only
+    } else {
+        0
+    };
+    let device_shadow = if cfg!(feature = "cuda") { mla } else { 0 };
+    cfg.n_layers as usize * (mla + gqa_full + device_shadow) * 4
 }
 
 type Provider<'a> = ExpertCache<ShardsExpertProvider<'a>>;
@@ -155,7 +153,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // stored per kv-head. Without this a big `COLI_CTX` looks fine at startup and only OOMs
     // when a large request finally allocates its KV.
     const CTX_RAM_RESERVE: u64 = 18 << 30;
-    let kv_pt = (kv_bytes_per_token(&model.cfg) as u64).saturating_mul(KV_COPIES).max(1);
+    let kv_pt = (kv_bytes_per_token(&model.cfg) as u64).max(1); // already includes device shadow
     let ram_ctx = colibri_engine::total_ram_bytes()
         .map(|t| (t.saturating_sub(CTX_RAM_RESERVE) / kv_pt) as usize)
         .unwrap_or(usize::MAX)
@@ -172,9 +170,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // reserved up front: each request reserves *its own* KV dynamically (evicting experts
     // just-in-time — see `ExpertCache::reserve_ram`), so this is only the ceiling we quote.
     // The initial expert budget leaves a modest base for it; the adaptive monitor takes over.
-    let kv_worst_case = (kv_bytes_per_token(&model.cfg) as u64)
-        .saturating_mul(ctx_len as u64)
-        .saturating_mul(KV_COPIES);
+    let kv_worst_case = (kv_bytes_per_token(&model.cfg) as u64).saturating_mul(ctx_len as u64);
     let budget = crate::ram_budget_reserving(kv_worst_case.min(8 << 30));
     let gib = (1u64 << 30) as f64;
     if budget == u64::MAX {
@@ -191,7 +187,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             budget as f64 / gib,
             kv_worst_case as f64 / gib,
             ctx_len,
-            if KV_COPIES > 1 { ", incl. device shadow" } else { "" }
+            if cfg!(feature = "cuda") { ", incl. device shadow" } else { "" }
         );
     }
 
@@ -559,9 +555,7 @@ fn complete(
     // time (~KB/token), which the adaptive monitor evicts experts against gradually; no
     // giant eager allocation to race, so short generations never pay for a big `max_tokens`.
     // If even the prompt's KV can't fit after evicting every expert, reject rather than OOM.
-    let kv_bytes = (kv_bytes_per_token(&model.cfg) as u64)
-        .saturating_mul(ids.len() as u64)
-        .saturating_mul(KV_COPIES);
+    let kv_bytes = (kv_bytes_per_token(&model.cfg) as u64).saturating_mul(ids.len() as u64);
     if !provider.reserve_ram(kv_bytes) {
         let gib = (1u64 << 30) as f64;
         let msg = format!(

@@ -183,7 +183,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_RAM_GB` | **manual override** of the adaptive default ([RAM residency](#ram-residency-adaptive-by-default) below). Forces a fixed expert-cache budget and disables the adaptive monitor. Rarely needed; on a ≫-RAM model, setting it *higher* drives the box into swap (measured on GLM: 85 GB → ~0.11 tok/s vs ~0.46 at the safe budget). | adaptive (see below) |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
-| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound well below the architectural max on one node — see [Context & output length](#context--output-length): GLM ~290k · M3 ~210k · M2.7 ~100k | `32768` |
+| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): M3 ~370k · GLM ~290k · M2.7 ~195k | `32768` |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
 | `COLI_VRAM_GB` | cap the VRAM expert store | all free VRAM |
@@ -335,18 +335,19 @@ real ceiling is **memory, not the model's architectural max**: on one 121 GB Spa
 must fit alongside the resident weights, so the server clamps `COLI_CTX` to what RAM can hold
 and prints the limit at startup.
 
-The KV per token differs sharply by attention type. GLM's **MLA** compresses K/V into a small
-latent (~175 KB/token); the MiniMax **GQA** models store *full* K and V per kv-head, which is
-much larger — so, counterintuitively, GLM holds the *longest* context:
+The KV per token depends on the attention shape. GLM's **MLA** stores a compressed latent
+that is mirrored on the GPU (host + device); the MiniMax **GQA** models store full K and V
+per kv-head **on the host only** (the GPU reads them over unified memory), plus a small roped
+key that is mirrored. So the cost scales with kv-heads × layers, and M3's 4 kv-heads actually
+make it *lighter* per token than GLM's latent:
 
-| model | attention | KV / token (incl. ×2 GB10 shadow) | max `COLI_CTX` on a 121 GB Spark |
+| model | attention | KV / token (host + GB10 device shadow) | max `COLI_CTX` on a 121 GB Spark |
 |---|---|---|---|
-| **GLM-5.2** | MLA (compressed) | ~350 KB | ~290k |
-| **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | ~500 KB | ~210k |
-| **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | ~1.0 MB | ~100k |
+| **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | ~270 KB | ~370k |
+| **GLM-5.2** | MLA (compressed), mirrored | ~350 KB | ~290k |
+| **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | ~530 KB | ~195k |
 
-(architectural maxima are 1M / 1M / 196,608 respectively — none is memory-reachable on one
-node.) These are ceilings where the experts are nearly all evicted, so throughput there is low;
+(architectural maxima are 1M / 1M / 196,608 respectively; only M2.7 is near-reachable.) These are ceilings where the experts are nearly all evicted, so throughput there is low;
 practical high-throughput context is lower. The default `COLI_CTX` stays **32,768** — a small KV
 keeps the most RAM for resident experts and the lowest latency. `max_tokens` defaults to 128 and
 is bounded only by the remaining context (no fixed cap).

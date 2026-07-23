@@ -17,6 +17,7 @@ use crate::usage::UsageHistory;
 use colibri_core::tier::evict_score;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 /// Online next-layer expert predictor for speculative prefetch (`COLI_PREFETCH`).
@@ -142,7 +143,10 @@ pub struct CacheStats {
 /// A resident, budget-bounded cache in front of any [`ExpertProvider`].
 pub struct ExpertCache<P: ExpertProvider> {
     inner: P,
-    budget: u64,
+    /// Cache byte ceiling. Atomic because the adaptive-budget monitor
+    /// ([`spawn_adaptive_budget`]) rewrites it live to track free RAM; the static
+    /// path just sets it once. Read on every insert's eviction pass.
+    budget: AtomicU64,
     state: Mutex<State>,
     /// Speculative-prefetch predictor + background-loader channel, present only
     /// when [`enable_prefetch`](ExpertCache::enable_prefetch) was called.
@@ -156,7 +160,7 @@ impl<P: ExpertProvider> ExpertCache<P> {
     pub fn new(inner: P, budget_bytes: u64) -> ExpertCache<P> {
         ExpertCache {
             inner,
-            budget: budget_bytes,
+            budget: AtomicU64::new(budget_bytes),
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 pinned: HashSet::new(),
@@ -260,7 +264,7 @@ impl<P: ExpertProvider> ExpertCache<P> {
             evictions: s.evictions,
             resident: s.entries.len(),
             bytes: s.bytes,
-            budget: self.budget,
+            budget: self.budget.load(Ordering::Relaxed),
         }
     }
 }
@@ -345,7 +349,7 @@ impl<P: ExpertProvider> ExpertCache<P> {
             },
         );
         s.bytes += bytes;
-        let budget = self.budget;
+        let budget = self.budget.load(Ordering::Relaxed);
         s.evict_to(budget);
         Ok(ex)
     }
@@ -463,7 +467,7 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
             s.bytes += bytes;
             s.misses += 1;
         }
-        let budget = self.budget;
+        let budget = self.budget.load(Ordering::Relaxed);
         s.evict_to_protecting(budget, &batch);
         Ok(())
     }
@@ -498,6 +502,46 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
         std::thread::spawn(move || {
             for (layer, eids) in rx {
                 let _ = cache.load_batch(layer, &eids);
+            }
+        });
+    }
+
+    /// Make the byte ceiling **adaptive**: a background thread rewrites `budget` to
+    /// fill free RAM down to `floor_bytes`, so the cache holds as many experts as
+    /// physically fit and shrinks (evicting LRU experts) the moment prefill, decode,
+    /// or another process claims memory.
+    ///
+    /// Each tick: `budget = resident + (MemAvailable − floor)` — grow by the slack
+    /// above the floor, or shrink below current residency and evict when MemAvailable
+    /// dips under it. At steady state MemAvailable settles at `floor`.
+    ///
+    /// SAFETY / correctness: `MemAvailable` is only an honest "free RAM" signal once
+    /// expert reads bypass the page cache (O_DIRECT). With buffered reads it counts the
+    /// page cache holding the model as free, so the cache over-grows and pages itself
+    /// out — the trap documented on [`total_ram_bytes`]. Enable this only alongside the
+    /// O_DIRECT read path. Off-Linux (no `/proc/meminfo`) it no-ops.
+    pub fn spawn_adaptive_budget(self: &Arc<Self>, floor_bytes: u64) {
+        const TICK_MS: u64 = 250;
+        const FLOOR_MIN: u64 = 2 << 30; // never target < 2 GiB free — burst headroom
+        let floor = floor_bytes.max(FLOOR_MIN);
+        let cache = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+            let avail = match available_ram_bytes() {
+                Some(a) => a,
+                None => return, // non-Linux: no live signal, leave the static budget
+            };
+            let resident = cache.state.lock().unwrap().bytes;
+            let new_budget = if avail >= floor {
+                resident.saturating_add(avail - floor)
+            } else {
+                resident.saturating_sub(floor - avail)
+            }
+            .max(FLOOR_MIN);
+            cache.budget.store(new_budget, Ordering::Relaxed);
+            // Shrink now under external pressure, without waiting for the next insert.
+            if new_budget < resident {
+                cache.state.lock().unwrap().evict_to(new_budget);
             }
         });
     }

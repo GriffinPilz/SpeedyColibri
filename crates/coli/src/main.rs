@@ -564,6 +564,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
+    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
@@ -813,6 +814,7 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
+    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
     }
@@ -2132,6 +2134,59 @@ fn budget_from(avail: u64, reserve: u64, total: Option<u64>) -> u64 {
 /// Expert-cache byte budget for callers with nothing extra to reserve.
 fn ram_budget() -> u64 {
     ram_budget_reserving(0)
+}
+
+/// Engage adaptive max-residency only when the achievable cache (RAM − reserve) holds
+/// at least this % of the model's routed-expert bytes. Near-fit models (MiniMax-M2.7
+/// ~99%) win big (measured 1.75×); models ≫ RAM (GLM ~15%) stay on the page-cache path,
+/// which the kernel serves better at 4 KB granularity.
+const NEARFIT_COVERAGE_PCT: u64 = 80;
+
+/// Choose the expert-cache memory policy from the model-size / RAM ratio. `COLI_RAM_GB`
+/// forces the static budget. Otherwise, for a model that nearly fits, engage adaptive
+/// max-residency: enable fadvise (single tier → honest `MemAvailable`) and grow the
+/// cache to fill RAM, evicting under pressure — measured 1.75× over the static
+/// 41 GB + page-cache default on M2.7. Models ≫ RAM keep the static path. Off-Linux
+/// (no `/proc/meminfo`) it no-ops (static).
+fn wire_adaptive_cache<P>(
+    provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
+    cfg: &colibri_core::Config,
+    ebits: u32,
+) where
+    P: colibri_engine::ExpertProvider + Send + Sync + 'static,
+{
+    if std::env::var("COLI_RAM_GB").is_ok() {
+        return; // explicit static override
+    }
+    let total = match colibri_engine::total_ram_bytes() {
+        Some(t) => t,
+        None => return, // non-Linux: no live signal, stay static
+    };
+    let n_moe = (cfg.n_layers - cfg.first_dense).max(0) as u64;
+    let per = colibri_engine::capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, ebits);
+    let total_expert_bytes = per.saturating_mul(cfg.n_experts as u64).saturating_mul(n_moe);
+    // Reserve for activations / KV / GPU staging / read buffers before filling with experts.
+    let floor = WORKING_RESERVE.max(total / 20);
+    let achievable = total.saturating_sub(floor);
+    let covers_pct = if total_expert_bytes > 0 {
+        achievable.saturating_mul(100) / total_expert_bytes
+    } else {
+        0
+    };
+    if covers_pct >= NEARFIT_COVERAGE_PCT {
+        colibri_safetensors::set_fadvise(true);
+        provider.spawn_adaptive_budget(floor);
+        eprintln!(
+            "[cache] adaptive max-residency: ~{} GB routed experts / {} GB RAM ({covers_pct}% coverage) \
+             → fill to ~{} GB, fadvise on, evict under pressure",
+            total_expert_bytes >> 30, total >> 30, achievable >> 30
+        );
+    } else {
+        eprintln!(
+            "[cache] static + page-cache path: ~{} GB experts / {} GB RAM ({covers_pct}% coverage < {NEARFIT_COVERAGE_PCT}%)",
+            total_expert_bytes >> 30, total >> 30
+        );
+    }
 }
 
 /// Speculative-prefetch setting from `COLI_PREFETCH`: unset/`0` → off; `1` → on

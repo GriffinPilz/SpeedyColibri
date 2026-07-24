@@ -68,6 +68,24 @@ pub struct Layer {
     pub ix_wp: Option<QTensor>,     // per-head weight proj: hidden -> index_nh
     pub ix_knorm_w: Vec<f32>,       // key LayerNorm weight (eps 1e-6)
     pub ix_knorm_b: Vec<f32>,       // key LayerNorm bias
+
+    // ---- Nemotron-H Mamba2 mixer (present on `LayerKind::Mamba` layers) ----
+    // `in_ln` above is the single block-input RMSNorm; Nemotron has no `post_ln`.
+    pub mamba_in_proj: Option<QTensor>, // hidden -> d_inner + conv_dim + n_heads (18560)
+    pub mamba_out_proj: Option<QTensor>, // d_inner -> hidden
+    pub mamba_conv_w: Vec<f32>,     // depthwise conv [conv_dim, k] (from [conv_dim,1,k])
+    pub mamba_conv_b: Vec<f32>,     // conv bias [conv_dim]
+    pub mamba_a_log: Vec<f32>,      // [n_heads]; A = -exp(a_log)
+    pub mamba_d: Vec<f32>,          // skip connection [n_heads]
+    pub mamba_dt_bias: Vec<f32>,    // step bias [n_heads]
+    pub mamba_norm: Vec<f32>,       // gated RMSNorm weight [d_inner]
+
+    // ---- Nemotron-H latent-MoE projections (present on `LayerKind::Moe` layers) ----
+    // Routed experts (`sh_*` unused here; routed via the expert provider) run in the
+    // `moe_latent` space between these two projections; `router`/`router_bias` above
+    // are reused for the gate. `up_proj`/`down_proj` reused for the shared expert.
+    pub fc1_latent: Option<QTensor>, // hidden -> moe_latent
+    pub fc2_latent: Option<QTensor>, // moe_latent -> hidden
 }
 
 /// The MTP (multi-token prediction) speculative head — port of the `mtpL` /

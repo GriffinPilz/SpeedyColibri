@@ -407,6 +407,34 @@ __global__ static void nvfp4_gate_up(float *gate,float *up,const float *x,
 #endif
 }
 
+/* Single-row decode GEMV (S==1) for int8 W8A16 — mirror of `fp8a16_gemv` with the
+ * weight decode swapped e4m3 -> signed int8 (1 byte/weight, direct K stride). One warp
+ * per output column; all 32 lanes sweep the row coalesced, so the grid is O/warps-per-
+ * block blocks instead of the tiled kernel's (O/64, 1).
+ *
+ * This is the decode shape for the DENSE resident matmuls — Nemotron-H's mamba
+ * in/out-proj (28.7% of decode), shared expert (20.6%), fc1/fc2 and the attention
+ * projections. `i8a16_matmul` wastes 15/16 of its MMA at S==1; falling back to
+ * `quant_matmul` (PR #13) already bought 1.53x, and this replaces that generic path
+ * with the same one-warp-per-column shape the fp8/nvfp4 expert GEMVs use.
+ *
+ * Scale is applied once to the reduced accumulator (as `fp8a16_gemv` does) rather than
+ * per weight: `sum(x*w)*scale` factors exactly, and it keeps the inner loop a plain fma. */
+__global__ static void i8a16_gemv(float *y,const float *x,const uint8_t *w,
+                                  const float *scale,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    const signed char *wr=(const signed char*)w+(size_t)n*K; float acc=0.f;
+    for(int k=lane;k<K;k+=32) acc+=xs[k]*(float)wr[k];
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*scale[n];
+}
+
 /* int8 (W8A16) tiled tensor-core matmuls — clones of fp8a16_* with the weight decode
  * swapped e4m3 -> signed int8 (1 byte/weight, direct K stride). For the shared expert /
  * resident int8 weights that ran on the naive quant_matmul (nsys: 60% of GPU kernel
@@ -1162,7 +1190,24 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     // byte-identical; prefill unaffected since it runs S>>16. `COLI_TILE_I8=force`
     // keeps tiles on at S==1 for A/B.
     if (S == 1 && !(tile_env && strcmp(tile_env, "force") == 0)) tile = 0;
-    if (tile && (fmt == 1 || fmt == 4)) {
+    // Decode (S==1): use the purpose-built one-warp-per-column GEMV rather than falling
+    // back to the generic `quant_matmul`. Needs x in shared memory, so it is limited to
+    // weights whose K fits the 48 KB default dynamic-shared cap (I<=12288 floats); the
+    // wider ones fall through to quant_matmul as before. COLI_I8_GEMV=0 disables for A/B.
+    static int s_i8gemv = -1;
+    if (s_i8gemv < 0) { const char *e = getenv("COLI_I8_GEMV"); s_i8gemv = !e || strcmp(e, "0") != 0; }
+    size_t gemv_shmem = (size_t)I * sizeof(float);
+    if (s_i8gemv && S == 1 && (fmt == 1 || fmt == 4) && ctx->compute_major >= 7 &&
+        gemv_shmem <= 48u * 1024u) {
+        const int tpb = 128, wpb = tpb / 32;
+        unsigned blocks = (unsigned)((O + wpb - 1) / wpb);
+        if (fmt == 1)
+            i8a16_gemv<<<blocks, tpb, gemv_shmem>>>(ctx->y, ctx->x,
+                (const uint8_t *)t->weights, t->scales, I, O);
+        else
+            fp8a16_gemv<<<blocks, tpb, gemv_shmem>>>(ctx->y, ctx->x,
+                (const uint8_t *)t->weights, t->scales, I, O);
+    } else if (tile && (fmt == 1 || fmt == 4)) {
         dim3 tg((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
         if (fmt == 4)
             fp8a16_matmul<<<tg, 128>>>(ctx->y, ctx->x, (const uint8_t *)t->weights, t->scales, S, I, O);

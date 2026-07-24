@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
 | prefill bench | PASS | PASS | PASS | PASS 33.1 s / 15.5 tok/s |
-| decode bench | PASS | PASS ~1.9 | PASS | PASS 4.65 tok/s |
+| decode bench | PASS | PASS 1.99 | PASS | PASS **7.11 tok/s** |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
 | chat template in serve | PASS | PASS (GLM-style) | PASS (M2 format) | PASS ChatML, PR #8 |
@@ -39,6 +39,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | sliding-window attention | **NEG** lose-lose | N/A | N/A | TODO |
 | 2-node expert-parallel | PASS 1.38× | TODO | TODO | TODO |
 | TP attention (2-node) | PASS | TODO | TODO | TODO |
+| **S==1 GEMV dispatch** | TODO re-measure | PASS no regression | TODO re-measure | PASS **1.53×** (PR #13) |
 | long context (>32k) | TODO | TODO | TODO | PASS 1M w/ COLI_ALLOW_LONG_CTX |
 
 ## Per-model notes
@@ -47,10 +48,21 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 88 layers = 40 Mamba2 + 40 latent-MoE + 8 GQA (NoPE, no qk-norm). 512 experts top-22,
 gateless ReLU² in a 1024-wide latent space. NVFP4 routed experts.
 
-- **prefill 33.1 s / 15.5 tok/s**, **decode 4.65 tok/s**, **serve 3.60 tok/s** (2026-07-24).
-- **Experts are only ~59 GB against 121 GB of RAM (172% coverage) — they FIT.** This model is
-  *not* in the disk-streaming regime GLM is in, so GLM-derived "bytes-bound floor" reasoning
-  does not transfer. Any claim that its decode is at a fundamental floor needs its own profile.
+- **prefill ~38 s**, **decode 7.11 tok/s** (after PR #13), **serve 3.60 tok/s** (measured pre-#13).
+- ⚠️ An earlier prefill figure of **33.1 s** does not reproduce — runs both *before* and *after*
+  PR #13 give ~38 s on the same box. NOT attributable to #13 (pre-change runs already showed
+  38.4 s). Treat 33.1 as measured in an unidentified state; re-run
+  `bench.sh nemotron-3-super prefill` for a current number.
+- **Experts are only ~59 GB against 121 GB of RAM (172% coverage) — they FIT.** Profiled:
+  `18,179 resident, 0 evictions`; steady-state decode reads NOTHING from disk. It is *not* in
+  GLM's disk-streaming regime, so GLM-derived "bytes-bound floor" reasoning does not transfer.
+- **Decode profile** (matched differential NGEN=25−NGEN=1), per token *before* PR #13: mamba
+  in/out-proj 71.0 ms (28.7%) · shared expert 50.9 (20.6%) · routed gpu-ffn 45.0 (18.2%) ·
+  expert-load 20.3 · scan 12.8 · attention 12.7 (the transformer part of this hybrid is nearly
+  free). ~8.9 GB/token at 247 ms = **36 GB/s against ~273 GB/s peak** — a kernel-shape problem,
+  NOT dispatch (launch cost is ~4%, so CUDA graphs would not have paid). PR #13 fixed the
+  biggest slice; at 7.11 tok/s we are still only ~62 GB/s, so headroom remains. Next lever: a
+  dedicated `i8a16_gemv` mirroring the existing `fp8a16_gemv`, then MTP.
 - **BROKEN — prefill scratch is unreserved.** Measured peak-RSS slope **210 KB/token**
   (2 reps: 214.5 / 206.2) against the **24 KB/token** serve reserves. The Mamba mixer allocates
   per-layer buffers that scale with prompt length (`proj` 18560 + `gate` 8192 + `hbc` 10240 +

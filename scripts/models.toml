@@ -52,3 +52,16 @@ notes     = "MLA + DSA lightning indexer, 256 experts top-8, NVFP4 routed. NOT r
 
 ["glm-5.2".convert_env]
 COLI_KEEP_INDEXER = "1"   # keep the DSA indexer weights so the container can run sparse attention
+
+# ---------------------------------------------------------------------------
+# First non-transformer arch: hybrid Mamba2 (SSM) + GQA + latent-MoE. Auto-detected
+# from config.json model_type=nemotron_h, so `arch` here is a label only.
+[nemotron-3-super]
+container = "Nemotron-3-Super-120B-container"
+source    = "Nemotron-3-Super-120B-src"
+arch      = "nemotron-h"
+prompt    = "100..611"
+notes     = "Hybrid: 88 layers = 40 Mamba2 + 40 latent-MoE + 8 GQA (NoPE, no qk-norm). 512 experts top-22 GATELESS relu2 in latent space (moe_latent 1024), sigmoid+bias grouped-topk router + shared expert. NVFP4 routed experts. Live on 42b2."
+
+[nemotron-3-super.convert_env]
+# NVFP4 experts + int8 resident are the convert defaults; `.mixer.` marker auto-classifies. Nothing to override.

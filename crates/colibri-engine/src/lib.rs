@@ -516,6 +516,19 @@ pub fn load_model_with(
                 t.gpu_eligible = true;
             }
         }
+        // Nemotron-H latent-MoE fc1/fc2 — the resident dense projections that lift x into
+        // the shared moe_latent space (hidden->1024) and back (1024->hidden) around the
+        // routed experts. `nemotron_moe` runs them through `matmul_qt`; WITHOUT this they
+        // take the single-threaded CPU path. The prefill profile measured moe=40 s of which
+        // only 14.4 s was GPU (expert-load 7.7 + gpu-ffn 6.7) — the ~25 s remainder was
+        // these two projections over 512 tok × 40 MoE layers on one core. Same omission /
+        // same fix as the mamba proj above (the shared expert reuses up_proj/down_proj,
+        // already eligible). Token-identical.
+        for t in [&mut l.fc1_latent, &mut l.fc2_latent] {
+            if let Some(t) = t {
+                t.gpu_eligible = true;
+            }
+        }
     }
     Ok(model)
 }

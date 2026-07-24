@@ -272,18 +272,96 @@ impl KvCache {
         if model.has_mtp {
             kv.kv_start[n_layers] = KV_UNSET;
         }
-        if model.cfg.arch.is_gqa() {
-            kv.enable_gqa(model.cfg.n_kv_heads as usize * model.cfg.qk_head as usize);
-        }
+        // One predicate for "has GQA full-KV", shared with `bytes_per_token` — if these
+        // two ever disagree the reservation silently mis-sizes (see `allocates_gqa_kv`).
         // Nemotron-H is hybrid: its 8 attention layers need the GQA full-KV cache AND its
         // 40 Mamba layers need recurrent conv+ssm state. `enable_gqa` allocates KV rows for
         // every layer (only attention rows are ever written — the rest stay lazily
         // uncommitted), and `enable_mamba2` allocates state on just the Mamba rows.
-        if model.cfg.arch == Arch::NemotronH {
+        if Self::allocates_gqa_kv(&model.cfg) {
             kv.enable_gqa(model.cfg.n_kv_heads as usize * model.cfg.qk_head as usize);
+        }
+        if model.cfg.arch == Arch::NemotronH {
             kv.enable_mamba2(&model.cfg);
         }
         kv
+    }
+
+    /// Does [`KvCache::for_model`] give this architecture the GQA full-KV buffers?
+    ///
+    /// Deliberately NOT `cfg.arch.is_gqa()`: Nemotron-H is excluded from `is_gqa()`
+    /// (its hybrid stack is not a GQA transformer) yet `for_model` still calls
+    /// `enable_gqa` for its 8 attention layers. Callers that size or reserve memory
+    /// must ask this, not `is_gqa()`, or they silently omit `k_full`/`v_full` — which
+    /// is exactly how the serve reservation under-counted the largest KV term.
+    fn allocates_gqa_kv(cfg: &Config) -> bool {
+        cfg.arch.is_gqa() || cfg.arch == Arch::NemotronH
+    }
+
+    /// How many layers actually hold KV. For a hybrid stack only the attention layers
+    /// do (Nemotron-H: 8 of 88) — `for_model` allocates rows for every layer, but the
+    /// non-attention rows are never written and stay lazily uncommitted, so they cost
+    /// no physical memory and must not be charged for.
+    fn kv_layers(cfg: &Config) -> usize {
+        if cfg.layer_kind.is_empty() {
+            cfg.n_layers as usize
+        } else {
+            cfg.layer_kind.iter().filter(|k| **k == LayerKind::Attn).count()
+        }
+    }
+
+    /// Resident KV bytes per token — host cache **plus** the CUDA device shadow.
+    ///
+    /// Per KV-holding layer: latent (`kv_lora`) + roped key (`qk_rope`), and, when the
+    /// GQA buffers are allocated, the full K and V at `kv_dim = n_kv_heads * qk_head`
+    /// each. The device shadow (`DeviceKv`, CUDA only) mirrors **only** latent + rope —
+    /// `k_full`/`v_full` are read from host over GB10's unified memory — so it doubles
+    /// just the MLA-style terms.
+    ///
+    /// This lives beside [`KvCache::for_model`] on purpose: it is the accounting twin of
+    /// the allocation, and the two drifting apart is what produced every past error here.
+    /// Three fixed so far: the original omitted GQA `k_full`/`v_full` (~17× undercount);
+    /// the interim fix doubled the *whole* host figure, over-counting GQA ~2×; and the
+    /// hybrid case charged all 88 Nemotron layers while omitting its `k_full`/`v_full`
+    /// (a net ~3.7× over-count). Excludes [`KvCache::fixed_bytes`], which is per-sequence.
+    pub fn bytes_per_token(cfg: &Config) -> usize {
+        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize; // mirrored on device
+        let gqa_full = if Self::allocates_gqa_kv(cfg) {
+            2 * cfg.n_kv_heads as usize * cfg.qk_head as usize // k_full + v_full: host only
+        } else {
+            0
+        };
+        let device_shadow = if cfg!(feature = "cuda") { mla } else { 0 };
+        Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4
+    }
+
+    /// Per-sequence KV bytes that do **not** scale with context length: the Mamba2
+    /// recurrent state (conv history + selective-scan state) on each Mamba layer.
+    ///
+    /// O(1) in context, but far from free — Nemotron-H carries ~174 MB per sequence
+    /// across its 40 Mamba layers, dominated by the `[n_heads, head_dim, d_state]` scan
+    /// state. A reservation that counts only per-token bytes under-commits by that much
+    /// for every concurrent sequence, and the shortfall is worst for SHORT requests,
+    /// where the per-token term is too small to accidentally cover it.
+    pub fn fixed_bytes(cfg: &Config) -> usize {
+        if cfg.layer_kind.is_empty() {
+            return 0;
+        }
+        let n_mamba = cfg.layer_kind.iter().filter(|k| **k == LayerKind::Mamba).count();
+        let conv_dim =
+            cfg.mamba_inter as usize + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
+        let conv = cfg.mamba_d_conv as usize * conv_dim;
+        let ssm = cfg.mamba_n_heads as usize * cfg.mamba_head_dim as usize
+            * cfg.mamba_d_state as usize;
+        n_mamba * (conv + ssm) * 4
+    }
+
+    /// Total resident bytes for a sequence of `n_tokens`: the per-token KV plus the
+    /// fixed per-sequence state. This is what a reservation should ask for.
+    pub fn bytes_for(cfg: &Config, n_tokens: usize) -> usize {
+        Self::bytes_per_token(cfg)
+            .saturating_mul(n_tokens)
+            .saturating_add(Self::fixed_bytes(cfg))
     }
 
     /// Record that the layer's cache covers positions from `pos` onward, if that
@@ -424,5 +502,105 @@ impl Model {
     /// Convenience accessor for the config.
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+}
+
+#[cfg(test)]
+mod kv_accounting_tests {
+    use super::*;
+    use colibri_core::Config;
+
+    fn cfg_from(json: &str) -> Config {
+        Config::from_json(&colibri_json::Json::parse(json).unwrap()).unwrap()
+    }
+
+    /// A hybrid stack must charge only its ATTENTION layers for per-token KV, and must
+    /// include `k_full`/`v_full` (which `for_model` really allocates via `enable_gqa`,
+    /// even though `Arch::is_gqa()` is false for Nemotron-H).
+    ///
+    /// This pins the bug that made serve quote 88 KB/token for the real model when the
+    /// true figure is 24 KB: it charged all 88 layers and, because it keyed off
+    /// `is_gqa()`, dropped the largest term entirely.
+    #[test]
+    fn hybrid_kv_counts_only_attention_layers_and_includes_full_kv() {
+        // 4 layers: Mamba, MoE, Attn, Mamba — exactly one carries KV.
+        let cfg = cfg_from(
+            r#"{"model_type":"nemotron_h","hidden_size":8,"num_hidden_layers":4,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,"vocab_size":8,
+                "hybrid_override_pattern":"ME*M","n_routed_experts":4,"num_experts_per_tok":2,
+                "moe_intermediate_size":6,"moe_latent_size":4,
+                "moe_shared_expert_intermediate_size":6,"norm_topk_prob":false,
+                "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
+                "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
+                "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
+        );
+        assert_eq!(KvCache::kv_layers(&cfg), 1, "only the single '*' layer holds KV");
+        assert!(KvCache::allocates_gqa_kv(&cfg), "for_model calls enable_gqa for NemotronH");
+
+        // per attn layer: mla(kv_lora 0 + qk_rope 4) + k_full/v_full(2*2*4=16) + shadow(mla)
+        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
+        let shadow = if cfg!(feature = "cuda") { mla } else { 0 };
+        assert_eq!(KvCache::bytes_per_token(&cfg), (mla + 16 + shadow) * 4);
+
+        // Counting all 4 layers — the old behaviour — would be 4x too big.
+        assert!(
+            KvCache::bytes_per_token(&cfg) * 4
+                > KvCache::bytes_per_token(&cfg) * cfg.n_layers as usize / 2,
+            "sanity: per-token figure must not scale with total layer count"
+        );
+    }
+
+    /// The Mamba2 recurrent state is per-SEQUENCE and O(1) in context. It must be
+    /// reported separately, never folded into the per-token figure — otherwise it
+    /// scales with context length and the short-prompt case stays under-reserved.
+    #[test]
+    fn hybrid_reports_fixed_mamba_state_separately() {
+        let cfg = cfg_from(
+            r#"{"model_type":"nemotron_h","hidden_size":8,"num_hidden_layers":4,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,"vocab_size":8,
+                "hybrid_override_pattern":"ME*M","n_routed_experts":4,"num_experts_per_tok":2,
+                "moe_intermediate_size":6,"moe_latent_size":4,
+                "moe_shared_expert_intermediate_size":6,"norm_topk_prob":false,
+                "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
+                "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
+                "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
+        );
+        // 2 Mamba layers x (conv: d_conv * (inter + 2*groups*state)  +  ssm: nh*hd*state)
+        let conv_dim = cfg.mamba_inter as usize + 2 * 1 * 2;
+        let per_layer = 2 * conv_dim + 2 * 2 * 2;
+        assert_eq!(KvCache::fixed_bytes(&cfg), 2 * per_layer * 4);
+
+        // bytes_for = per-token * n + fixed, and the fixed part does NOT scale with n.
+        let pt = KvCache::bytes_per_token(&cfg);
+        let fx = KvCache::fixed_bytes(&cfg);
+        assert_eq!(KvCache::bytes_for(&cfg, 100), pt * 100 + fx);
+        assert_eq!(KvCache::bytes_for(&cfg, 1), pt + fx);
+        assert!(fx > 0, "a hybrid model must report non-zero fixed state");
+    }
+
+    /// Non-hybrid models keep their previous accounting exactly: all layers hold KV and
+    /// there is no fixed state. Guards the refactor against changing GLM/M3/M2.7 figures.
+    #[test]
+    fn uniform_transformer_accounting_is_unchanged() {
+        let cfg = cfg_from(
+            r#"{"model_type":"minimax_m2","hidden_size":8,"intermediate_size":6,
+                "num_hidden_layers":3,"num_attention_heads":4,"num_key_value_heads":2,
+                "head_dim":4,"partial_rotary_factor":0.5,"rotary_dim":2,"vocab_size":8,
+                "num_local_experts":4,"num_experts_per_tok":2,"shared_intermediate_size":0,
+                "scoring_func":"sigmoid","use_routing_bias":true,"hidden_act":"silu",
+                "rms_norm_eps":1e-5,"eos_token_id":2}"#,
+        );
+        assert!(cfg.layer_kind.is_empty(), "uniform archs carry no layer_kind");
+        assert_eq!(KvCache::kv_layers(&cfg), cfg.n_layers as usize, "every layer holds KV");
+        assert_eq!(KvCache::fixed_bytes(&cfg), 0, "no recurrent state");
+        assert_eq!(KvCache::bytes_for(&cfg, 7), KvCache::bytes_per_token(&cfg) * 7);
+
+        // Matches the long-standing formula for a GQA transformer.
+        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
+        let shadow = if cfg!(feature = "cuda") { mla } else { 0 };
+        let expect = cfg.n_layers as usize
+            * (mla + 2 * cfg.n_kv_heads as usize * cfg.qk_head as usize + shadow)
+            * 4;
+        assert_eq!(KvCache::bytes_per_token(&cfg), expect);
     }
 }

@@ -55,27 +55,14 @@ fn parse_ctx(s: &str) -> Option<usize> {
     num.parse::<f64>().ok().map(|v| (v * mul as f64) as usize)
 }
 
-/// KV-cache bytes per token: two f32 latent/rotary buffers per layer.
-/// Total resident KV bytes per token — the host cache **plus** the CUDA device shadow.
+/// Resident KV bytes per token. Thin delegate to [`KvCache::bytes_per_token`], which
+/// lives beside the allocation it accounts for — every past error in this figure came
+/// from a copy here drifting from what `KvCache::for_model` actually allocates.
 ///
-/// Host (`KvCache::for_model`): latent (`kv_lora`) + roped key (`qk_rope`) per layer, and —
-/// for GQA — the full K and V at `kv_dim = n_kv_heads * head_dim` each. The device shadow
-/// (`DeviceKv`, CUDA only) mirrors **only** latent + rope, not `k_full`/`v_full` (those are
-/// read from host over GB10's unified memory), so it doubles just the MLA-style terms.
-///
-/// Two accounting bugs this fixes: the original omitted the GQA `k_full`/`v_full` entirely
-/// (~17× undercount); the interim fix then multiplied the *whole* host figure by 2, which
-/// over-counted GQA ~2× by doubling `k_full`/`v_full` that have no device copy. The net —
-/// e.g. M3: `60·(2·64 + 2·512)·4 ≈ 270 KB/token`.
+/// Per-token only: [`KvCache::fixed_bytes`] (the per-sequence Mamba2 recurrent state)
+/// is a separate term, so callers should prefer [`KvCache::bytes_for`].
 fn kv_bytes_per_token(cfg: &colibri_core::Config) -> usize {
-    let mla = cfg.kv_lora as usize + cfg.qk_rope as usize; // latent + rope: mirrored on device
-    let gqa_full = if cfg.arch.is_gqa() {
-        2 * cfg.n_kv_heads as usize * cfg.qk_head as usize // k_full + v_full: host only
-    } else {
-        0
-    };
-    let device_shadow = if cfg!(feature = "cuda") { mla } else { 0 };
-    cfg.n_layers as usize * (mla + gqa_full + device_shadow) * 4
+    KvCache::bytes_per_token(cfg)
 }
 
 type Provider<'a> = ExpertCache<ShardsExpertProvider<'a>>;
@@ -154,8 +141,11 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // when a large request finally allocates its KV.
     const CTX_RAM_RESERVE: u64 = 18 << 30;
     let kv_pt = (kv_bytes_per_token(&model.cfg) as u64).max(1); // already includes device shadow
+    // Subtract the fixed per-sequence state (Mamba2) before dividing: it is not a
+    // per-token cost, so folding it into `kv_pt` would scale it with context.
+    let kv_fixed = KvCache::fixed_bytes(&model.cfg) as u64;
     let ram_ctx = colibri_engine::total_ram_bytes()
-        .map(|t| (t.saturating_sub(CTX_RAM_RESERVE) / kv_pt) as usize)
+        .map(|t| (t.saturating_sub(CTX_RAM_RESERVE).saturating_sub(kv_fixed) / kv_pt) as usize)
         .unwrap_or(usize::MAX)
         .max(1);
     let ctx_len = requested_ctx.min(ram_ctx);
@@ -170,7 +160,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // reserved up front: each request reserves *its own* KV dynamically (evicting experts
     // just-in-time — see `ExpertCache::reserve_ram`), so this is only the ceiling we quote.
     // The initial expert budget leaves a modest base for it; the adaptive monitor takes over.
-    let kv_worst_case = (kv_bytes_per_token(&model.cfg) as u64).saturating_mul(ctx_len as u64);
+    let kv_worst_case = KvCache::bytes_for(&model.cfg, ctx_len) as u64;
     let budget = crate::ram_budget_reserving(kv_worst_case.min(8 << 30));
     let gib = (1u64 << 30) as f64;
     if budget == u64::MAX {
@@ -310,7 +300,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         "[serve] coli {} — OpenAI-compatible server on http://{addr}  (model: {model_id})",
         crate::version_string()
     );
-    let kv_at_ctx = kv_bytes_per_token(&model.cfg).saturating_mul(ctx_len) as f64 / (1u64 << 30) as f64;
+    let kv_at_ctx = KvCache::bytes_for(&model.cfg, ctx_len) as f64 / (1u64 << 30) as f64;
     let model_max_str =
         if model.cfg.max_ctx > 0 { model.cfg.max_ctx.to_string() } else { "unknown".to_string() };
     println!(
@@ -555,7 +545,10 @@ fn complete(
     // time (~KB/token), which the adaptive monitor evicts experts against gradually; no
     // giant eager allocation to race, so short generations never pay for a big `max_tokens`.
     // If even the prompt's KV can't fit after evicting every expert, reject rather than OOM.
-    let kv_bytes = (kv_bytes_per_token(&model.cfg) as u64).saturating_mul(ids.len() as u64);
+    // `bytes_for` adds the fixed per-sequence term (Nemotron-H's ~174 MB of Mamba2 conv+scan
+    // state). That is O(1) in context, so counting only per-token bytes under-reserves worst
+    // for SHORT prompts — where the per-token figure is far too small to cover it.
+    let kv_bytes = KvCache::bytes_for(&model.cfg, ids.len()) as u64;
     if !provider.reserve_ram(kv_bytes) {
         let gib = (1u64 << 30) as f64;
         let msg = format!(

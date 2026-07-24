@@ -899,6 +899,15 @@ pub fn try_expert_group_relu2(
     if active.is_empty() {
         return true; // nothing routed — `out` unchanged
     }
+    // DECODE ONLY. Grouping saves the per-expert H2D/D2H round-trip, which is a decode
+    // win (+5% end-to-end, MEASURED interleaved) — but at prefill the per-expert path can
+    // stage weights to the device (`COLI_FFN_DEVCOPY`, S>=16) and this one cannot: those
+    // ctx buffers are single, so a group would need one per expert. Reading zero-copy
+    // where the per-expert path would devcopy made prefill 38.5 -> 40.3 s (4.7% SLOWER).
+    // Restricting to single-row (decode) keeps the win and drops the regression.
+    if active.iter().any(|(_, rows, _)| rows.len() != 1) {
+        return false;
+    }
     // `d` is the expert input width (the MoE latent for Nemotron-H, not the model hidden);
     // the kernel derives D from up.I, so decline rather than mis-stride if they disagree.
     if !active.iter().all(|(ex, _, _)| {

@@ -187,6 +187,34 @@ pub fn selective_scan(
     y
 }
 
+/// Precompute the per-head selective-scan scalars for a **single** token step
+/// (`seq == 1`, i.e. decode): `dt_h[h] = max(softplus(dt[h] + dt_bias[h]), dt_min)`
+/// and the decay `dA_h[h] = exp(dt_h[h] * A[h])` with `A[h] = -exp(a_log[h])`.
+///
+/// These are exactly the scalars [`selective_scan`] derives per head at `t == 0`, so
+/// computing them here (in the same Rust `f32` softplus/exp) and handing them to the
+/// GPU scan keeps the transcendental parts bit-identical to the CPU reference — the
+/// kernel then only does the deterministic multiply/add recurrence over `d_state`.
+/// `dt` is the token's raw step `[n_heads]`; `a_log`/`dt_bias` are `[n_heads]`.
+pub fn step_head_scalars(
+    dims: MambaDims,
+    dt: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let nh = dims.n_heads;
+    assert!(dt.len() >= nh && a_log.len() >= nh && dt_bias.len() >= nh);
+    let mut dt_h = vec![0.0f32; nh];
+    let mut da_h = vec![0.0f32; nh];
+    for h in 0..nh {
+        let a_h = -(a_log[h].exp());
+        let dth = softplus(dt[h] + dt_bias[h]).max(dims.dt_min);
+        dt_h[h] = dth;
+        da_h[h] = (dth * a_h).exp();
+    }
+    (dt_h, da_h)
+}
+
 /// Gated per-group RMSNorm — the Mamba `MambaRMSNormGated` with
 /// `norm_before_gate = false`: `out = rmsnorm(y ⊙ silu(gate)) ⊙ weight`, where the
 /// RMS is computed independently over each of `n_groups` contiguous groups of

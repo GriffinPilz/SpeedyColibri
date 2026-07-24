@@ -40,6 +40,9 @@ typedef struct {
     float *esg,*esu,*esd; size_t esg_cap,esu_cap,esd_cap;
     uint8_t *ebsg,*ebsu,*ebsd; size_t ebsg_cap,ebsu_cap,ebsd_cap;  /* NVFP4 block-scale device scratch (devcopy) */
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
+    /* Nemotron-H Mamba2 selective-scan decode scratch (state in/out + per-step inputs). */
+    float *ms_state,*ms_x,*ms_y,*ms_b,*ms_c,*ms_dth,*ms_dah,*ms_d;
+    size_t ms_state_cap,ms_x_cap,ms_y_cap,ms_b_cap,ms_c_cap,ms_dth_cap,ms_dah_cap,ms_d_cap;
     void *asel,*acnt; size_t asel_cap,acnt_cap;  /* DSA sparse-attention selection */
     void *aqa,*akb,*amsk; size_t aqa_cap,akb_cap,amsk_cap;  /* tensor-core sparse attn: QA/KB fp16 + per-query key bitmask */
     float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
@@ -542,6 +545,36 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+/* Nemotron-H Mamba2 selective-scan, one decode token (S==1). One block per head, one
+ * thread per head-dim row p; each thread loops the d_state axis, updating that row's
+ * SSM state and reducing y. B/C are shared per group g=h/(nh/ng); dt_h/dA_h are the
+ * host-precomputed per-head step/decay (softplus/exp already applied on the host so
+ * they match the CPU reference). The recurrence uses __fmul_rn/__fadd_rn (no FMA
+ * contraction) in the exact operand order of the CPU `selective_scan`, so the result
+ * is bit-identical: ssm = ssm*dA + dt*B*x ; y = sum_n ssm*C + x*D. */
+__global__ static void mamba2_scan_kernel(float *state, float *y, const float *hidden,
+        const float *b, const float *c, const float *dt_h, const float *da_h,
+        const float *d, int nh, int hd, int ds, int ng) {
+    int h = blockIdx.x, pp = threadIdx.x;
+    if (h >= nh || pp >= hd) return;
+    int hpg = nh / ng, grp = h / hpg;
+    const float *b_row = b + (size_t)grp * ds;
+    const float *c_row = c + (size_t)grp * ds;
+    float dth = dt_h[h], dah = da_h[h], dh = d[h];
+    float x_hp = hidden[(size_t)h * hd + pp];
+    size_t base = ((size_t)h * hd + pp) * ds;
+    float acc = 0.f;
+    for (int nn = 0; nn < ds; nn++) {
+        float ss = state[base + nn];
+        // ss = ss*dA + (dt*B)*x  — same left-to-right f32 order as the CPU scan.
+        float upd = __fadd_rn(__fmul_rn(ss, dah),
+                              __fmul_rn(__fmul_rn(dth, b_row[nn]), x_hp));
+        state[base + nn] = upd;
+        acc = __fadd_rn(acc, __fmul_rn(upd, c_row[nn]));   // y += ss*C
+    }
+    y[(size_t)h * hd + pp] = __fadd_rn(acc, __fmul_rn(x_hp, dh));  // + x*D
+}
+
 /* Standard grouped-query attention prefill (MiniMax-M3): Q[S,H,D], full K/V[T,Hkv,D]
  * (no MLA absorption). One block per (query s, head h); a query head maps to KV head
  * h/(H/Hkv). Causal over [0, T-S+s]. Shared-mem softmax, mirroring the absorb batch
@@ -987,6 +1020,9 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
+        if(ctx->ms_state)cudaFree(ctx->ms_state);if(ctx->ms_x)cudaFree(ctx->ms_x);if(ctx->ms_y)cudaFree(ctx->ms_y);
+        if(ctx->ms_b)cudaFree(ctx->ms_b);if(ctx->ms_c)cudaFree(ctx->ms_c);
+        if(ctx->ms_dth)cudaFree(ctx->ms_dth);if(ctx->ms_dah)cudaFree(ctx->ms_dah);if(ctx->ms_d)cudaFree(ctx->ms_d);
         if(ctx->asel)cudaFree(ctx->asel);if(ctx->acnt)cudaFree(ctx->acnt);
         if(ctx->aqa)cudaFree(ctx->aqa);if(ctx->akb)cudaFree(ctx->akb);if(ctx->amsk)cudaFree(ctx->amsk);
         for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
@@ -1589,6 +1625,49 @@ extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const 
     if (!cuda_ok(cudaGetLastError(), "gqa launch")) return 0;
     if (!cuda_ok(cudaMemcpyAsync(ctx, dc->ac, qb, cudaMemcpyDeviceToHost, dc->stream), "gqa ctx download") ||
         !cuda_ok(cudaStreamSynchronize(dc->stream), "gqa sync"))
+        return 0;
+    return 1;
+}
+
+/* Nemotron-H Mamba2 selective-scan for one decode token (S==1). Uploads the persisted
+ * ssm state + this token's post-conv h/B/C and the host-precomputed per-head dt_h/dA_h/D,
+ * runs mamba2_scan_kernel (block per head, thread per head-dim row), then downloads the
+ * updated state and the scan output y. Bit-identical twin of the CPU `selective_scan`. */
+extern "C" int coli_cuda_mamba2_scan(int device, float *state, float *y, const float *hidden,
+        const float *b, const float *c, const float *dt_h, const float *da_h,
+        const float *d, int nh, int hd, int ds, int ng) {
+    if (!state || !y || !hidden || !b || !c || !dt_h || !da_h || !d) return 0;
+    if (nh < 1 || hd < 1 || hd > 1024 || ds < 1 || ng < 1 || nh % ng) return 0;
+    DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
+    cudaStream_t st = dc->stream;
+    size_t stt = (size_t)nh * hd * ds * sizeof(float);
+    size_t xb  = (size_t)nh * hd * sizeof(float);
+    size_t bcb = (size_t)ng * ds * sizeof(float);
+    size_t hb  = (size_t)nh * sizeof(float);
+    if (!reserve(&dc->ms_state, &dc->ms_state_cap, stt) ||
+        !reserve(&dc->ms_x, &dc->ms_x_cap, xb) ||
+        !reserve(&dc->ms_y, &dc->ms_y_cap, xb) ||
+        !reserve(&dc->ms_b, &dc->ms_b_cap, bcb) ||
+        !reserve(&dc->ms_c, &dc->ms_c_cap, bcb) ||
+        !reserve(&dc->ms_dth, &dc->ms_dth_cap, hb) ||
+        !reserve(&dc->ms_dah, &dc->ms_dah_cap, hb) ||
+        !reserve(&dc->ms_d, &dc->ms_d_cap, hb))
+        return 0;
+    if (!cuda_ok(cudaMemcpyAsync(dc->ms_state, state, stt, cudaMemcpyHostToDevice, st), "mamba state up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_x, hidden, xb, cudaMemcpyHostToDevice, st), "mamba x up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_b, b, bcb, cudaMemcpyHostToDevice, st), "mamba b up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_c, c, bcb, cudaMemcpyHostToDevice, st), "mamba c up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_dth, dt_h, hb, cudaMemcpyHostToDevice, st), "mamba dth up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_dah, da_h, hb, cudaMemcpyHostToDevice, st), "mamba dah up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_d, d, hb, cudaMemcpyHostToDevice, st), "mamba d up"))
+        return 0;
+    mamba2_scan_kernel<<<dim3(nh), hd, 0, st>>>(dc->ms_state, dc->ms_y, dc->ms_x,
+        dc->ms_b, dc->ms_c, dc->ms_dth, dc->ms_dah, dc->ms_d, nh, hd, ds, ng);
+    if (!cuda_ok(cudaGetLastError(), "mamba launch")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(state, dc->ms_state, stt, cudaMemcpyDeviceToHost, st), "mamba state down") ||
+        !cuda_ok(cudaMemcpyAsync(y, dc->ms_y, xb, cudaMemcpyDeviceToHost, st), "mamba y download") ||
+        !cuda_ok(cudaStreamSynchronize(st), "mamba sync"))
         return 0;
     return 1;
 }

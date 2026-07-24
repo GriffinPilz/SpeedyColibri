@@ -173,6 +173,68 @@ pub fn try_gqa_attn(
     }
 }
 
+/// GPU Nemotron-H Mamba2 selective-scan for one decode token (`seq == 1`). Runs the
+/// per-token recurrent update `ssm = ssm*dA + dt*B*x; y = Σ ssm*C + x*D` on the GPU,
+/// parallelized over `(head, head_dim)` with each thread looping `d_state`. `state`
+/// (`[n_heads*head_dim*d_state]`) is uploaded, updated in place on the device, and
+/// downloaded back; `y` (`[n_heads*head_dim]`) is the scan output. `dt_h`/`da_h`
+/// (`[n_heads]`) are the per-head step + decay precomputed on the host by
+/// [`crate::mamba2::step_head_scalars`] (so softplus/exp match the CPU exactly); the
+/// kernel does only fma-free `f32` multiply/adds, so the result is bit-identical to
+/// the CPU [`crate::mamba2::selective_scan`]. Returns false — leaving `state`/`y`
+/// untouched — when CUDA is unavailable, so the caller runs the CPU scan.
+#[allow(clippy::too_many_arguments)]
+pub fn try_mamba2_scan(
+    state: &mut [f32],
+    y: &mut [f32],
+    hidden: &[f32],
+    b: &[f32],
+    c: &[f32],
+    dt_h: &[f32],
+    da_h: &[f32],
+    d: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    d_state: usize,
+    n_groups: usize,
+) -> bool {
+    if !available() {
+        return false;
+    }
+    // Guard the buffer sizes so the kernel's indexing stays in bounds.
+    if state.len() != n_heads * head_dim * d_state
+        || y.len() != n_heads * head_dim
+        || hidden.len() != n_heads * head_dim
+        || b.len() != n_groups * d_state
+        || c.len() != n_groups * d_state
+        || dt_h.len() != n_heads
+        || da_h.len() != n_heads
+        || d.len() != n_heads
+        || n_groups == 0
+        || n_heads % n_groups != 0
+    {
+        return false;
+    }
+    // SAFETY: all slice lengths are checked above to match the (nh, hd, ds, ng) the
+    // kernel indexes with; state/y are host in/out, the rest read-only.
+    unsafe {
+        cuda::mamba2_scan_raw(
+            state.as_mut_ptr(),
+            y.as_mut_ptr(),
+            hidden.as_ptr(),
+            b.as_ptr(),
+            c.as_ptr(),
+            dt_h.as_ptr(),
+            da_h.as_ptr(),
+            d.as_ptr(),
+            n_heads as i32,
+            head_dim as i32,
+            d_state as i32,
+            n_groups as i32,
+        )
+    }
+}
+
 /// How many matmuls actually ran on the GPU this thread (proof the path fired).
 pub fn matmul_count() -> u64 {
     GPU_MATMULS.with(|c| c.get())

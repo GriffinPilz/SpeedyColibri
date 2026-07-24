@@ -304,18 +304,41 @@ pub fn mamba2_mixer(
         n_groups: ng,
         dt_min: cfg.mamba_dt_min,
     };
-    let y = selective_scan(
-        dims,
-        kv.mamba_ssm_mut(layer),
-        &h,
-        &b,
-        &c,
-        &dt,
-        &l.mamba_a_log,
-        &l.mamba_d,
-        &l.mamba_dt_bias,
-        s,
-    );
+    // Decode (S==1) routes the recurrent scan to the GPU: the per-head step/decay are
+    // precomputed here (bit-identical softplus/exp to the CPU), then the device kernel
+    // does the fma-free multiply/add recurrence over d_state and updates the persisted
+    // ssm state in place. Prefill (S>1) and any GPU-unavailable case fall to the CPU
+    // `selective_scan`, so tokens are identical either way.
+    #[cfg(feature = "cuda")]
+    let gpu_y: Option<Vec<f32>> = if s == 1 && crate::gpu::available() {
+        let (dt_h, da_h) =
+            crate::mamba2::step_head_scalars(dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias);
+        let mut yv = vec![0f32; s * d_inner];
+        let st = kv.mamba_ssm_mut(layer);
+        crate::gpu::try_mamba2_scan(
+            &mut st.data, &mut yv, &h, &b, &c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng,
+        )
+        .then_some(yv)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cuda"))]
+    let gpu_y: Option<Vec<f32>> = None;
+    let y = match gpu_y {
+        Some(v) => v,
+        None => selective_scan(
+            dims,
+            kv.mamba_ssm_mut(layer),
+            &h,
+            &b,
+            &c,
+            &dt,
+            &l.mamba_a_log,
+            &l.mamba_d,
+            &l.mamba_dt_bias,
+            s,
+        ),
+    };
 
     // ---- gated RMSNorm (per group, silu gate) then out_proj --------------
     let yn = gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps);

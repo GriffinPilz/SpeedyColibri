@@ -21,7 +21,7 @@ use crate::linear::{matmul_f32, matmul_qt};
 use crate::math::silu;
 use crate::model::Layer;
 use colibri_cluster::{ExpertRequest, ExpertSharding, NodeId, Transport};
-use colibri_core::{Bytes, Config, QTensor};
+use colibri_core::{Arch, Bytes, Config, QTensor};
 use colibri_safetensors::Shards;
 use std::io;
 use std::sync::{Arc, OnceLock};
@@ -145,28 +145,91 @@ pub fn cluster_ctx() -> Option<&'static ClusterCtx> {
     CLUSTER.get()
 }
 
-/// One routed expert's SwiGLU weights.
+/// One routed expert's FFN weights.
+///
+/// 3-tensor SwiGLU experts (GLM/MiniMax) populate all three projections; Nemotron-H's
+/// **gateless** ReLU² experts ship only `up`/`down` and leave `gate` at its empty
+/// default (the ReLU² FFN ignores it). Kept as a plain `QTensor` rather than an
+/// `Option` so both shapes share one struct and `bytes()`/`mark_gpu_eligible()` treat
+/// an empty gate as zero-cost.
 #[derive(Debug, Clone, Default)]
 pub struct Expert {
-    /// gate_proj `[moe_inter, hidden]`
+    /// gate_proj `[moe_inter, hidden]` — **empty** for gateless (Nemotron-H) experts.
     pub gate: QTensor,
-    /// up_proj `[moe_inter, hidden]`
+    /// up_proj `[moe_inter, hidden]` (or `[moe_inter, moe_latent]` for Nemotron-H).
     pub up: QTensor,
-    /// down_proj `[hidden, moe_inter]`
+    /// down_proj `[hidden, moe_inter]` (or `[moe_latent, moe_inter]` for Nemotron-H).
     pub down: QTensor,
 }
 
 impl Expert {
-    /// Resident byte size of this expert (sum of the three tensors).
+    /// Resident byte size of this expert (sum of its tensors; an empty gate is 0).
     pub fn bytes(&self) -> u64 {
         (self.gate.bytes() + self.up.bytes() + self.down.bytes()) as u64
     }
 
-    /// Mark all three tensors as GPU-cacheable (for preloaded/resident experts).
+    /// Mark this expert's tensors as GPU-cacheable (for preloaded/resident experts).
+    /// A gateless expert's empty gate is marked too — harmless, it is never used.
     pub fn mark_gpu_eligible(&mut self) {
         self.gate.gpu_eligible = true;
         self.up.gpu_eligible = true;
         self.down.gpu_eligible = true;
+    }
+}
+
+/// How a routed expert's weights are **named and shaped** in the container — the two
+/// axes the streaming loader needs beyond the raw dims. GLM/MiniMax experts are
+/// 3-tensor SwiGLU (`gate_proj`/`up_proj`/`down_proj`) under
+/// `model.layers.N.mlp.experts.E.`; Nemotron-H experts are 2-tensor **gateless**
+/// (`up_proj`/`down_proj`, ReLU²) under `model.layers.N.mixer.experts.E.` and run in
+/// the low-rank `moe_latent` space. Both layouts are read as one coalesced span (the
+/// projections are contiguous on disk) and detected by the same scale-sidecar probe, so
+/// the loader shares a single code path across arches.
+#[derive(Clone, Copy)]
+pub struct ExpertLayout {
+    /// Mixer-block segment of the container name: `"mlp"` (GLM/MiniMax) or `"mixer"`
+    /// (Nemotron-H).
+    prefix: &'static str,
+    /// Gateless: 2-tensor `up`/`down`, no `gate_proj` (Nemotron-H ReLU²). The
+    /// [`Expert::gate`] is left empty and ignored by the ReLU² FFN.
+    gateless: bool,
+}
+
+impl ExpertLayout {
+    /// The container layout for `arch`. Nemotron-H is gateless under `.mixer.experts.`;
+    /// every other arch is 3-tensor SwiGLU under `.mlp.experts.`.
+    pub fn for_arch(arch: Arch) -> ExpertLayout {
+        match arch {
+            Arch::NemotronH => ExpertLayout { prefix: "mixer", gateless: true },
+            _ => ExpertLayout { prefix: "mlp", gateless: false },
+        }
+    }
+
+    /// The ordered projection suffixes for one expert: `[gate,up,down]` (SwiGLU) or
+    /// `[up,down]` (gateless). This is the group the coalesced read fetches, in disk order.
+    fn projs(&self) -> &'static [&'static str] {
+        if self.gateless {
+            &["up_proj", "down_proj"]
+        } else {
+            &["gate_proj", "up_proj", "down_proj"]
+        }
+    }
+
+    /// Container weight name for one expert projection (`suf` ∈ [`ExpertLayout::projs`]).
+    fn weight_name(&self, layer: usize, eid: usize, suf: &str) -> String {
+        format!("model.layers.{layer}.{}.experts.{eid}.{suf}.weight", self.prefix)
+    }
+}
+
+/// The outer (input/output) dimension of a routed expert: the model `hidden` for the
+/// 3-tensor SwiGLU arches, but the low-rank `moe_latent` bottleneck for Nemotron-H,
+/// whose experts run entirely in latent space (`up: moe_latent→moe_inter`,
+/// `down: moe_inter→moe_latent`).
+fn expert_outer_dim(cfg: &Config) -> usize {
+    if matches!(cfg.arch, Arch::NemotronH) {
+        cfg.moe_latent as usize
+    } else {
+        cfg.hidden as usize
     }
 }
 
@@ -209,6 +272,9 @@ pub struct ShardsExpertProvider<'a> {
     /// `COLI_LOAD_THREADS` overrides; see [`default_read_threads`] for why the
     /// default is 2× cores rather than the core count.
     read_threads: usize,
+    /// Container name/shape convention for this arch's experts (3-tensor SwiGLU vs
+    /// 2-tensor gateless). Derived once from `cfg.arch` at construction.
+    layout: ExpertLayout,
 }
 
 /// Read-thread count for on-demand expert streaming: `COLI_LOAD_THREADS` else
@@ -248,12 +314,13 @@ impl<'a> ShardsExpertProvider<'a> {
     pub fn new(shards: &'a Shards, cfg: &Config, ebits: u32) -> ShardsExpertProvider<'a> {
         ShardsExpertProvider {
             shards,
-            hidden: cfg.hidden as usize,
+            hidden: expert_outer_dim(cfg),
             moe_inter: cfg.moe_inter as usize,
             ebits,
             sharding: ExpertSharding::single(cfg.n_experts as u32),
             this_node: NodeId(0),
             read_threads: default_read_threads(),
+            layout: ExpertLayout::for_arch(cfg.arch),
         }
     }
 
@@ -267,12 +334,13 @@ impl<'a> ShardsExpertProvider<'a> {
     ) -> ShardsExpertProvider<'a> {
         ShardsExpertProvider {
             shards,
-            hidden: cfg.hidden as usize,
+            hidden: expert_outer_dim(cfg),
             moe_inter: cfg.moe_inter as usize,
             ebits,
             sharding,
             this_node,
             read_threads: default_read_threads(),
+            layout: ExpertLayout::for_arch(cfg.arch),
         }
     }
 }
@@ -338,10 +406,15 @@ fn experts_gpu_decision(setting: Option<&str>, zerocopy: bool) -> bool {
     }
 }
 
-/// Load one routed expert (gate/up/down) directly from the shards. Shared by
-/// `ShardsExpertProvider` and the direct parallel preloader.
+/// Load one routed expert directly from the shards. Shared by `ShardsExpertProvider`
+/// and the direct parallel preloader. `layout` selects the container convention:
+/// 3-tensor SwiGLU (`gate/up/down` under `.mlp.experts.`) or 2-tensor gateless
+/// (`up/down` under `.mixer.experts.`, Nemotron-H) — the gateless expert's `gate` is
+/// left empty. `hidden` is the expert's **outer** dim (the model hidden, or `moe_latent`
+/// for Nemotron's latent-space experts).
 pub fn load_expert(
     shards: &Shards,
+    layout: ExpertLayout,
     hidden: usize,
     moe_inter: usize,
     ebits: u32,
@@ -349,24 +422,38 @@ pub fn load_expert(
     eid: usize,
     read_threads: usize,
 ) -> io::Result<Expert> {
-    let wn = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-    let (gate_w, up_w, down_w) = (wn("gate_proj"), wn("up_proj"), wn("down_proj"));
+    let projs = layout.projs();
+    let first = layout.weight_name(layer, eid, projs[0]);
     // Container marker is `.qs` (int/e4m3 per-row scales) OR `.g` (NVFP4 global scale);
     // NVFP4 experts drop `.qs` entirely, so both must count as "pre-quantized container".
-    let mut ex = if shards.has(&format!("{gate_w}.qs")) || shards.has(&format!("{gate_w}.g")) {
-        // Pre-quantized container: the 3 weights are contiguous on disk (~18 MB),
-        // so read them in ONE coalesced read into a shared buffer the tensors view
-        // — instead of 3 separate reads + allocations (the streaming bottleneck).
-        // The read is chunked across `read_threads` cores so a single miss saturates
-        // the disk. Scales are tiny and elsewhere; keep them as small per-tensor reads.
-        let ws = shards.read_raw_shared(&[&gate_w, &up_w, &down_w], read_threads)?;
-        expert_from_views(shards, hidden, moe_inter, layer, eid, &ws)?
+    let mut ex = if shards.has(&format!("{first}.qs")) || shards.has(&format!("{first}.g")) {
+        // Pre-quantized container: the projections are contiguous on disk (~18 MB for the
+        // 3-tensor case), so read the whole group (2 gateless / 3 SwiGLU) in ONE coalesced
+        // read into a shared buffer the tensors view — instead of a separate read +
+        // allocation per projection (the streaming bottleneck). The read is chunked across
+        // `read_threads` cores so a single miss saturates the disk. Scales are tiny and
+        // elsewhere; keep them as small per-tensor reads.
+        let names: Vec<String> = projs.iter().map(|s| layout.weight_name(layer, eid, s)).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ws = shards.read_raw_shared(&name_refs, read_threads)?;
+        expert_from_views(shards, layout, hidden, moe_inter, layer, eid, &ws)?
     } else {
         // Full-tensor (runtime-quantized) path — the tiny oracle model.
-        Expert {
-            gate: crate::loader::qt_load(shards, &gate_w, moe_inter, hidden, ebits)?,
-            up: crate::loader::qt_load(shards, &up_w, moe_inter, hidden, ebits)?,
-            down: crate::loader::qt_load(shards, &down_w, hidden, moe_inter, ebits)?,
+        let load = |suf: &str, o: usize, i: usize| {
+            crate::loader::qt_load(shards, &layout.weight_name(layer, eid, suf), o, i, ebits)
+        };
+        if layout.gateless {
+            Expert {
+                gate: QTensor::default(),
+                up: load("up_proj", moe_inter, hidden)?,
+                down: load("down_proj", hidden, moe_inter)?,
+            }
+        } else {
+            Expert {
+                gate: load("gate_proj", moe_inter, hidden)?,
+                up: load("up_proj", moe_inter, hidden)?,
+                down: load("down_proj", hidden, moe_inter)?,
+            }
         }
     };
     // Route streamed experts through the GPU fused-FFN path. This only ever happens
@@ -431,11 +518,14 @@ fn nvfp4_sim_e4m3(codes: &[u8], o: usize, i: usize, row_scale: &[f32]) -> (Vec<u
     (out, ns)
 }
 
-/// Build an `Expert` from three raw weight views (`gate,up,down`, each as returned
-/// by [`Shards::read_raw_shared`]/`read_raw_shared_batched`), reading the tiny
-/// per-weight scales separately. Shared by the single-expert and batched loaders.
+/// Build an `Expert` from its raw weight views (in [`ExpertLayout::projs`] order — 3
+/// `gate,up,down` for SwiGLU or 2 `up,down` for gateless — each as returned by
+/// [`Shards::read_raw_shared`]/`read_raw_shared_batched`), reading the tiny per-weight
+/// scales separately. Shared by the single-expert and batched loaders. A gateless
+/// expert's `gate` is left empty.
 fn expert_from_views(
     shards: &Shards,
+    layout: ExpertLayout,
     hidden: usize,
     moe_inter: usize,
     layer: usize,
@@ -511,12 +601,24 @@ fn expert_from_views(
         }
         Ok(t)
     };
-    let wn = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight.qs");
-    Ok(Expert {
-        gate: mk(moe_inter, hidden, &views[0], wn("gate_proj"))?,
-        up: mk(moe_inter, hidden, &views[1], wn("up_proj"))?,
-        down: mk(hidden, moe_inter, &views[2], wn("down_proj"))?,
-    })
+    // `mk` reads the scale sidecar by name; pass the `.qs` name — it is also the carrier
+    // the NVFP4 (`.g`) branch strips back to the base weight name to find the global.
+    let qs = |suf: &str| format!("{}.qs", layout.weight_name(layer, eid, suf));
+    if layout.gateless {
+        // 2-tensor gateless (Nemotron-H): views = [up, down], no gate_proj. Experts run
+        // in the `moe_latent` space, so `hidden` here is `moe_latent`.
+        Ok(Expert {
+            gate: QTensor::default(),
+            up: mk(moe_inter, hidden, &views[0], qs("up_proj"))?,
+            down: mk(hidden, moe_inter, &views[1], qs("down_proj"))?,
+        })
+    } else {
+        Ok(Expert {
+            gate: mk(moe_inter, hidden, &views[0], qs("gate_proj"))?,
+            up: mk(moe_inter, hidden, &views[1], qs("up_proj"))?,
+            down: mk(hidden, moe_inter, &views[2], qs("down_proj"))?,
+        })
+    }
 }
 
 /// Pool a whole layer's expert reads through one continuously-streaming worker
@@ -536,6 +638,7 @@ fn reader_pool_enabled() -> bool {
 /// full-tensor (oracle) path. Returns experts in `eids` order.
 pub fn load_experts_batch(
     shards: &Shards,
+    layout: ExpertLayout,
     hidden: usize,
     moe_inter: usize,
     ebits: u32,
@@ -546,33 +649,31 @@ pub fn load_experts_batch(
     if eids.is_empty() {
         return Ok(Vec::new());
     }
+    let projs = layout.projs();
     // The pooled path applies only to the pre-quantized container (contiguous
-    // gate|up|down + sidecar scales). Detect via the first expert's scale sidecar:
-    // `.qs` (int/e4m3) or `.g` (NVFP4, which has no `.qs`).
-    let base = format!("model.layers.{layer}.mlp.experts.{}.gate_proj.weight", eids[0]);
-    if !shards.has(&format!("{base}.qs")) && !shards.has(&format!("{base}.g")) {
+    // projections + sidecar scales). Detect via the first expert's first projection
+    // scale sidecar: `.qs` (int/e4m3) or `.g` (NVFP4, which has no `.qs`).
+    let first = layout.weight_name(layer, eids[0], projs[0]);
+    if !shards.has(&format!("{first}.qs")) && !shards.has(&format!("{first}.g")) {
         return eids
             .iter()
-            .map(|&e| load_expert(shards, hidden, moe_inter, ebits, layer, e, read_threads))
+            .map(|&e| load_expert(shards, layout, hidden, moe_inter, ebits, layer, e, read_threads))
             .collect();
     }
-    // One [gate,up,down] name group per expert; keep the owned strings alive so
-    // the borrowed &str slices handed to the reader stay valid.
-    let names: Vec<[String; 3]> = eids
+    // One projection-name group per expert (2 gateless / 3 SwiGLU); keep the owned
+    // strings alive so the borrowed &str slices handed to the reader stay valid.
+    let names: Vec<Vec<String>> = eids
         .iter()
-        .map(|&eid| {
-            let wn = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-            [wn("gate_proj"), wn("up_proj"), wn("down_proj")]
-        })
+        .map(|&eid| projs.iter().map(|s| layout.weight_name(layer, eid, s)).collect())
         .collect();
-    let groups: Vec<[&str; 3]> =
-        names.iter().map(|g| [g[0].as_str(), g[1].as_str(), g[2].as_str()]).collect();
-    let group_refs: Vec<&[&str]> = groups.iter().map(|g| &g[..]).collect();
+    let groups: Vec<Vec<&str>> =
+        names.iter().map(|g| g.iter().map(String::as_str).collect()).collect();
+    let group_refs: Vec<&[&str]> = groups.iter().map(|g| g.as_slice()).collect();
     let views = shards.read_raw_shared_batched(&group_refs, read_threads)?;
 
     let mut out = Vec::with_capacity(eids.len());
     for (gi, &eid) in eids.iter().enumerate() {
-        let mut ex = expert_from_views(shards, hidden, moe_inter, layer, eid, &views[gi])?;
+        let mut ex = expert_from_views(shards, layout, hidden, moe_inter, layer, eid, &views[gi])?;
         if gpu_experts_enabled() {
             ex.mark_gpu_eligible();
         }
@@ -601,6 +702,7 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
         }
         Ok(Arc::new(load_expert(
             self.shards,
+            self.layout,
             self.hidden,
             self.moe_inter,
             self.ebits,
@@ -628,6 +730,7 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
         if reader_pool_enabled() {
             let exps = load_experts_batch(
                 self.shards,
+                self.layout,
                 self.hidden,
                 self.moe_inter,
                 self.ebits,
@@ -1128,12 +1231,11 @@ pub fn moe<P: ExpertProvider>(
 /// which makes [`ffn`] ignore the unused gate). The shared expert reuses `l.up_proj`/
 /// `l.down_proj` (its `gate_proj` is empty and ignored under ReLU²).
 ///
-/// NOTE (streaming provider): the routed experts are latent-space **2-tensor** (up/down,
-/// no gate) NVFP4 weights. Feeding them through the existing [`ExpertProvider`] requires a
-/// gateless expert loader (the current [`load_expert`] reads a 3-tensor `gate/up/down`
-/// group); that loader change is a convert/loader-phase task. This forward math is
-/// provider-agnostic — a provider that returns [`Expert`]s whose `up`/`down` are the
-/// latent projections (any `gate`) computes the correct result here.
+/// The routed experts are latent-space **2-tensor** (up/down, no gate) NVFP4 weights.
+/// [`ShardsExpertProvider`] streams them via the gateless [`ExpertLayout`]
+/// (`.mixer.experts.` naming, 2-projection coalesced read, empty `gate`); the forward
+/// math here is provider-agnostic — any provider returning [`Expert`]s whose `up`/`down`
+/// are the latent projections (any `gate`) computes the correct result.
 pub fn nemotron_moe<P: ExpertProvider>(
     cfg: &Config,
     l: &Layer,
@@ -1776,7 +1878,8 @@ mod tests {
         );
 
         let shards = Shards::open(&dir).unwrap();
-        let ex = load_expert(&shards, hidden, moe_inter, 4, 0, 0, 8).unwrap();
+        let glm = ExpertLayout::for_arch(Arch::GlmMoeDsa);
+        let ex = load_expert(&shards, glm, hidden, moe_inter, 4, 0, 0, 8).unwrap();
 
         // (a) each Bytes::Shared view holds exactly its on-disk bytes + scales + dims.
         assert!(ex.gate.q4.as_slice() == gate_q4.as_slice(), "gate q4 mismatch");
@@ -1828,6 +1931,182 @@ mod tests {
         check(&ex.gate, &gate_q4, &gate_s, moe_inter, hidden);
         check(&ex.up, &up_q4, &up_s, moe_inter, hidden);
         check(&ex.down, &down_q4, &down_s, hidden, moe_inter);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nemotron-H routed experts are 2-tensor **gateless** (up_proj + down_proj, no
+    /// gate_proj), NVFP4, latent-space, and live under `.mixer.experts.`. Build one
+    /// faithful to what `convert.rs` emits — U8 weight = packed e2m1 nibbles ++ ue4m3
+    /// block-scales, plus an F32 `.g` global; codes block first then the floats, exactly
+    /// `convert_snapshot`'s on-disk order — stream it through `ShardsExpertProvider` (both
+    /// the single-expert and the pooled batched read), and assert the loaded `Expert`
+    /// (empty gate; correct 2-tensor NVFP4 up/down in `moe_latent` space) computes
+    /// `down(relu(up·x)²)` identically to an in-memory expert built from the same blobs.
+    #[test]
+    fn shards_provider_loads_gateless_nemotron_expert() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Expert outer dim (moe_latent) = 16 = one NVFP4 block; moe_inter = 32 = two.
+        const LATENT: usize = 16;
+        const MOE_INTER: usize = 32;
+        const NR: usize = 2; // tokens
+
+        fn temp_dir() -> PathBuf {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+            let p = PathBuf::from(base).join(format!(
+                "colibri-nemo-gateless-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        // Deterministic smooth weights so the NVFP4 encoding is well-conditioned.
+        let wv = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n).map(|k| ((k + seed) as f32 * 0.19).sin() * 0.5).collect()
+        };
+        let w_up = wv(MOE_INTER * LATENT, 3); // up:   [MOE_INTER, LATENT]
+        let w_down = wv(LATENT * MOE_INTER, 7); // down: [LATENT, MOE_INTER]
+        let (nib_u, bsc_u, g_u) = crate::convert::quantize_nvfp4(&w_up, MOE_INTER, LATENT);
+        let (nib_d, bsc_d, g_d) = crate::convert::quantize_nvfp4(&w_down, LATENT, MOE_INTER);
+        let mut blob_u = nib_u.clone();
+        blob_u.extend_from_slice(&bsc_u); // weight = nibbles ++ block-scales
+        let mut blob_d = nib_d.clone();
+        blob_d.extend_from_slice(&bsc_d);
+
+        // safetensors shard: the two U8 weight blobs contiguous (so the loader's coalesced
+        // 2-tensor read fires), then the F32 `.g` globals — convert's codes-then-floats
+        // order. NO gate_proj, NO `.qs`.
+        let dir = temp_dir();
+        let p = |suf: &str| format!("model.layers.0.mixer.experts.0.{suf}");
+        let (uw, dw, ug, dg) =
+            (p("up_proj.weight"), p("down_proj.weight"), p("up_proj.weight.g"), p("down_proj.weight.g"));
+        let entries: [(&str, &str, Vec<u8>); 4] = [
+            (uw.as_str(), "U8", blob_u.clone()),
+            (dw.as_str(), "U8", blob_d.clone()),
+            (ug.as_str(), "F32", g_u.to_le_bytes().to_vec()),
+            (dg.as_str(), "F32", g_d.to_le_bytes().to_vec()),
+        ];
+        let mut hjson = String::from("{");
+        let mut off = 0usize;
+        for (i, (name, dtype, b)) in entries.iter().enumerate() {
+            if i > 0 {
+                hjson.push(',');
+            }
+            let numel = if *dtype == "F32" { b.len() / 4 } else { b.len() };
+            hjson.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{numel}],\"data_offsets\":[{off},{}]}}",
+                off + b.len()
+            ));
+            off += b.len();
+        }
+        hjson.push('}');
+        let hbytes = hjson.as_bytes();
+        let mut f = File::create(dir.join("model.safetensors")).unwrap();
+        f.write_all(&(hbytes.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(hbytes).unwrap();
+        for (_, _, b) in &entries {
+            f.write_all(b).unwrap();
+        }
+        drop(f);
+
+        // Tiny 1-layer Nemotron-H config: `arch` drives the gateless `.mixer.experts.`
+        // layout and the `moe_latent` expert outer dim.
+        let json = colibri_json::Json::parse(&format!(
+            r#"{{"model_type":"nemotron_h","hidden_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"vocab_size":8,
+                "hybrid_override_pattern":"E","n_routed_experts":4,"num_experts_per_tok":2,
+                "moe_intermediate_size":{MOE_INTER},"moe_latent_size":{LATENT},
+                "moe_shared_expert_intermediate_size":6,"norm_topk_prob":false,
+                "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
+                "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
+                "chunk_size":2,"layer_norm_epsilon":1e-5}}"#
+        ))
+        .unwrap();
+        let cfg = Config::from_json(&json).unwrap();
+        assert_eq!(cfg.arch, Arch::NemotronH);
+        assert_eq!((cfg.moe_latent, cfg.moe_inter), (LATENT as i32, MOE_INTER as i32));
+
+        let shards = Shards::open(&dir).unwrap();
+        let provider = ShardsExpertProvider::new(&shards, &cfg, 8);
+        // The provider must have picked up the gateless/latent layout from the arch.
+        assert!(provider.layout.gateless, "Nemotron provider must use the gateless layout");
+        assert_eq!(provider.hidden, LATENT, "expert outer dim must be moe_latent");
+
+        // In-memory reference expert built straight from the same NVFP4 blobs.
+        let ref_qt = |o: usize, i: usize, nib: &[u8], bsc: &[u8], g: f32| QTensor {
+            fmt_code: 5,
+            o: o as i32,
+            i: i as i32,
+            q4: Bytes::Owned(nib.to_vec()),
+            bs: Bytes::Owned(bsc.to_vec()),
+            g,
+            ..Default::default()
+        };
+        let up_ref = ref_qt(MOE_INTER, LATENT, &nib_u, &bsc_u, g_u);
+        let down_ref = ref_qt(LATENT, MOE_INTER, &nib_d, &bsc_d, g_d);
+
+        // Gateless ReLU² FFN `down(relu(up·x)²)` over `[NR, LATENT]` (mirrors the `relu2`
+        // branch of `ffn_cpu`), computed directly so this test never touches the
+        // process-global activation the SwiGLU unit tests rely on.
+        let relu2 = |up: &QTensor, down: &QTensor, x: &[f32]| -> Vec<f32> {
+            let mut u = vec![0f32; NR * MOE_INTER];
+            matmul_qt(&mut u, x, up, NR);
+            for v in u.iter_mut() {
+                let r = v.max(0.0);
+                *v = r * r;
+            }
+            let mut y = vec![0f32; NR * LATENT];
+            matmul_qt(&mut y, &u, down, NR);
+            y
+        };
+        let x: Vec<f32> = (0..NR * LATENT).map(|k| 0.4 - 0.03 * (k % 9) as f32).collect();
+        let want = relu2(&up_ref, &down_ref, &x);
+        assert!(want.iter().any(|v| v.abs() > 1e-4), "reference relu2 output is all-zero");
+
+        // Both provider entry points: the single-expert load and the pooled batched read
+        // (a 2-tensor group through `read_raw_shared_batched`).
+        for (label, ex) in [
+            ("expert", provider.expert(0, 0).unwrap()),
+            ("experts_batch", provider.experts_batch(0, &[0]).unwrap().remove(0)),
+        ] {
+            // Gateless: gate is empty; up/down are NVFP4 (fmt 5) with the latent-space dims.
+            assert!(
+                ex.gate.q4.is_empty() && ex.gate.o == 0 && ex.gate.i == 0,
+                "{label}: gateless expert must have an empty gate"
+            );
+            assert_eq!(
+                (ex.up.fmt_code, ex.up.o, ex.up.i),
+                (5, MOE_INTER as i32, LATENT as i32),
+                "{label}: up dims/format"
+            );
+            assert_eq!(
+                (ex.down.fmt_code, ex.down.o, ex.down.i),
+                (5, LATENT as i32, MOE_INTER as i32),
+                "{label}: down dims/format"
+            );
+            // The coalesced `.g` read materialized exactly the on-disk nibble + block-scale
+            // halves and the global — byte-for-byte, at the right offsets.
+            assert_eq!(ex.up.q4.as_slice(), nib_u.as_slice(), "{label}: up nibbles");
+            assert_eq!(ex.up.bs.as_slice(), bsc_u.as_slice(), "{label}: up block-scales");
+            assert_eq!(ex.up.g, g_u, "{label}: up global");
+            assert_eq!(ex.down.q4.as_slice(), nib_d.as_slice(), "{label}: down nibbles");
+            assert_eq!(ex.down.bs.as_slice(), bsc_d.as_slice(), "{label}: down block-scales");
+            assert_eq!(ex.down.g, g_d, "{label}: down global");
+
+            // Computes `down(relu(up·x)²)` identically to the in-memory reference.
+            let got = relu2(&ex.up, &ex.down, &x);
+            for (k, (&a, &b)) in got.iter().zip(&want).enumerate() {
+                let tol = 1e-5 * a.abs().max(b.abs()).max(1.0);
+                assert!((a - b).abs() <= tol, "{label} row {k}: loaded {a} vs reference {b}");
+            }
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

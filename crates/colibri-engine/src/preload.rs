@@ -17,7 +17,7 @@
 //! the layer's `(fmt, dims)` in the manifest say how to slice it. int8 (fmt 1)
 //! experts are supported.
 
-use crate::moe::{expert_gate_name, load_expert, Expert, ExpertProvider};
+use crate::moe::{expert_gate_name, load_expert, Expert, ExpertLayout, ExpertProvider};
 use colibri_core::{Config, QTensor};
 use colibri_json::Json;
 use colibri_safetensors::Shards;
@@ -309,6 +309,7 @@ pub fn preload_parallel(
 ) -> io::Result<PreloadStore> {
     let hidden = cfg.hidden as usize;
     let moe_inter = cfg.moe_inter as usize;
+    let layout = ExpertLayout::for_arch(cfg.arch);
     let nthreads = num_threads.max(1);
 
     // (layer, eid) sorted by on-disk offset of the gate tensor → sequential reads
@@ -343,7 +344,7 @@ pub fn preload_parallel(
                             // Bulk preload is already ~20-way parallel across experts,
                             // so each expert's read stays a single stream (chunking it
                             // too would only oversubscribe the drive).
-                            let mut ex = load_expert(shards, hidden, moe_inter, ebits, layer, eid, 1)?;
+                            let mut ex = load_expert(shards, layout, hidden, moe_inter, ebits, layer, eid, 1)?;
                             ex.mark_gpu_eligible(); // preloaded == resident/stable
                             used += ex.bytes();
                             map.insert((layer, eid), Arc::new(ex));

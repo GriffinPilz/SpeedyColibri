@@ -635,7 +635,7 @@ fn e2m1_code(t: f32) -> u8 {
 /// **back** from that byte (`f8e4m3_to_f32(code) * global`), so encode and the kernel/CPU
 /// decode agree exactly. This is the real quantizer behind [`quantize_nvfp4_sim`]'s
 /// reconstruction (which was scored at 9.4% rel-RMS on the real experts).
-fn quantize_nvfp4(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<u8>, f32) {
+pub(crate) fn quantize_nvfp4(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<u8>, f32) {
     let amax = w.iter().fold(0f32, |m, &v| m.max(v.abs()));
     let global = (amax / (E2M1_LEVELS[7] * UE4M3_MAX)).max(f32::MIN_POSITIVE);
     let nb = i.div_ceil(NVFP4_BLOCK);

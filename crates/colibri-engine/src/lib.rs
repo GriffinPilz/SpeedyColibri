@@ -51,7 +51,8 @@ pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
 pub use model::{KvCache, Layer, Model, MtpHead, KV_UNSET};
 pub use moe::{
     cluster_ctx, compute_experts_partial, dense_mlp, moe, moe_sharded, nemotron_moe, route,
-    set_activation, set_cluster, ClusterCtx, Expert, ExpertProvider, ShardsExpertProvider,
+    set_activation, set_cluster, ClusterCtx, Expert, ExpertLayout, ExpertProvider,
+    ShardsExpertProvider,
 };
 pub use mtp::{absorb as mtp_absorb, draft as mtp_draft};
 pub use preload::{default_num_files, preload_parallel, repack, Manifest, PreloadStore};

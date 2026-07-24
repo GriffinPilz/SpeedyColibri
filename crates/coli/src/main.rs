@@ -1854,6 +1854,7 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
         }
     };
     let (hidden, moe_inter) = (cfg.hidden as usize, cfg.moe_inter as usize);
+    let elayout = colibri_engine::moe::ExpertLayout::for_arch(cfg.arch);
     let wn = |l: usize, e: usize, suf: &str| {
         format!("model.layers.{l}.mlp.experts.{e}.{suf}.weight")
     };
@@ -1918,7 +1919,7 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
     for (i, t) in [threads, 1].into_iter().enumerate() {
         let t0 = std::time::Instant::now();
         for e in 0..n_experts {
-            let ex = colibri_engine::moe::load_expert(&shards, hidden, moe_inter, 4, layer, e, t)
+            let ex = colibri_engine::moe::load_expert(&shards, elayout, hidden, moe_inter, 4, layer, e, t)
                 .expect("load_expert");
             std::hint::black_box(&ex);
         }
@@ -1932,7 +1933,7 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
         let eids: Vec<usize> = (0..n_experts).collect();
         let t0 = std::time::Instant::now();
         let exps =
-            colibri_engine::moe::load_experts_batch(&shards, hidden, moe_inter, 4, layer, &eids, threads)
+            colibri_engine::moe::load_experts_batch(&shards, elayout, hidden, moe_inter, 4, layer, &eids, threads)
                 .expect("load_experts_batch");
         std::hint::black_box(&exps);
         report(

@@ -55,6 +55,15 @@ typedef struct {
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
+/* One mutex per DeviceContext slot. Every compute entry point holds it across the whole
+ * reserve -> upload -> launch -> download -> synchronize sequence, so two threads issuing
+ * work on the same device can't clobber that context's shared scratch (aq/al/ar/ac,
+ * x/y/gate/up, qx/qscale, ewg..., asel/acnt, aqa/akb/amsk). Production forward() is
+ * single-threaded per device, so this is uncontended there; it exists to make the
+ * multi-threaded `cargo test` harness deterministic. Kept out of DeviceContext itself
+ * because that struct is reset with `*ctx = {}` (line ~936), which a std::mutex member
+ * would forbid. Indexed by slot (ctx - g_ctx), always in [0, COLI_CUDA_MAX_DEVICES). */
+static std::mutex g_scratch_mu[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
 static std::mutex g_group_stats_mu;
@@ -69,6 +78,10 @@ static DeviceContext *find_ctx(int device) {
     for (int i = 0; i < g_nctx; i++) if (g_ctx[i].device == device) return &g_ctx[i];
     return nullptr;
 }
+
+/* Mutex guarding `ctx`'s shared scratch. `ctx` must point into g_ctx (find_ctx only ever
+ * returns that or nullptr, and callers bail on nullptr before locking). */
+static inline std::mutex &scratch_mu(DeviceContext *ctx) { return g_scratch_mu[ctx - g_ctx]; }
 
 /* cudaSetDevice on every call doubles expert-matmul time on 2 GPUs when the
  * serial expert loop alternates devices (measured on RTX 5090 + 4090: 14.3s
@@ -1078,6 +1091,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     ColiCudaTensor *t = *tensor;
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
     size_t rb = row_bytes(fmt, I);
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
@@ -1110,6 +1124,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
         down->I != gate->O || down->O != gate->I) return 0;
     DeviceContext *ctx = find_ctx(gate->device);
     if (!select_ctx(ctx)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
     int D = gate->I, I = gate->O;
     size_t xb=(size_t)S*D*sizeof(float), ib=(size_t)S*I*sizeof(float);
     size_t yb=(size_t)S*D*sizeof(float);
@@ -1140,6 +1155,7 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
        gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
        gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
     DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
     int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
        !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
@@ -1220,6 +1236,7 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
        gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
        gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
     DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
     int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
        !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
@@ -1284,6 +1301,7 @@ extern "C" int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate,ColiCudaTensor *u
        gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
        gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
     DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
     int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
        !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
@@ -1327,6 +1345,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
@@ -1401,6 +1420,7 @@ extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const flo
     if(!w||!ctx||!q||!latent||!rope||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>4096||
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     size_t qb=(size_t)H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
     size_t rb=(size_t)T*R*sizeof(float),cb=(size_t)H*V*sizeof(float);
     if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||
@@ -1424,6 +1444,9 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
        T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
     if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    // Static helper: reached only from the public absorb_batch / project_batch wrappers,
+    // neither of which locks — so this is the single lock point for both.
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
     size_t rb=(size_t)T*R*sizeof(float),cb=(size_t)S*H*V*sizeof(float);
     if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||
@@ -1466,6 +1489,7 @@ extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const 
     // or D not tile-aligned, falls back to the scalar gqa_attn_kernel (mode 0).
     int flash = (mode == 1 && D % 16 == 0);
     DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     size_t qb = (size_t)S * H * D * sizeof(float), kb = (size_t)T * Hkv * D * sizeof(float);
     if (!reserve(&dc->aq, &dc->aq_cap, qb) || !reserve(&dc->al, &dc->al_cap, kb) ||
         !reserve(&dc->ar, &dc->ar_cap, kb) || !reserve(&dc->ac, &dc->ac_cap, qb))
@@ -1501,6 +1525,7 @@ extern "C" int coli_cuda_dsa_indexer_scores(float *scores,const float *qi,const 
         const float *keys,int nsp,int s0,int nh,int hd,int T,int pos_base,int device){
     if(!scores||!qi||!hw||!keys||nsp<1||nh<1||nh>32||hd<1||T<1)return 0;
     DeviceContext *dc=find_ctx(device);if(!select_ctx(dc))return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     size_t qb=(size_t)nsp*nh*hd*sizeof(float),wb=(size_t)nsp*nh*sizeof(float);
     size_t kb=(size_t)T*hd*sizeof(float),sb=(size_t)nsp*T*sizeof(float);
     if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ar,&dc->ar_cap,wb)||
@@ -1563,11 +1588,14 @@ static int attention_absorb_sparse_run(ColiCudaTensor *w,ColiCudaTensor *proj,fl
     // pooled context buffer first (stale from a prior call) — needed for the copy-back
     // and for the fused GPU o_proj, which contracts over all H*V ctx columns.
     if(H0<0||HC<1||H0+HC>H)return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    // Lock before the tc branch: tc_sparse_attn_run uses the same per-device scratch and
+    // does not lock itself (it runs nested under this guard).
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     // Tensor-core WMMA path (opt-in). Only the non-fused case (no o_proj); ~3x the scalar core.
     { static int tc=-1; if(tc<0){const char*e=getenv("COLI_TC_ATTN");tc=(e&&atoi(e))?1:0;}
       if(tc && !proj) return tc_sparse_attn_run(w,out,q,latent,rope,sel_idx,sel_cnt,maxsel,H0,HC,S,H,Q,R,V,K,T,scale); }
     if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
-    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
     size_t rb=(size_t)T*R*sizeof(float),cb=(size_t)S*H*V*sizeof(float);
     size_t sib=(size_t)S*maxsel*sizeof(int),scb=(size_t)S*sizeof(int);

@@ -1150,6 +1150,18 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     // reads each weight once per 16-row tile vs quant_matmul's S-fold re-read.
     const char *tile_env = getenv("COLI_TILE_I8");
     int tile = (!tile_env || strcmp(tile_env, "0") != 0) && ctx->compute_major >= 7;
+    // ...but ONLY when there are rows to fill the tile. At S==1 (decode) 15/16 of the
+    // MMA is padding and the grid collapses to (O/64, 1) — e.g. 290 blocks for
+    // Nemotron's [18560,4096] mamba in_proj, far too few to saturate memory.
+    // quant_matmul launches one block per output row instead, and its S-fold weight
+    // re-read costs nothing when S is 1. This is the same principle the expert FFN
+    // path already applies (fp8a16_gemv / nvfp4_gemv, "waste 15/16 of their MMA at
+    // S==1"); it was simply never applied to the dense resident matmuls, which is
+    // where Nemotron-H spends most of decode (mamba in/out-proj, shared expert,
+    // fc1/fc2). MEASURED on Nemotron-H decode: 4.65 -> 7.0 tok/s (1.50x), tokens
+    // byte-identical; prefill unaffected since it runs S>>16. `COLI_TILE_I8=force`
+    // keeps tiles on at S==1 for A/B.
+    if (S == 1 && !(tile_env && strcmp(tile_env, "force") == 0)) tile = 0;
     if (tile && (fmt == 1 || fmt == 4)) {
         dim3 tg((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
         if (fmt == 4)

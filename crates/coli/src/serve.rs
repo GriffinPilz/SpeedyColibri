@@ -591,6 +591,7 @@ fn complete(
 fn build_chat_prompt(tok: &Tokenizer, messages: &[Json], arch: colibri_core::Arch) -> Vec<i32> {
     match arch {
         colibri_core::Arch::MinimaxM2 => build_chat_prompt_minimax(tok, messages),
+        colibri_core::Arch::NemotronH => build_chat_prompt_nemotron(tok, messages),
         // GLM-5.2 / MiniMax-M3: GLM-style chat markers.
         _ => {
             let mut s = String::from("[gMASK]<sop>");
@@ -607,6 +608,39 @@ fn build_chat_prompt(tok: &Tokenizer, messages: &[Json], arch: colibri_core::Arc
             tok.encode(&s)
         }
     }
+}
+
+/// Nemotron-H chat format (from its `chat_template.jinja`): plain **ChatML** —
+/// each turn is `<|im_start|>{role}\n{content}<|im_end|>\n`, with no conversation
+/// opener and no default system turn (the template emits a system block only when
+/// the caller supplies one). The generation prompt is `<|im_start|>assistant\n`
+/// followed by the template's `enable_thinking` branch; we emit the disabled form
+/// `<think></think>` so the model answers directly, matching what the GLM path does.
+///
+/// Getting here matters: without this arm Nemotron fell through to the GLM branch
+/// and was served `[gMASK]<sop><|user|>…` — control tokens absent from its vocab.
+/// `<|im_start|>`/`<|im_end|>` are single added-vocab ids (10/11), and 11 is already
+/// in `stop_ids` via `generation_config.json`, so turn termination needs no extra
+/// wiring — only the prompt was wrong.
+fn build_chat_prompt_nemotron(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
+    tok.encode(&nemotron_chat_string(messages))
+}
+
+/// The ChatML assembly for [`build_chat_prompt_nemotron`], split out so the exact
+/// marker layout is unit-testable without loading a 67 GB model's tokenizer.
+fn nemotron_chat_string(messages: &[Json]) -> String {
+    let mut s = String::new();
+    for m in messages {
+        let o = match m.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let role = o.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let content = o.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+    }
+    s.push_str("<|im_start|>assistant\n<think></think>");
+    s
 }
 
 /// MiniMax-M2 chat format (from its `chat_template.jinja`): `]~!b[` opens the
@@ -850,6 +884,41 @@ mod tests {
         assert_eq!(jstr("tab\tx"), "\"tab\\tx\"");
         assert_eq!(jstr("\u{0007}"), "\"\\u0007\""); // bell → 
         assert_eq!(jstr("café ☕"), "\"café ☕\""); // multibyte passes through
+    }
+
+    /// Nemotron-H is ChatML, NOT the GLM markers it used to fall through to.
+    /// Mirrors `chat_template.jinja`: no opener, no injected system turn, one
+    /// `<|im_start|>{role}\n{content}<|im_end|>\n` per message, and a generation
+    /// prompt whose `<think></think>` is the template's disabled-thinking branch.
+    #[test]
+    fn nemotron_chat_is_chatml() {
+        // Built by parsing, so the test walks the same shape a real request does.
+        let msgs = match Json::parse(
+            r#"[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}]"#,
+        ) {
+            Some(Json::Arr(a)) => a,
+            other => panic!("expected a JSON array, got {other:?}"),
+        };
+        let s = nemotron_chat_string(&msgs);
+        assert_eq!(
+            s,
+            "<|im_start|>system\nBe brief.<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n\
+             <|im_start|>assistant\n<think></think>"
+        );
+        // The regression this fixes: none of the GLM control tokens may appear.
+        assert!(!s.contains("[gMASK]"), "GLM opener leaked into the Nemotron prompt");
+        assert!(!s.contains("<|user|>"), "GLM role markers leaked into the Nemotron prompt");
+    }
+
+    /// No messages still yields a valid generation prompt (not an empty string),
+    /// so a malformed request cannot make the model continue arbitrary text.
+    #[test]
+    fn nemotron_chat_empty_messages_still_prompts() {
+        assert_eq!(
+            nemotron_chat_string(&[]),
+            "<|im_start|>assistant\n<think></think>"
+        );
     }
 
     #[test]

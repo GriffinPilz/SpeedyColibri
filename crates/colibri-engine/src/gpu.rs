@@ -173,6 +173,14 @@ pub fn try_gqa_attn(
     }
 }
 
+/// Whether the Mamba2 selective-scan decode step runs on the GPU (default-on when CUDA
+/// is available). `COLI_MAMBA_CPU=1` forces the CPU `selective_scan` — an A/B switch to
+/// confirm the GPU kernel is token-identical with everything else unchanged.
+pub fn mamba_scan_gpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_MAMBA_CPU").ok().as_deref() != Some("1"))
+}
+
 /// GPU Nemotron-H Mamba2 selective-scan for one decode token (`seq == 1`). Runs the
 /// per-token recurrent update `ssm = ssm*dA + dt*B*x; y = Σ ssm*C + x*D` on the GPU,
 /// parallelized over `(head, head_dim)` with each thread looping `d_state`. `state`

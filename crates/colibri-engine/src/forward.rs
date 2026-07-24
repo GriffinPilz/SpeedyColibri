@@ -310,7 +310,10 @@ pub fn mamba2_mixer(
     // ssm state in place. Prefill (S>1) and any GPU-unavailable case fall to the CPU
     // `selective_scan`, so tokens are identical either way.
     #[cfg(feature = "cuda")]
-    let gpu_y: Option<Vec<f32>> = if s == 1 && crate::gpu::available() {
+    let gpu_y: Option<Vec<f32>> = if s == 1
+        && crate::gpu::available()
+        && crate::gpu::mamba_scan_gpu_enabled()
+    {
         let (dt_h, da_h) =
             crate::mamba2::step_head_scalars(dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias);
         let mut yv = vec![0f32; s * d_inner];

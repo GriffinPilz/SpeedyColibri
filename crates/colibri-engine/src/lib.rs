@@ -20,6 +20,7 @@ pub mod forward;
 pub mod gpu;
 pub mod linear;
 pub mod loader;
+pub mod mamba2;
 pub mod math;
 pub mod model;
 pub mod moe;

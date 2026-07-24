@@ -2438,6 +2438,7 @@ fn parse_ctx(s: &str) -> Option<u64> {
 fn cmd_capacity(args: &[String]) -> ExitCode {
     use colibri_engine::capacity::{
         bytes_per_expert, context_in_kv_budget, experts_in_budget, kv_bytes_per_token,
+        kv_fixed_bytes,
     };
     let snap = match args.get(2) {
         Some(p) => p,
@@ -2472,8 +2473,9 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
     // working buffers / OS headroom ~4 GB.
     let dense_gb = 10u64;
     let working_gb = 4u64;
-    let kv_per_tok = kv_bytes_per_token(cfg.kv_lora as u64, cfg.qk_rope as u64, cfg.n_layers as u64);
-    let kv_bytes = kv_per_tok * ctx;
+    let kv_per_tok = kv_bytes_per_token(&cfg);
+    let kv_fixed = kv_fixed_bytes(&cfg); // per-sequence Mamba2 state; 0 unless hybrid
+    let kv_bytes = kv_per_tok * ctx + kv_fixed;
 
     let ram_bytes = ram_gb * gib;
     let expert_budget =
@@ -2485,8 +2487,18 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
         cfg.hidden, cfg.moe_inter, cfg.n_experts, cfg.n_layers, sparse_layers);
     println!("per expert (nvfp4 ~4-bit): {:.2} MB   total routed: {total_experts} → {:.0} GB",
         mb(bpe), gb(total_experts * bpe));
-    println!("KV cache: {:.1} KB/token (compressed MLA, {} layers)",
-        kv_per_tok as f64 / 1024.0, cfg.n_layers);
+    // Report the layers that actually hold KV, not the total: a hybrid stack caches on
+    // only its attention layers (Nemotron-H: 8 of 88).
+    let kv_layers = if cfg.layer_kind.is_empty() {
+        cfg.n_layers as usize
+    } else {
+        cfg.layer_kind.iter().filter(|k| matches!(k, colibri_core::LayerKind::Attn)).count()
+    };
+    println!("KV cache: {:.1} KB/token ({} of {} layers cache KV)",
+        kv_per_tok as f64 / 1024.0, kv_layers, cfg.n_layers);
+    if kv_fixed > 0 {
+        println!("  + {:.0} MB/sequence fixed Mamba2 state (O(1) in context)", mb(kv_fixed));
+    }
     println!("  8 GB KV holds ~{} tokens ({}K)",
         context_in_kv_budget(8 * gib, kv_per_tok),
         context_in_kv_budget(8 * gib, kv_per_tok) / 1024);

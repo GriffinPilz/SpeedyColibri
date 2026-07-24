@@ -658,6 +658,8 @@ impl<P: ExpertProvider> ExpertCache<P> {
 
 /// Capacity planning for DGX Spark deployments.
 pub mod capacity {
+    use colibri_core::Config;
+
     /// Byte size of one `[O, I]` tensor stored at `bits` (matches `QTensor::bytes`
     /// / the `qt_alloc` format selection).
     fn qt_bytes(o: u64, i: u64, bits: u32) -> u64 {
@@ -689,12 +691,24 @@ pub mod capacity {
         }
     }
 
-    /// Compressed MLA KV-cache bytes per token — exactly what `KvCache`
-    /// allocates: every one of `n_layers` attention layers caches a normalized
-    /// latent (`kv_lora` floats) and a roped key (`qk_rope` floats) per token.
-    /// (The DSA indexer, if enabled, adds a little more; not counted here.)
-    pub fn kv_bytes_per_token(kv_lora: u64, qk_rope: u64, n_layers: u64) -> u64 {
-        (kv_lora + qk_rope) * 4 * n_layers
+    /// KV-cache bytes per token. Delegates to [`crate::KvCache::bytes_per_token`],
+    /// which lives beside the allocation and is the single source of truth.
+    ///
+    /// This used to be its own MLA-only formula — `(kv_lora + qk_rope) * 4 * n_layers`
+    /// — which silently under-reported every model that is not GLM: it omitted the GQA
+    /// `k_full`/`v_full` (the dominant term for M3 / M2.7), the CUDA device shadow, and
+    /// for a hybrid stack it charged all layers rather than just the attention ones.
+    /// `coli capacity` therefore quoted context limits far larger than RAM can hold.
+    /// Keep this a delegate: a fourth private copy of this arithmetic is how each of
+    /// the previous errors happened.
+    pub fn kv_bytes_per_token(cfg: &Config) -> u64 {
+        crate::KvCache::bytes_per_token(cfg) as u64
+    }
+
+    /// Per-sequence KV bytes independent of context length (Mamba2 recurrent state);
+    /// 0 for non-hybrid models. See [`crate::KvCache::fixed_bytes`].
+    pub fn kv_fixed_bytes(cfg: &Config) -> u64 {
+        crate::KvCache::fixed_bytes(cfg) as u64
     }
 
     /// Max context (tokens) whose KV cache fits in `budget_bytes`.

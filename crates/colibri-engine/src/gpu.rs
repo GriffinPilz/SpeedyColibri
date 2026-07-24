@@ -652,6 +652,42 @@ pub fn try_expert_ffn(
     ok
 }
 
+/// Try the gateless ReLU² expert FFN `out = down(relu(up·x)²)` on the GPU (Nemotron-H's
+/// two-tensor expert — no gate projection). NVFP4-only: reuses the same zero-copy NVFP4
+/// decode as [`try_expert_ffn`], with a relu² activation between the up and down GEMMs.
+/// Returns `true` if it ran there; the caller falls back to the CPU reference otherwise.
+pub fn try_expert_ffn_relu2(
+    up: &QTensor,
+    down: &QTensor,
+    x: &[f32],
+    nr: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !up.gpu_eligible || !down.gpu_eligible {
+        return false;
+    }
+    // NVFP4 (fmt==5) is zero-copy only — the block-scale/global plumbing has no
+    // device-copy path. Bail to the CPU reference for any other format or when
+    // zero-copy is unavailable.
+    if up.fmt_code != 5 || down.fmt_code != 5 || !zerocopy() {
+        return false;
+    }
+    // Fresh, owned descriptors held only for this call — see `wrap_fresh`. Safe under
+    // cache eviction (no stale pointer-keyed descriptors).
+    let (Some(u), Some(d)) = (wrap_fresh(up), wrap_fresh(down)) else {
+        return false;
+    };
+    // SAFETY: u/d live until end of scope, covering the synchronous kernel + download in
+    // expert_mlp_nvfp4_relu2_raw; out/x sized [nr, up.I]/[nr, up.I] by ffn() (latent-space).
+    let ok = unsafe {
+        cuda::expert_mlp_nvfp4_relu2_raw(u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+    };
+    if ok {
+        GPU_FFN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 /// `COLI_EXPERT_GROUP=1` batches a layer's routed experts through the grouped async
 /// kernel (one H2D/D2H per ≤64-expert chunk) instead of a synchronous call per expert
 /// — attacks the per-expert round-trip that dominates moe-compute.

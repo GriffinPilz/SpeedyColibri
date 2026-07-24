@@ -185,6 +185,20 @@ extern "C" void coli_cuda_set_activation(int oai, float alpha, float limit) {
     g_act_limit = limit;
 }
 
+/* Gateless ReLU² activation (Nemotron-H experts): t = relu(t)² in place over `n`
+ * elements. The two-tensor expert has no gate to combine — it squares the ReLU of the
+ * single up-projection between the up and down GEMMs. Mirrors the CPU reference
+ * `r = u.max(0.0); u = r*r` (moe.rs `ffn_cpu`, relu2 branch) so the GPU path is
+ * token-identical. */
+__global__ static void relu2_inplace(float *t, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = t[i];
+        v = v > 0.f ? v : 0.f;
+        t[i] = v * v;
+    }
+}
+
 /* Launch the selected gate*up activation-combine over `n` elements on `stream`. */
 static inline void act_mul(float *gate, const float *up, size_t n, cudaStream_t stream) {
     unsigned blocks = (unsigned)((n + 255) / 256);
@@ -1288,6 +1302,72 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "expert nvfp4 output download")||
        !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert nvfp4 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    return 1;
+}
+
+/* Gateless ReLU² NVFP4 expert FFN (Nemotron-H): y = down( relu(up·x)² ). The two-tensor
+ * expert has no gate projection, so this reuses the SAME NVFP4 weight decode + GEMV /
+ * tiled-matmul device code as coli_cuda_expert_mlp_nvfp4 (nvfp4_gemv / nvfp4_matmul); the
+ * only difference is the middle activation — relu²-in-place over the single up projection
+ * instead of the SwiGLU gate*up combine. Requires up/down at fmt==5, with down the
+ * transpose of up (down->I==up->O, down->O==up->I). x is [S, up->I] (latent). */
+extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
+        ColiCudaTensor *down,float *y,const float *x,int S){
+    if(!up||!down||!x||!y||S<1||up->fmt!=5||down->fmt!=5||
+       up->device!=down->device||down->I!=up->O||down->O!=up->I)return 0;
+    DeviceContext *ctx=find_ctx(up->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    int D=up->I,I=up->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->up,&ctx->up_cap,ib)||
+       !reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert nvfp4 relu2 input upload"))return 0;
+    const uint8_t *uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
+    const uint8_t *ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
+    float ug=up->gscale,dg=down->gscale;
+    // Prefill devcopy (COLI_FFN_DEVCOPY, default on for S>=COLI_FFN_DEVCOPY_MIN=16): stage
+    // up/down nibbles + ue4m3 block scales to device so the tiled kernel reads clean memory
+    // instead of freshly-pread host pages. Decode (S==1 gemv) stays zero-copy.
+    static int s_dc=-1,s_dcmin=16;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
+    if(s_dc&&S>=s_dcmin){
+        size_t unb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (up, down)
+        size_t usb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
+        if(reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,unb)&&reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dnb)&&
+           reserve_bytes((void**)&ctx->ebsu,&ctx->ebsu_cap,usb)&&reserve_bytes((void**)&ctx->ebsd,&ctx->ebsd_cap,dsb)){
+            cudaMemcpyAsync(ctx->ewu,uw,unb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ewd,dw,dnb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ebsu,ubs,usb,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->ebsd,dbs,dsb,cudaMemcpyHostToDevice,ctx->stream);
+            uw=ctx->ewu;dw=ctx->ewd;ubs=ctx->ebsu;dbs=ctx->ebsd;
+        }
+    }
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+    if(S==1&&!s_tiled){
+        int tpb=256,wpb=tpb>>5;
+        // t = up·x  → ctx->up [I]
+        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+        // t = relu(t)²
+        relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)I);
+        // y = down·t → ctx->y [D]
+        nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->up,dw,dbs,dg,I,D);
+    }else{
+        // Single up projection (no gate) via the tiled WMMA matmul, then relu², then down.
+        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+        nvfp4_matmul<<<hidden,128,0,ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,S,D,I);
+        relu2_inplace<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)S*I);
+        nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->up,dw,dbs,dg,S,I,D);
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert nvfp4 relu2 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert nvfp4 relu2 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert nvfp4 relu2 synchronize"))return 0;
     std::memcpy(y,ctx->host_y,xb);
     return 1;
 }

@@ -80,6 +80,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate, ColiCudaT
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Gateless ReLU² NVFP4 expert FFN (Nemotron-H): y = down(relu(up·x)²). Two-tensor
+ * expert (no gate); reuses the NVFP4 decode of coli_cuda_expert_mlp_nvfp4 with a relu²
+ * activation between the up and down projections. Requires up/down at fmt==5, with
+ * down the transpose of up. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
+                         ColiCudaTensor *down, float *y, const float *x, int S);
+
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,

@@ -788,14 +788,19 @@ pub fn route(cfg: &Config, logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32
 /// Apply a SwiGLU FFN over `x[nr, D]` into `out[nr, D]`:
 /// `out = down(silu(gate·x) ⊙ up·x)`. Port of the expert compute in `moe()`.
 fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
-    // Fused GPU expert pipeline (one host round-trip) for resident weights. The
-    // fused kernels apply the model's SwiGLU variant (set via gpu::set_activation),
-    // so this path is correct for both GLM (SiLU) and MiniMax-M3 (swigluoai). CPU
-    // reference below on decline. The gateless ReLU² path (Nemotron-H) stays on the CPU
-    // for now — the fused kernel only knows the SwiGLU variants — so skip the GPU there.
+    // Fused GPU expert pipeline (one host round-trip) for resident weights. The SwiGLU
+    // kernels apply the model's variant (set via gpu::set_activation), so that path is
+    // correct for both GLM (SiLU) and MiniMax-M3 (swigluoai). Nemotron-H's gateless ReLU²
+    // expert (`down(relu(up·x)²)`, no gate) routes to the dedicated NVFP4 relu² kernel.
+    // Either falls back to the CPU reference below on decline (GPU unavailable, wrong
+    // format, or out-of-range).
     #[cfg(feature = "cuda")]
     {
-        if !activation().relu2 && crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
+        if activation().relu2 {
+            if crate::gpu::try_expert_ffn_relu2(up, down, x, nr, out) {
+                return;
+            }
+        } else if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
             return;
         }
     }

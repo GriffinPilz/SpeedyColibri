@@ -111,6 +111,13 @@ extern "C" {
         x: *const f32,
         s: c_int,
     ) -> c_int;
+    fn coli_cuda_expert_mlp_nvfp4_relu2(
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
     fn coli_cuda_expert_group(
         gates: *const *mut ColiCudaTensor,
         ups: *const *mut ColiCudaTensor,
@@ -515,6 +522,23 @@ pub unsafe fn expert_mlp_nvfp4_raw(
     s: i32,
 ) -> bool {
     coli_cuda_expert_mlp_nvfp4(gate, up, down, y, x, s) != 0
+}
+
+/// Gateless ReLU² NVFP4 expert FFN (Nemotron-H): `y = down(relu(up·x)²)`. Two-tensor
+/// expert (no gate projection); reuses the same NVFP4 decode as
+/// [`expert_mlp_nvfp4_raw`] with a relu² activation between the projections. Requires
+/// `up`/`down` at fmt==5, `down` the transpose of `up`.
+///
+/// # Safety
+/// The two handles must be resident on the same device; `y`/`x` hold `s*up.I` floats.
+pub unsafe fn expert_mlp_nvfp4_relu2_raw(
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_nvfp4_relu2(up, down, y, x, s) != 0
 }
 
 /// Tiled int8 (W8A16) fused expert/MLP FFN — tensor-core replacement for the naive

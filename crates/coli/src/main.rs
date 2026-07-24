@@ -383,8 +383,10 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     // per-model (M3 yes, M2 no — read from the config). Missing config → falls back to GLM.
     let src_cfg = colibri_core::Config::load(indir).ok();
     let minimax = src_cfg.as_ref().map(|c| c.arch.is_gqa()).unwrap_or(false);
+    let nemotron =
+        src_cfg.as_ref().map(|c| c.arch == colibri_core::Arch::NemotronH).unwrap_or(false);
     let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
-    let n_layers = if minimax {
+    let n_layers = if minimax || nemotron {
         src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)
     } else {
         env_u32("COLI_NLAYERS", 78) as usize
@@ -409,6 +411,8 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // MiniMax-M3 name/norm handling (auto-detected above).
         minimax,
         gemma_norm,
+        // Nemotron-H hybrid: backbone.*→model.* remap + `.mixer.` classification.
+        nemotron,
     };
 
     eprintln!(

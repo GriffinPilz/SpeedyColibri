@@ -97,6 +97,11 @@ pub struct ConvertOpts {
     /// fold `+1` into RMSNorm weights (MiniMax-M3 Gemma-norm) so the engine's plain
     /// `rmsnorm` computes `x·(1+w)`; requires `minimax`.
     pub gemma_norm: bool,
+    /// source is Nemotron-H (`nemotron_h`): a hybrid Mamba2/GQA/latent-MoE model.
+    /// Maps its `backbone.*` tensor names to the container's `model.*` names, drops the
+    /// MTP module, and (via the `.mixer.` marker) classifies the Mamba2 vectors,
+    /// latent projections, and latent-space routed experts. See [`nemotron_container_name`].
+    pub nemotron: bool,
 }
 
 impl Default for ConvertOpts {
@@ -110,8 +115,27 @@ impl Default for ConvertOpts {
             mtp_only: false,
             minimax: false,
             gemma_norm: false,
+            nemotron: false,
         }
     }
+}
+
+/// Map a Nemotron-H source tensor name to its colibrì-container name, or `None` to
+/// drop it. Renames the `backbone.` prefix to `model.` and `embeddings.weight` to
+/// `embed_tokens.weight` (so the shared `classify` Io/norm checks match); drops the
+/// MTP next-token module (`mtp.*`, deferred). The per-layer `mixer.*` structure
+/// (Mamba2 `in_proj`/`conv1d`/`A_log`/`D`/`dt_bias`/`norm`/`out_proj`; MoE
+/// `gate`/`fc{1,2}_latent_proj`/`experts.*`/`shared_experts.*`; attention q/k/v/o)
+/// is preserved verbatim — the `.mixer.` marker is how `classify` recognizes it.
+/// Sidecar scales ride along unchanged.
+fn nemotron_container_name(name: &str) -> Option<String> {
+    if name.starts_with("mtp") || name.contains(".mtp") || name.contains("nextn") {
+        return None;
+    }
+    let n = name.strip_prefix("backbone.").map(|r| format!("model.{r}")).unwrap_or_else(|| name.to_string());
+    // `model.embeddings.weight` → `model.embed_tokens.weight`.
+    let n = n.replace("model.embeddings.weight", "model.embed_tokens.weight");
+    Some(n)
 }
 
 /// Map a MiniMax-M3 source tensor name to its colibrì-container (GLM-style) name, or
@@ -188,6 +212,11 @@ fn classify(name: &str, n_layers: usize, keep_idx: bool, mtp_only: bool) -> Kind
     {
         return Kind::Skip;
     }
+    // Nemotron-H hybrid layers carry a `.mixer.` marker that no GLM/MiniMax tensor has,
+    // so we can classify them without threading an arch flag through every caller.
+    if name.contains(".mixer.") {
+        return classify_nemotron(name);
+    }
     let li = layer_idx(name);
     let is_mtp = li >= 0 && li as usize == n_layers;
     // The MTP speculative head lives at layer index `n_layers` (the single
@@ -250,6 +279,35 @@ fn classify(name: &str, n_layers: usize, keep_idx: bool, mtp_only: bool) -> Kind
         return Kind::Q; // attention / dense MLP / shared (resident)
     }
     Kind::F32
+}
+
+/// Classify a Nemotron-H `.mixer.*` tensor. (Block `norm.weight`, `embed_tokens`, and
+/// `lm_head` have no `.mixer.` marker and are handled by the shared [`classify`].)
+/// - **routed experts** `mixer.experts.<n>.{up,down}_proj.weight` (latent-space) → `X`
+///   (streamed NVFP4 / e4m3). `shared_experts.*` contains "experts" but NOT the
+///   `.mixer.experts.<idx>.` pattern, so it stays resident.
+/// - **resident matmuls** — Mamba2 `in_proj`/`out_proj`, MoE `fc{1,2}_latent_proj` and
+///   `shared_experts.{up,down}_proj`, attention `{q,k,v,o}_proj` → `Q` (`ebits`).
+/// - **full precision** `F32` — the router (`mixer.gate.weight`), its correction bias,
+///   the tiny depthwise `conv1d.*`, all RMSNorm weights (incl. the gated `mixer.norm`),
+///   and the 1-D Mamba2 parameters `A_log`/`D`/`dt_bias`.
+fn classify_nemotron(name: &str) -> Kind {
+    if name.ends_with("mixer.gate.weight") || name.ends_with("e_score_correction_bias") {
+        return Kind::F32; // MoE router + its additive correction bias
+    }
+    if name.contains(".conv1d.") {
+        return Kind::F32; // tiny depthwise conv ([C,1,k]) — keep exact
+    }
+    if name.ends_with("norm.weight") {
+        return Kind::F32; // gated Mamba norm (and any per-head attn q/k norm)
+    }
+    if name.contains(".mixer.experts.") && name.ends_with(".weight") {
+        return Kind::X; // latent-space routed expert (streamed)
+    }
+    if name.ends_with(".weight") {
+        return Kind::Q; // in_proj/out_proj/fc*_latent/shared_experts/attn q,k,v,o
+    }
+    Kind::F32 // A_log, D, dt_bias, conv1d.bias, any other 1-D param
 }
 
 /// Materialize a tensor as f32, returning `(data, logical_shape)`. The logical
@@ -1145,6 +1203,11 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
             _ => return Ok(TensorOut::Skip),
         }
+    } else if opts.nemotron {
+        match nemotron_container_name(name) {
+            Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
+            _ => return Ok(TensorOut::Skip),
+        }
     } else {
         name.to_string()
     };
@@ -1872,6 +1935,69 @@ mod tests {
         );
         // Anything above the single nextn head is not part of the architecture.
         assert_eq!(classify("model.layers.79.eh_proj.weight", 78, false, false), Kind::Skip);
+    }
+
+    #[test]
+    fn nemotron_name_mapping() {
+        let m = |s: &str| nemotron_container_name(s);
+        assert_eq!(m("backbone.embeddings.weight").as_deref(), Some("model.embed_tokens.weight"));
+        assert_eq!(
+            m("backbone.layers.5.mixer.in_proj.weight").as_deref(),
+            Some("model.layers.5.mixer.in_proj.weight")
+        );
+        assert_eq!(
+            m("backbone.layers.7.norm.weight").as_deref(),
+            Some("model.layers.7.norm.weight")
+        );
+        assert_eq!(m("lm_head.weight").as_deref(), Some("lm_head.weight"));
+        // MTP module dropped.
+        assert_eq!(m("mtp.layers.0.mixer.gate.weight"), None);
+    }
+
+    #[test]
+    fn nemotron_classify_rules() {
+        // Routed experts (latent-space) → streamed X.
+        assert_eq!(
+            classify("model.layers.1.mixer.experts.3.up_proj.weight", 88, false, false),
+            Kind::X
+        );
+        assert_eq!(
+            classify("model.layers.1.mixer.experts.3.down_proj.weight", 88, false, false),
+            Kind::X
+        );
+        // Shared expert stays resident (contains "experts" but not `.mixer.experts.<n>.`).
+        assert_eq!(
+            classify("model.layers.1.mixer.shared_experts.up_proj.weight", 88, false, false),
+            Kind::Q
+        );
+        // Router + correction bias → F32.
+        assert_eq!(classify("model.layers.1.mixer.gate.weight", 88, false, false), Kind::F32);
+        assert_eq!(
+            classify("model.layers.1.mixer.gate.e_score_correction_bias", 88, false, false),
+            Kind::F32
+        );
+        // Latent projections + Mamba2 big matmuls → resident Q.
+        assert_eq!(classify("model.layers.1.mixer.fc1_latent_proj.weight", 88, false, false), Kind::Q);
+        assert_eq!(classify("model.layers.1.mixer.fc2_latent_proj.weight", 88, false, false), Kind::Q);
+        assert_eq!(classify("model.layers.0.mixer.in_proj.weight", 88, false, false), Kind::Q);
+        assert_eq!(classify("model.layers.0.mixer.out_proj.weight", 88, false, false), Kind::Q);
+        // Tiny Mamba2 params → F32 (exact).
+        assert_eq!(classify("model.layers.0.mixer.conv1d.weight", 88, false, false), Kind::F32);
+        assert_eq!(classify("model.layers.0.mixer.conv1d.bias", 88, false, false), Kind::F32);
+        assert_eq!(classify("model.layers.0.mixer.A_log", 88, false, false), Kind::F32);
+        assert_eq!(classify("model.layers.0.mixer.D", 88, false, false), Kind::F32);
+        assert_eq!(classify("model.layers.0.mixer.dt_bias", 88, false, false), Kind::F32);
+        // Gated Mamba norm + block norm → F32.
+        assert_eq!(classify("model.layers.0.mixer.norm.weight", 88, false, false), Kind::F32);
+        assert_eq!(classify("model.layers.0.norm.weight", 88, false, false), Kind::F32);
+        // Attention proj (the 8 * layers) → resident Q.
+        assert_eq!(classify("model.layers.7.mixer.q_proj.weight", 88, false, false), Kind::Q);
+        assert_eq!(classify("model.layers.7.mixer.o_proj.weight", 88, false, false), Kind::Q);
+        // Sidecar scales still dropped (handled before the .mixer. branch).
+        assert_eq!(
+            classify("model.layers.1.mixer.experts.3.up_proj.weight_scale", 88, false, false),
+            Kind::Skip
+        );
     }
 
     #[test]

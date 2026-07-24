@@ -2195,13 +2195,29 @@ fn wire_adaptive_cache<P>(
         Some(t) => t,
         None => return, // non-Linux: no live pressure signal, leave the static budget
     };
-    let n_moe = (cfg.n_layers - cfg.first_dense).max(0) as u64;
+    // Number of MoE layers and the index of one, to size the streamed-expert footprint.
+    // Homogeneous arches (GLM/MiniMax): every layer at/after `first_dense` is MoE. Nemotron-H
+    // is hybrid (Mamba/attn/MoE by index) — layer `first_dense` (0) is a *Mamba* layer with
+    // NO experts, so probing it falls to the dense-width fallback and both the count and the
+    // per-expert size come out wildly wrong (~17× → misclassifies a RAM-fitting model as
+    // ≫-RAM, leaving experts non-resident). Probe an actual MoE layer and count only MoE ones.
+    let (n_moe, probe_layer) = if cfg.layer_kind.is_empty() {
+        ((cfg.n_layers - cfg.first_dense).max(0) as u64, cfg.first_dense as usize)
+    } else {
+        let n = cfg.layer_kind.iter().filter(|k| matches!(k, colibri_core::LayerKind::Moe)).count();
+        let idx = cfg
+            .layer_kind
+            .iter()
+            .position(|k| matches!(k, colibri_core::LayerKind::Moe))
+            .unwrap_or(cfg.first_dense as usize);
+        (n as u64, idx)
+    };
     // Size an expert from a real one on disk — its QTensors carry the true format
     // (NVFP4 fmt=5, e4m3 fmt=4, …), so block-scale overhead and the actual bit-width
-    // are exact. The `ebits` estimate is only a fallback: it reflects the *requested*
-    // resident dense width (default 8), not the streamed experts' real format, and
-    // would overcount NVFP4 experts ~1.7× (int8 vs 4-bit) and mis-decide coverage.
-    let per = match provider.expert(cfg.first_dense as usize, 0) {
+    // are exact (for Nemotron this also captures the latent input dim, not `hidden`). The
+    // `ebits` estimate is only a fallback: it reflects the *requested* resident dense width
+    // (default 8), not the streamed experts' real format, and would mis-decide coverage.
+    let per = match provider.expert(probe_layer, 0) {
         Ok(e) => (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64,
         Err(_) => {
             colibri_engine::capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, ebits)

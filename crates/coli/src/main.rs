@@ -2172,9 +2172,10 @@ const NEARFIT_COVERAGE_PCT: u64 = 80;
 ///   killed the server); now that same budget simply caps itself where the box stays safe.
 /// - **near-fit** (experts ≈ RAM) → fill to `total − reserve` **plus fadvise** — the whole
 ///   working set resident, no page-cache double-hold.
-/// - **≫ RAM** (experts ≫ RAM) → fill to `total − reserve` with **fadvise off**: hold as many
-///   experts as fit, keep the page cache as a second tier, and let the monitor evict the LRU
-///   tail under pressure. No OOM, and more resident than the old static `MemTotal/3`.
+/// - **≫ RAM** (experts ≫ RAM) → hold only `MemTotal / CACHE_CAP_DIVISOR` with **fadvise
+///   off**, letting the OS page cache serve the streaming tail as a second tier. Holding more
+///   *thrashes* (a ~101 GB hold collapsed M3 decode to ~0.7 tok/s); `MemTotal/3` is the settled
+///   sustainable ceiling — see `memory-ceiling-is-real` / `autopin-single-node-negative`.
 ///
 /// Off-Linux (no `/proc/meminfo`) it no-ops — there is no live pressure signal to evict on.
 fn wire_adaptive_cache<P>(
@@ -2216,7 +2217,16 @@ fn wire_adaptive_cache<P>(
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|g| g << 30);
-    let fill_target = explicit.unwrap_or(natural_fill);
+    // Fill target by regime. Near-fit: fill to `natural_fill` — the whole set nearly
+    // fits and the fadvise below keeps MemAvailable honest. ≫-RAM: hold only the
+    // settled `MemTotal / CACHE_CAP_DIVISOR` ceiling and let the OS page cache serve the
+    // streaming tail as a second tier. Holding more *thrashes*: filling ~101 GB collapsed
+    // M3 decode to ~0.7 tok/s (memory-ceiling-is-real / autopin-single-node-negative).
+    let fill_target = explicit.unwrap_or(if near_fit {
+        natural_fill
+    } else {
+        total / CACHE_CAP_DIVISOR
+    });
     // fadvise only auto-engages for a near-fit model on the automatic path; an explicit
     // budget leaves fadvise to the COLI_FADVISE env, and ≫-RAM keeps the page cache.
     if near_fit && explicit.is_none() {

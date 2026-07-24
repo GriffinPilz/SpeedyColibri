@@ -94,6 +94,30 @@ I/O-oriented work (prefetch-ahead, eviction policy, autopin, RAM sweeps) was dev
 this model, and **those conclusions are regime-specific — re-measure before assuming they hold
 for a model whose experts fit in RAM.**
 
+## Cross-model transfer queue
+
+**Findings established on one model that have NOT been checked on the others.** This is the
+highest-value column in this file: most wins here were architecture-neutral, and most wrong
+conclusions came from assuming a result transferred when it did not. A row leaves this table
+only when someone measures it — not when it seems obvious.
+
+| finding | found on | should transfer to | status |
+|---|---|---|---|
+| **S==1 tile bypass** (PR #13, 1.53×) | nemotron | **glm, m2.7** (m3 spot-checked, no regression) | UNMEASURED — every model decodes at S==1 |
+| **dedicated `i8a16_gemv`** (PR #15, 1.12×) | nemotron | **glm, m2.7** (m3 +4%) | UNMEASURED — same path, any int8 resident weight |
+| **grouped expert dispatch** (880 calls/token) | nemotron | **glm** (top-8 × ~90L ≈ 720/tok), **m2.7** (top-8 × 62L ≈ 496/tok) | IN PROGRESS on nemotron |
+| **prefill scratch unreserved** (210 vs 24 KB/tok) | nemotron | **glm, m3, m2.7** | UNMEASURED — transformers allocate S×S attention scores, so possibly worse |
+| **MTP head dropped at convert** | nemotron (bug), glm (fixed earlier) | — | m3/m2.7 have no head in their quants |
+| **chat-template arm required in serve.rs** | nemotron (was serving GLM markers) | any new arch | it is a 4th edit, not the documented 3 |
+| **`COLI_PREFETCH_AHEAD`** (glm 1.58×, m3 1.26×) | glm, m3 | **nemotron, m2.7** | UNMEASURED |
+| **hot-expert autopin** (glm: ~10% LOSS) | glm | do NOT assume for others | glm streams from disk; nemotron's experts are RAM-resident — different regime |
+
+**Regime warning.** Most I/O-shaped conclusions (prefetch-ahead, eviction policy, autopin,
+RAM sweeps) were developed against GLM, which streams 735 GB of experts from disk at ~5.9% RAM
+coverage. Nemotron's experts *fit in RAM* (172% coverage, 0 evictions). **A result measured in
+one regime is not evidence in the other** — this is how the "bytes-bound floor" claim was wrongly
+carried from GLM to Nemotron and cost a wrong diagnosis.
+
 ## Recurring traps (cost us real time; check these when adding a model)
 
 1. **An unhandled arch silently inherits a GLM-shaped default.** Four instances on Nemotron
@@ -106,3 +130,9 @@ for a model whose experts fit in RAM.**
    its MoE phase. Tell: a profile phase whose total far exceeds the sum of its GPU sub-timers.
 3. **A passing gate is not proof of a measurement.** Check step/token counts are what you expect.
 4. **Never reuse a number from a different regime.** The single most repeated error here.
+5. **Re-profile after any change to a shared path, before picking the next target.** PRs #13/#15
+   touched `coli_cuda_matmul` and silently re-ranked everything downstream: the shared expert
+   went 20.6% → 1.5% and mamba proj 28.7% → 20.7% without either being touched directly. A
+   "next lever" chosen off a pre-change profile can be chasing a slice that no longer exists.
+6. **Interleave A/B arms (0 1 0 1), never all-of-A then all-of-B.** A cold post-rebuild run landed
+   entirely on one arm and turned a true 1.12× into an apparent 1.5×. Discard a warmup too.

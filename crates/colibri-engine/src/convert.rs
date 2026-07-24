@@ -132,9 +132,19 @@ fn nemotron_container_name(name: &str) -> Option<String> {
     if name.starts_with("mtp") || name.contains(".mtp") || name.contains("nextn") {
         return None;
     }
-    let n = name.strip_prefix("backbone.").map(|r| format!("model.{r}")).unwrap_or_else(|| name.to_string());
+    let mut n = name.strip_prefix("backbone.").map(|r| format!("model.{r}")).unwrap_or_else(|| name.to_string());
     // `model.embeddings.weight` → `model.embed_tokens.weight`.
-    let n = n.replace("model.embeddings.weight", "model.embed_tokens.weight");
+    n = n.replace("model.embeddings.weight", "model.embed_tokens.weight");
+    // Canonicalize the norm names so the engine's generic completeness check + final-norm
+    // load (which key on GLM naming) find them: the final `norm_f` → `model.norm.weight`,
+    // and the block-input `layers.N.norm.weight` → `layers.N.input_layernorm.weight` (the
+    // gated `layers.N.mixer.norm.weight` is left untouched — it has the `.mixer.` marker).
+    if n == "model.norm_f.weight" {
+        return Some("model.norm.weight".to_string());
+    }
+    if !n.contains(".mixer.") && n.contains(".layers.") && n.ends_with(".norm.weight") {
+        n = n.replace(".norm.weight", ".input_layernorm.weight");
+    }
     Some(n)
 }
 
@@ -1945,10 +1955,17 @@ mod tests {
             m("backbone.layers.5.mixer.in_proj.weight").as_deref(),
             Some("model.layers.5.mixer.in_proj.weight")
         );
+        // Block-input norm canonicalized to input_layernorm; the gated mixer.norm is not.
         assert_eq!(
             m("backbone.layers.7.norm.weight").as_deref(),
-            Some("model.layers.7.norm.weight")
+            Some("model.layers.7.input_layernorm.weight")
         );
+        assert_eq!(
+            m("backbone.layers.7.mixer.norm.weight").as_deref(),
+            Some("model.layers.7.mixer.norm.weight")
+        );
+        // Final norm norm_f -> the canonical model.norm.weight.
+        assert_eq!(m("backbone.norm_f.weight").as_deref(), Some("model.norm.weight"));
         assert_eq!(m("lm_head.weight").as_deref(), Some("lm_head.weight"));
         // MTP module dropped.
         assert_eq!(m("mtp.layers.0.mixer.gate.weight"), None);

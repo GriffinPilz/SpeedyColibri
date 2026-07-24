@@ -270,7 +270,9 @@ fn load_layer_nemotron(
     let p = |s: &str| format!("model.layers.{i}.{s}");
     let mut l = Layer::default();
     // The block's single input RMSNorm (Nemotron-H has no post-attention norm).
-    l.in_ln = ld(shards, &p("norm.weight"))?;
+    // Convert emits it under the canonical `input_layernorm.weight` name (the source's
+    // `layers.N.norm.weight`), so the generic completeness check finds it.
+    l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
 
     match cfg.layer_kind[i] {
         LayerKind::Mamba => {

@@ -38,6 +38,10 @@ static MOE_US: AtomicU64 = AtomicU64::new(0);
 static DENSE_US: AtomicU64 = AtomicU64::new(0);
 /// Nemotron-H Mamba2 mixer wall time (its analog of `ATTN_US` for attention layers).
 static MAMBA_US: AtomicU64 = AtomicU64::new(0);
+/// Sub-totals of `MAMBA_US`: the selective scan (GPU kernel or CPU `selective_scan`)
+/// and the in_proj + out_proj matmuls. The remainder is conv1d + splits + gated norm.
+static MAMBA_SCAN_US: AtomicU64 = AtomicU64::new(0);
+static MAMBA_PROJ_US: AtomicU64 = AtomicU64::new(0);
 static EMBED_US: AtomicU64 = AtomicU64::new(0);
 /// Time spent fetching experts through the provider (disk→RAM on a cache miss).
 /// A sub-total of `MOE_US`. Incremented from `moe`.
@@ -252,7 +256,7 @@ pub fn mamba2_mixer(
 
     // ---- in_proj, then split gate | hidden_B_C | dt ----------------------
     let mut proj = vec![0f32; s * proj_out];
-    matmul_qt(&mut proj, x, in_proj, s);
+    timed(&MAMBA_PROJ_US, || matmul_qt(&mut proj, x, in_proj, s));
     let mut gate = vec![0f32; s * d_inner];
     let mut hbc = vec![0f32; s * conv_dim];
     let mut dt = vec![0f32; s * nh];
@@ -309,43 +313,45 @@ pub fn mamba2_mixer(
     // does the fma-free multiply/add recurrence over d_state and updates the persisted
     // ssm state in place. Prefill (S>1) and any GPU-unavailable case fall to the CPU
     // `selective_scan`, so tokens are identical either way.
-    #[cfg(feature = "cuda")]
-    let gpu_y: Option<Vec<f32>> = if s == 1
-        && crate::gpu::available()
-        && crate::gpu::mamba_scan_gpu_enabled()
-    {
-        let (dt_h, da_h) =
-            crate::mamba2::step_head_scalars(dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias);
-        let mut yv = vec![0f32; s * d_inner];
-        let st = kv.mamba_ssm_mut(layer);
-        crate::gpu::try_mamba2_scan(
-            &mut st.data, &mut yv, &h, &b, &c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng,
-        )
-        .then_some(yv)
-    } else {
-        None
-    };
-    #[cfg(not(feature = "cuda"))]
-    let gpu_y: Option<Vec<f32>> = None;
-    let y = match gpu_y {
-        Some(v) => v,
-        None => selective_scan(
-            dims,
-            kv.mamba_ssm_mut(layer),
-            &h,
-            &b,
-            &c,
-            &dt,
-            &l.mamba_a_log,
-            &l.mamba_d,
-            &l.mamba_dt_bias,
-            s,
-        ),
-    };
+    let y = timed(&MAMBA_SCAN_US, || {
+        #[cfg(feature = "cuda")]
+        let gpu_y: Option<Vec<f32>> = if s == 1
+            && crate::gpu::available()
+            && crate::gpu::mamba_scan_gpu_enabled()
+        {
+            let (dt_h, da_h) =
+                crate::mamba2::step_head_scalars(dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias);
+            let mut yv = vec![0f32; s * d_inner];
+            let st = kv.mamba_ssm_mut(layer);
+            crate::gpu::try_mamba2_scan(
+                &mut st.data, &mut yv, &h, &b, &c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng,
+            )
+            .then_some(yv)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let gpu_y: Option<Vec<f32>> = None;
+        match gpu_y {
+            Some(v) => v,
+            None => selective_scan(
+                dims,
+                kv.mamba_ssm_mut(layer),
+                &h,
+                &b,
+                &c,
+                &dt,
+                &l.mamba_a_log,
+                &l.mamba_d,
+                &l.mamba_dt_bias,
+                s,
+            ),
+        }
+    });
 
     // ---- gated RMSNorm (per group, silu gate) then out_proj --------------
     let yn = gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps);
-    matmul_qt(out, &yn, out_proj, s);
+    timed(&MAMBA_PROJ_US, || matmul_qt(out, &yn, out_proj, s));
 }
 
 /// Run the transformer stack over `ids` (positions `pos_base..pos_base+S`),
@@ -825,6 +831,12 @@ where
             ms(&ATTN_INDEX_US),
             ms(&ATTN_CORE_US),
             ms(&ATTN_OPROJ_US),
+        );
+        eprintln!(
+            "[profile] mamba breakdown: scan {:.0} ms | in/out-proj {:.0} ms | conv+norm {:.0} ms",
+            ms(&MAMBA_SCAN_US),
+            ms(&MAMBA_PROJ_US),
+            ms(&MAMBA_US) - ms(&MAMBA_SCAN_US) - ms(&MAMBA_PROJ_US),
         );
     }
     Ok(DecodeStats {

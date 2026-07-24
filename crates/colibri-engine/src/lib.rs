@@ -506,6 +506,16 @@ pub fn load_model_with(
                 t.gpu_eligible = true;
             }
         }
+        // Nemotron-H Mamba2 in_proj/out_proj — resident dense int8 weights routed through
+        // `matmul_qt`. WITHOUT this they fall to the single-threaded CPU path: the mamba
+        // COLI_PROFILE breakdown measured them at 9322 ms of a 9945 ms mamba total (94%),
+        // dwarfing the selective scan (451 ms). Same omission as the M3 q/k/v projections
+        // above; marking them eligible routes them to the GPU int8 matmul (token-identical).
+        for t in [&mut l.mamba_in_proj, &mut l.mamba_out_proj] {
+            if let Some(t) = t {
+                t.gpu_eligible = true;
+            }
+        }
     }
     Ok(model)
 }

@@ -35,6 +35,9 @@ struct ActCfg {
     oai: bool,
     alpha: f32,
     limit: f32,
+    /// Gateless ReLU² (Nemotron-H `mlp_hidden_act == "relu2"`): the FFN is
+    /// `down(relu(up·x)²)` with **no gate projection**. Overrides `oai` when set.
+    relu2: bool,
 }
 
 static ACTIVATION: OnceLock<ActCfg> = OnceLock::new();
@@ -46,6 +49,7 @@ pub fn set_activation(cfg: &Config) {
         oai: cfg.swiglu_oai,
         alpha: cfg.swiglu_alpha,
         limit: cfg.swiglu_limit,
+        relu2: cfg.relu2,
     });
     // Mirror the choice into the CUDA backend so the fused FFN kernels apply the
     // same SwiGLU variant (host-side globals; safe to set before device init).
@@ -56,7 +60,7 @@ pub fn set_activation(cfg: &Config) {
 /// The active SwiGLU variant (defaults to SiLU when unset — the GLM path and
 /// unit tests that never call [`set_activation`]).
 fn activation() -> ActCfg {
-    *ACTIVATION.get().unwrap_or(&ActCfg { oai: false, alpha: 0.0, limit: 0.0 })
+    *ACTIVATION.get().unwrap_or(&ActCfg { oai: false, alpha: 0.0, limit: 0.0, relu2: false })
 }
 
 /// Process-wide expert-parallel context. `serve`/`worker` set this once at startup
@@ -684,25 +688,41 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
     // Fused GPU expert pipeline (one host round-trip) for resident weights. The
     // fused kernels apply the model's SwiGLU variant (set via gpu::set_activation),
     // so this path is correct for both GLM (SiLU) and MiniMax-M3 (swigluoai). CPU
-    // reference below on decline.
+    // reference below on decline. The gateless ReLU² path (Nemotron-H) stays on the CPU
+    // for now — the fused kernel only knows the SwiGLU variants — so skip the GPU there.
     #[cfg(feature = "cuda")]
     {
-        if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
+        if !activation().relu2 && crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
             return;
         }
     }
     ffn_cpu(gate, up, down, x, nr, out);
 }
 
-/// CPU SwiGLU FFN (the reference / fallback path). Applies the model's SwiGLU
-/// variant ([`activation`]): SiLU-gated (GLM) or clamped OpenAI-SwiGLU (M3).
+/// CPU FFN reference / fallback. Two shapes selected by [`activation`]:
+///   * SwiGLU (GLM/MiniMax): `down(act(gate·x) ⊙ up·x)`, `act` = SiLU or clamped
+///     OpenAI-SwiGLU.
+///   * gateless ReLU² (Nemotron-H, `relu2`): `down(relu(up·x)²)` — the `gate` argument
+///     is unused (Nemotron experts ship no gate projection).
 fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: &mut [f32]) {
+    let a = activation();
+    if a.relu2 {
+        // Gateless ReLU²: one up-projection, square the ReLU, one down-projection.
+        let inter = up.o as usize;
+        let mut uu = vec![0f32; nr * inter];
+        matmul_qt(&mut uu, x, up, nr);
+        for u in uu.iter_mut() {
+            let r = u.max(0.0);
+            *u = r * r;
+        }
+        matmul_qt(out, &uu, down, nr);
+        return;
+    }
     let inter = gate.o as usize; // moe_inter (or shared intermediate)
     let mut gg = vec![0f32; nr * inter];
     let mut uu = vec![0f32; nr * inter];
     matmul_qt(&mut gg, x, gate, nr);
     matmul_qt(&mut uu, x, up, nr);
-    let a = activation();
     for (g, &u) in gg.iter_mut().zip(uu.iter()) {
         *g = if a.oai {
             crate::math::swiglu_oai(*g, u, a.alpha, a.limit)
@@ -1088,6 +1108,90 @@ pub fn moe<P: ExpertProvider>(
         }
     }
 
+    Ok(())
+}
+
+/// Nemotron-H latent-space MoE over `x[S, hidden]` into `out[S, hidden]` (`x` is the
+/// block-normed input). Port of `NemotronHMoE.forward`:
+///
+/// ```text
+///   idx, w  = route(gate·x)                  # router runs on hidden (sigmoid+bias top-k)
+///   h_lat   = fc1_latent · x                 # hidden -> moe_latent
+///   moe_lat = Σ_k w_k · expert_k(h_lat)      # routed experts run in latent space (ReLU²)
+///   out     = fc2_latent · moe_lat           # moe_latent -> hidden
+///   out    += shared_expert(x)               # gateless ReLU² on the original hidden
+/// ```
+///
+/// The routed experts are **gateless ReLU²** (`down(relu(up·x)²)`) and operate entirely
+/// in the `moe_latent` space, so [`compute_experts_partial`] is reused with
+/// `hidden := moe_latent` and the `relu2` activation (set once by [`set_activation`],
+/// which makes [`ffn`] ignore the unused gate). The shared expert reuses `l.up_proj`/
+/// `l.down_proj` (its `gate_proj` is empty and ignored under ReLU²).
+///
+/// NOTE (streaming provider): the routed experts are latent-space **2-tensor** (up/down,
+/// no gate) NVFP4 weights. Feeding them through the existing [`ExpertProvider`] requires a
+/// gateless expert loader (the current [`load_expert`] reads a 3-tensor `gate/up/down`
+/// group); that loader change is a convert/loader-phase task. This forward math is
+/// provider-agnostic — a provider that returns [`Expert`]s whose `up`/`down` are the
+/// latent projections (any `gate`) computes the correct result here.
+pub fn nemotron_moe<P: ExpertProvider>(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    x: &[f32],
+    s_len: usize,
+    out: &mut [f32],
+    provider: &P,
+) -> io::Result<()> {
+    let d = cfg.hidden as usize;
+    let dl = cfg.moe_latent as usize;
+    let e_n = cfg.n_experts as usize;
+    let k = (cfg.topk as usize).min(e_n);
+
+    // ---- router (f32, on the hidden state) + top-K per position -----------
+    let mut logits = vec![0f32; s_len * e_n];
+    let _rt = std::time::Instant::now();
+    router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
+    if crate::forward::profile_on() {
+        crate::forward::ROUTER_US
+            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut idxs = vec![0usize; s_len * k];
+    let mut ws = vec![0f32; s_len * k];
+    for s in 0..s_len {
+        let (idx, w) = route(cfg, &logits[s * e_n..(s + 1) * e_n], &l.router_bias);
+        idxs[s * k..s * k + k].copy_from_slice(&idx);
+        ws[s * k..s * k + k].copy_from_slice(&w);
+    }
+    log_routing(layer, s_len, k, &idxs);
+
+    // ---- fc1: hidden -> latent --------------------------------------------
+    let fc1 = l.fc1_latent.as_ref().expect("nemotron MoE layer missing fc1_latent");
+    let fc2 = l.fc2_latent.as_ref().expect("nemotron MoE layer missing fc2_latent");
+    let mut h_lat = vec![0f32; s_len * dl];
+    matmul_qt(&mut h_lat, x, fc1, s_len);
+
+    // ---- routed experts (weighted sum, in latent space) -------------------
+    let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
+    let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+    let moe_lat = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, &h_lat, s_len, dl)?;
+
+    // ---- fc2: latent -> hidden --------------------------------------------
+    matmul_qt(out, &moe_lat, fc2, s_len);
+
+    // ---- shared expert (gateless ReLU², on the original hidden) -----------
+    let _st = std::time::Instant::now();
+    let mut sh = vec![0f32; s_len * d];
+    // `l.gate_proj` is empty for a Nemotron MoE layer and ignored under ReLU²; the
+    // shared expert is `l.up_proj`/`l.down_proj` (hidden -> shared_inter -> hidden).
+    ffn(&l.gate_proj, &l.up_proj, &l.down_proj, x, s_len, &mut sh);
+    for (o, &sv) in out.iter_mut().zip(sh.iter()) {
+        *o += sv;
+    }
+    if crate::forward::profile_on() {
+        crate::forward::SHARED_US
+            .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 

@@ -40,24 +40,25 @@ pub use convert::{
     ConvertStats, Scheme, SourceFormat, TensorErr,
 };
 pub use usage::UsageHistory;
-pub use colibri_core::Config;
+pub use colibri_core::{Config, QTensor};
 pub use forward::{
     forward, forward_batched, generate_greedy, generate_stream, generate_stream_drafting,
-    layer_forward, logits, DecodeStats,
+    layer_forward, logits, mamba2_mixer, DecodeStats,
 };
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
 pub use model::{KvCache, Layer, Model, MtpHead, KV_UNSET};
 pub use moe::{
-    cluster_ctx, compute_experts_partial, dense_mlp, moe, moe_sharded, route, set_cluster,
-    ClusterCtx, Expert, ExpertProvider, ShardsExpertProvider,
+    cluster_ctx, compute_experts_partial, dense_mlp, moe, moe_sharded, nemotron_moe, route,
+    set_activation, set_cluster, ClusterCtx, Expert, ExpertProvider, ShardsExpertProvider,
 };
 pub use mtp::{absorb as mtp_absorb, draft as mtp_draft};
 pub use preload::{default_num_files, preload_parallel, repack, Manifest, PreloadStore};
 pub use quantize::qtensor_from_f32;
 pub use sampling::{argmax, sample_top_p, SampleConfig};
 
+use colibri_core::{Arch, LayerKind};
 use std::path::Path;
 
 /// Errors from loading or running the engine.
@@ -130,6 +131,12 @@ fn load_layer(
     dbits: u32,
     sparse: bool,
 ) -> Result<Layer, EngineError> {
+    // Nemotron-H layers are heterogeneous (Mamba2 / GQA attention / latent-MoE) and use a
+    // single block norm under a different tensor layout (`mixer.*`), so they load via a
+    // dedicated per-kind path rather than the shared MLA/GQA prefix below.
+    if cfg.arch == Arch::NemotronH {
+        return load_layer_nemotron(shards, cfg, i, dbits);
+    }
     let d = cfg.hidden as usize;
     let h = cfg.n_heads as usize;
     let p = |s: &str| format!("model.layers.{i}.{s}");
@@ -236,6 +243,78 @@ fn load_layer(
             l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?;
             l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?;
             l.sh_down = qt_load(shards, &p("mlp.shared_experts.down_proj.weight"), d, s_i, dbits)?;
+        }
+    }
+    Ok(l)
+}
+
+/// Load one Nemotron-H layer, keyed on `cfg.layer_kind[i]`. Tensors live under the
+/// `mixer.*` prefix and the block's single norm is `norm.weight` (no post-norm).
+///
+///   * **Mamba2** (`in_proj`/`out_proj` resident matmuls; `conv1d.{weight,bias}`, `A_log`,
+///     `D`, `dt_bias`, gated `norm.weight` as f32 vectors). `conv1d.weight` is stored
+///     `[conv_dim, 1, k]`; read flat it is exactly the `[conv_dim, k]` the mixer wants.
+///   * **Attention** — GQA `q/k/v/o` projections (NoPE, no QK-norm), q/k/v fused into one
+///     matmul like the M3/M2 path so `attention_gqa` runs a single projection.
+///   * **MoE** — router (`gate.weight` f32 + `gate.e_score_correction_bias`), the two
+///     latent projections, and the resident shared expert (`shared_experts.{up,down}_proj`
+///     → `up_proj`/`down_proj`, gateless ReLU²). The routed experts stream via the provider.
+fn load_layer_nemotron(
+    shards: &colibri_safetensors::Shards,
+    cfg: &Config,
+    i: usize,
+    dbits: u32,
+) -> Result<Layer, EngineError> {
+    let d = cfg.hidden as usize;
+    let p = |s: &str| format!("model.layers.{i}.{s}");
+    let mut l = Layer::default();
+    // The block's single input RMSNorm (Nemotron-H has no post-attention norm).
+    l.in_ln = ld(shards, &p("norm.weight"))?;
+
+    match cfg.layer_kind[i] {
+        LayerKind::Mamba => {
+            let nh = cfg.mamba_n_heads as usize;
+            let d_inner = cfg.mamba_inter as usize;
+            let conv_dim = d_inner + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
+            let proj_out = d_inner + conv_dim + nh;
+            l.mamba_in_proj = Some(qt_load(shards, &p("mixer.in_proj.weight"), proj_out, d, dbits)?);
+            l.mamba_out_proj =
+                Some(qt_load(shards, &p("mixer.out_proj.weight"), d, d_inner, dbits)?);
+            // `[conv_dim, 1, k]` read flat == `[conv_dim, k]`; bias present iff use_conv_bias
+            // (empty is tolerated by `causal_conv1d_silu`).
+            l.mamba_conv_w = ld(shards, &p("mixer.conv1d.weight"))?;
+            l.mamba_conv_b = ld(shards, &p("mixer.conv1d.bias")).unwrap_or_default();
+            l.mamba_a_log = ld(shards, &p("mixer.A_log"))?;
+            l.mamba_d = ld(shards, &p("mixer.D"))?;
+            l.mamba_dt_bias = ld(shards, &p("mixer.dt_bias"))?;
+            l.mamba_norm = ld(shards, &p("mixer.norm.weight"))?;
+        }
+        LayerKind::Attn => {
+            let hd = cfg.qk_head as usize;
+            let h = cfg.n_heads as usize;
+            let kvh = cfg.n_kv_heads as usize;
+            // Fuse q/k/v (shared input) into ONE matmul, as on the M3/M2 GQA path; NoPE and
+            // no QK-norm, so `q_norm`/`k_norm` stay empty (see `attention_gqa`).
+            let q = qt_load(shards, &p("mixer.q_proj.weight"), h * hd, d, dbits)?;
+            let k = qt_load(shards, &p("mixer.k_proj.weight"), kvh * hd, d, dbits)?;
+            let v = qt_load(shards, &p("mixer.v_proj.weight"), kvh * hd, d, dbits)?;
+            l.qkv_proj = Some(crate::loader::concat_rows(&[&q, &k, &v]));
+            l.o = qt_load(shards, &p("mixer.o_proj.weight"), d, h * hd, dbits)?;
+        }
+        LayerKind::Moe => {
+            l.sparse = true;
+            // Router (f32) + its additive selection bias (both reused from the M3/M2 path).
+            l.router = ld(shards, &p("mixer.gate.weight"))?;
+            l.router_bias = ld(shards, &p("mixer.gate.e_score_correction_bias"))?;
+            let dl = cfg.moe_latent as usize;
+            l.fc1_latent = Some(qt_load(shards, &p("mixer.fc1_latent_proj.weight"), dl, d, dbits)?);
+            l.fc2_latent = Some(qt_load(shards, &p("mixer.fc2_latent_proj.weight"), d, dl, dbits)?);
+            // Shared expert (gateless ReLU²) reuses `up_proj`/`down_proj`.
+            let si = cfg.shared_inter as usize;
+            l.up_proj = qt_load(shards, &p("mixer.shared_experts.up_proj.weight"), si, d, dbits)?;
+            l.down_proj =
+                qt_load(shards, &p("mixer.shared_experts.down_proj.weight"), d, si, dbits)?;
+            // Routed experts (latent-space, gateless ReLU²) stream via the ExpertProvider.
         }
     }
     Ok(l)

@@ -272,26 +272,37 @@ pub fn attention_gqa(
     //     vector once, before the head split (matches the HF reference, which norms
     //     q_proj/k_proj output pre-reshape). RoPE is always per-head over the first `rot`.
     let qk_per_layer = l.q_norm.len() > hd;
+    // Two model-dependent toggles let this one core serve both GQA families:
+    //   * QK-norm: only when the layer actually carries `q_norm`/`k_norm` (M3/M2 do;
+    //     Nemotron-H attention has none → empty → skipped).
+    //   * RoPE: only the GQA family (M3/M2) applies partial rotary. Nemotron-H attention
+    //     is NoPE — position comes from its Mamba2 layers — so the whole rotary step drops.
+    let use_qk_norm = !l.q_norm.is_empty();
+    let use_rope = cfg.arch.is_gqa();
     let _tr = std::time::Instant::now();
     for s in 0..s_len {
         let pos = pos_base + s;
-        if qk_per_layer {
+        if use_qk_norm && qk_per_layer {
             rmsnorm_inplace(&mut q[s * h * hd..(s + 1) * h * hd], &l.q_norm, eps);
             rmsnorm_inplace(&mut k[s * kv_dim..(s + 1) * kv_dim], &l.k_norm, eps);
         }
         for hh in 0..h {
             let qs = &mut q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
-            if !qk_per_layer {
+            if use_qk_norm && !qk_per_layer {
                 rmsnorm_inplace(qs, &l.q_norm, eps);
             }
-            rope_neox(&mut qs[..rot], pos, rot, theta);
+            if use_rope {
+                rope_neox(&mut qs[..rot], pos, rot, theta);
+            }
         }
         for hh in 0..kvh {
             let ks = &mut k[s * kv_dim + hh * hd..s * kv_dim + hh * hd + hd];
-            if !qk_per_layer {
+            if use_qk_norm && !qk_per_layer {
                 rmsnorm_inplace(ks, &l.k_norm, eps);
             }
-            rope_neox(&mut ks[..rot], pos, rot, theta);
+            if use_rope {
+                rope_neox(&mut ks[..rot], pos, rot, theta);
+            }
         }
         kv.k_full_row_mut(layer, pos)
             .copy_from_slice(&k[s * kv_dim..(s + 1) * kv_dim]);

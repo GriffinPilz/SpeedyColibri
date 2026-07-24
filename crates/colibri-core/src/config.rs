@@ -157,6 +157,9 @@ pub struct Config {
     /// ReLU² expert activation (`mlp_hidden_act == "relu2"`): gateless `down(relu(up·x)²)`.
     /// `false` = the existing gated SwiGLU path.
     pub relu2: bool,
+    /// Mamba2 lower clamp on the discretized step `dt` (`time_step_min`); the scan
+    /// applies `dt = max(softplus(dt+dt_bias), dt_min)`. 0.0 for non-Mamba arches.
+    pub mamba_dt_min: f32,
 }
 
 /// Error from loading/validating a config.
@@ -347,6 +350,7 @@ impl Config {
             mamba_chunk: 0,
             moe_latent: 0,
             relu2: false,
+            mamba_dt_min: 0.0,
         };
 
         // rope theta lives under rope_parameters.rope_theta
@@ -511,6 +515,7 @@ impl Config {
             mamba_chunk: 0,
             moe_latent: 0,
             relu2: false,
+            mamba_dt_min: 0.0,
         };
 
         // eos/stop ids may sit in text_config or at the root.
@@ -621,6 +626,9 @@ impl Config {
             mamba_chunk: gi("chunk_size").max(1),
             moe_latent: gi("moe_latent_size"),
             relu2: r.get("mlp_hidden_act").and_then(Json::as_str) == Some("relu2"),
+            // Scan clamps the discretized step to `time_step_min` (reference:
+            // `torch.clamp(dt, self.time_step_min)`); default 0.0 (no floor) if absent.
+            mamba_dt_min: gf("time_step_min", 0.0) as f32,
         };
 
         parse_stop_ids(r, &mut c.stop_ids);
@@ -919,7 +927,7 @@ mod tests {
             "n_routed_experts": 512, "num_experts_per_tok": 22, "moe_intermediate_size": 2688,
             "moe_latent_size": 1024, "moe_shared_expert_intermediate_size": 5376,
             "n_shared_experts": 1, "routed_scaling_factor": 5.0, "norm_topk_prob": true,
-            "mlp_hidden_act": "relu2",
+            "mlp_hidden_act": "relu2", "time_step_min": 0.001,
             "ssm_state_size": 128, "conv_kernel": 4, "mamba_num_heads": 128,
             "mamba_head_dim": 64, "n_groups": 8, "chunk_size": 128
         }"#,
@@ -937,6 +945,7 @@ mod tests {
         assert_eq!((c.moe_latent, c.moe_inter, c.shared_inter), (1024, 2688, 5376));
         assert!(c.relu2 && c.sigmoid_route && c.norm_topk);
         assert_eq!(c.routed_scale, 5.0);
+        assert!((c.mamba_dt_min - 0.001).abs() < 1e-9);
         assert_eq!(
             c.layer_kind,
             vec![

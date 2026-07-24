@@ -8,10 +8,12 @@
 
 use crate::attention::{attention_gqa, attention_sharded, attention_with, AttnCore};
 use crate::linear::{embed_row, matmul_qt};
+use crate::mamba2::{causal_conv1d_silu, gated_rmsnorm, selective_scan, MambaDims};
 use crate::math::rmsnorm;
 use crate::model::{KvCache, Layer, Model};
 use crate::moe::{cluster_ctx, dense_mlp, moe, ExpertProvider};
 use crate::sampling::argmax;
+use colibri_core::{Arch, Config, LayerKind};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -34,6 +36,8 @@ pub(crate) fn profile_on() -> bool {
 static ATTN_US: AtomicU64 = AtomicU64::new(0);
 static MOE_US: AtomicU64 = AtomicU64::new(0);
 static DENSE_US: AtomicU64 = AtomicU64::new(0);
+/// Nemotron-H Mamba2 mixer wall time (its analog of `ATTN_US` for attention layers).
+static MAMBA_US: AtomicU64 = AtomicU64::new(0);
 static EMBED_US: AtomicU64 = AtomicU64::new(0);
 /// Time spent fetching experts through the provider (disk→RAM on a cache miss).
 /// A sub-total of `MOE_US`. Incremented from `moe`.
@@ -110,6 +114,12 @@ pub fn layer_forward<P: ExpertProvider>(
     dsa_sel: &mut Option<Vec<Vec<u32>>>,
 ) -> io::Result<()> {
     let cfg = &model.cfg;
+    // Nemotron-H is a hybrid single-sublayer-per-layer stack (Mamba2 / GQA attention /
+    // latent-MoE) dispatched by `layer_kind`, with no post-attention norm — so it takes
+    // its own path rather than the two-sublayer GLM/M3 driver below. `dsa_sel` is unused.
+    if cfg.arch == Arch::NemotronH {
+        return nemotron_layer_forward(model, kv, provider, l, li, x, s, pos_base, nrm, tmp);
+    }
     let d = cfg.hidden as usize;
     // in_ln -> attention -> residual
     for si in 0..s {
@@ -164,6 +174,152 @@ pub fn layer_forward<P: ExpertProvider>(
         x[j] += tmp[j];
     }
     Ok(())
+}
+
+/// Run ONE Nemotron-H layer over `x[S * hidden]` in place. Nemotron-H blocks have a
+/// single sublayer — `in_ln` (the only norm; there is no post-norm) → the mixer selected
+/// by `layer_kind[li]` → residual add — unlike the two-sublayer GLM/M3 [`layer_forward`].
+/// Mamba2 and attention layers update their per-layer state in `kv`; MoE layers stream
+/// their routed experts through `provider`.
+#[allow(clippy::too_many_arguments)]
+fn nemotron_layer_forward<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    l: &Layer,
+    li: usize,
+    x: &mut [f32],
+    s: usize,
+    pos_base: usize,
+    nrm: &mut [f32],
+    tmp: &mut [f32],
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    // in_ln (the block's only norm) -> mixer -> residual.
+    for si in 0..s {
+        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
+    }
+    match cfg.layer_kind[li] {
+        LayerKind::Mamba => timed(&MAMBA_US, || mamba2_mixer(cfg, l, kv, li, nrm, s, tmp)),
+        // NoPE GQA attention (no rotary, no QK-norm — see `attention_gqa`).
+        LayerKind::Attn => timed(&ATTN_US, || attention_gqa(cfg, l, li, kv, nrm, s, pos_base, tmp)),
+        LayerKind::Moe => {
+            timed(&MOE_US, || crate::moe::nemotron_moe(cfg, l, li, nrm, s, tmp, provider))?
+        }
+    }
+    for j in 0..s * d {
+        x[j] += tmp[j];
+    }
+    Ok(())
+}
+
+/// Nemotron-H Mamba2 mixer over the block-normed input `x[S, hidden]`, writing
+/// `out[S, hidden]`. Carries the layer's recurrent conv + ssm state in `kv`, so a
+/// single-shot prefill (`S = prompt`) and a run of one-token decode steps (`S = 1`)
+/// produce identical outputs. Port of `NemotronHMamba2Mixer.torch_forward`:
+///
+/// ```text
+///   proj        = in_proj · x                        # [S, d_inner + conv_dim + n_heads]
+///   gate,hBC,dt = split(proj, [d_inner, conv_dim, n_heads])   # d_mlp == 0
+///   hBC         = silu(causal_conv1d(hBC))           # depthwise, carries conv state
+///   h,B,C       = split(hBC, [d_inner, G·N, G·N])
+///   y           = selective_scan(h, B, C, dt; A, D, dt_bias)  # carries ssm state
+///   y           = gated_rmsnorm(y, gate)             # per-group, silu gate
+///   out         = out_proj · y                        # [S, hidden]
+/// ```
+pub fn mamba2_mixer(
+    cfg: &Config,
+    l: &Layer,
+    kv: &mut KvCache,
+    layer: usize,
+    x: &[f32],
+    s: usize,
+    out: &mut [f32],
+) {
+    let nh = cfg.mamba_n_heads as usize;
+    let hd = cfg.mamba_head_dim as usize;
+    let ds = cfg.mamba_d_state as usize;
+    let ng = cfg.mamba_n_groups as usize;
+    let d_inner = cfg.mamba_inter as usize; // n_heads * head_dim
+    let gn = ng * ds; // per-group B/C width (n_groups * d_state)
+    let conv_dim = d_inner + 2 * gn;
+    let kk = cfg.mamba_d_conv as usize;
+    let proj_out = d_inner + conv_dim + nh;
+
+    let in_proj = l.mamba_in_proj.as_ref().expect("mamba layer missing in_proj");
+    let out_proj = l.mamba_out_proj.as_ref().expect("mamba layer missing out_proj");
+
+    // ---- in_proj, then split gate | hidden_B_C | dt ----------------------
+    let mut proj = vec![0f32; s * proj_out];
+    matmul_qt(&mut proj, x, in_proj, s);
+    let mut gate = vec![0f32; s * d_inner];
+    let mut hbc = vec![0f32; s * conv_dim];
+    let mut dt = vec![0f32; s * nh];
+    for t in 0..s {
+        let base = t * proj_out;
+        gate[t * d_inner..(t + 1) * d_inner].copy_from_slice(&proj[base..base + d_inner]);
+        hbc[t * conv_dim..(t + 1) * conv_dim]
+            .copy_from_slice(&proj[base + d_inner..base + d_inner + conv_dim]);
+        dt[t * nh..(t + 1) * nh].copy_from_slice(&proj[base + d_inner + conv_dim..base + proj_out]);
+    }
+
+    // ---- causal depthwise conv1d + silu, carrying the conv state ---------
+    // Prepend the saved (k-1) history columns so the conv at each new token sees its real
+    // preceding context (all-zero at a fresh sequence start), then keep the last k input
+    // columns as the next state. `causal_conv1d_silu`'s left zero-pad only touches the
+    // discarded history rows, so this reduces to a plain prefill when the state is zero,
+    // and its per-token outputs are identical whether the sequence arrives whole or split.
+    let hist = kk - 1;
+    let aug_len = hist + s;
+    let mut aug = vec![0f32; aug_len * conv_dim];
+    {
+        // conv state is [k, conv_dim] time-major (row k-1 = most recent); the (k-1)
+        // history columns before this chunk are rows [1, k).
+        let cs = kv.mamba_conv_row(layer);
+        aug[..hist * conv_dim].copy_from_slice(&cs[conv_dim..kk * conv_dim]);
+    }
+    aug[hist * conv_dim..].copy_from_slice(&hbc[..s * conv_dim]);
+    let conv_aug =
+        causal_conv1d_silu(&aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk);
+    let conv_out = &conv_aug[hist * conv_dim..aug_len * conv_dim]; // [s, conv_dim]
+    // Next state = the last k input columns of the augmented buffer.
+    kv.mamba_conv_row_mut(layer)
+        .copy_from_slice(&aug[(aug_len - kk) * conv_dim..aug_len * conv_dim]);
+
+    // ---- split conv output into h | B | C, then the selective scan -------
+    let mut h = vec![0f32; s * d_inner];
+    let mut b = vec![0f32; s * gn];
+    let mut c = vec![0f32; s * gn];
+    for t in 0..s {
+        let base = t * conv_dim;
+        h[t * d_inner..(t + 1) * d_inner].copy_from_slice(&conv_out[base..base + d_inner]);
+        b[t * gn..(t + 1) * gn].copy_from_slice(&conv_out[base + d_inner..base + d_inner + gn]);
+        c[t * gn..(t + 1) * gn].copy_from_slice(&conv_out[base + d_inner + gn..base + conv_dim]);
+    }
+    let dims = MambaDims {
+        n_heads: nh,
+        head_dim: hd,
+        d_state: ds,
+        n_groups: ng,
+        dt_min: cfg.mamba_dt_min,
+    };
+    let y = selective_scan(
+        dims,
+        kv.mamba_ssm_mut(layer),
+        &h,
+        &b,
+        &c,
+        &dt,
+        &l.mamba_a_log,
+        &l.mamba_d,
+        &l.mamba_dt_bias,
+        s,
+    );
+
+    // ---- gated RMSNorm (per group, silu gate) then out_proj --------------
+    let yn = gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps);
+    matmul_qt(out, &yn, out_proj, s);
 }
 
 /// Run the transformer stack over `ids` (positions `pos_base..pos_base+S`),
@@ -619,8 +775,9 @@ where
         // Totals across prefill + all decode steps (microseconds -> ms).
         let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e3;
         eprintln!(
-            "[profile] totals: attn {:.0} ms | moe {:.0} ms (of which expert-load {:.0} ms) | dense {:.0} ms | embed {:.0} ms | logits {:.0} ms",
+            "[profile] totals: attn {:.0} ms | mamba {:.0} ms | moe {:.0} ms (of which expert-load {:.0} ms) | dense {:.0} ms | embed {:.0} ms | logits {:.0} ms",
             ms(&ATTN_US),
+            ms(&MAMBA_US),
             ms(&MOE_US),
             ms(&LOAD_US),
             ms(&DENSE_US),
@@ -650,4 +807,165 @@ where
         drafts_proposed: proposed,
         drafts_accepted: accepted,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quantize::qtensor_from_f32;
+
+    // A tiny but real Nemotron-H config (single Mamba layer) with hand-picked small dims:
+    // hidden 4, 2 heads × head_dim 2 (d_inner 4), 1 group × d_state 2, conv_kernel 2
+    // (conv_dim = 4 + 2·1·2 = 8, in_proj out = 4 + 8 + 2 = 14).
+    fn mamba_cfg() -> Config {
+        let json = colibri_json::Json::parse(
+            r#"{
+            "model_type":"nemotron_h",
+            "hidden_size":4, "num_hidden_layers":1,
+            "num_attention_heads":2, "num_key_value_heads":1, "head_dim":2,
+            "vocab_size":8, "hybrid_override_pattern":"M",
+            "n_routed_experts":4, "num_experts_per_tok":2, "moe_intermediate_size":4,
+            "moe_latent_size":2, "moe_shared_expert_intermediate_size":4,
+            "ssm_state_size":2, "conv_kernel":2, "mamba_num_heads":2, "mamba_head_dim":2,
+            "n_groups":1, "chunk_size":2, "mlp_hidden_act":"relu2", "time_step_min":0.001,
+            "layer_norm_epsilon":1e-5
+        }"#,
+        )
+        .unwrap();
+        Config::from_json(&json).unwrap()
+    }
+
+    // Deterministic pseudo-random-ish weight for reproducible tests.
+    fn wv(n: usize, seed: usize) -> Vec<f32> {
+        (0..n).map(|i| (((i + seed) as f32 * 0.41).sin() * 0.5) + 0.05).collect()
+    }
+
+    // A Mamba layer over `mamba_cfg`, with f32 (exact) projection weights so the test
+    // exercises the mixer wiring, not quantization error.
+    fn mamba_layer(cfg: &Config) -> Layer {
+        let d = cfg.hidden as usize; // 4
+        let d_inner = cfg.mamba_inter as usize; // 4
+        let nh = cfg.mamba_n_heads as usize; // 2
+        let conv_dim =
+            d_inner + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize; // 8
+        let proj_out = d_inner + conv_dim + nh; // 14
+        let k = cfg.mamba_d_conv as usize; // 2
+        let mut l = Layer::default();
+        l.mamba_in_proj = Some(qtensor_from_f32(&wv(proj_out * d, 1), proj_out, d, 16));
+        l.mamba_out_proj = Some(qtensor_from_f32(&wv(d * d_inner, 2), d, d_inner, 16));
+        l.mamba_conv_w = wv(conv_dim * k, 3);
+        l.mamba_conv_b = wv(conv_dim, 4);
+        l.mamba_a_log = wv(nh, 5);
+        l.mamba_d = wv(nh, 6);
+        l.mamba_dt_bias = wv(nh, 7);
+        l.mamba_norm = wv(d_inner, 8);
+        l
+    }
+
+    fn mamba_kv(cfg: &Config) -> KvCache {
+        let mut kv = KvCache::new(cfg.n_layers as usize, 0, 0, 16);
+        kv.enable_mamba2(cfg);
+        kv
+    }
+
+    /// The mixer's whole point: a single-shot prefill over `S` tokens must equal a run of
+    /// `S` one-token decode steps carrying the conv + ssm state (mirrors the scan-level
+    /// test in `mamba2.rs`, but through in_proj → conv(state) → scan(state) → gated norm →
+    /// out_proj). This validates BOTH recurrent caches and the split arithmetic.
+    #[test]
+    fn mamba2_mixer_prefill_equals_stepwise_decode() {
+        let cfg = mamba_cfg();
+        let l = mamba_layer(&cfg);
+        let d = cfg.hidden as usize;
+        let s = 3usize;
+        let x = wv(s * d, 100);
+
+        // Prefill: all S tokens in one call, fresh state.
+        let mut kv_full = mamba_kv(&cfg);
+        let mut out_full = vec![0f32; s * d];
+        mamba2_mixer(&cfg, &l, &mut kv_full, 0, &x, s, &mut out_full);
+
+        // Decode: one token per call, carrying state across calls.
+        let mut kv_step = mamba_kv(&cfg);
+        let mut out_step = vec![0f32; s * d];
+        for t in 0..s {
+            let mut o = vec![0f32; d];
+            mamba2_mixer(&cfg, &l, &mut kv_step, 0, &x[t * d..(t + 1) * d], 1, &mut o);
+            out_step[t * d..(t + 1) * d].copy_from_slice(&o);
+        }
+
+        for i in 0..s * d {
+            assert!(
+                (out_full[i] - out_step[i]).abs() < 1e-5,
+                "mismatch at {i}: prefill {} vs stepwise {}",
+                out_full[i],
+                out_step[i]
+            );
+        }
+        // Sanity: the mixer actually did something (not all zeros).
+        assert!(out_full.iter().any(|v| v.abs() > 1e-6), "mixer produced all-zero output");
+    }
+
+    /// A fresh mixer with zero state must reproduce the stateless primitives directly:
+    /// conv with left zero-pad ([`causal_conv1d_silu`]) then the scan, gated norm, out_proj.
+    /// Guards the split offsets (gate|hBC|dt and h|B|C) against a silent transposition.
+    #[test]
+    fn mamba2_mixer_matches_stateless_primitives_at_sequence_start() {
+        let cfg = mamba_cfg();
+        let l = mamba_layer(&cfg);
+        let d = cfg.hidden as usize;
+        let d_inner = cfg.mamba_inter as usize;
+        let ng = cfg.mamba_n_groups as usize;
+        let ds = cfg.mamba_d_state as usize;
+        let nh = cfg.mamba_n_heads as usize;
+        let conv_dim = d_inner + 2 * ng * ds;
+        let proj_out = d_inner + conv_dim + nh;
+        let k = cfg.mamba_d_conv as usize;
+        let gn = ng * ds;
+        let s = 2usize;
+        let x = wv(s * d, 200);
+
+        // Reference: replay the mixer math with the standalone primitives (zero state).
+        let mut proj = vec![0f32; s * proj_out];
+        matmul_qt(&mut proj, &x, l.mamba_in_proj.as_ref().unwrap(), s);
+        let (mut gate, mut hbc, mut dt) =
+            (vec![0f32; s * d_inner], vec![0f32; s * conv_dim], vec![0f32; s * nh]);
+        for t in 0..s {
+            let b = t * proj_out;
+            gate[t * d_inner..(t + 1) * d_inner].copy_from_slice(&proj[b..b + d_inner]);
+            hbc[t * conv_dim..(t + 1) * conv_dim]
+                .copy_from_slice(&proj[b + d_inner..b + d_inner + conv_dim]);
+            dt[t * nh..(t + 1) * nh].copy_from_slice(&proj[b + d_inner + conv_dim..b + proj_out]);
+        }
+        let conv = causal_conv1d_silu(&hbc, &l.mamba_conv_w, &l.mamba_conv_b, s, conv_dim, k);
+        let (mut h, mut bb, mut cc) =
+            (vec![0f32; s * d_inner], vec![0f32; s * gn], vec![0f32; s * gn]);
+        for t in 0..s {
+            let b = t * conv_dim;
+            h[t * d_inner..(t + 1) * d_inner].copy_from_slice(&conv[b..b + d_inner]);
+            bb[t * gn..(t + 1) * gn].copy_from_slice(&conv[b + d_inner..b + d_inner + gn]);
+            cc[t * gn..(t + 1) * gn].copy_from_slice(&conv[b + d_inner + gn..b + conv_dim]);
+        }
+        let dims = MambaDims {
+            n_heads: nh,
+            head_dim: cfg.mamba_head_dim as usize,
+            d_state: ds,
+            n_groups: ng,
+            dt_min: cfg.mamba_dt_min,
+        };
+        let mut st = crate::mamba2::SsmState::zeros(nh, cfg.mamba_head_dim as usize, ds);
+        let y = selective_scan(
+            dims, &mut st, &h, &bb, &cc, &dt, &l.mamba_a_log, &l.mamba_d, &l.mamba_dt_bias, s,
+        );
+        let yn = gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps);
+        let mut expect = vec![0f32; s * d];
+        matmul_qt(&mut expect, &yn, l.mamba_out_proj.as_ref().unwrap(), s);
+
+        let mut kv = mamba_kv(&cfg);
+        let mut out = vec![0f32; s * d];
+        mamba2_mixer(&cfg, &l, &mut kv, 0, &x, s, &mut out);
+        for i in 0..s * d {
+            assert!((out[i] - expect[i]).abs() < 1e-5, "at {i}: {} vs {}", out[i], expect[i]);
+        }
+    }
 }

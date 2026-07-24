@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # Spin up the SpeedyColibri container on a DGX Spark host.
 #
-#   docker/run-dgx.sh [hf_TOKEN] [coli-command [args...]]
+# Quick start — download (+ convert) and serve a model in one line:
 #
+#   docker/run-dgx.sh -h hf_xxxxxxxxxxxxxxxxxxxx -p 8080 -m m2.7
+#     -h <token>   Hugging Face token (first download only; also HF_TOKEN env)
+#     -p <port>    port to serve on                    (default 8080)
+#     -m <model>   m2.7 | m3 | glm   (or any org/repo) (default glm)
+#   With flags and no subcommand it runs `serve`.
+#
+# Advanced / positional form (any coli subcommand):
+#   docker/run-dgx.sh [hf_TOKEN] [coli-command [args...]]
 #   docker/run-dgx.sh gen 100 200 300          # model from HF cache / /model
 #   docker/run-dgx.sh hf_abc123 gen 100 200    # token as an argument
 #   HF_TOKEN=hf_abc123 docker/run-dgx.sh gen   # ...or from the environment
@@ -21,6 +29,35 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 IMAGE=${COLI_IMAGE:-speedycolibri:latest}
+
+# ---- friendly flags: -h <hf_token>  -p <port>  -m <model> ----------------------
+# `docker/run-dgx.sh -h hf_xxx -p 8080 -m m2.7` → download (+convert) + serve, one line.
+# Short model names resolve to their HF checkpoint; a full `org/repo` also works.
+model_repo() {
+  case "$1" in
+    m2.7|m2|minimax-m2.7|minimax-m2)     echo "nvidia/MiniMax-M2.7-NVFP4" ;;
+    m3|minimax-m3)                       echo "nvidia/MiniMax-M3-NVFP4" ;;
+    glm|glm-5.2|glm5.2|glm52)            echo "nvidia/GLM-5.2-NVFP4" ;;
+    */*)                                 echo "$1" ;;   # already a full org/repo or URL
+    *)                                   echo "" ;;     # unknown short name
+  esac
+}
+used_flags=0
+while [[ "${1:-}" == -[hpm] || "${1:-}" == --hf-token || "${1:-}" == --port || "${1:-}" == --model ]]; do
+  case "$1" in
+    -h|--hf-token) export HF_TOKEN="${2:?-h needs a token}"; shift 2 ;;
+    -p|--port)     export COLI_PORT="${2:?-p needs a port}"; shift 2 ;;
+    -m|--model)
+      repo="$(model_repo "${2:?-m needs a model}")"
+      [[ -n "$repo" ]] || { echo "[run-dgx] unknown model '$2' — try: m2.7, m3, glm, or an org/repo" >&2; exit 2; }
+      export COLI_MODEL_REPO="$repo"; shift 2 ;;
+  esac
+  used_flags=1
+done
+# With the friendly flags and no explicit subcommand, default to serving on the
+# chosen port (passed positionally so the entrypoint's `coli serve <container> <port>`
+# gets it directly).
+[[ "$used_flags" == 1 && $# -eq 0 ]] && set -- serve "${COLI_PORT:-8080}"
 
 # HF token: first argument or environment.
 if [[ "${1:-}" == hf_* ]]; then

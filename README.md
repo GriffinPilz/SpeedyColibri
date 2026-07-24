@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/colibri.svg" width="440" alt="SpeedyColibri — colibrì, in Rust, on the DGX Spark">
+</p>
+
 <h1 align="center">SpeedyColibri</h1>
 
 **Run huge Mixture-of-Experts models on a single NVIDIA DGX Spark** — GLM-5.2
@@ -72,58 +76,46 @@ variant + a convert mapping + one registry block — the checklist is in
 
 ## Quick start (DGX Spark)
 
-The deliverable is an **OpenAI-compatible inference server**. Run these four steps
-on the Spark, top to bottom. Everything — the image build, the model download, and
-GPU passthrough (even on a stock shared Spark with no `--gpus` runtime and no root)
-— is handled by `docker/run-dgx.sh`.
+An **OpenAI-compatible inference server** in two steps. `docker/run-dgx.sh` handles
+everything — the image build, GPU passthrough (even on a stock shared Spark with no
+`--gpus` runtime and no root), the model download **and conversion**, and serving.
 
-> **Prerequisites:** a DGX Spark (GB10) with Docker and the NVIDIA driver ≥ 580
-> (CUDA 13) — both ship with DGX OS. A Hugging Face account/token for the first
-> model download. ~360 GB free disk for the model. No root required.
+> **Prerequisites:** a DGX Spark (GB10) with Docker and the NVIDIA driver ≥ 580 (both
+> ship with DGX OS), a Hugging Face token for the first download, and free disk for the
+> model (~130 GB `m2.7` · ~230 GB `m3` · ~360 GB `glm`). No root required.
 
-**Time budget (first run, cold):** ~10 min build + 30–90 min model download +
-~1–2 min server startup. Everything after the first run skips the build and
-download (~1–2 min to a ready server).
-
-### 1. Get the code  ·  ~30 s
+**1 — Get the code**
 
 ```bash
 git clone https://github.com/GriffinPilz/SpeedyColibri.git
 cd SpeedyColibri
-# already cloned? update instead:
-# git pull
 ```
 
-### 2. Start the server  ·  first run ~10 min build, then a one-time 30–90 min download
-
-`run-dgx.sh` builds the image if it doesn't exist yet, downloads the model into
-your Hugging Face cache if it isn't there, warms the cache, and starts serving.
+**2 — Download and serve, one command**
 
 ```bash
-# First run — pass your HF token so the 358 GB model can download.
-# (~10 min to build the image, then ~30–90 min for the one-time download.)
-docker/run-dgx.sh hf_xxxxxxxxxxxxxxxxxxxx serve 8080 "warm up the cache"
-
-# Later runs — model already cached, no token needed. Ready in ~1–2 min.
-docker/run-dgx.sh serve 8080 "warm up the cache"
+docker/run-dgx.sh -h hf_xxxxxxxxxxxxxxxxxxxx -p 8080 -m m2.7
 ```
 
-Wait for this line before sending requests:
-
-```
-[serve] OpenAI-compatible server on http://0.0.0.0:8080  (model: nvidia/GLM-5.2-NVFP4)
-```
-
-**Command shape:** `docker/run-dgx.sh [hf_TOKEN] serve [port] [warm-up prompt...]`
-
-| Argument | Meaning | Default |
+| flag | meaning | default |
 |---|---|---|
-| `hf_TOKEN` | *(optional, first)* Hugging Face token — any arg starting `hf_`. Only needed the first time, to download the model. Equivalent to the `HF_TOKEN` env var. | none (fine once cached) |
-| `serve` | The subcommand: start the HTTP inference server. | — |
-| `port` | *(optional)* TCP port to listen on and publish from the container. | `8080` |
-| `warm-up prompt...` | *(optional)* Text run through one short generation at startup, so the hottest experts are resident before the first real request. Several via `COLI_WARMUP="a\|b"`. | none |
+| `-h <token>` | Hugging Face token — first download only (or the `HF_TOKEN` env var) | none |
+| `-p <port>` | port to serve on | `8080` |
+| `-m <model>` | `m2.7` · `m3` · `glm`  (or any `org/repo` checkpoint) | `glm` |
 
-### 3. Query it  ·  ~0.5 tok/s single-node decode (see the record for current numbers)
+First run builds the image (~10 min) and downloads + converts the model (a one-time
+30–90 min, cached in your HF cache); later runs skip both and reach a ready server in
+~1–2 min — and once cached you can drop `-h`. Wait for:
+
+```
+[serve] OpenAI-compatible server on http://0.0.0.0:8080  (model: MiniMax-M2.7-container)
+```
+
+The advanced positional form — `docker/run-dgx.sh [hf_TOKEN] <coli-command> [args...]` —
+and every `COLI_*` knob still work; see [Switching models](#switching-models), the
+environment-variable table below, and the `docker/run-dgx.sh` header comments.
+
+**3 — Query it**
 
 Any OpenAI client works. Streaming (`"stream": true`) sends tokens as they are
 produced — worth using at sub-1 tok/s so output appears live instead of after the
@@ -158,9 +150,12 @@ curl http://localhost:8080/v1/completions -H 'Content-Type: application/json' -d
 | `stream` | both | `true` → SSE token stream ending in `data: [DONE]`; `false` → one JSON object | `false` |
 | `model` | both | accepted and echoed; ignored for routing (one model is served) | — |
 
-### 4. Stop it
+**4 — Stop it**
 
 `Ctrl-C` in the foreground, or `docker rm -f <container>` (find it with `docker ps`).
+
+To serve a different model, stop it and re-run step 2 with a different `-m` (see
+[Switching models](#switching-models)).
 
 ---
 
@@ -270,21 +265,18 @@ COLI_BATCH_VERIFY=1 ./target/release/coli genbatch /path/to/container 64 16 785 
 
 One `coli` process serves one model — the model is the container you point it at.
 
-**Docker.** Set the repo (and, for a local snapshot, the directory); everything else is
-the same command:
+**Docker.** Pick the model with `-m`; everything else is the same command:
 
 ```bash
-# GLM-5.2 (default) — nothing extra needed
-docker/run-dgx.sh <hf_token> serve 8080 "warm up"
+docker/run-dgx.sh -h <hf_token> -p 8080 -m glm     # GLM-5.2 (default)
+docker/run-dgx.sh -h <hf_token> -p 8080 -m m3      # MiniMax-M3
+docker/run-dgx.sh -h <hf_token> -p 8080 -m m2.7    # MiniMax-M2.7
 
-# MiniMax-M3
-COLI_MODEL_REPO=nvidia/MiniMax-M3-NVFP4 docker/run-dgx.sh <hf_token> serve 8080
+# any other checkpoint by its HF repo:
+docker/run-dgx.sh -h <hf_token> -p 8080 -m unsloth/GLM-5.2-FP8
 
-# MiniMax-M2.7
-COLI_MODEL_REPO=nvidia/MiniMax-M2.7-NVFP4 docker/run-dgx.sh <hf_token> serve 8080
-
-# A snapshot you already downloaded/converted
-COLI_MODEL_DIR=/path/to/container docker/run-dgx.sh serve 8080
+# a snapshot you already downloaded/converted:
+COLI_MODEL_DIR=/path/to/container docker/run-dgx.sh -p 8080
 ```
 
 **Without Docker.** The registry ([`scripts/models.toml`](scripts/models.toml)) maps a

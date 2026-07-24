@@ -87,8 +87,17 @@ suite_batch() {
   local sizes="${BATCH_SIZES:-1 4 8 16 32}" ngen="${BATCH_NGEN:-10}"
   echo; echo "── batch (genbatch aggregate tok/s vs B; ngen=$ngen) ──"
   echo "  verify (B=8, token-identity vs single-sequence):"
-  local vout
-  vout=$(COLI_BATCH_VERIFY=1 "$COLI_BIN" genbatch "$CONTAINER" 8 8 $PROMPT_TOKENS 2>&1 | grep -i "VERIFY" || true)
+  local vraw vout
+  vraw=$(COLI_BATCH_VERIFY=1 "$COLI_BIN" genbatch "$CONTAINER" 8 8 $PROMPT_TOKENS 2>&1)
+  # Models whose architecture has no batched path say so; report that and skip the
+  # sweep rather than printing a column of blanks for every B (which reads as a
+  # measurement rather than an unsupported configuration).
+  if grep -qi "not implemented for hybrid" <<<"$vraw"; then
+    echo "    SKIPPED — batched decode is not implemented for this architecture:"
+    grep -oiP "batched decode is not implemented[^\"]*" <<<"$vraw" | head -1 | sed 's/^/      /'
+    return 0
+  fi
+  vout=$(grep -i "VERIFY" <<<"$vraw" || true)
   echo "    ${vout:-<no VERIFY line — check genbatch output>}"
   local b out rate step
   for b in $sizes; do

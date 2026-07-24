@@ -537,6 +537,23 @@ pub fn forward_batched<P: ExpertProvider>(
     assert_eq!(kvs.len(), n, "one KvCache per sequence");
     assert_eq!(positions.len(), n, "one position per sequence");
     assert_eq!(hidden_out.len(), n * d);
+    // `layer_forward_batched` assumes the uniform transformer shape every layer is
+    // `in_ln -> attention -> residual -> MoE`, with attention picked by `is_gqa()`.
+    // A hybrid stack (`layer_kind` non-empty: Nemotron-H's Mamba2/Attn/MoE mix) has
+    // neither property, so it used to fall through to the MLA branch and panic deep in
+    // `matmul_qt` on an empty `q_a` ("x must be [S,I], left: 4096, right: 0"). Refuse
+    // it here with a real error instead. Only `coli genbatch` reaches this — `serve`
+    // and single-sequence `gen` never call it, so nothing user-facing regressed.
+    if !cfg.layer_kind.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "batched decode is not implemented for hybrid architectures ({:?}); \
+                 use single-sequence `coli gen`",
+                cfg.arch
+            ),
+        ));
+    }
     FWD_STEP.fetch_add(1, Ordering::Relaxed);
 
     let mut x = vec![0f32; n * d];

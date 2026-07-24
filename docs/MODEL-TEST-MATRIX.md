@@ -57,29 +57,29 @@ gateless ReLU² in a 1024-wide latent space. NVFP4 routed experts.
 - **Experts are only ~59 GB against 121 GB of RAM (172% coverage) — they FIT.** Profiled:
   `18,179 resident, 0 evictions`; steady-state decode reads NOTHING from disk. It is *not* in
   GLM's disk-streaming regime, so GLM-derived "bytes-bound floor" reasoning does not transfer.
-- **Decode profile** (matched differential NGEN=25−NGEN=1), per token *before* PR #13: mamba
-  in/out-proj 71.0 ms (28.7%) · shared expert 50.9 (20.6%) · routed gpu-ffn 45.0 (18.2%) ·
-  expert-load 20.3 · scan 12.8 · attention 12.7 (the transformer part of this hybrid is nearly
-  free). ~8.9 GB/token at 247 ms = **36 GB/s against ~273 GB/s peak** — a kernel-shape problem,
-  NOT dispatch (launch cost is ~4%, so CUDA graphs would not have paid). PR #13 (tile
-  bypass, 1.53×) then PR #15 (dedicated `i8a16_gemv`, 1.12×) took decode **4.65 → 8.00 tok/s
-  = 1.72×**, all token-identical. Still only ~70 GB/s of ~273, so headroom remains. Next
-  levers: the **shared expert** (20.6% of decode at the worst efficiency, 35 GB/s; it is
-  gateless ReLU² so the fused kernel shape already exists), then **MTP**.
-- **BROKEN — prefill scratch is unreserved.** Measured peak-RSS slope **210 KB/token**
-  (2 reps: 214.5 / 206.2) against the **24 KB/token** serve reserves. The Mamba mixer allocates
-  per-layer buffers that scale with prompt length (`proj` 18560 + `gate` 8192 + `hbc` 10240 +
-  `h` 8192 + `b`/`c` + `aug`/`conv_aug`), freed per layer so peak ≈ one layer live. A prompt can
-  therefore be admitted as "fits" and then OOM in the mixer. ~6.1 GB unaccounted at 32k ctx.
-- **MTP head exists but we throw it away.** Source ships `mtp.layers.0` (attention +
-  `eh_proj`/`enorm`/`hnorm`) and `mtp.layers.1` (latent-MoE, 512 experts), with
-  `num_nextn_predict_layers: 1`. `convert.rs:132` drops every `mtp*`/`nextn` tensor, so the
-  container has no head and `DRAFT=N` cannot engage. **This is the same bug already fixed once
-  for GLM** (keep-the-head-in-convert). Recoverable — source weights are on disk.
-- Context: 262,144 by default, **1,048,576** with `COLI_ALLOW_LONG_CTX=1` (NoPE ⇒ the config's
-  `max_position_embeddings` is advisory, not architectural). 24 KB/token makes 1M cost ~24 GiB.
-  ⚠️ Interacts with the prefill-scratch bug above: a genuinely long *prompt* is exactly the case
-  the reservation under-counts.
+- **Decode profile — RE-MEASURED after PRs #13/#15** (matched differential NGEN=25−NGEN=1).
+  Decode 109.5 ms/token; ~8.9 GB/token = **81 GB/s, 30% of ~273 peak** (was 36 GB/s / 13%).
+
+  | component | ms/tok | share |
+  |---|---|---|
+  | **routed experts (gpu-ffn)** | **47.5** | **43.4%** |
+  | mamba in/out-proj | 22.7 | 20.7% |
+  | mamba scan | 9.7 | 8.9% |
+  | attention (8 layers) | 8.5 | 7.8% |
+  | conv+norm | 7.2 | 6.6% |
+  | expert-load | 3.3 | 3.0% |
+  | shared expert | 1.7 | 1.5% |
+
+  ⚠️ **The pre-#13 ranking is obsolete — do not plan from it.** It had mamba in/out-proj at
+  71.0 ms (28.7%) and the **shared expert at 50.9 ms (20.6%)**; those are now 22.7 and 1.7.
+  Both fell out incidentally because their matmuls route through the same `coli_cuda_matmul`
+  the GEMV work fixed. A planned "fused int8 relu² shared-expert kernel" was dropped after
+  this re-profile showed it would chase a 1.5% slice.
+
+  **Next lever: grouped expert dispatch.** The counters show `38,371 fused expert FFNs` for
+  prefill+25 decode — i.e. **22 experts × 40 layers = 880 separate kernel calls per token**,
+  each with its own H2D/D2H round-trip. One grouped call per layer would be 40 dispatches per
+  token instead of 880. Not a faster kernel — fewer of them.
 
 ### minimax-m3 / minimax-m2.7 — GQA transformers
 Most infra is shared via `arch.is_gqa()`. M2.7 adds per-layer QK-norm.

@@ -761,6 +761,17 @@ pub fn try_expert_ffn_relu2(
 /// `COLI_EXPERT_GROUP=1` batches a layer's routed experts through the grouped async
 /// kernel (one H2D/D2H per ≤64-expert chunk) instead of a synchronous call per expert
 /// — attacks the per-expert round-trip that dominates moe-compute.
+/// Is the gateless ReLU² grouped expert path on? **Default ON**, unlike the fp8
+/// `expert_group_enabled()` opt-in: this path declines outside decode (`rows==1`), so it
+/// cannot hit the prefill devcopy gap that kept the fp8 one opt-in. MEASURED on Nemotron-H,
+/// interleaved with a discarded warmup: decode 8.11 -> 8.31 tok/s (+2.5%, non-overlapping
+/// ranges), prefill 38.5 -> 38.6 s (unchanged), tokens byte-identical. `COLI_EXPERT_GROUP=0`
+/// turns it off.
+pub fn expert_group_relu2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() != Some("0"))
+}
+
 pub fn expert_group_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() == Some("1"))

@@ -933,7 +933,12 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     // instead of a synchronous upload/kernel/download per expert — the per-expert
     // round-trip is what dominates moe-compute. Falls through per-expert if it can't run.
     #[cfg(feature = "cuda")]
-    if crate::gpu::expert_group_enabled() {
+    // The gateless ReLU² grouped path is DEFAULT-ON (it declines outside decode, so it
+    // cannot hit the prefill devcopy gap); the fp8 SwiGLU one keeps its opt-in default,
+    // which earlier work chose on prefill evidence. `COLI_EXPERT_GROUP=0` disables both.
+    if (activation().relu2 && crate::gpu::expert_group_relu2_enabled())
+        || crate::gpu::expert_group_enabled()
+    {
         let mut active = Vec::with_capacity(per_expert.len());
         for (e, rows, rw) in &per_expert {
             active.push((provider.expert(layer, *e)?, rows.clone(), rw.clone()));

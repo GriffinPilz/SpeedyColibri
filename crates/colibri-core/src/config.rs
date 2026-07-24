@@ -31,6 +31,26 @@ pub enum Arch {
     /// (silu), standard RMSNorm, no shared expert, all-MoE, per-layer QK-norm,
     /// sigmoid+bias top-k router. Shares the M3 GQA forward path (dims differ).
     MinimaxM2,
+    /// Nemotron-H: hybrid Mamba2 (SSM) + GQA + latent-MoE. The layer sequence is
+    /// heterogeneous by index — see [`Config::layer_kind`]. Mamba2 layers carry a
+    /// recurrent conv+ssm state instead of a KV cache; MoE experts run in a low-rank
+    /// latent space (`moe_latent`) with a gateless ReLU² activation. Only its 8
+    /// attention layers are GQA, so it is NOT blanket [`Arch::is_gqa`] — the
+    /// per-layer `layer_kind` dispatch routes each layer to its mixer.
+    NemotronH,
+}
+
+/// Per-layer mixer type for a hybrid architecture (Nemotron-H). Homogeneous
+/// arches leave [`Config::layer_kind`] empty and never consult this. Parsed from
+/// `hybrid_override_pattern` (`M`→`Mamba`, `E`→`Moe`, `*`→`Attn`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Mamba2 selective-scan (state-space) mixer.
+    Mamba,
+    /// Grouped-query attention mixer.
+    Attn,
+    /// Mixture-of-experts (routed + shared, latent-space) mixer.
+    Moe,
 }
 
 impl Arch {
@@ -111,6 +131,32 @@ pub struct Config {
     /// Sigmoid expert scoring with an additive routing bias (MiniMax-M3
     /// `scoring_func == "sigmoid"` + `e_score_correction_bias`); `false` = GLM.
     pub sigmoid_route: bool,
+
+    // ---- Nemotron-H (hybrid Mamba2/GQA/latent-MoE) fields ----
+    // (GLM/MiniMax leave `layer_kind` empty and the Mamba/latent fields at 0.)
+    /// Per-layer mixer kind, one entry per layer, from `hybrid_override_pattern`.
+    /// Empty for homogeneous arches; drives per-layer dispatch when non-empty.
+    pub layer_kind: Vec<LayerKind>,
+    /// Mamba2 SSM state size (`ssm_state_size`); 0 for non-Mamba arches.
+    pub mamba_d_state: i32,
+    /// Mamba2 causal-conv kernel width (`conv_kernel`).
+    pub mamba_d_conv: i32,
+    /// Mamba2 number of SSM heads (`mamba_num_heads`).
+    pub mamba_n_heads: i32,
+    /// Mamba2 per-head dim (`mamba_head_dim`).
+    pub mamba_head_dim: i32,
+    /// Mamba2 number of B/C groups (`n_groups`), broadcast to `mamba_n_heads`.
+    pub mamba_n_groups: i32,
+    /// Mamba2 inner width = `mamba_n_heads * mamba_head_dim`.
+    pub mamba_inter: i32,
+    /// Mamba2 chunk size for the parallel prefill scan (`chunk_size`).
+    pub mamba_chunk: i32,
+    /// MoE latent bottleneck dim (`moe_latent_size`); experts run in this space.
+    /// 0 = experts run directly in `hidden` (GLM/MiniMax).
+    pub moe_latent: i32,
+    /// ReLU² expert activation (`mlp_hidden_act == "relu2"`): gateless `down(relu(up·x)²)`.
+    /// `false` = the existing gated SwiGLU path.
+    pub relu2: bool,
 }
 
 /// Error from loading/validating a config.
@@ -222,6 +268,10 @@ impl Config {
                 .map(|a| a.iter().any(|v| v.as_str() == Some(name)))
                 .unwrap_or(false)
         };
+        // Nemotron-H: hybrid Mamba2/GQA/latent-MoE, flat config at the root.
+        if model_type == Some("nemotron_h") || arch_is("NemotronHForCausalLM") {
+            return Config::from_json_nemotron(r);
+        }
         // MiniMax-M2: flat config (hyperparameters at the root, no vision tower),
         // same GQA family as M3. Parse from the root object.
         if model_type == Some("minimax_m2") || arch_is("MiniMaxM2ForCausalLM") {
@@ -286,6 +336,17 @@ impl Config {
             swiglu_alpha: 0.0,
             swiglu_limit: 0.0,
             sigmoid_route: false,
+            // Nemotron-H-only fields (unused by GLM).
+            layer_kind: Vec::new(),
+            mamba_d_state: 0,
+            mamba_d_conv: 0,
+            mamba_n_heads: 0,
+            mamba_head_dim: 0,
+            mamba_n_groups: 0,
+            mamba_inter: 0,
+            mamba_chunk: 0,
+            moe_latent: 0,
+            relu2: false,
         };
 
         // rope theta lives under rope_parameters.rope_theta
@@ -439,6 +500,17 @@ impl Config {
             swiglu_alpha: t.get("swiglu_alpha").and_then(Json::as_f64).unwrap_or(1.702) as f32,
             swiglu_limit: t.get("swiglu_limit").and_then(Json::as_f64).unwrap_or(7.0) as f32,
             sigmoid_route: scoring == "sigmoid",
+            // Nemotron-H-only fields (unused by MiniMax).
+            layer_kind: Vec::new(),
+            mamba_d_state: 0,
+            mamba_d_conv: 0,
+            mamba_n_heads: 0,
+            mamba_head_dim: 0,
+            mamba_n_groups: 0,
+            mamba_inter: 0,
+            mamba_chunk: 0,
+            moe_latent: 0,
+            relu2: false,
         };
 
         // eos/stop ids may sit in text_config or at the root.
@@ -453,6 +525,125 @@ impl Config {
         ckr!("rotary_dim", rotary_dim, 1, head_dim);
         ckr!("num_key_value_heads", c.n_kv_heads, 1, c.n_heads);
         ckr!("shared_intermediate_size", c.shared_inter, 0, 1 << 24);
+        Ok(c)
+    }
+
+    /// Nemotron-H (`nemotron_h`) parse — a hybrid Mamba2 / GQA / latent-MoE model.
+    /// The per-layer mixer sequence is read from `hybrid_override_pattern` into
+    /// [`Config::layer_kind`] (`M`→Mamba, `E`→MoE, `*`→attention). The 8 attention
+    /// layers are GQA with **full** RoPE (`partial_rotary_factor == 1.0`), so the head
+    /// geometry folds onto `qk_rope = head_dim`, `qk_nope = 0` (mirroring MiniMax).
+    /// The 40 MoE layers route in a low-rank `moe_latent` space with gateless ReLU²
+    /// experts; the 40 Mamba2 layers carry recurrent conv+ssm state (no KV).
+    fn from_json_nemotron(r: &Json) -> Result<Config, ConfigError> {
+        let gi = |k: &str| gi_in(r, k);
+        let gf = |k: &str, d: f64| r.get(k).and_then(Json::as_f64).unwrap_or(d);
+
+        let head_dim = gi("head_dim");
+        // partial_rotary_factor == 1.0 → full rope over the whole head.
+        let rot = gf("partial_rotary_factor", 1.0);
+        let qk_rope = ((head_dim as f64) * rot).round() as i32;
+        let qk_nope = head_dim - qk_rope;
+
+        // Per-layer mixer kinds from the hybrid pattern; length must == num_hidden_layers.
+        let pattern = r.get("hybrid_override_pattern").and_then(Json::as_str).unwrap_or("");
+        let mut layer_kind: Vec<LayerKind> = Vec::new();
+        for ch in pattern.chars() {
+            let k = match ch {
+                'M' => LayerKind::Mamba,
+                'E' => LayerKind::Moe,
+                '*' => LayerKind::Attn,
+                other => {
+                    return Err(ConfigError::Unsupported(format!(
+                        "nemotron_h: unknown hybrid_override_pattern char '{other}'"
+                    )))
+                }
+            };
+            layer_kind.push(k);
+        }
+
+        let mamba_n_heads = gi("mamba_num_heads");
+        let mamba_head_dim = gi("mamba_head_dim");
+        let mamba_inter = mamba_n_heads * mamba_head_dim;
+
+        let mut c = Config {
+            hidden: gi("hidden_size"),
+            n_layers: gi("num_hidden_layers"),
+            n_heads: gi("num_attention_heads"),
+            n_experts: gi("n_routed_experts"),
+            topk: gi("num_experts_per_tok"),
+            moe_inter: gi("moe_intermediate_size"),
+            // No dense-MLP layers; keep validation happy with a nonzero width (unused).
+            dense_inter: gi("moe_intermediate_size").max(1),
+            first_dense: 0, // MoE layers are index-selected via layer_kind, not a prefix.
+            q_lora: 0,
+            kv_lora: 0,
+            qk_nope,
+            qk_rope,
+            qk_head: head_dim,
+            v_head: head_dim,
+            n_shared: gi("n_shared_experts").max(0),
+            vocab: gi("vocab_size"),
+            max_ctx: gi("max_position_embeddings"),
+            n_group: gi("n_group").max(1),
+            topk_group: gi("topk_group").max(1),
+            norm_topk: r.get("norm_topk_prob").and_then(Json::as_bool).unwrap_or(true),
+            stop_ids: Vec::new(),
+            index_topk: 0,
+            index_nh: 0,
+            index_hd: 0,
+            index_block_size: 0,
+            index_topk_blocks: 0,
+            index_local_blocks: 0,
+            idx_type: Vec::new(),
+            // Nemotron-H uses `layer_norm_epsilon` (also mirrored as `norm_eps`), both 1e-5.
+            eps: gf("layer_norm_epsilon", gf("norm_eps", 1e-5)) as f32,
+            theta: gf("rope_theta", 10000.0) as f32,
+            attn_scale: if head_dim > 0 { 1.0 / (head_dim as f32).sqrt() } else { 0.0 },
+            routed_scale: gf("routed_scaling_factor", 1.0) as f32,
+            arch: Arch::NemotronH,
+            n_kv_heads: gi("num_key_value_heads"),
+            shared_inter: gi("moe_shared_expert_intermediate_size").max(0),
+            qk_norm: false,
+            gemma_norm: false,
+            swiglu_oai: false,
+            swiglu_alpha: 0.0,
+            swiglu_limit: 0.0,
+            // DeepSeek-style sigmoid router with an additive correction bias.
+            sigmoid_route: true,
+            layer_kind,
+            mamba_d_state: gi("ssm_state_size"),
+            mamba_d_conv: gi("conv_kernel"),
+            mamba_n_heads,
+            mamba_head_dim,
+            mamba_n_groups: gi("n_groups").max(1),
+            mamba_inter,
+            mamba_chunk: gi("chunk_size").max(1),
+            moe_latent: gi("moe_latent_size"),
+            relu2: r.get("mlp_hidden_act").and_then(Json::as_str) == Some("relu2"),
+        };
+
+        parse_stop_ids(r, &mut c.stop_ids);
+
+        c.validate_common()?;
+        // GQA + Mamba2-specific ranges.
+        ckr!("head_dim", head_dim, 1, 1 << 16);
+        ckr!("num_key_value_heads", c.n_kv_heads, 1, c.n_heads);
+        ckr!("ssm_state_size", c.mamba_d_state, 1, 1 << 16);
+        ckr!("conv_kernel", c.mamba_d_conv, 1, 64);
+        ckr!("mamba_num_heads", c.mamba_n_heads, 1, 1 << 16);
+        ckr!("mamba_head_dim", c.mamba_head_dim, 1, 1 << 16);
+        ckr!("n_groups", c.mamba_n_groups, 1, c.mamba_n_heads);
+        ckr!("chunk_size", c.mamba_chunk, 1, 1 << 16);
+        ckr!("moe_latent_size", c.moe_latent, 1, 1 << 20);
+        ckr!("moe_shared_expert_intermediate_size", c.shared_inter, 1, 1 << 24);
+        if c.layer_kind.len() != c.n_layers as usize {
+            return Err(ConfigError::Unsupported(format!(
+                "nemotron_h: hybrid_override_pattern length {} != num_hidden_layers {}",
+                c.layer_kind.len(),
+                c.n_layers
+            )));
+        }
         Ok(c)
     }
 
@@ -711,5 +902,62 @@ mod tests {
             Config::from_json(&text),
             Err(ConfigError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn loads_nemotron_h_shape() {
+        // Real NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 hyperparameters, with a short
+        // 8-layer hybrid pattern (M/E/*) standing in for the full 88.
+        let text = Json::parse(
+            r#"{
+            "model_type": "nemotron_h",
+            "hidden_size": 4096, "num_hidden_layers": 8,
+            "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+            "partial_rotary_factor": 1.0, "rope_theta": 10000, "layer_norm_epsilon": 1e-5,
+            "vocab_size": 131072, "max_position_embeddings": 262144,
+            "hybrid_override_pattern": "MEMEMEM*",
+            "n_routed_experts": 512, "num_experts_per_tok": 22, "moe_intermediate_size": 2688,
+            "moe_latent_size": 1024, "moe_shared_expert_intermediate_size": 5376,
+            "n_shared_experts": 1, "routed_scaling_factor": 5.0, "norm_topk_prob": true,
+            "mlp_hidden_act": "relu2",
+            "ssm_state_size": 128, "conv_kernel": 4, "mamba_num_heads": 128,
+            "mamba_head_dim": 64, "n_groups": 8, "chunk_size": 128
+        }"#,
+        )
+        .unwrap();
+        let c = Config::from_json(&text).expect("nemotron_h parse");
+        assert_eq!(c.arch, Arch::NemotronH);
+        assert!(!c.arch.is_gqa(), "NemotronH is not blanket-GQA (per-layer dispatch)");
+        assert_eq!(c.hidden, 4096);
+        assert_eq!(c.n_kv_heads, 2);
+        assert_eq!((c.qk_rope, c.qk_nope, c.qk_head), (128, 0, 128)); // full rope
+        assert_eq!(c.mamba_d_state, 128);
+        assert_eq!((c.mamba_n_heads, c.mamba_head_dim, c.mamba_inter), (128, 64, 8192));
+        assert_eq!((c.mamba_n_groups, c.mamba_d_conv, c.mamba_chunk), (8, 4, 128));
+        assert_eq!((c.moe_latent, c.moe_inter, c.shared_inter), (1024, 2688, 5376));
+        assert!(c.relu2 && c.sigmoid_route && c.norm_topk);
+        assert_eq!(c.routed_scale, 5.0);
+        assert_eq!(
+            c.layer_kind,
+            vec![
+                LayerKind::Mamba, LayerKind::Moe, LayerKind::Mamba, LayerKind::Moe,
+                LayerKind::Mamba, LayerKind::Moe, LayerKind::Mamba, LayerKind::Attn,
+            ]
+        );
+    }
+
+    #[test]
+    fn nemotron_pattern_length_must_match_layers() {
+        let text = Json::parse(
+            r#"{"model_type":"nemotron_h","hidden_size":4096,"num_hidden_layers":8,
+            "num_attention_heads":32,"num_key_value_heads":2,"head_dim":128,
+            "vocab_size":131072,"hybrid_override_pattern":"ME",
+            "n_routed_experts":512,"num_experts_per_tok":22,"moe_intermediate_size":2688,
+            "moe_latent_size":1024,"moe_shared_expert_intermediate_size":5376,
+            "ssm_state_size":128,"conv_kernel":4,"mamba_num_heads":128,"mamba_head_dim":64,
+            "n_groups":8,"chunk_size":128}"#,
+        )
+        .unwrap();
+        assert!(matches!(Config::from_json(&text), Err(ConfigError::Unsupported(_))));
     }
 }

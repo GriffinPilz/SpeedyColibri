@@ -127,6 +127,14 @@ extern "C" {
         y: *mut f32,
         x: *const f32,
     ) -> c_int;
+    fn coli_cuda_expert_group_nvfp4_relu2(
+        ups: *const *mut ColiCudaTensor,
+        downs: *const *mut ColiCudaTensor,
+        rows: *const c_int,
+        count: c_int,
+        y: *mut f32,
+        x: *const f32,
+    ) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn coli_cuda_attention_absorb_batch(
         kv_b: *mut ColiCudaTensor,
@@ -596,6 +604,36 @@ pub unsafe fn expert_group_raw(
     }
     coli_cuda_expert_group(
         gates.as_ptr(),
+        ups.as_ptr(),
+        downs.as_ptr(),
+        rows.as_ptr(),
+        count as c_int,
+        y,
+        x,
+    ) != 0
+}
+
+/// Batched gateless ReLU² NVFP4 expert FFN (Nemotron-H): all `count` experts computed
+/// with ONE H2D + ONE D2H and async kernels on the stream. Per-expert math is identical
+/// to [`expert_mlp_nvfp4_relu2_raw`]; only the transfers are pooled — at decode ~44 µs
+/// of a ~54 µs per-expert call is round-trip, and there are 880 of them per token.
+/// `x`/`y` hold `sum(rows)` consecutive `[up.I]` rows in expert order.
+///
+/// # Safety
+/// The two slices are `count`-long arrays of resident fmt==5 handles on one device;
+/// `x`/`y` hold `sum(rows)*up.I` floats. Handles must outlive the call.
+pub unsafe fn expert_group_nvfp4_relu2_raw(
+    ups: &[*mut ColiCudaTensor],
+    downs: &[*mut ColiCudaTensor],
+    rows: &[i32],
+    y: *mut f32,
+    x: *const f32,
+) -> bool {
+    let count = ups.len();
+    if count == 0 || downs.len() != count || rows.len() != count {
+        return false;
+    }
+    coli_cuda_expert_group_nvfp4_relu2(
         ups.as_ptr(),
         downs.as_ptr(),
         rows.as_ptr(),

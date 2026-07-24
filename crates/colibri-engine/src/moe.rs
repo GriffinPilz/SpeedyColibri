@@ -938,7 +938,14 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         for (e, rows, rw) in &per_expert {
             active.push((provider.expert(layer, *e)?, rows.clone(), rw.clone()));
         }
-        if crate::gpu::try_expert_group(&active, activations, d, &mut out) {
+        // Gateless ReLU² (Nemotron-H) has its own grouped kernel — the fp8 one is SwiGLU
+        // and would read a gate tensor these experts don't ship.
+        let grouped = if activation().relu2 {
+            crate::gpu::try_expert_group_relu2(&active, activations, d, &mut out)
+        } else {
+            crate::gpu::try_expert_group(&active, activations, d, &mut out)
+        };
+        if grouped {
             return Ok(out);
         }
     }

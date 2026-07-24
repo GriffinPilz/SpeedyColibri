@@ -95,6 +95,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            const int *rows, int count,
                            float *y, const float *x);
 
+/* Packed group of same-shaped gateless ReLU² NVFP4 experts (Nemotron-H). Same math as
+ * coli_cuda_expert_mlp_nvfp4_relu2 per expert, but the whole group shares ONE H2D and
+ * ONE D2H — the per-expert round-trip is ~44 us of the ~54 us a call costs at decode.
+ * Requires fmt==5 on every up/down. Inputs and outputs contain sum(rows) consecutive
+ * [up->I] rows in call order. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           float *y, const float *x);
+
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,
                                const float *latent,const float *rope,int H,int Q,

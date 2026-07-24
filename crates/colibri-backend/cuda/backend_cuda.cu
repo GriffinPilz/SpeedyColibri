@@ -1586,6 +1586,76 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     return 1;
 }
 
+/* Grouped gateless ReLU² NVFP4 experts (Nemotron-H): the coli_cuda_expert_group idea
+ * applied to the two-tensor relu² expert. The math is byte-for-byte the single-expert
+ * coli_cuda_expert_mlp_nvfp4_relu2 — same nvfp4_gemv / nvfp4_matmul, same relu2_inplace,
+ * same per-expert accumulation order — only the transfers are pooled: ONE H2D of all
+ * rows and ONE D2H of all results per call instead of a synchronous round-trip each.
+ * That is the whole point: the measured decode cost is 22 experts x 40 layers = 880
+ * calls/token at ~54 us, of which only ~10 us is kernel; ~44 us is round-trip. Kernels
+ * are enqueued back-to-back on ctx->stream and only synchronized once, at the download.
+ *
+ * x/y hold sum(rows) consecutive [D] rows in expert order (D = up->I, the MoE latent for
+ * Nemotron-H); rows[c] is expert c's row count. Zero-copy only, like the single-expert
+ * path — no devcopy staging, because the NVFP4 weight scratch (ctx->ewu/ebsu) is a single
+ * buffer and a group would need one per expert; decode reads each expert's weights once
+ * anyway, so staging would be pure added copy. No GroupDesc upload either: each expert
+ * gets its own launch trio with host-side pointers, so there is no ≤64 count cap here
+ * (the Rust caller still chunks at 64 to share the shape of the fp8 group path). */
+extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
+        ColiCudaTensor *const *downs,const int *rows,int count,float *y,const float *x){
+    if(!ups||!downs||!rows||!x||!y||count<1)return 0;
+    ColiCudaTensor *first=ups[0]; if(!first)return 0;
+    int device=first->device,D=first->I,I=first->O,total=0;
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *u=ups[c],*d=downs[c];
+        if(!u||!d||rows[c]<1||u->fmt!=5||d->fmt!=5||u->device!=device||d->device!=device||
+           u->I!=D||u->O!=I||d->I!=I||d->O!=D)return 0;
+        total+=rows[c];
+    }
+    DeviceContext *ctx=find_ctx(device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    size_t xb=(size_t)total*D*sizeof(float),ib=(size_t)total*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->up,&ctx->up_cap,ib)||
+       !reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert group nvfp4 relu2 input upload"))return 0;
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+    int tpb=256,wpb=tpb>>5,off=0;
+    for(int c=0;c<count;c++){
+        int r=rows[c];
+        const uint8_t *uw=(const uint8_t*)ups[c]->weights,*dw=(const uint8_t*)downs[c]->weights;
+        const uint8_t *ubs=(const uint8_t*)ups[c]->bscale,*dbs=(const uint8_t*)downs[c]->bscale;
+        float ug=ups[c]->gscale,dg=downs[c]->gscale;
+        // This expert's slice of the pooled buffers: rows [off, off+r).
+        float *xc=ctx->x+(size_t)off*D,*tc=ctx->up+(size_t)off*I,*yc=ctx->y+(size_t)off*D;
+        if(r==1&&!s_tiled){
+            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ug,D,I);
+            relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tc,(size_t)I);
+            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,dg,I,D);
+        }else{
+            dim3 hidden((unsigned)((I+63)/64),(unsigned)((r+15)/16));
+            dim3 output((unsigned)((D+63)/64),(unsigned)((r+15)/16));
+            nvfp4_matmul<<<hidden,128,0,ctx->stream>>>(tc,xc,uw,ubs,ug,r,D,I);
+            relu2_inplace<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(tc,(size_t)r*I);
+            nvfp4_matmul<<<output,128,0,ctx->stream>>>(yc,tc,dw,dbs,dg,r,I,D);
+        }
+        off+=r;
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert group nvfp4 relu2 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert group nvfp4 relu2 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group nvfp4 relu2 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+    return 1;
+}
+
 
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,

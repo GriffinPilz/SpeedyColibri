@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
 | prefill bench | PASS | PASS | PASS | PASS 33.1 s / 15.5 tok/s |
-| decode bench | PASS | PASS 1.99 | PASS | PASS **7.11 tok/s** |
+| decode bench | PASS | PASS 2.07 | PASS | PASS **8.00 tok/s** |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
 | chat template in serve | PASS | PASS (GLM-style) | PASS (M2 format) | PASS ChatML, PR #8 |
@@ -39,7 +39,8 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | sliding-window attention | **NEG** lose-lose | N/A | N/A | TODO |
 | 2-node expert-parallel | PASS 1.38× | TODO | TODO | TODO |
 | TP attention (2-node) | PASS | TODO | TODO | TODO |
-| **S==1 GEMV dispatch** | TODO re-measure | PASS no regression | TODO re-measure | PASS **1.53×** (PR #13) |
+| **S==1 tile bypass** | TODO re-measure | PASS no regression | TODO re-measure | PASS **1.53×** (PR #13) |
+| **dedicated i8a16_gemv** | TODO re-measure | PASS +4% | TODO re-measure | PASS **1.12×** (PR #15) |
 | long context (>32k) | TODO | TODO | TODO | PASS 1M w/ COLI_ALLOW_LONG_CTX |
 
 ## Per-model notes
@@ -60,9 +61,11 @@ gateless ReLU² in a 1024-wide latent space. NVFP4 routed experts.
   in/out-proj 71.0 ms (28.7%) · shared expert 50.9 (20.6%) · routed gpu-ffn 45.0 (18.2%) ·
   expert-load 20.3 · scan 12.8 · attention 12.7 (the transformer part of this hybrid is nearly
   free). ~8.9 GB/token at 247 ms = **36 GB/s against ~273 GB/s peak** — a kernel-shape problem,
-  NOT dispatch (launch cost is ~4%, so CUDA graphs would not have paid). PR #13 fixed the
-  biggest slice; at 7.11 tok/s we are still only ~62 GB/s, so headroom remains. Next lever: a
-  dedicated `i8a16_gemv` mirroring the existing `fp8a16_gemv`, then MTP.
+  NOT dispatch (launch cost is ~4%, so CUDA graphs would not have paid). PR #13 (tile
+  bypass, 1.53×) then PR #15 (dedicated `i8a16_gemv`, 1.12×) took decode **4.65 → 8.00 tok/s
+  = 1.72×**, all token-identical. Still only ~70 GB/s of ~273, so headroom remains. Next
+  levers: the **shared expert** (20.6% of decode at the worst efficiency, 35 GB/s; it is
+  gateless ReLU² so the fused kernel shape already exists), then **MTP**.
 - **BROKEN — prefill scratch is unreserved.** Measured peak-RSS slope **210 KB/token**
   (2 reps: 214.5 / 206.2) against the **24 KB/token** serve reserves. The Mamba mixer allocates
   per-layer buffers that scale with prompt length (`proj` 18560 + `gate` 8192 + `hbc` 10240 +

@@ -120,18 +120,40 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
     let model_id = model_id_from(&snap);
-    // Served context length (prompt + completion). The model's hard ceiling is
-    // `max_position_embeddings`; the served value is COLI_CTX (else a memory-safe
-    // default), clamped to that ceiling. Requests are validated against it.
+    // Served context length (prompt + completion). The served value is COLI_CTX (else a
+    // memory-safe default), clamped to the model ceiling. Requests are validated against it.
     //
     // Computed *before* the expert-cache budget: the budget has to reserve the KV
     // this window can allocate, and KV is sized from ctx_len.
-    let model_max = if model.cfg.max_ctx > 0 { model.cfg.max_ctx as usize } else { usize::MAX };
+    //
+    // `max_position_embeddings` is NOT always a hard architectural ceiling. For a NoPE
+    // model there is no positional-embedding table to overflow — Nemotron-H's 8 attention
+    // layers apply no rope at all (position comes from the Mamba layers), so its 262144 is
+    // an advisory default while the model card documents support "up to 1M tokens". The
+    // upstream runtimes treat it the same way: vLLM needs VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+    // and SGLang SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 to exceed it.
+    //
+    // COLI_ALLOW_LONG_CTX=1 is our equivalent. It stays opt-in rather than automatic:
+    // running past the length a model was validated at is a quality decision, not a
+    // memory one, and the RAM clamp below still applies either way.
+    let allow_long = std::env::var("COLI_ALLOW_LONG_CTX").is_ok_and(|v| v != "0");
+    let model_max = match (model.cfg.max_ctx, allow_long) {
+        (m, false) if m > 0 => m as usize,
+        _ => usize::MAX,
+    };
     let requested_ctx = std::env::var("COLI_CTX")
         .ok()
         .and_then(|s| parse_ctx(&s))
         .unwrap_or(DEFAULT_CTX)
         .clamp(1, model_max);
+    if allow_long && model.cfg.max_ctx > 0 && requested_ctx > model.cfg.max_ctx as usize {
+        eprintln!(
+            "[serve] COLI_ALLOW_LONG_CTX: serving {requested_ctx} tokens, past this model's \
+             advertised max_position_embeddings ({}). Valid for NoPE models (no positional \
+             table to overflow); output quality past the validated length is not guaranteed.",
+            model.cfg.max_ctx
+        );
+    }
     // Also clamp to what RAM can actually hold: a full-window request's KV
     // (`kv_bytes_per_token * ctx * copies`, non-evictable) must fit alongside the dense
     // tier + a minimal streaming expert cache + the OOM floor. Reserve ~18 GB for those;

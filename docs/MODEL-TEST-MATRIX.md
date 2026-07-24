@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
 | prefill bench | PASS | PASS | PASS | PASS 33.1 s / 15.5 tok/s |
-| decode bench | PASS | PASS 2.07 | PASS | PASS **8.00 tok/s** |
+| decode bench | PASS | PASS 2.07 | PASS | PASS **8.3 tok/s** |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
 | chat template in serve | PASS | PASS (GLM-style) | PASS (M2 format) | PASS ChatML, PR #8 |
@@ -41,6 +41,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | TP attention (2-node) | PASS | TODO | TODO | TODO |
 | **S==1 tile bypass** | TODO re-measure | PASS no regression | TODO re-measure | PASS **1.53×** (PR #13) |
 | **dedicated i8a16_gemv** | TODO re-measure | PASS +4% | TODO re-measure | PASS **1.12×** (PR #15) |
+| **grouped nvfp4 relu2 experts** | N/A (fp8+gate) | N/A | N/A | PASS **+2.5%** decode-only (PR #19) |
 | long context (>32k) | TODO | TODO | TODO | PASS 1M w/ COLI_ALLOW_LONG_CTX |
 
 ## Per-model notes
@@ -76,10 +77,15 @@ gateless ReLU² in a 1024-wide latent space. NVFP4 routed experts.
   the GEMV work fixed. A planned "fused int8 relu² shared-expert kernel" was dropped after
   this re-profile showed it would chase a 1.5% slice.
 
-  **Next lever: grouped expert dispatch.** The counters show `38,371 fused expert FFNs` for
-  prefill+25 decode — i.e. **22 experts × 40 layers = 880 separate kernel calls per token**,
-  each with its own H2D/D2H round-trip. One grouped call per layer would be 40 dispatches per
-  token instead of 880. Not a faster kernel — fewer of them.
+  **Grouped expert dispatch: DONE, and it was only +2.5%** (PR #19). The 880 calls/token
+  (22 experts × 40 layers) *are* real, but grouping them removed only the memcpy round-trips —
+  it still launches 3 kernels per expert, and more importantly **NVFP4 experts are ZERO-COPY
+  HOST READS, not VRAM**. ~51 GB/s is plausibly that ceiling, which no amount of grouping
+  moves. A prediction of ~4× on this slice (13.8 tok/s) was wrong for exactly that reason.
+
+  ⚠️ **This rules out cheaper expert dispatch as a decode lever.** The slice is bandwidth-bound
+  on host reads and device-resident experts are a known 22.7× regression ([[zerocopy-is-load-bearing]]).
+  What remains: **fewer forwards (MTP)** or **fewer bytes**, not faster dispatch.
 
 ### minimax-m3 / minimax-m2.7 — GQA transformers
 Most infra is shared via `arch.is_gqa()`. M2.7 adds per-layer QK-norm.
@@ -105,7 +111,7 @@ only when someone measures it — not when it seems obvious.
 |---|---|---|---|
 | **S==1 tile bypass** (PR #13, 1.53×) | nemotron | **glm, m2.7** (m3 spot-checked, no regression) | UNMEASURED — every model decodes at S==1 |
 | **dedicated `i8a16_gemv`** (PR #15, 1.12×) | nemotron | **glm, m2.7** (m3 +4%) | UNMEASURED — same path, any int8 resident weight |
-| **grouped expert dispatch** (880 calls/token) | nemotron | **glm** (top-8 × ~90L ≈ 720/tok), **m2.7** (top-8 × 62L ≈ 496/tok) | IN PROGRESS on nemotron |
+| ~~grouped expert dispatch~~ | nemotron | — | **DONE, +2.5% only** — the slice is bandwidth-bound on zero-copy host reads (~51 GB/s), not dispatch-bound. Low value elsewhere |
 | **prefill scratch unreserved** (210 vs 24 KB/tok) | nemotron | **glm, m3, m2.7** | UNMEASURED — transformers allocate S×S attention scores, so possibly worse |
 | **MTP head dropped at convert** | nemotron (bug), glm (fixed earlier) | — | m3/m2.7 have no head in their quants |
 | **chat-template arm required in serve.rs** | nemotron (was serving GLM markers) | any new arch | it is a 4th edit, not the documented 3 |

@@ -1548,7 +1548,6 @@ mod tests {
         let hi = ConvertOpts { ebits: 16, ..Default::default() };
         assert!(!hi.xfp8, "raising ebits must not drag the experts up with it");
     }
-    use super::*;
     use std::path::PathBuf;
 
     fn tmp() -> PathBuf {

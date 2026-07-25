@@ -32,7 +32,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | KV reservation accounting | PASS | PASS | PASS | PASS after PR #10 (was 3.7× over) |
 | grow-on-demand KV | PASS | PASS | PASS | PASS 3301-tok prompt, no OOM |
 | **prefill scratch reservation** | TODO | TODO | TODO | **BROKEN** 210 vs 24 KB/tok |
-| **MTP / speculative decode** | PASS (break-even) | N/A no head | N/A no head in quant | **TODO — head is DROPPED at convert** |
+| **MTP / speculative decode** | PASS (break-even) | N/A no head | N/A no head in quant | **NEG (blocked)** head loads + 77% accept, but output DIVERGES and it is 1.18× SLOWER |
 | COLI_PREFETCH_AHEAD | PASS 1.58× | PASS 1.26× | TODO | TODO |
 | COLI_RAM_GB sweep | PASS (flat) | TODO | TODO | TODO |
 | hot-expert autopin | **NEG** ~10% loss | TODO | TODO | TODO |
@@ -87,6 +87,48 @@ gateless ReLU² in a 1024-wide latent space. NVFP4 routed experts.
   on host reads and device-resident experts are a known 22.7× regression ([[zerocopy-is-load-bearing]]).
   What remains: **fewer forwards (MTP)** or **fewer bytes**, not faster dispatch.
 
+- **MTP / speculative decode — head now converts and loads, but the lever is BLOCKED twice.**
+  The head was being dropped outright at convert (`mtp.*` → `None`); it is now mapped into
+  `model.layers.{88,89}` and loads (`has_mtp=true`). All 1040 source tensors convert
+  (1033 quantized + 7 f32, 1.7 GB, 4 s via `COLI_MTP_ONLY=1` — no 67 GB re-convert).
+  Nemotron's head is TWO sublayers (`mtp_hybrid_override_pattern == "*E"`) where GLM's is one.
+
+  Measured on a 32-token prompt, `COLI_NGEN=24`, arms interleaved, 2 reps each. **These are
+  NOT comparable to the 8.4 tok/s registry-prompt bench — only the within-run A/B is.**
+
+  | arm | acceptance | tok/forward | ms/forward | ms/token | tokens |
+  |---|---|---|---|---|---|
+  | DRAFT=0 | — | 1.00 | 292 | **292** | `173c8cc8` |
+  | DRAFT=1 | **77%** (10/13) | 1.85 | 636 | **344** (1.18× slower) | `4b201eb9` ✗ |
+  | DRAFT=2 | 46% (11/24) | 2.00 | 770 | **385** (1.31× slower) | `3aa6ae18` ✗ |
+
+  1. ⚠️ **CORRECTNESS: speculation changes the output.** Each arm is deterministic across reps
+     and they disagree with each other — this is real divergence, not noise. **Mamba recurrent
+     state is not rolled back on a rejected draft.** The verify forward runs `[next, drafts…]`
+     and `mamba2_mixer` advances conv + SSM state in place for every token in the batch
+     (`kv.mamba_conv_row_mut`, `selective_scan` mutating `state.data`); on partial acceptance
+     the rejected tokens are permanently baked into the state. Attention KV is fine — stale
+     rows get overwritten — which is why **this never bit GLM**. There is no snapshot/rollback
+     anywhere in the engine. The sequences share their first 12 tokens then split, the
+     signature of accumulating drift rather than a broken head.
+     Fix: snapshot conv+SSM (~166 MiB: 40 layers × 128 heads × 64 × 128 f32) before verify,
+     cache per-token mixer inputs (~5 MB), restore + replay the *scan only* for the accepted
+     prefix. ~1 ms/step always + ~10–20 ms per rejection.
+  2. ⚠️ **PERF: the verify forward falls off every decode fast path.** `expert-load` is
+     *unchanged* between arms (8077 vs 8060 ms) — extra expert bytes are NOT the cost, it is
+     compute. All three of the decode wins are gated to a single row: the tile bypass
+     (`backend_cuda.cu:1192`, `S == 1`), `i8a16_gemv` (`:1200`, `S == 1`), and grouped NVFP4
+     relu² (`gpu.rs:919`, `rows.len() != 1`). MTP verifies at S=2, so it silently reverts to
+     the pre-#13 slow path. Consistent with the arithmetic: those PRs were 1.79× cumulative,
+     so a slow-path 1-tok forward ≈ 292 × 1.79 ≈ 523 ms and a 2-tok one somewhat more —
+     measured 637. (Diagnosis inferred from the gating + the timing match; NOT yet proven by
+     forcing the fast path at S=2.)
+
+  **The 77% acceptance says the head itself is good** — a mis-converted head sits near 0%.
+  Both blockers must be fixed for MTP to pay, and #1 makes it slower still. Estimated payoff
+  if small-S dispatch lands: 2-tok forward ≈ 356 ms → ~192 ms/token, **~1.5×**.
+  Do NOT re-run MTP on Nemotron expecting a win until small-S dispatch exists.
+
 ### minimax-m3 / minimax-m2.7 — GQA transformers
 Most infra is shared via `arch.is_gqa()`. M2.7 adds per-layer QK-norm.
 - M3 batching is a **monotonic loss** (2.47→1.46 tok/s, B1→B32) — the opposite of GLM's win.
@@ -113,7 +155,9 @@ only when someone measures it — not when it seems obvious.
 | **dedicated `i8a16_gemv`** (PR #15, 1.12×) | nemotron | **glm, m2.7** (m3 +4%) | UNMEASURED — same path, any int8 resident weight |
 | ~~grouped expert dispatch~~ | nemotron | — | **DONE, +2.5% only** — the slice is bandwidth-bound on zero-copy host reads (~51 GB/s), not dispatch-bound. Low value elsewhere |
 | **prefill scratch unreserved** (210 vs 24 KB/tok) | nemotron | **glm, m3, m2.7** | UNMEASURED — transformers allocate S×S attention scores, so possibly worse |
-| **MTP head dropped at convert** | nemotron (bug), glm (fixed earlier) | — | m3/m2.7 have no head in their quants |
+| **MTP head dropped at convert** | nemotron (bug), glm (fixed earlier) | — | FIXED on nemotron; m3/m2.7 have no head in their quants |
+| **decode fast paths are gated to S==1** (tile bypass, `i8a16_gemv`, grouped relu²) | nemotron | **glm, m3, m2.7 — and any small-S path anywhere** | UNMEASURED. Anything running at S=2..4 (MTP verify, short batches, chunked prefill tails) silently gets the SLOW kernel. On nemotron this alone turns a 77%-acceptance MTP into a 1.18× loss |
+| **Mamba state is not rolled back on a rejected draft** | nemotron | any future hybrid/recurrent arch | Structural, not a Nemotron quirk: speculation is unsound on ANY in-place recurrent mixer. Pure-attention arches are unaffected (stale KV is overwritten) |
 | **chat-template arm required in serve.rs** | nemotron (was serving GLM markers) | any new arch | it is a 4th edit, not the documented 3 |
 | **`COLI_PREFETCH_AHEAD`** (glm 1.58×, m3 1.26×) | glm, m3 | **nemotron, m2.7** | UNMEASURED |
 | **hot-expert autopin** (glm: ~10% LOSS) | glm | do NOT assume for others | glm streams from disk; nemotron's experts are RAM-resident — different regime |
@@ -140,5 +184,19 @@ carried from GLM to Nemotron and cost a wrong diagnosis.
    touched `coli_cuda_matmul` and silently re-ranked everything downstream: the shared expert
    went 20.6% → 1.5% and mamba proj 28.7% → 20.7% without either being touched directly. A
    "next lever" chosen off a pre-change profile can be chasing a slice that no longer exists.
-6. **Interleave A/B arms (0 1 0 1), never all-of-A then all-of-B.** A cold post-rebuild run landed
+6. **A kernel fast path gated on `S == 1` is a trap for every non-decode-shaped caller.**
+   Three separate S==1 gates (tile bypass, `i8a16_gemv`, grouped relu²) meant MTP's 2-token
+   verify forward reverted to the pre-optimization kernel with no warning — a 1.79× penalty
+   applied silently. When gating an optimization on shape, grep for every caller that could
+   hit an adjacent shape.
+7. **Speculation is unsound on any in-place recurrent mixer.** The accept-longest-prefix
+   trick assumes rejected work can be discarded by overwriting; that holds for attention KV
+   and NOT for Mamba conv/SSM state. Check this before enabling MTP on a new architecture.
+8. **Hash the token line, not the whole stdout.** A first attempt at the MTP A/B md5'd all of
+   `coli gen`'s output, which includes a VRAM-summary line that varies run to run — it would
+   have manufactured a "divergence" between two identical arms. Gate on `generated (N tok):`.
+9. **`tok/s` in the decode timer is per FORWARD, not per token.** With speculation a forward
+   emits >1 token, so the printed figure understates throughput. Convert via `tok/forward`
+   before comparing to a non-speculative arm — raw, DRAFT=2 looks 2.6× slower than it is.
+10. **Interleave A/B arms (0 1 0 1), never all-of-A then all-of-B.** A cold post-rebuild run landed
    entirely on one arm and turned a true 1.12× into an apparent 1.5×. Discard a warmup too.

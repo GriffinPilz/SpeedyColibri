@@ -43,12 +43,12 @@ pub use usage::UsageHistory;
 pub use colibri_core::{Config, QTensor};
 pub use forward::{
     forward, forward_batched, generate_greedy, generate_stream, generate_stream_drafting,
-    layer_forward, logits, mamba2_mixer, DecodeStats,
+    layer_forward, layer_forward_kind, logits, mamba2_mixer, DecodeStats,
 };
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
-pub use model::{KvCache, Layer, Model, MtpHead, KV_UNSET};
+pub use model::{KvCache, Layer, Model, MtpBlock, MtpHead, KV_UNSET};
 pub use moe::{
     cluster_ctx, compute_experts_partial, dense_mlp, moe, moe_sharded, nemotron_moe, route,
     set_activation, set_cluster, ClusterCtx, Expert, ExpertLayout, ExpertProvider,
@@ -266,6 +266,21 @@ fn load_layer_nemotron(
     i: usize,
     dbits: u32,
 ) -> Result<Layer, EngineError> {
+    load_layer_nemotron_kind(shards, cfg, i, dbits, cfg.layer_kind[i])
+}
+
+/// [`load_layer_nemotron`] with the mixer kind supplied instead of looked up.
+///
+/// The MTP head's sublayers live at `i >= n_layers`, past the end of `cfg.layer_kind`
+/// (which is `num_hidden_layers` long and describes the main stack only), so they cannot
+/// look their own kind up — see `Config::mtp_layer_kind`.
+fn load_layer_nemotron_kind(
+    shards: &colibri_safetensors::Shards,
+    cfg: &Config,
+    i: usize,
+    dbits: u32,
+    kind: LayerKind,
+) -> Result<Layer, EngineError> {
     let d = cfg.hidden as usize;
     let p = |s: &str| format!("model.layers.{i}.{s}");
     let mut l = Layer::default();
@@ -274,7 +289,7 @@ fn load_layer_nemotron(
     // `layers.N.norm.weight`), so the generic completeness check finds it.
     l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
 
-    match cfg.layer_kind[i] {
+    match kind {
         LayerKind::Mamba => {
             let nh = cfg.mamba_n_heads as usize;
             let d_inner = cfg.mamba_inter as usize;
@@ -335,6 +350,14 @@ fn load_mtp(
     cfg: &Config,
     dbits: u32,
 ) -> Result<Option<MtpHead>, EngineError> {
+    // `MTP=0` disables any head, on every architecture. Checked before the per-arch
+    // probes so the env override cannot be defeated by tensor layout.
+    if std::env::var("MTP").ok().as_deref() == Some("0") {
+        return Ok(None);
+    }
+    if cfg.arch == Arch::NemotronH {
+        return load_mtp_nemotron(shards, cfg, dbits);
+    }
     let i = cfg.n_layers as usize;
     let last_e = (cfg.n_experts - 1).max(0) as usize;
     // Same required set as the C, with the last expert index taken from the
@@ -361,22 +384,192 @@ fn load_mtp(
     if !required.iter().all(|s| shards.has(&format!("model.layers.{i}.{s}"))) {
         return Ok(None);
     }
-    if std::env::var("MTP").ok().as_deref() == Some("0") {
-        return Ok(None);
-    }
 
     let d = cfg.hidden as usize;
     let p = |s: &str| format!("model.layers.{i}.{s}");
     // The head's block is always sparse (C: `l->sparse = 1`).
     let layer = load_layer(shards, cfg, i, dbits, true)?;
     Ok(Some(MtpHead {
-        layer,
+        // GLM/M3: exactly one block, and no `kind` — those arches never consult one.
+        blocks: vec![MtpBlock { layer, kind: None }],
         // [D, 2D]: consumes the concatenated [embed_normed ; hidden_normed].
         eh_proj: qt_load(shards, &p("eh_proj.weight"), d, 2 * d, dbits)?,
         enorm: ld(shards, &p("enorm.weight"))?,
         hnorm: ld(shards, &p("hnorm.weight"))?,
         mtp_norm: ld(shards, &p("shared_head.norm.weight"))?,
     }))
+}
+
+/// Load the Nemotron-H MTP head, which is **two** sublayers rather than GLM's one:
+/// `mtp_hybrid_override_pattern == "*E"` — a NoPE-GQA attention block at layer index
+/// `n_layers`, then a gateless latent-MoE block at `n_layers + 1`. Both load through the
+/// ordinary [`load_layer_nemotron`] (same `mixer.*` names, same canonical
+/// `input_layernorm.weight`), which is the whole point of the container mapping in
+/// `convert::nemotron_container_name`: the head is just two more layers.
+///
+/// The fusion tensors (`eh_proj`/`enorm`/`hnorm`) and the head's final norm
+/// (`shared_head.norm.weight`, from the source's `mtp.layers.1.final_layernorm`) all sit
+/// at the head's BASE index, sharing GLM's names — so the two loaders differ only in the
+/// sublayer list, not in the head's own plumbing.
+///
+/// Same completeness contract as GLM: probe every required tensor first and return
+/// `None` on any gap. A half-loaded head drafts garbage, and the head's tensors span
+/// several shards, so a truncated conversion is the realistic failure. The routed
+/// experts of sublayer 1 stream through the provider at layer index `n_layers + 1`, so
+/// only the first and last are probed (they land on different shards than the rest).
+fn load_mtp_nemotron(
+    shards: &colibri_safetensors::Shards,
+    cfg: &Config,
+    dbits: u32,
+) -> Result<Option<MtpHead>, EngineError> {
+    // The head's sublayer kinds come from the config, not from the tensor layout: a
+    // checkpoint with no `mtp_hybrid_override_pattern` has no head to load.
+    if cfg.mtp_layer_kind.is_empty() {
+        return Ok(None);
+    }
+    let base = cfg.n_layers as usize;
+    let last_e = (cfg.n_experts - 1).max(0) as usize;
+
+    // Per-sublayer required tensors, derived from the sublayer's kind so a future head
+    // shape (e.g. a Mamba sublayer) is a matter of extending this match, not the caller.
+    let mut required: Vec<String> = vec![
+        format!("model.layers.{base}.eh_proj.weight"),
+        format!("model.layers.{base}.enorm.weight"),
+        format!("model.layers.{base}.hnorm.weight"),
+        format!("model.layers.{base}.shared_head.norm.weight"),
+    ];
+    for (j, kind) in cfg.mtp_layer_kind.iter().enumerate() {
+        let li = base + j;
+        required.push(format!("model.layers.{li}.input_layernorm.weight"));
+        let m = |s: &str| format!("model.layers.{li}.mixer.{s}");
+        match kind {
+            LayerKind::Attn => required.extend([
+                m("q_proj.weight"),
+                m("k_proj.weight"),
+                m("v_proj.weight"),
+                m("o_proj.weight"),
+            ]),
+            LayerKind::Moe => required.extend([
+                m("gate.weight"),
+                m("gate.e_score_correction_bias"),
+                m("fc1_latent_proj.weight"),
+                m("fc2_latent_proj.weight"),
+                m("shared_experts.up_proj.weight"),
+                m("shared_experts.down_proj.weight"),
+                m("experts.0.up_proj.weight"),
+                m(&format!("experts.{last_e}.down_proj.weight")),
+            ]),
+            LayerKind::Mamba => required.extend([
+                m("in_proj.weight"),
+                m("out_proj.weight"),
+                m("conv1d.weight"),
+                m("A_log"),
+                m("D"),
+                m("dt_bias"),
+                m("norm.weight"),
+            ]),
+        }
+    }
+    if !required.iter().all(|s| shards.has(s)) {
+        return Ok(None);
+    }
+
+    let d = cfg.hidden as usize;
+    let p = |s: &str| format!("model.layers.{base}.{s}");
+    let mut blocks = Vec::with_capacity(cfg.mtp_layer_kind.len());
+    for (j, &kind) in cfg.mtp_layer_kind.iter().enumerate() {
+        // `load_layer_nemotron` normally reads `cfg.layer_kind[li]`, which does not extend
+        // to the head — hence the explicit-kind entry point. `sparse` is unused on this
+        // path (the Nemotron loader keys off the kind), so pass the kind's own answer.
+        let mut layer = load_layer_nemotron_kind(shards, cfg, base + j, dbits, kind)?;
+        // The `gpu_eligible` trap: a resident weight left off this list silently takes the
+        // single-threaded CPU matmul (it cost 84% of an M3 prefill and 94% of Nemotron's
+        // mamba before those were caught). The main stack is marked in `load_model_with`,
+        // which iterates `model.layers` only — the head is not in that vector, so mark it
+        // here or every draft step runs its projections on one core.
+        mark_gpu_eligible(&mut layer);
+        blocks.push(MtpBlock { layer, kind: Some(kind) });
+    }
+    Ok(Some(MtpHead {
+        blocks,
+        eh_proj: qt_load(shards, &p("eh_proj.weight"), d, 2 * d, dbits)?,
+        enorm: ld(shards, &p("enorm.weight"))?,
+        hnorm: ld(shards, &p("hnorm.weight"))?,
+        mtp_norm: ld(shards, &p("shared_head.norm.weight"))?,
+    }))
+}
+
+/// Mark a layer's resident weights as GPU-cacheable.
+///
+/// **The `gpu_eligible` trap**: a resident weight missing from these lists silently takes
+/// `matmul_qt`'s single-threaded CPU path. That has cost 84% of an M3 prefill (q/k/v),
+/// 94% of Nemotron's mamba total (in/out_proj) and ~25 s of a 40 s Nemotron MoE phase
+/// (fc1/fc2). The tell is a phase total far exceeding the sum of its GPU sub-timers.
+/// Marking is token-identical — it only changes which kernel runs. Audit this function
+/// when adding any architecture.
+///
+/// Lives as a free function because the MTP head's sublayers are NOT in `model.layers`
+/// and so are never reached by the loop in [`load_model_with`].
+fn mark_gpu_eligible(l: &mut Layer) {
+    for t in [
+        &mut l.q_a,
+        &mut l.q_b,
+        &mut l.kv_a,
+        &mut l.kv_b,
+        &mut l.o,
+        &mut l.gate_proj,
+        &mut l.up_proj,
+        &mut l.down_proj,
+        &mut l.sh_gate,
+        &mut l.sh_up,
+        &mut l.sh_down,
+    ] {
+        t.gpu_eligible = true;
+    }
+    // DSA indexer projections: batched in `indexer_forward`, so they want the GPU.
+    // `matmul_qt`'s CPU path is single-threaded — a batched call on one core is
+    // *slower* than the old per-query GEMVs spread across the indexer's worker
+    // threads (measured: 46s -> 81s). On the GPU the batched form is the fast one.
+    for t in [&mut l.ix_wk, &mut l.ix_wq, &mut l.ix_wp] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
+    // MiniMax-M3 GQA attention projections (Option; absent on the GLM path). These
+    // are the resident q/k/v projections and the block-sparse indexer projections —
+    // dense int8 weights that route through `matmul_qt`. WITHOUT this they fall to
+    // the single-threaded CPU path: the COLI_PROFILE breakdown measured the q/k/v
+    // projections at 197 s of a 236 s / 512-tok prefill (84%!) — dwarfing both the
+    // attention core (5.6 s) and expert I/O (31 s). `l.o` (o_proj) is already marked
+    // above via the GLM list, which is why it was fast; these were simply omitted.
+    for t in [&mut l.qkv_proj, &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.idx_q_proj, &mut l.idx_k_proj] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
+    // Nemotron-H Mamba2 in_proj/out_proj — resident dense int8 weights routed through
+    // `matmul_qt`. WITHOUT this they fall to the single-threaded CPU path: the mamba
+    // COLI_PROFILE breakdown measured them at 9322 ms of a 9945 ms mamba total (94%),
+    // dwarfing the selective scan (451 ms). Same omission as the M3 q/k/v projections
+    // above; marking them eligible routes them to the GPU int8 matmul (token-identical).
+    for t in [&mut l.mamba_in_proj, &mut l.mamba_out_proj] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
+    // Nemotron-H latent-MoE fc1/fc2 — the resident dense projections that lift x into
+    // the shared moe_latent space (hidden->1024) and back (1024->hidden) around the
+    // routed experts. `nemotron_moe` runs them through `matmul_qt`; WITHOUT this they
+    // take the single-threaded CPU path. The prefill profile measured moe=40 s of which
+    // only 14.4 s was GPU (expert-load 7.7 + gpu-ffn 6.7) — the ~25 s remainder was
+    // these two projections over 512 tok × 40 MoE layers on one core. Same omission /
+    // same fix as the mamba proj above (the shared expert reuses up_proj/down_proj,
+    // already eligible). Token-identical.
+    for t in [&mut l.fc1_latent, &mut l.fc2_latent] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
 }
 
 /// Load a model snapshot, materializing the **dense** weights (embeddings,
@@ -470,65 +663,7 @@ pub fn load_model_with(
     model.embed.gpu_eligible = true;
     model.lm_head.gpu_eligible = true;
     for l in &mut model.layers {
-        for t in [
-            &mut l.q_a,
-            &mut l.q_b,
-            &mut l.kv_a,
-            &mut l.kv_b,
-            &mut l.o,
-            &mut l.gate_proj,
-            &mut l.up_proj,
-            &mut l.down_proj,
-            &mut l.sh_gate,
-            &mut l.sh_up,
-            &mut l.sh_down,
-        ] {
-            t.gpu_eligible = true;
-        }
-        // DSA indexer projections: batched in `indexer_forward`, so they want the GPU.
-        // `matmul_qt`'s CPU path is single-threaded — a batched call on one core is
-        // *slower* than the old per-query GEMVs spread across the indexer's worker
-        // threads (measured: 46s -> 81s). On the GPU the batched form is the fast one.
-        for t in [&mut l.ix_wk, &mut l.ix_wq, &mut l.ix_wp] {
-            if let Some(t) = t {
-                t.gpu_eligible = true;
-            }
-        }
-        // MiniMax-M3 GQA attention projections (Option; absent on the GLM path). These
-        // are the resident q/k/v projections and the block-sparse indexer projections —
-        // dense int8 weights that route through `matmul_qt`. WITHOUT this they fall to
-        // the single-threaded CPU path: the COLI_PROFILE breakdown measured the q/k/v
-        // projections at 197 s of a 236 s / 512-tok prefill (84%!) — dwarfing both the
-        // attention core (5.6 s) and expert I/O (31 s). `l.o` (o_proj) is already marked
-        // above via the GLM list, which is why it was fast; these were simply omitted.
-        for t in [&mut l.qkv_proj, &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.idx_q_proj, &mut l.idx_k_proj] {
-            if let Some(t) = t {
-                t.gpu_eligible = true;
-            }
-        }
-        // Nemotron-H Mamba2 in_proj/out_proj — resident dense int8 weights routed through
-        // `matmul_qt`. WITHOUT this they fall to the single-threaded CPU path: the mamba
-        // COLI_PROFILE breakdown measured them at 9322 ms of a 9945 ms mamba total (94%),
-        // dwarfing the selective scan (451 ms). Same omission as the M3 q/k/v projections
-        // above; marking them eligible routes them to the GPU int8 matmul (token-identical).
-        for t in [&mut l.mamba_in_proj, &mut l.mamba_out_proj] {
-            if let Some(t) = t {
-                t.gpu_eligible = true;
-            }
-        }
-        // Nemotron-H latent-MoE fc1/fc2 — the resident dense projections that lift x into
-        // the shared moe_latent space (hidden->1024) and back (1024->hidden) around the
-        // routed experts. `nemotron_moe` runs them through `matmul_qt`; WITHOUT this they
-        // take the single-threaded CPU path. The prefill profile measured moe=40 s of which
-        // only 14.4 s was GPU (expert-load 7.7 + gpu-ffn 6.7) — the ~25 s remainder was
-        // these two projections over 512 tok × 40 MoE layers on one core. Same omission /
-        // same fix as the mamba proj above (the shared expert reuses up_proj/down_proj,
-        // already eligible). Token-identical.
-        for t in [&mut l.fc1_latent, &mut l.fc2_latent] {
-            if let Some(t) = t {
-                t.gpu_eligible = true;
-            }
-        }
+        mark_gpu_eligible(l);
     }
     Ok(model)
 }

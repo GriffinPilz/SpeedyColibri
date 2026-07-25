@@ -98,10 +98,17 @@ pub struct ConvertOpts {
     /// `rmsnorm` computes `x·(1+w)`; requires `minimax`.
     pub gemma_norm: bool,
     /// source is Nemotron-H (`nemotron_h`): a hybrid Mamba2/GQA/latent-MoE model.
-    /// Maps its `backbone.*` tensor names to the container's `model.*` names, drops the
-    /// MTP module, and (via the `.mixer.` marker) classifies the Mamba2 vectors,
+    /// Maps its `backbone.*` tensor names to the container's `model.*` names, folds the
+    /// MTP module into the layer indices above the main stack, and (via the `.mixer.`
+    /// marker) classifies the Mamba2 vectors,
     /// latent projections, and latent-space routed experts. See [`nemotron_container_name`].
     pub nemotron: bool,
+    /// How many container layer indices the MTP speculative head occupies, starting at
+    /// `n_layers` — `Config::mtp_head_layers()`. **1** for GLM/M3 (one sparse block) and
+    /// **2** for Nemotron-H (`mtp_hybrid_override_pattern == "*E"`: an attention sublayer
+    /// then a latent-MoE one). Everything at `n_layers + mtp_layers` and above is not part
+    /// of the architecture and is dropped. Defaults to 1 so the GLM path is unchanged.
+    pub mtp_layers: usize,
 }
 
 impl Default for ConvertOpts {
@@ -116,21 +123,61 @@ impl Default for ConvertOpts {
             minimax: false,
             gemma_norm: false,
             nemotron: false,
+            mtp_layers: 1,
         }
     }
 }
 
 /// Map a Nemotron-H source tensor name to its colibrì-container name, or `None` to
 /// drop it. Renames the `backbone.` prefix to `model.` and `embeddings.weight` to
-/// `embed_tokens.weight` (so the shared `classify` Io/norm checks match); drops the
-/// MTP next-token module (`mtp.*`, deferred). The per-layer `mixer.*` structure
-/// (Mamba2 `in_proj`/`conv1d`/`A_log`/`D`/`dt_bias`/`norm`/`out_proj`; MoE
-/// `gate`/`fc{1,2}_latent_proj`/`experts.*`/`shared_experts.*`; attention q/k/v/o)
+/// `embed_tokens.weight` (so the shared `classify` Io/norm checks match). The per-layer
+/// `mixer.*` structure (Mamba2 `in_proj`/`conv1d`/`A_log`/`D`/`dt_bias`/`norm`/`out_proj`;
+/// MoE `gate`/`fc{1,2}_latent_proj`/`experts.*`/`shared_experts.*`; attention q/k/v/o)
 /// is preserved verbatim — the `.mixer.` marker is how `classify` recognizes it.
 /// Sidecar scales ride along unchanged.
-fn nemotron_container_name(name: &str) -> Option<String> {
-    if name.starts_with("mtp") || name.contains(".mtp") || name.contains("nextn") {
-        return None;
+///
+/// # The MTP speculative head
+///
+/// The head is folded into the SAME `model.layers.N.*` namespace the rest of the
+/// container uses, at the indices just above the main stack — mirroring GLM, whose head
+/// lives at `model.layers.{n_layers}`. Nemotron's head is two sublayers
+/// (`mtp_hybrid_override_pattern == "*E"`), so:
+///
+/// ```text
+/// mtp.layers.0.*  ->  model.layers.{n_layers}.*        (attention sublayer)
+/// mtp.layers.1.*  ->  model.layers.{n_layers + 1}.*    (latent-MoE sublayer)
+/// ```
+///
+/// Two deliberate special cases:
+///
+/// * `mtp.layers.J.norm.weight` → `input_layernorm.weight`, exactly the canonicalization
+///   the main stack already gets, so `load_layer_nemotron` reads one name everywhere.
+/// * `mtp.layers.1.final_layernorm.weight` → `model.layers.{n_layers}.shared_head.norm.weight`.
+///   This is the head's own final norm before `lm_head` — semantically identical to GLM's
+///   `shared_head.norm`. Reusing GLM's *name*, at the head's FIRST index, means both
+///   loaders probe and read the same key (`p0("shared_head.norm.weight")`) and `classify`
+///   already routes it to F32 via its existing `shared_head` rule. Putting it at index
+///   `n_layers` rather than `n_layers + 1` keeps every non-sublayer head tensor
+///   (`eh_proj`/`enorm`/`hnorm`/`shared_head.norm`) co-located at one index.
+fn nemotron_container_name(name: &str, n_layers: usize) -> Option<String> {
+    // The next-token-prediction module. Everything under `mtp.layers.J.` is remapped
+    // into the layer namespace above the main stack; any other `mtp`/`nextn` tensor
+    // (e.g. a duplicate `mtp.lm_head`) is not part of the head we run, so it is dropped.
+    if name.starts_with("mtp.") || name.contains(".mtp.") || name.contains("nextn") {
+        let rest = name.strip_prefix("mtp.layers.")?;
+        let (j, tail) = rest.split_once('.')?;
+        let j: usize = j.parse().ok()?;
+        // `layers.1.final_layernorm` is the head's final norm, not a sublayer tensor —
+        // park it at the head's base index under GLM's name (see the doc comment).
+        if tail == "final_layernorm.weight" {
+            return Some(format!("model.layers.{n_layers}.shared_head.norm.weight"));
+        }
+        let li = n_layers + j;
+        // Same block-norm canonicalization as the main stack: the sublayer's own
+        // `norm.weight` becomes `input_layernorm.weight`; the gated `mixer.norm.weight`
+        // keeps its `.mixer.` marker and is left alone.
+        let tail = if tail == "norm.weight" { "input_layernorm.weight" } else { tail };
+        return Some(format!("model.layers.{li}.{tail}"));
     }
     let mut n = name.strip_prefix("backbone.").map(|r| format!("model.{r}")).unwrap_or_else(|| name.to_string());
     // `model.embeddings.weight` → `model.embed_tokens.weight`.
@@ -212,6 +259,20 @@ fn layer_idx(name: &str) -> i64 {
 /// reference's `--indexer` pass: retain the DSA lightning-indexer weights instead of
 /// dropping them.
 fn classify(name: &str, n_layers: usize, keep_idx: bool, mtp_only: bool) -> Kind {
+    // A single-block MTP head (GLM/M3) is the default shape; see `classify_head`.
+    classify_head(name, n_layers, keep_idx, mtp_only, 1)
+}
+
+/// [`classify`] with an explicit MTP-head size: the head occupies layer indices
+/// `n_layers .. n_layers + mtp_layers`. GLM/M3 pass 1 (one sparse block); Nemotron-H
+/// passes 2 (an attention sublayer + a latent-MoE sublayer, `"*E"`).
+fn classify_head(
+    name: &str,
+    n_layers: usize,
+    keep_idx: bool,
+    mtp_only: bool,
+    mtp_layers: usize,
+) -> Kind {
     // scale sidecars are consumed with their weight
     if name.ends_with("_scale_inv") {
         return Kind::Skip;
@@ -222,18 +283,14 @@ fn classify(name: &str, n_layers: usize, keep_idx: bool, mtp_only: bool) -> Kind
     {
         return Kind::Skip;
     }
-    // Nemotron-H hybrid layers carry a `.mixer.` marker that no GLM/MiniMax tensor has,
-    // so we can classify them without threading an arch flag through every caller.
-    if name.contains(".mixer.") {
-        return classify_nemotron(name);
-    }
     let li = layer_idx(name);
-    let is_mtp = li >= 0 && li as usize == n_layers;
-    // The MTP speculative head lives at layer index `n_layers` (the single
-    // `num_nextn_predict_layers` block). It is KEPT by default so every container ships
-    // MTP-ready — drafting stays opt-in at runtime (`DRAFT=n`; `MTP=0` forces it off).
-    // Only layers ABOVE the head (not part of this architecture) are dropped.
-    if li >= 0 && li as usize > n_layers {
+    let is_mtp = li >= 0 && (li as usize) >= n_layers && (li as usize) < n_layers + mtp_layers;
+    // The MTP speculative head occupies layer indices `n_layers .. n_layers+mtp_layers`
+    // (one block on GLM/M3, two sublayers on Nemotron-H). It is KEPT by default so every
+    // container ships MTP-ready — drafting stays opt-in at runtime (`DRAFT=n`; `MTP=0`
+    // forces it off). Only layers ABOVE the head (not part of this architecture) are
+    // dropped.
+    if li >= 0 && (li as usize) >= n_layers + mtp_layers {
         return Kind::Skip;
     }
     if mtp_only && !is_mtp {
@@ -241,6 +298,13 @@ fn classify(name: &str, n_layers: usize, keep_idx: bool, mtp_only: bool) -> Kind
         // container (base layers, embeddings, lm_head, final norm already live there)
         // without re-converting the whole model.
         return Kind::Skip;
+    }
+    // Nemotron-H hybrid layers carry a `.mixer.` marker that no GLM/MiniMax tensor has,
+    // so we can classify them without threading an arch flag through every caller. This
+    // sits AFTER the layer-range and `mtp_only` gates so the head's `mixer.*` sublayers
+    // obey exactly the same keep/drop rules as every other tensor at those indices.
+    if name.contains(".mixer.") {
+        return classify_nemotron(name);
     }
     // DSA lightning indexer (`self_attn.indexer.{wk,wq_b,weights_proj,k_norm}`). Dropped
     // by default; kept when `keep_idx` so the container can run DSA — the wk/wq_b/
@@ -1214,8 +1278,16 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             _ => return Ok(TensorOut::Skip),
         }
     } else if opts.nemotron {
-        match nemotron_container_name(name) {
-            Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
+        // Unlike the M3 branch above (whose head is dropped by name), Nemotron's MTP head
+        // is KEPT and remapped into `model.layers.{n_layers..n_layers+mtp_layers}`, so the
+        // ceiling here has to include it or the head would be silently discarded again.
+        match nemotron_container_name(name, opts.n_layers) {
+            Some(n)
+                if layer_idx(&n) < 0
+                    || (layer_idx(&n) as usize) < opts.n_layers + opts.mtp_layers =>
+            {
+                n
+            }
             _ => return Ok(TensorOut::Skip),
         }
     } else {
@@ -1227,7 +1299,8 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
         shape,
         bytes: f32_bytes(w),
     };
-    match classify(&out_name, opts.n_layers, opts.keep_indexer, opts.mtp_only) {
+    match classify_head(&out_name, opts.n_layers, opts.keep_indexer, opts.mtp_only, opts.mtp_layers)
+    {
         Kind::Skip => Ok(TensorOut::Skip),
         Kind::F32 => {
             let (mut w, shape) = dequant(shards, name)?;
@@ -1949,7 +2022,7 @@ mod tests {
 
     #[test]
     fn nemotron_name_mapping() {
-        let m = |s: &str| nemotron_container_name(s);
+        let m = |s: &str| nemotron_container_name(s, 88);
         assert_eq!(m("backbone.embeddings.weight").as_deref(), Some("model.embed_tokens.weight"));
         assert_eq!(
             m("backbone.layers.5.mixer.in_proj.weight").as_deref(),
@@ -1967,8 +2040,70 @@ mod tests {
         // Final norm norm_f -> the canonical model.norm.weight.
         assert_eq!(m("backbone.norm_f.weight").as_deref(), Some("model.norm.weight"));
         assert_eq!(m("lm_head.weight").as_deref(), Some("lm_head.weight"));
-        // MTP module dropped.
-        assert_eq!(m("mtp.layers.0.mixer.gate.weight"), None);
+    }
+
+    /// The MTP head (`mtp_hybrid_override_pattern == "*E"`, `num_nextn_predict_layers == 1`)
+    /// folds into `model.layers.{88, 89}` — GLM's "the head lives above the stack"
+    /// convention, widened to the head's two sublayers.
+    #[test]
+    fn nemotron_mtp_head_name_mapping() {
+        let m = |s: &str| nemotron_container_name(s, 88);
+        // --- sublayer 0: the attention block, at index n_layers -------------------
+        assert_eq!(
+            m("mtp.layers.0.mixer.q_proj.weight").as_deref(),
+            Some("model.layers.88.mixer.q_proj.weight")
+        );
+        assert_eq!(
+            m("mtp.layers.0.mixer.o_proj.weight").as_deref(),
+            Some("model.layers.88.mixer.o_proj.weight")
+        );
+        // The sublayer's own block norm canonicalizes exactly like the main stack's.
+        assert_eq!(
+            m("mtp.layers.0.norm.weight").as_deref(),
+            Some("model.layers.88.input_layernorm.weight")
+        );
+        // The three fusion tensors sit at the head's base index, unprefixed (GLM naming).
+        assert_eq!(m("mtp.layers.0.eh_proj.weight").as_deref(), Some("model.layers.88.eh_proj.weight"));
+        assert_eq!(m("mtp.layers.0.enorm.weight").as_deref(), Some("model.layers.88.enorm.weight"));
+        assert_eq!(m("mtp.layers.0.hnorm.weight").as_deref(), Some("model.layers.88.hnorm.weight"));
+
+        // --- sublayer 1: the latent-MoE block, at index n_layers + 1 --------------
+        assert_eq!(
+            m("mtp.layers.1.norm.weight").as_deref(),
+            Some("model.layers.89.input_layernorm.weight")
+        );
+        assert_eq!(
+            m("mtp.layers.1.mixer.gate.weight").as_deref(),
+            Some("model.layers.89.mixer.gate.weight")
+        );
+        assert_eq!(
+            m("mtp.layers.1.mixer.gate.e_score_correction_bias").as_deref(),
+            Some("model.layers.89.mixer.gate.e_score_correction_bias")
+        );
+        assert_eq!(
+            m("mtp.layers.1.mixer.fc1_latent_proj.weight").as_deref(),
+            Some("model.layers.89.mixer.fc1_latent_proj.weight")
+        );
+        assert_eq!(
+            m("mtp.layers.1.mixer.shared_experts.up_proj.weight").as_deref(),
+            Some("model.layers.89.mixer.shared_experts.up_proj.weight")
+        );
+        assert_eq!(
+            m("mtp.layers.1.mixer.experts.511.down_proj.weight").as_deref(),
+            Some("model.layers.89.mixer.experts.511.down_proj.weight")
+        );
+
+        // --- the head's final norm keeps GLM's `shared_head.norm` name, at the BASE
+        // index, so `load_mtp` reads one key on both architectures.
+        assert_eq!(
+            m("mtp.layers.1.final_layernorm.weight").as_deref(),
+            Some("model.layers.88.shared_head.norm.weight")
+        );
+
+        // Anything MTP-ish that is not a `mtp.layers.J.*` sublayer tensor is still dropped
+        // (a duplicate head would shadow the shared `lm_head` we actually use).
+        assert_eq!(m("mtp.lm_head.weight"), None);
+        assert_eq!(m("mtp.norm.weight"), None);
     }
 
     #[test]
@@ -2013,6 +2148,48 @@ mod tests {
         // Sidecar scales still dropped (handled before the .mixer. branch).
         assert_eq!(
             classify("model.layers.1.mixer.experts.3.up_proj.weight_scale", 88, false, false),
+            Kind::Skip
+        );
+    }
+
+    /// With a TWO-sublayer head (`mtp_layers == 2`), indices 88 and 89 classify exactly as
+    /// ordinary Nemotron layers do, and 90 — above the architecture — is dropped. The
+    /// default head size (1) must still drop 89, so a GLM-shaped call is unaffected.
+    #[test]
+    fn nemotron_mtp_head_classify_rules() {
+        let c2 = |n: &str| classify_head(n, 88, false, false, 2);
+        // sublayer 0 — attention + the fusion tensors
+        assert_eq!(c2("model.layers.88.mixer.q_proj.weight"), Kind::Q);
+        assert_eq!(c2("model.layers.88.mixer.o_proj.weight"), Kind::Q);
+        assert_eq!(c2("model.layers.88.input_layernorm.weight"), Kind::F32);
+        assert_eq!(c2("model.layers.88.eh_proj.weight"), Kind::Q);
+        assert_eq!(c2("model.layers.88.enorm.weight"), Kind::F32);
+        assert_eq!(c2("model.layers.88.hnorm.weight"), Kind::F32);
+        assert_eq!(c2("model.layers.88.shared_head.norm.weight"), Kind::F32);
+        // sublayer 1 — latent MoE
+        assert_eq!(c2("model.layers.89.input_layernorm.weight"), Kind::F32);
+        assert_eq!(c2("model.layers.89.mixer.gate.weight"), Kind::F32);
+        assert_eq!(c2("model.layers.89.mixer.gate.e_score_correction_bias"), Kind::F32);
+        assert_eq!(c2("model.layers.89.mixer.fc1_latent_proj.weight"), Kind::Q);
+        assert_eq!(c2("model.layers.89.mixer.fc2_latent_proj.weight"), Kind::Q);
+        assert_eq!(c2("model.layers.89.mixer.shared_experts.up_proj.weight"), Kind::Q);
+        assert_eq!(c2("model.layers.89.mixer.experts.0.up_proj.weight"), Kind::X);
+        assert_eq!(c2("model.layers.89.mixer.experts.511.down_proj.weight"), Kind::X);
+        // above the head: not part of the architecture
+        assert_eq!(c2("model.layers.90.mixer.q_proj.weight"), Kind::Skip);
+        assert_eq!(c2("model.layers.90.input_layernorm.weight"), Kind::Skip);
+
+        // The single-block default (GLM/M3) still stops at index 88.
+        assert_eq!(classify("model.layers.89.mixer.gate.weight", 88, false, false), Kind::Skip);
+
+        // `COLI_MTP_ONLY` keeps BOTH sublayers and nothing else.
+        assert_eq!(classify_head("model.layers.88.eh_proj.weight", 88, false, true, 2), Kind::Q);
+        assert_eq!(
+            classify_head("model.layers.89.mixer.experts.7.up_proj.weight", 88, false, true, 2),
+            Kind::X
+        );
+        assert_eq!(
+            classify_head("model.layers.3.mixer.in_proj.weight", 88, false, true, 2),
             Kind::Skip
         );
     }

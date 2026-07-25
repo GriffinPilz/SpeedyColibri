@@ -107,9 +107,21 @@ pub struct Layer {
 ///
 /// The head is trained to predict token `t+2` from the state at `t` and the
 /// embedding of `t+1`, which is what makes its drafts worth verifying.
+///
+/// # Why the block is a `Vec`
+///
+/// GLM's head is exactly one block, but Nemotron-H's is **two** sublayers
+/// (`mtp_hybrid_override_pattern == "*E"`: a NoPE-GQA attention block then a latent-MoE
+/// block), so `hx` runs through both before the final norm. Rather than bolt an
+/// `Option<Layer>` onto the side — which would leave every consumer branching on "one or
+/// two?" and would not extend to a three-sublayer head — the head owns an ordered
+/// `Vec<MtpBlock>` and the forward path is a loop. GLM builds a one-element vec, so its
+/// loop body runs exactly the calls it always did, in the same order, at the same layer
+/// index; [`MtpHead::layer`] keeps the "the block" reading concise for that case.
 pub struct MtpHead {
-    /// the MTP transformer block (always sparse), at layer index `n_layers`
-    pub layer: Layer,
+    /// The head's transformer block(s), in execution order, occupying layer indices
+    /// `n_layers .. n_layers + blocks.len()`. Each carries its own KV row.
+    pub blocks: Vec<MtpBlock>,
     /// `[D, 2D]` — projects the concatenated `[e ; h]` back to hidden width
     pub eh_proj: QTensor,
     /// RMSNorm weight applied to the next token's embedding
@@ -118,6 +130,27 @@ pub struct MtpHead {
     pub hnorm: Vec<f32>,
     /// `shared_head.norm.weight` — the head's own final norm before `lm_head`
     pub mtp_norm: Vec<f32>,
+}
+
+/// One sublayer of the MTP head: the weights, plus (on a hybrid arch) which mixer runs.
+pub struct MtpBlock {
+    /// the sublayer's resident weights, loaded exactly like a main-stack layer's
+    pub layer: Layer,
+    /// Which mixer this sublayer is, for hybrid architectures whose per-layer dispatch
+    /// normally reads `cfg.layer_kind[li]`. **Must** be `Some` on Nemotron-H: the head
+    /// lives at `li >= n_layers`, which is past the end of `layer_kind` (that vector is
+    /// `num_hidden_layers` long by contract and describes the main stack only — see
+    /// `Config::mtp_layer_kind`). `None` on GLM/M3, where the block shape is implied by
+    /// the arch and nothing consults a kind.
+    pub kind: Option<LayerKind>,
+}
+
+impl MtpHead {
+    /// The head's first (on GLM/M3, only) block. Convenience for the single-block case
+    /// and for tests; the forward path iterates [`MtpHead::blocks`] instead.
+    pub fn layer(&self) -> &Layer {
+        &self.blocks[0].layer
+    }
 }
 
 /// The compressed MLA KV-cache — port of the `Lc`/`Rc` per-layer buffers in
@@ -254,23 +287,25 @@ impl KvCache {
 
     /// Allocate a cache sized for `model`, holding up to `max_t` tokens.
     ///
-    /// When the model carries an MTP head this allocates **`n_layers + 1`** rows
-    /// (C: `NR = c->n_layers + 1`) — the head is a real layer at index `n_layers`
-    /// with its own KV. That row starts [`KV_UNSET`] rather than 0 (C:
+    /// When the model carries an MTP head this allocates one extra row **per head
+    /// sublayer** (C: `NR = c->n_layers + 1`, which assumed GLM's single block; a
+    /// Nemotron-H head is two sublayers, so it needs two). Each is a real layer at index
+    /// `n_layers + j` with its own KV. Those rows start [`KV_UNSET`] rather than 0 (C:
     /// `kv_start[i] = -1`): unlike the main stack, the head's cache begins at the
     /// first *decode* position, not at the start of the prompt, so it holds only a
     /// partial suffix of the sequence.
     pub fn for_model(model: &Model, max_t: usize) -> KvCache {
         let n_layers = model.cfg.n_layers as usize;
-        let rows = n_layers + usize::from(model.has_mtp);
+        let head_rows = model.mtp.as_ref().map_or(0, |m| m.blocks.len());
+        let rows = n_layers + head_rows;
         let mut kv = KvCache::new(
             rows,
             model.cfg.kv_lora as usize,
             model.cfg.qk_rope as usize,
             max_t,
         );
-        if model.has_mtp {
-            kv.kv_start[n_layers] = KV_UNSET;
+        for r in n_layers..n_layers + head_rows {
+            kv.kv_start[r] = KV_UNSET;
         }
         // One predicate for "has GQA full-KV", shared with `bytes_per_token` — if these
         // two ever disagree the reservation silently mis-sizes (see `allocates_gqa_kv`).

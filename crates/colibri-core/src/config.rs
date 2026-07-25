@@ -137,6 +137,16 @@ pub struct Config {
     /// Per-layer mixer kind, one entry per layer, from `hybrid_override_pattern`.
     /// Empty for homogeneous arches; drives per-layer dispatch when non-empty.
     pub layer_kind: Vec<LayerKind>,
+    /// Per-SUBLAYER mixer kind of the MTP speculative head, from
+    /// `mtp_hybrid_override_pattern` (Nemotron-H ships `"*E"`: one attention sublayer
+    /// then one latent-MoE sublayer). Empty on every other arch — GLM/M3 heads are a
+    /// single sparse block whose shape is implied by the arch, not by a pattern.
+    ///
+    /// Kept SEPARATE from [`Config::layer_kind`] rather than appended to it: that vector
+    /// is `num_hidden_layers` long by contract, and both the KV accounting
+    /// (`KvCache::kv_layers`, `fixed_bytes`) and the loader iterate it to describe the
+    /// *main stack*. Appending the head would silently inflate every one of those.
+    pub mtp_layer_kind: Vec<LayerKind>,
     /// Mamba2 SSM state size (`ssm_state_size`); 0 for non-Mamba arches.
     pub mamba_d_state: i32,
     /// Mamba2 causal-conv kernel width (`conv_kernel`).
@@ -212,6 +222,25 @@ macro_rules! ckr {
             });
         }
     }};
+}
+
+/// Decode a Nemotron-H mixer pattern string (`M`→Mamba, `E`→MoE, `*`→attention) into
+/// one [`LayerKind`] per character. `field` names the config key in the error message,
+/// since the same grammar describes both the main stack (`hybrid_override_pattern`) and
+/// the MTP head (`mtp_hybrid_override_pattern`). An empty/absent string yields an empty
+/// vec — for the head that simply means "no MTP module in this checkpoint".
+fn parse_hybrid_pattern(pattern: &str, field: &str) -> Result<Vec<LayerKind>, ConfigError> {
+    pattern
+        .chars()
+        .map(|ch| match ch {
+            'M' => Ok(LayerKind::Mamba),
+            'E' => Ok(LayerKind::Moe),
+            '*' => Ok(LayerKind::Attn),
+            other => Err(ConfigError::Unsupported(format!(
+                "nemotron_h: unknown {field} char '{other}'"
+            ))),
+        })
+        .collect()
 }
 
 /// Collect `eos_token_id` (scalar or array) into `out`.
@@ -341,6 +370,7 @@ impl Config {
             sigmoid_route: false,
             // Nemotron-H-only fields (unused by GLM).
             layer_kind: Vec::new(),
+            mtp_layer_kind: Vec::new(),
             mamba_d_state: 0,
             mamba_d_conv: 0,
             mamba_n_heads: 0,
@@ -506,6 +536,7 @@ impl Config {
             sigmoid_route: scoring == "sigmoid",
             // Nemotron-H-only fields (unused by MiniMax).
             layer_kind: Vec::new(),
+            mtp_layer_kind: Vec::new(),
             mamba_d_state: 0,
             mamba_d_conv: 0,
             mamba_n_heads: 0,
@@ -551,21 +582,16 @@ impl Config {
         let qk_nope = head_dim - qk_rope;
 
         // Per-layer mixer kinds from the hybrid pattern; length must == num_hidden_layers.
-        let pattern = r.get("hybrid_override_pattern").and_then(Json::as_str).unwrap_or("");
-        let mut layer_kind: Vec<LayerKind> = Vec::new();
-        for ch in pattern.chars() {
-            let k = match ch {
-                'M' => LayerKind::Mamba,
-                'E' => LayerKind::Moe,
-                '*' => LayerKind::Attn,
-                other => {
-                    return Err(ConfigError::Unsupported(format!(
-                        "nemotron_h: unknown hybrid_override_pattern char '{other}'"
-                    )))
-                }
-            };
-            layer_kind.push(k);
-        }
+        let layer_kind =
+            parse_hybrid_pattern(r.get("hybrid_override_pattern").and_then(Json::as_str).unwrap_or(""),
+                                 "hybrid_override_pattern")?;
+        // The MTP speculative head's own sublayer sequence (`"*E"` on Nemotron-H-MTP:
+        // an attention block then a latent-MoE block). Absent on checkpoints without a
+        // head, in which case this stays empty and the engine simply never loads one.
+        let mtp_layer_kind = parse_hybrid_pattern(
+            r.get("mtp_hybrid_override_pattern").and_then(Json::as_str).unwrap_or(""),
+            "mtp_hybrid_override_pattern",
+        )?;
 
         let mamba_n_heads = gi("mamba_num_heads");
         let mamba_head_dim = gi("mamba_head_dim");
@@ -617,6 +643,7 @@ impl Config {
             // DeepSeek-style sigmoid router with an additive correction bias.
             sigmoid_route: true,
             layer_kind,
+            mtp_layer_kind,
             mamba_d_state: gi("ssm_state_size"),
             mamba_d_conv: gi("conv_kernel"),
             mamba_n_heads,
@@ -653,6 +680,19 @@ impl Config {
             )));
         }
         Ok(c)
+    }
+
+    /// How many extra layer indices (above `n_layers`) an MTP speculative head occupies.
+    ///
+    /// GLM/M3's head is a single sparse block living at index `n_layers`, so the answer
+    /// is 1 and no pattern is involved. Nemotron-H's head is two sublayers
+    /// (`mtp_hybrid_override_pattern == "*E"`: attention then latent-MoE), occupying
+    /// `n_layers` and `n_layers + 1`.
+    ///
+    /// This answers a SHAPE question, not an existence one — it returns 1 for a container
+    /// that ships no head at all. Ask `Model::has_mtp` / `Model::mtp` for existence.
+    pub fn mtp_head_layers(&self) -> usize {
+        self.mtp_layer_kind.len().max(1)
     }
 
     /// Validation shared by both architectures (the C `CKR` choke point).
@@ -953,6 +993,65 @@ mod tests {
                 LayerKind::Mamba, LayerKind::Moe, LayerKind::Mamba, LayerKind::Attn,
             ]
         );
+        // No `mtp_hybrid_override_pattern` in this checkpoint -> no head sublayers, but
+        // `mtp_head_layers()` still answers the shape question with the 1-block default.
+        assert!(c.mtp_layer_kind.is_empty());
+        assert_eq!(c.mtp_head_layers(), 1);
+    }
+
+    /// `mtp_hybrid_override_pattern` describes the speculative head, NOT the main stack:
+    /// it must land in its own vector (`layer_kind` stays exactly `num_hidden_layers`
+    /// long — the KV accounting and the loader both iterate it) and drive
+    /// `mtp_head_layers()`.
+    #[test]
+    fn nemotron_mtp_pattern_is_separate_from_the_main_stack() {
+        let text = Json::parse(
+            r#"{
+            "model_type": "nemotron_h",
+            "hidden_size": 4096, "num_hidden_layers": 8,
+            "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+            "layer_norm_epsilon": 1e-5, "vocab_size": 131072,
+            "hybrid_override_pattern": "MEMEMEM*",
+            "mtp_hybrid_override_pattern": "*E", "num_nextn_predict_layers": 1,
+            "n_routed_experts": 512, "num_experts_per_tok": 22, "moe_intermediate_size": 2688,
+            "moe_latent_size": 1024, "moe_shared_expert_intermediate_size": 5376,
+            "mlp_hidden_act": "relu2",
+            "ssm_state_size": 128, "conv_kernel": 4, "mamba_num_heads": 128,
+            "mamba_head_dim": 64, "n_groups": 8, "chunk_size": 128
+        }"#,
+        )
+        .unwrap();
+        let c = Config::from_json(&text).expect("nemotron_h + mtp parse");
+        assert_eq!(c.layer_kind.len(), 8, "main stack unchanged by the head pattern");
+        assert_eq!(c.mtp_layer_kind, vec![LayerKind::Attn, LayerKind::Moe]);
+        assert_eq!(c.mtp_head_layers(), 2, "head occupies n_layers and n_layers+1");
+    }
+
+    /// A bad character in the head pattern must be rejected with the HEAD's field name,
+    /// so the error points at the right config key.
+    #[test]
+    fn nemotron_rejects_unknown_mtp_pattern_char() {
+        let text = Json::parse(
+            r#"{
+            "model_type": "nemotron_h",
+            "hidden_size": 8, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 2,
+            "layer_norm_epsilon": 1e-5, "vocab_size": 8,
+            "hybrid_override_pattern": "E", "mtp_hybrid_override_pattern": "*X",
+            "n_routed_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 4,
+            "moe_latent_size": 2, "moe_shared_expert_intermediate_size": 4,
+            "mlp_hidden_act": "relu2",
+            "ssm_state_size": 2, "conv_kernel": 2, "mamba_num_heads": 2,
+            "mamba_head_dim": 2, "n_groups": 1, "chunk_size": 2
+        }"#,
+        )
+        .unwrap();
+        match Config::from_json(&text) {
+            Err(ConfigError::Unsupported(m)) => {
+                assert!(m.contains("mtp_hybrid_override_pattern"), "wrong field named: {m}")
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

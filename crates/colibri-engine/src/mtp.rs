@@ -3,8 +3,9 @@
 //!
 //! The head predicts token `t+2` from the main model's hidden state at `t` and
 //! the embedding of `t+1`. Both entry points fuse those two inputs identically
-//! (see [`fuse`]) and then run the head's own transformer block at layer index
-//! `n_layers`:
+//! (see [`fuse`]) and then run the head's own transformer block(s) starting at layer
+//! index `n_layers` (see [`head_forward`] — one block on GLM, two sublayers on
+//! Nemotron-H):
 //!
 //! - [`absorb`] runs it over already-**verified** tokens purely to keep the
 //!   head's KV in sync with the main model's; its output is discarded.
@@ -24,7 +25,7 @@
 //!    block's own output and must NOT be re-`final_norm`'d.
 //! 2. **The concatenation is `[e ; h]`**, embedding first.
 
-use crate::forward::layer_forward;
+use crate::forward::layer_forward_kind;
 use crate::linear::{embed_row, matmul_qt};
 use crate::math::rmsnorm;
 use crate::model::{KvCache, Model, MtpHead};
@@ -65,6 +66,40 @@ fn fuse(model: &Model, mtp: &MtpHead, next_tok: i32, h: &[f32], h_is_raw: bool, 
     matmul_qt(out, &cat, &mtp.eh_proj, 1);
 }
 
+/// Run the head's block(s) over the fused input `hx[S * hidden]`, in place.
+///
+/// GLM's head is a single sparse block; Nemotron-H's is two sublayers (attention, then
+/// latent-MoE — `mtp_hybrid_override_pattern == "*E"`), chained exactly as the main
+/// stack chains its layers. Sublayer `j` occupies layer index `n_layers + j` and owns
+/// that KV row, so `kv.start_at` is recorded per row. With one block this is literally
+/// the call the GLM path always made, at the same index.
+///
+/// The head runs dense: no DSA selection is shared in from the main stack (`dsa_sel`
+/// stays `None`), and Nemotron's head carries no Mamba sublayer, so nothing needs
+/// recurrent state beyond the KV rows `KvCache::for_model` already allocated.
+#[allow(clippy::too_many_arguments)]
+fn head_forward<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    mtp: &MtpHead,
+    hx: &mut [f32],
+    s: usize,
+    pos_base: usize,
+    nrm: &mut [f32],
+    tmp: &mut [f32],
+) -> io::Result<()> {
+    let li0 = model.cfg.n_layers as usize;
+    for (j, b) in mtp.blocks.iter().enumerate() {
+        let li = li0 + j;
+        kv.start_at(li, pos_base);
+        layer_forward_kind(
+            model, kv, provider, &b.layer, li, b.kind, hx, s, pos_base, nrm, tmp, &mut None,
+        )?;
+    }
+    Ok(())
+}
+
 /// Run the head over tokens the main model has already **verified**, so its KV
 /// covers the same positions. Port of `mtp_absorb`.
 ///
@@ -90,10 +125,8 @@ pub fn absorb<P: ExpertProvider>(
         return Ok(());
     }
     let d = model.cfg.hidden as usize;
-    let li = model.cfg.n_layers as usize;
     debug_assert!(hidden.len() >= s * d);
 
-    kv.start_at(li, pos_base);
     let mut hx = vec![0f32; s * d];
     for i in 0..s {
         fuse(
@@ -107,8 +140,7 @@ pub fn absorb<P: ExpertProvider>(
     }
     let mut nrm = vec![0f32; s * d];
     let mut tmp = vec![0f32; s * d];
-    // MTP head runs dense (no DSA sharing from the main stack).
-    layer_forward(model, kv, provider, &mtp.layer, li, &mut hx, s, pos_base, &mut nrm, &mut tmp, &mut None)
+    head_forward(model, kv, provider, mtp, &mut hx, s, pos_base, &mut nrm, &mut tmp)
 }
 
 /// Propose up to `g_max` draft tokens by chaining the head. Port of `mtp_draft`.
@@ -138,10 +170,13 @@ pub fn draft<P: ExpertProvider>(
         return Ok(Vec::new());
     }
     let d = model.cfg.hidden as usize;
-    let li = model.cfg.n_layers as usize;
     let p = kv_idx - 1;
 
-    kv.start_at(li, p);
+    // `head_forward` records this per sublayer too, but do it up front so the head's
+    // first row is marked even when the loop below breaks immediately for want of room
+    // (the C's `mtp_draft` sets `kv_start` before its loop; keeping that order keeps the
+    // GLM path bit-identical).
+    kv.start_at(model.cfg.n_layers as usize, p);
     let mut out = Vec::with_capacity(g_max);
     let mut h = last_hidden[..d].to_vec();
     let mut tok = next_tok;
@@ -158,7 +193,7 @@ pub fn draft<P: ExpertProvider>(
         // Only the first step's hidden is raw (it came from the main stack);
         // afterwards `h` is this block's own output.
         fuse(model, mtp, tok, &h, g == 0, &mut hx);
-        layer_forward(model, kv, provider, &mtp.layer, li, &mut hx, 1, pos, &mut nrm, &mut tmp, &mut None)?;
+        head_forward(model, kv, provider, mtp, &mut hx, 1, pos, &mut nrm, &mut tmp)?;
 
         // the head's own final norm, then the SHARED lm_head
         rmsnorm(&mut row, &hx, &mtp.mtp_norm, model.cfg.eps);

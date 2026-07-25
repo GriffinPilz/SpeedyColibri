@@ -117,12 +117,39 @@ pub fn layer_forward<P: ExpertProvider>(
     tmp: &mut [f32],
     dsa_sel: &mut Option<Vec<Vec<u32>>>,
 ) -> io::Result<()> {
+    layer_forward_kind(model, kv, provider, l, li, None, x, s, pos_base, nrm, tmp, dsa_sel)
+}
+
+/// [`layer_forward`] with an explicit mixer `kind`, for layers that are NOT in
+/// `cfg.layer_kind`.
+///
+/// The only such layers are the MTP head's sublayers: they run at `li >= n_layers`, past
+/// the end of `layer_kind` (which is `num_hidden_layers` long and describes the main
+/// stack), so indexing it there would panic. `kind: None` means "look it up", which is
+/// what every main-stack call does and what keeps the GLM/M3 path byte-identical —
+/// those arches ignore `kind` entirely.
+#[allow(clippy::too_many_arguments)]
+pub fn layer_forward_kind<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    l: &Layer,
+    li: usize,
+    kind: Option<LayerKind>,
+    x: &mut [f32],
+    s: usize,
+    pos_base: usize,
+    nrm: &mut [f32],
+    tmp: &mut [f32],
+    dsa_sel: &mut Option<Vec<Vec<u32>>>,
+) -> io::Result<()> {
     let cfg = &model.cfg;
     // Nemotron-H is a hybrid single-sublayer-per-layer stack (Mamba2 / GQA attention /
     // latent-MoE) dispatched by `layer_kind`, with no post-attention norm — so it takes
     // its own path rather than the two-sublayer GLM/M3 driver below. `dsa_sel` is unused.
     if cfg.arch == Arch::NemotronH {
-        return nemotron_layer_forward(model, kv, provider, l, li, x, s, pos_base, nrm, tmp);
+        let kind = kind.unwrap_or_else(|| cfg.layer_kind[li]);
+        return nemotron_layer_forward(model, kv, provider, l, li, kind, x, s, pos_base, nrm, tmp);
     }
     let d = cfg.hidden as usize;
     // in_ln -> attention -> residual
@@ -181,8 +208,10 @@ pub fn layer_forward<P: ExpertProvider>(
 }
 
 /// Run ONE Nemotron-H layer over `x[S * hidden]` in place. Nemotron-H blocks have a
-/// single sublayer — `in_ln` (the only norm; there is no post-norm) → the mixer selected
-/// by `layer_kind[li]` → residual add — unlike the two-sublayer GLM/M3 [`layer_forward`].
+/// single sublayer — `in_ln` (the only norm; there is no post-norm) → the mixer named by
+/// `kind` → residual add — unlike the two-sublayer GLM/M3 [`layer_forward`]. `kind` is
+/// passed in rather than read from `cfg.layer_kind[li]` because the MTP head's sublayers
+/// run at `li >= n_layers`, outside that vector (see [`layer_forward_kind`]).
 /// Mamba2 and attention layers update their per-layer state in `kv`; MoE layers stream
 /// their routed experts through `provider`.
 #[allow(clippy::too_many_arguments)]
@@ -192,6 +221,7 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     provider: &P,
     l: &Layer,
     li: usize,
+    kind: LayerKind,
     x: &mut [f32],
     s: usize,
     pos_base: usize,
@@ -204,7 +234,7 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     for si in 0..s {
         rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
     }
-    match cfg.layer_kind[li] {
+    match kind {
         LayerKind::Mamba => timed(&MAMBA_US, || mamba2_mixer(cfg, l, kv, li, nrm, s, tmp)),
         // NoPE GQA attention (no rotary, no QK-norm — see `attention_gqa`).
         LayerKind::Attn => timed(&ATTN_US, || attention_gqa(cfg, l, li, kv, nrm, s, pos_base, tmp)),

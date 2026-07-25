@@ -242,13 +242,53 @@ regime axis exactly. There is nothing to hide when the experts are already in RA
 Nemotron is **neutral, not negative**: its expert-load is unchanged (9.67 vs 9.75 s, well
 inside noise), so the default costs it nothing and should stay on everywhere.
 
-⚠️ **Unexplained: on m2.7 the prefill saving is 2.2× the expert-load saving.** Prefill fell
-13.1 s while expert-load fell only 6.0 s. If the lever merely *overlapped* load with
-compute those two should be roughly equal. The untested hypothesis is that batching the
-reads deepens the I/O queue and makes the reads genuinely faster rather than merely
-hidden — which would fit the separate finding that read QD sits at ~8–10 against a drive
-that wants ≥32. **Do not cite a mechanism here until someone measures it**; if reads are
-actually getting faster, there is more available than overlap alone.
+### Why prefill falls further than expert-load (resolved 2026-07-25)
+
+The first pass showed prefill dropping 13.1 s while expert-load dropped only 6.0 s, which
+pure overlap cannot explain. Measured directly — `/proc/diskstats` deltas per run plus the
+full phase breakdown, 5 reps interleaved, token-identical.
+
+**It is not fewer bytes. Prefetch-ahead reads 21% MORE from disk and still finishes
+faster.** Median over 5 reps, m2.7 @512:
+
+| | OFF | ON | |
+|---|---|---|---|
+| disk read | 108.6 GB | **130.9 GB** | +21% — speculative reads include waste |
+| read requests | 944 k | 1 136 k | same 112 KB/request |
+| throughput (wall) | 1 788 MB/s | **2 946 MB/s** | **1.65×** |
+| mean queue depth | 6.2 | **11.5** | 1.85× |
+| cache misses / evictions | 13 414 / 0 | 15 353 / 1 641 | prefetch evicts, then re-misses |
+
+So the drive was simply **under-queued**: at QD 6.2 it delivered 1.8 GB/s, and merely
+keeping more requests in flight bought 1.65× more bandwidth — enough to absorb 21% extra
+traffic *and* finish 13 s sooner. (Ignore the diskstats "busy" fields: they imply
+17 GB/s, above what this drive can do, so `io_ms`/`weighted_ms` are unreliable on
+multiqueue NVMe. Wall throughput and byte counts are sound.)
+
+**Where the saving actually lands** — leaf deltas sum to 13 815 ms against a 13 776 ms
+prefill delta, so the phases account for 99.7% of it:
+
+| phase | OFF | ON | delta | ratio |
+|---|---|---|---|---|
+| expert-load | 19 016 | 9 983 | −9 033 | 1.90× |
+| **attn input proj** | **10 228** | **5 295** | **−4 933** | **1.93×** |
+| gpu-ffn | 9 762 | 9 891 | +129 | 0.99× |
+| rope+cache / core / o-proj / router | — | — | ±15 | 1.00× |
+
+Only two phases move, and **35% of the win is the attention input projections**, not
+expert load at all.
+
+⚠️ **New open question: why do attention projections speed up?** They are matmuls over
+*resident* int8 weights and have no dependency on expert prefetch. The obvious guess is
+contention — 944 k synchronous preads competing with the projections for memory bandwidth
+on GB10 unified memory — but that predicts the opposite sign, since with the lever ON the
+reads are issued *during* attention. It is reproducible (5 reps, 1.93× ± tight) and
+unexplained. There is no env knob for read-thread count on the `gen` path, so testing it
+needs a code change. **Do not cite a mechanism until someone measures it.**
+
+**Headroom remains.** 2.9 GB/s is still far under this drive's ~6.6–10.5 GB/s, and QD 11.5
+is under the ~32 buffered reads need. The lever did not exhaust the read path; it only
+stopped starving it.
 
 ## Recurring traps (cost us real time; check these when adding a model)
 

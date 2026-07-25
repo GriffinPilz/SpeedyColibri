@@ -244,22 +244,22 @@ which the 4-point fit corrected to 583.2 (1.11×).
    before comparing to a non-speculative arm — raw, DRAFT=2 looks 2.6× slower than it is.
 10. **Interleave A/B arms (0 1 0 1), never all-of-A then all-of-B.** A cold post-rebuild run landed
    entirely on one arm and turned a true 1.12× into an apparent 1.5×. Discard a warmup too.
-7. **The synthetic bench prompt (`seq 100 611`) is a defect, not a fixture.** That id range
+11. **The synthetic bench prompt (`seq 100 611`) is a defect, not a fixture.** That id range
    drives models into degenerate repetition, where argmax near-ties flip on harmless FP
    reassociation — so a **token-identity gate fires on benign noise**. It has produced two
    bogus results: it hit Nemotron's stop token (suites measured *nothing* while the gate
    "passed"), and it manufactured a GLM correctness FAIL that vanished entirely on a real
    natural-language prompt (all four runs then byte-identical). **Use a real NL prompt for
    any correctness gate.**
-8. **Median-of-3 is not enough on this box.** Roughly a quarter of decode runs land well
+12. **Median-of-3 is not enough on this box.** Roughly a quarter of decode runs land well
    below the mode, and it hits *both* arms — so P(≥2 of 3 low) ≈ **16% per arm**. This
    manufactured a fake **3.79×** on M2.7 that 8 reps dissolved to the real 1.19×. Use **≥8
    reps**, and never call an arm "unstable" without checking whether the other is equally
    scattered.
-9. **Do not diagnose a perf gap with instrumentation heavier than the gap.** `COLI_PROFILE=1`
+13. **Do not diagnose a perf gap with instrumentation heavier than the gap.** `COLI_PROFILE=1`
    dropped both M2.7 arms from ~4.4 to ~0.4–0.9 tok/s and made them *cross*. `COLI_TIMING=1`
    is cheap; reach for it first.
-10. **`git fetch` before any claim about what is or isn't merged.** `git log main..HEAD`,
+14. **`git fetch` before any claim about what is or isn't merged.** `git log main..HEAD`,
     `git log main`, and `git ls-tree main` all read the *local* ref, which in a worktree-heavy
     repo can sit months behind. A stale `main` produced a confident "these three PRs were
     never merged" (they were all on `origin/main`), two duplicated commits, and a
@@ -267,3 +267,14 @@ which the 4-point fit corrected to 583.2 (1.11×).
     against `origin/main`, or use `git merge-base --is-ancestor`. Related: because this repo
     **squash-merges**, a branch can show dozens of "unmerged" commits whose content is fully
     upstream — check the *diff*, not the commit count.
+15. **In tensor-parallel FFN, gather is byte-exact and all-reduce is not.** Splitting only
+    `gate`/`up` by intermediate rows and **gathering** the slices, then running `down` *once*
+    on the full intermediate, reproduces single-node output bit-for-bit — each intermediate
+    row is an independent dot, and `down` still sees the identical input in the identical
+    accumulation order. The tempting all-reduce form (every node runs the full `down` over a
+    masked intermediate, partials summed) reorders `down`'s f32 reduction and lands ~1 ULP
+    off. That is enough to fail a token-identity gate on an argmax near-tie, so the obvious
+    design silently breaks the correctness harness. Measured and asserted on branch
+    `multispark` @ `d28bede` (`ffn_intermediate_slice` + `dense_tp_gather_is_byte_identical`),
+    **not merged** — the primitive itself is expected to be a wash on a bytes-bound decode,
+    so only the finding is recorded here. Cherry-pick that commit if Obj C wants the code.

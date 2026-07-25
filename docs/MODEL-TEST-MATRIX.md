@@ -288,11 +288,17 @@ actually getting faster, there is more available than overlap alone.
    bogus results: it hit Nemotron's stop token (suites measured *nothing* while the gate
    "passed"), and it manufactured a GLM correctness FAIL that vanished entirely on a real
    natural-language prompt (all four runs then byte-identical). **Use a real NL prompt for
-   any correctness gate.** Still open: `scripts/models.toml` carries `prompt = "100..611"`
-   for **glm-5.2, minimax-m3 and minimax-m2.7** — only `nemotron-3-super` has a real
-   passage. Any suite run straight off the registry for those three still inherits the
-   defect. The 2026-07-25 prefetch-ahead run worked around it by tokenizing a real
-   512-token passage with m2.7's own tokenizer; the registry itself was left unchanged.
+   any correctness gate.** **FIXED 2026-07-25:** `scripts/models.toml` no longer contains
+   `100..611`. glm-5.2, minimax-m3 and minimax-m2.7 now carry 512 ids of real English
+   prose, tokenized with each model's *own* tokenizer (round-trip verified) and checked to
+   generate 6/6 tokens without hitting a stop id. Repeating one short paragraph to reach
+   length is the same trap in milder form — the continuation degenerates into a copy task,
+   which showed up as m3 and m2.7 emitting byte-identical continuations from a 4×-repeated
+   passage — so the committed prompts use non-repeating prose (~283 distinct ids of 512).
+   ⚠️ `nemotron-3-super` still carries a repeated passage (87 distinct of 512). It is real
+   text and sustains generation, so it is soundly usable, but it was left alone on purpose:
+   every nemotron figure in this file was measured against that exact prompt. Regenerate it
+   only together with a re-measure.
 12. **Median-of-3 is not enough on this box.** Roughly a quarter of decode runs land well
    below the mode, and it hits *both* arms — so P(≥2 of 3 low) ≈ **16% per arm**. This
    manufactured a fake **3.79×** on M2.7 that 8 reps dissolved to the real 1.19×. Use **≥8

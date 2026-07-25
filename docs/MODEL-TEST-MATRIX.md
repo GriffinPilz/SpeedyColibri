@@ -34,7 +34,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | grow-on-demand KV | PASS | PASS | PASS | PASS 3301-tok prompt, no OOM |
 | **prefill scratch reservation** | TODO (method too slow) | PASS-ish **1.98×** 533.8 vs 270 | PASS **1.11×** 583.2 vs 527 | **BROKEN** 210 vs 24 KB/tok (8.75×) |
 | **MTP / speculative decode** | PASS (break-even) | N/A no head | N/A no head in quant | **NEG (blocked)** head loads + 77% accept, but output DIVERGES and it is 1.18× SLOWER |
-| COLI_PREFETCH_AHEAD | PASS 1.58× | PASS 1.26× | TODO | TODO |
+| COLI_PREFETCH_AHEAD | PASS 1.58× | PASS 1.26× | PASS **1.43×** | **NEUTRAL 1.00×** (RAM-resident) |
 | COLI_RAM_GB sweep | PASS (flat) | TODO | TODO | TODO |
 | hot-expert autopin | **NEG** ~10% loss | TODO | TODO | TODO |
 | sliding-window attention | **NEG** lose-lose | N/A | N/A | TODO |
@@ -160,7 +160,7 @@ only when someone measures it — not when it seems obvious.
 | **decode fast paths are gated to S==1** (tile bypass, `i8a16_gemv`, grouped relu²) | nemotron | **glm, m3, m2.7 — and any small-S path anywhere** | UNMEASURED **at S=2..4** — distinct from the S==1 transfer row above, which is closed. Anything running at S=2..4 (MTP verify, short batches, chunked prefill tails) silently gets the SLOW kernel. On nemotron this alone turns a 77%-acceptance MTP into a 1.18× loss |
 | **Mamba state is not rolled back on a rejected draft** | nemotron | any future hybrid/recurrent arch | Structural, not a Nemotron quirk: speculation is unsound on ANY in-place recurrent mixer. Pure-attention arches are unaffected (stale KV is overwritten) |
 | **chat-template arm required in serve.rs** | nemotron (was serving GLM markers) | any new arch | it is a 4th edit, not the documented 3 |
-| **`COLI_PREFETCH_AHEAD`** (glm 1.58×, m3 1.26×) | glm, m3 | **nemotron, m2.7** | UNMEASURED |
+| ~~**`COLI_PREFETCH_AHEAD`**~~ | glm 1.58×, m3 1.26× | — | **DONE 2026-07-25 — m2.7 1.43×, nemotron 1.00× (neutral), both token-identical.** The win is proportional to how much of prefill is *disk* expert-load, so it orders exactly by regime and is not architectural. See below |
 | **hot-expert autopin** (glm: ~10% LOSS) | glm | do NOT assume for others | glm streams from disk; nemotron's experts are RAM-resident — different regime |
 
 **Regime warning.** Most I/O-shaped conclusions (prefetch-ahead, eviction policy, autopin,
@@ -212,6 +212,44 @@ M3 and M2.7 differ by architectural width (hidden 6144 / moe_inter 3072 versus 3
 not by an accounting bug. Use **≥4 points**: a 2-point fit put M2.7 at 676.7 KB/tok (1.28×),
 which the 4-point fit corrected to 583.2 (1.11×).
 
+## `COLI_PREFETCH_AHEAD`, measured on all four models (2026-07-25)
+
+Prefill only (self-gated by `PREFETCH_AHEAD_MIN = 64`, so decode is never affected) and
+**already default-on** — `COLI_PREFETCH_AHEAD=0` disables it. So this was not a decision
+about whether to enable the lever; it was a check that the shipped default is right for
+the two models that had never been measured. It is.
+
+Method: one binary per model, arms **interleaved `0 1 0 1`** (trap 10) rather than
+`bench.sh`'s all-of-A-then-all-of-B, one discarded warmup per arm, 5 reps, `NGEN=1`,
+512-token prompt on both. Run twice — once with `COLI_TIMING` only and once with
+`COLI_PROFILE` — so profile overhead was *measured* rather than assumed (trap 13).
+
+| model | OFF | ON | ratio | expert-load OFF→ON |
+|---|---|---|---|---|
+| glm-5.2 | — | — | **1.58×** | (earlier measurement) |
+| **minimax-m2.7** | 40 358 ms | 27 290 ms | **1.479×** profile / 1.429× timing | 18 799 → 12 771 ms |
+| minimax-m3 | — | — | **1.26×** | 25 000 → 14 000 ms |
+| **nemotron-3-super** | 38 291 ms | 38 120 ms | **1.004×** profile / 1.002× timing | 9 666 → 9 748 ms |
+
+Token-identity PASS on both new models, 24/24 runs each (m2.7 `[44]`, nemotron `[17054]`).
+Arms never overlapped on m2.7 (OFF 38.7–40.8 s, ON 26.7–31.6 s), so the result does not
+depend on the median.
+
+**The win is proportional to the disk-streaming fraction of prefill, not to architecture.**
+Ordering by expert residency — glm (735 GB streamed, ~5.9% coverage) 1.58× → m2.7 1.43× →
+m3 1.26× → nemotron (RAM-resident, 172% coverage, 0 evictions) 1.00× — reproduces the
+regime axis exactly. There is nothing to hide when the experts are already in RAM.
+Nemotron is **neutral, not negative**: its expert-load is unchanged (9.67 vs 9.75 s, well
+inside noise), so the default costs it nothing and should stay on everywhere.
+
+⚠️ **Unexplained: on m2.7 the prefill saving is 2.2× the expert-load saving.** Prefill fell
+13.1 s while expert-load fell only 6.0 s. If the lever merely *overlapped* load with
+compute those two should be roughly equal. The untested hypothesis is that batching the
+reads deepens the I/O queue and makes the reads genuinely faster rather than merely
+hidden — which would fit the separate finding that read QD sits at ~8–10 against a drive
+that wants ≥32. **Do not cite a mechanism here until someone measures it**; if reads are
+actually getting faster, there is more available than overlap alone.
+
 ## Recurring traps (cost us real time; check these when adding a model)
 
 1. **An unhandled arch silently inherits a GLM-shaped default.** Four instances on Nemotron
@@ -250,7 +288,11 @@ which the 4-point fit corrected to 583.2 (1.11×).
    bogus results: it hit Nemotron's stop token (suites measured *nothing* while the gate
    "passed"), and it manufactured a GLM correctness FAIL that vanished entirely on a real
    natural-language prompt (all four runs then byte-identical). **Use a real NL prompt for
-   any correctness gate.**
+   any correctness gate.** Still open: `scripts/models.toml` carries `prompt = "100..611"`
+   for **glm-5.2, minimax-m3 and minimax-m2.7** — only `nemotron-3-super` has a real
+   passage. Any suite run straight off the registry for those three still inherits the
+   defect. The 2026-07-25 prefetch-ahead run worked around it by tokenizing a real
+   512-token passage with m2.7's own tokenizer; the registry itself was left unchanged.
 12. **Median-of-3 is not enough on this box.** Roughly a quarter of decode runs land well
    below the mode, and it hits *both* arms — so P(≥2 of 3 low) ≈ **16% per arm**. This
    manufactured a fake **3.79×** on M2.7 that 8 reps dissolved to the real 1.19×. Use **≥8

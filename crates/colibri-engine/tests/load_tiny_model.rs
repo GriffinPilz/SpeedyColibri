@@ -233,7 +233,7 @@ fn tiny_model_with_mtp_head_loads() {
     assert!(m.has_mtp, "complete MTP tensor set must enable the head");
     let mtp = m.mtp.as_ref().expect("mtp head loaded");
     // the head's own block is always sparse (C: mtpL->sparse = 1)
-    assert!(mtp.layer.sparse, "MTP block must be sparse (MoE)");
+    assert!(mtp.layer().sparse, "MTP block must be sparse (MoE)");
     // eh_proj consumes the concatenated [e ; h] -> 2D wide, D out
     assert_eq!(mtp.eh_proj.o as usize, D);
     assert_eq!(mtp.eh_proj.i as usize, 2 * D);
@@ -241,7 +241,7 @@ fn tiny_model_with_mtp_head_loads() {
     assert_eq!(mtp.hnorm.len(), D);
     assert_eq!(mtp.mtp_norm.len(), D);
     // the head's attention loaded like any layer's
-    assert_eq!(mtp.layer.o.o as usize, D);
+    assert_eq!(mtp.layer().o.o as usize, D);
     // the main stack is untouched by the extra layer
     assert_eq!(m.layers.len(), NL);
 

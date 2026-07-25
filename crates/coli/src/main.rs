@@ -413,6 +413,10 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         gemma_norm,
         // Nemotron-H hybrid: backbone.*→model.* remap + `.mixer.` classification.
         nemotron,
+        // How many layer indices above the stack the MTP head occupies: 1 for GLM/M3's
+        // single sparse block, 2 for Nemotron-H's `"*E"` attention+latent-MoE pair. Read
+        // from the SOURCE config's `mtp_hybrid_override_pattern`; falls back to 1.
+        mtp_layers: src_cfg.as_ref().map(|c| c.mtp_head_layers()).unwrap_or(1),
     };
 
     eprintln!(
@@ -611,8 +615,9 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     let own_history = owned_history(&history, &sharding, cluster.this_node);
     apply_autopin(&provider, &own_history, budget);
 
-    // `for_model` sizes the KV for the MTP head too (rows = n_layers + has_mtp);
-    // hand-rolling `KvCache::new(n_layers, ..)` would under-allocate on an MTP model.
+    // `for_model` sizes the KV for the MTP head too (one extra row per head SUBLAYER:
+    // 1 on GLM/M3, 2 on Nemotron-H's `"*E"` head); hand-rolling
+    // `KvCache::new(n_layers, ..)` would under-allocate on an MTP model.
     let mut kv = colibri_engine::KvCache::for_model(model, prompt.len() + n_new);
     match colibri_engine::generate_greedy(model, &mut kv, &*provider, &prompt, n_new) {
         Ok(seq) => {

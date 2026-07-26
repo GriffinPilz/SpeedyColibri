@@ -243,6 +243,77 @@ pub fn try_mamba2_scan(
     }
 }
 
+/// Whole-sequence (prefill, `S > 1`) twin of [`try_mamba2_scan`]. `hidden`/`y` are
+/// `[seq, n_heads*head_dim]`, `b`/`c` `[seq, n_groups, d_state]`, `dt_h`/`da_h`
+/// `[seq, n_heads]` (from [`crate::mamba2::seq_head_scalars`], so the transcendentals
+/// stay Rust-side), `d` `[n_heads]`.
+///
+/// ⚠️ **Token-identical, not bit-identical** — unlike [`try_mamba2_scan`]. The per-element
+/// state recurrence keeps the CPU's operand order exactly, but `y = Σ_nn ss*C` is
+/// tree-reduced instead of summed in strict `nn` order (~1 ULP on a 128-term f32 sum).
+/// The bit-exact formulation exposes only `n_heads*head_dim` threads and measured no
+/// faster than the CPU scan on GB10; this one exposes `n_heads*head_dim*d_state`.
+/// Deterministic across runs, so it is reproducible — just not byte-equal to the CPU.
+/// **Gate correctness on token identity, not on comparing floats to `selective_scan`.**
+///
+/// Returns false — leaving `state`/`y` untouched — when the GPU path is unavailable,
+/// the sizes disagree, or the backend declines (`d_state` must fit a CUDA block). The
+/// caller then runs the CPU [`crate::mamba2::selective_scan`].
+#[allow(clippy::too_many_arguments)]
+pub fn try_mamba2_scan_seq(
+    state: &mut [f32],
+    y: &mut [f32],
+    hidden: &[f32],
+    b: &[f32],
+    c: &[f32],
+    dt_h: &[f32],
+    da_h: &[f32],
+    d: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    d_state: usize,
+    n_groups: usize,
+    seq: usize,
+) -> bool {
+    if !available() || !mamba_scan_gpu_enabled() || seq == 0 {
+        return false;
+    }
+    // Guard every buffer the kernel indexes; a mismatch means a caller bug, and reading
+    // out of bounds on the device is far harder to diagnose than declining here.
+    if state.len() != n_heads * head_dim * d_state
+        || y.len() != seq * n_heads * head_dim
+        || hidden.len() != seq * n_heads * head_dim
+        || b.len() != seq * n_groups * d_state
+        || c.len() != seq * n_groups * d_state
+        || dt_h.len() != seq * n_heads
+        || da_h.len() != seq * n_heads
+        || d.len() != n_heads
+        || n_groups == 0
+        || n_heads % n_groups != 0
+    {
+        return false;
+    }
+    // SAFETY: all slice lengths are checked above to match the (seq, nh, hd, ds, ng) the
+    // kernel indexes with; state/y are host in/out, the rest read-only.
+    unsafe {
+        cuda::mamba2_scan_seq_raw(
+            state.as_mut_ptr(),
+            y.as_mut_ptr(),
+            hidden.as_ptr(),
+            b.as_ptr(),
+            c.as_ptr(),
+            dt_h.as_ptr(),
+            da_h.as_ptr(),
+            d.as_ptr(),
+            n_heads as i32,
+            head_dim as i32,
+            d_state as i32,
+            n_groups as i32,
+            seq as i32,
+        )
+    }
+}
+
 /// How many matmuls actually ran on the GPU this thread (proof the path fired).
 pub fn matmul_count() -> u64 {
     GPU_MATMULS.with(|c| c.get())

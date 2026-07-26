@@ -132,6 +132,21 @@ COLI_CUDA_DLLEXPORT int coli_cuda_mamba2_scan(int device,float *state,float *y,c
                                      const float *da_h,const float *d,
                                      int n_heads,int head_dim,int d_state,int n_groups);
 
+/* Whole-sequence (prefill, S>1) twin of the above. hidden/y[seq*nh*hd], b/c[seq*ng*ds],
+ * dt_h/da_h[seq*nh], d[nh].
+ *
+ * ⚠️ WEAKER CONTRACT THAN THE S==1 KERNEL: token-identical, not bit-identical. One
+ * thread per (head, head-dim row, state index) keeps its own scalar state and walks t,
+ * which is bit-exact per element; the `y = Σ_nn ss*C` reduction is a tree rather than
+ * the CPU's strict nn order, worth ~1 ULP. The bit-identical form exposes only nh*hd
+ * threads and measured no faster than the CPU scan — see the .cu comment. Deterministic
+ * run to run. Returns 0 (caller falls back to the CPU scan) if d_state exceeds the
+ * maximum block size. */
+COLI_CUDA_DLLEXPORT int coli_cuda_mamba2_scan_seq(int device,float *state,float *y,
+                                     const float *hidden,const float *b,const float *c,
+                                     const float *dt_h,const float *da_h,const float *d,
+                                     int n_heads,int head_dim,int d_state,int n_groups,int seq);
+
 /* DSA sparse prefill attention: like the batch variant but each query attends only
  * to its indexer selection. sel_idx is [S, maxsel] int (row s holds the chosen
  * cache positions), sel_cnt is [S] int (count per query; <=0 means dense/is_dense).

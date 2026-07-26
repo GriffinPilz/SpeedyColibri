@@ -338,25 +338,48 @@ pub fn mamba2_mixer(
         n_groups: ng,
         dt_min: cfg.mamba_dt_min,
     };
-    // Decode (S==1) routes the recurrent scan to the GPU: the per-head step/decay are
-    // precomputed here (bit-identical softplus/exp to the CPU), then the device kernel
-    // does the fma-free multiply/add recurrence over d_state and updates the persisted
-    // ssm state in place. Prefill (S>1) and any GPU-unavailable case fall to the CPU
-    // `selective_scan`, so tokens are identical either way.
+    // The recurrent scan routes to the GPU at EVERY sequence length: the per-head
+    // step/decay are precomputed here (bit-identical softplus/exp to the CPU), then the
+    // device kernel does the fma-free multiply/add recurrence and updates the persisted
+    // ssm state in place. Any GPU-unavailable case, or a backend decline, falls to the
+    // CPU `selective_scan`.
+    //
+    // ⚠️ The two kernels carry DIFFERENT contracts. S==1 (decode) is bit-identical to the
+    // CPU. S>1 (prefill) is only TOKEN-identical: it threads per (head, head-dim row,
+    // state index) to get 128x the parallelism, which makes `y`'s sum over d_state a tree
+    // rather than the CPU's strict order (~1 ULP). The bit-exact prefill form was built
+    // first and measured no faster than the CPU (7.57 s vs ~7.50 s) because it exposes
+    // only n_heads*head_dim threads. `COLI_MAMBA_CPU=1` forces the CPU scan for an A/B.
+    //
+    // Prefill used to fall to the CPU unconditionally, which cost 7.95 s of a warm 23.1 s
+    // Nemotron prefill — 34%, the single largest block — because 40 Mamba layers ran a
+    // sequential scalar scan across the whole prompt. `S == 1` and `S > 1` take different
+    // kernels only because the sequence form stages the head's state in shared memory and
+    // carries a t loop; both reproduce the CPU operand order exactly.
     let y = timed(&MAMBA_SCAN_US, || {
         #[cfg(feature = "cuda")]
-        let gpu_y: Option<Vec<f32>> = if s == 1
-            && crate::gpu::available()
+        let gpu_y: Option<Vec<f32>> = if crate::gpu::available()
             && crate::gpu::mamba_scan_gpu_enabled()
         {
-            let (dt_h, da_h) =
-                crate::mamba2::step_head_scalars(dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias);
             let mut yv = vec![0f32; s * d_inner];
-            let st = kv.mamba_ssm_mut(layer);
-            crate::gpu::try_mamba2_scan(
-                &mut st.data, &mut yv, &h, &b, &c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng,
-            )
-            .then_some(yv)
+            if s == 1 {
+                let (dt_h, da_h) =
+                    crate::mamba2::step_head_scalars(dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias);
+                let st = kv.mamba_ssm_mut(layer);
+                crate::gpu::try_mamba2_scan(
+                    &mut st.data, &mut yv, &h, &b, &c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng,
+                )
+                .then_some(yv)
+            } else {
+                let (dt_h, da_h) = crate::mamba2::seq_head_scalars(
+                    dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias, s,
+                );
+                let st = kv.mamba_ssm_mut(layer);
+                crate::gpu::try_mamba2_scan_seq(
+                    &mut st.data, &mut yv, &h, &b, &c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng, s,
+                )
+                .then_some(yv)
+            }
         } else {
             None
         };

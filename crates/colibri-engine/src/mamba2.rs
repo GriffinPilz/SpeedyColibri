@@ -215,6 +215,37 @@ pub fn step_head_scalars(
     (dt_h, da_h)
 }
 
+/// [`step_head_scalars`] for a whole prefill sequence: `dt_h`/`dA_h` as `[seq, n_heads]`,
+/// row-major by token, from a raw `dt` of `[seq, n_heads]`.
+///
+/// Same reason as the single-step version — the softplus and both exps stay in Rust so
+/// the GPU scan only ever does the deterministic multiply/add recurrence and remains
+/// bit-identical to [`selective_scan`]. Note `selective_scan` hoists
+/// `a[h] = -exp(a_log[h])` out of its `t` loop and reuses it for every token; computing
+/// it per `(t, h)` here would be the same `f32` value from the same input, but it is
+/// hoisted anyway so the arithmetic is literally the same sequence.
+pub fn seq_head_scalars(
+    dims: MambaDims,
+    dt: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    seq: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let nh = dims.n_heads;
+    assert!(dt.len() >= seq * nh && a_log.len() >= nh && dt_bias.len() >= nh);
+    let a: Vec<f32> = a_log[..nh].iter().map(|&v| -(v.exp())).collect();
+    let mut dt_h = vec![0.0f32; seq * nh];
+    let mut da_h = vec![0.0f32; seq * nh];
+    for t in 0..seq {
+        for h in 0..nh {
+            let dth = softplus(dt[t * nh + h] + dt_bias[h]).max(dims.dt_min);
+            dt_h[t * nh + h] = dth;
+            da_h[t * nh + h] = (dth * a[h]).exp();
+        }
+    }
+    (dt_h, da_h)
+}
+
 /// Gated per-group RMSNorm — the Mamba `MambaRMSNormGated` with
 /// `norm_before_gate = false`: `out = rmsnorm(y ⊙ silu(gate)) ⊙ weight`, where the
 /// RMS is computed independently over each of `n_groups` contiguous groups of
@@ -259,6 +290,50 @@ pub fn gated_rmsnorm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `seq_head_scalars` must agree **bit-for-bit** with `step_head_scalars` applied
+    /// per token — the GPU sequence scan consumes the former where the decode scan
+    /// consumes the latter, and both must match what `selective_scan` derives inline.
+    /// Exact equality, not a tolerance: the whole point of computing these host-side is
+    /// that the transcendentals are the same Rust `f32` softplus/exp.
+    #[test]
+    fn seq_head_scalars_match_per_token_step_scalars() {
+        let dims = MambaDims {
+            n_heads: 5,
+            head_dim: 2,
+            d_state: 3,
+            n_groups: 1,
+            dt_min: 1e-3,
+        };
+        let nh = dims.n_heads;
+        let seq = 4;
+        // Spans far-negative (softplus underflows -> clamps to dt_min) through positive,
+        // so both sides of the `.max(dt_min)` are exercised.
+        let dt: Vec<f32> = (0..seq * nh).map(|i| (i as f32) * 0.9 - 12.0).collect();
+        let a_log: Vec<f32> = (0..nh).map(|h| (h as f32) * 0.11 - 0.4).collect();
+        let dt_bias: Vec<f32> = (0..nh).map(|h| (h as f32) * -0.23 + 0.05).collect();
+
+        let (sdt, sda) = seq_head_scalars(dims, &dt, &a_log, &dt_bias, seq);
+        assert_eq!(sdt.len(), seq * nh);
+        assert_eq!(sda.len(), seq * nh);
+        for t in 0..seq {
+            let (rdt, rda) = step_head_scalars(dims, &dt[t * nh..(t + 1) * nh], &a_log, &dt_bias);
+            for h in 0..nh {
+                assert_eq!(
+                    sdt[t * nh + h].to_bits(),
+                    rdt[h].to_bits(),
+                    "dt_h mismatch at t={t} h={h}"
+                );
+                assert_eq!(
+                    sda[t * nh + h].to_bits(),
+                    rda[h].to_bits(),
+                    "dA_h mismatch at t={t} h={h}"
+                );
+            }
+        }
+        // dt_min clamping actually exercised (else the test proves less than it looks).
+        assert!(sdt.iter().any(|&v| v == dims.dt_min), "no dt clamped to dt_min");
+    }
 
     /// Hand-computed selective-scan recurrence (n_heads=1, head_dim=1, d_state=2,
     /// n_groups=1, seq=2). A = -1, D = 0.5, dt_bias = 0, dt raw = 0 →

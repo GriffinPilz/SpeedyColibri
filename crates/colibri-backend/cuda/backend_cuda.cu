@@ -43,6 +43,11 @@ typedef struct {
     /* Nemotron-H Mamba2 selective-scan decode scratch (state in/out + per-step inputs). */
     float *ms_state,*ms_x,*ms_y,*ms_b,*ms_c,*ms_dth,*ms_dah,*ms_d;
     size_t ms_state_cap,ms_x_cap,ms_y_cap,ms_b_cap,ms_c_cap,ms_dth_cap,ms_dah_cap,ms_d_cap;
+    /* Pinned host staging for the prefill scan's bulk transfers (hidden in, y+state out).
+     * Pageable async copies fall back to a synchronous bounce buffer (~146 MB/s measured);
+     * pinned lets the DMA engine run and a plain host memcpy covers the rest. */
+    float *ms_pin_x,*ms_pin_y,*ms_pin_state;
+    size_t ms_pin_x_cap,ms_pin_y_cap,ms_pin_state_cap;
     void *asel,*acnt; size_t asel_cap,acnt_cap;  /* DSA sparse-attention selection */
     void *aqa,*akb,*amsk; size_t aqa_cap,akb_cap,amsk_cap;  /* tensor-core sparse attn: QA/KB fp16 + per-query key bitmask */
     float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
@@ -603,6 +608,76 @@ __global__ static void mamba2_scan_kernel(float *state, float *y, const float *h
     y[(size_t)h * hd + pp] = __fadd_rn(acc, __fmul_rn(x_hp, dh));  // + x*D
 }
 
+/* Nemotron-H Mamba2 selective-scan over a WHOLE prefill sequence (S>1).
+ *
+ * ⚠️ CONTRACT DIFFERS FROM THE S==1 KERNEL: this one is **token-identical, not
+ * bit-identical**, and that is a deliberate trade. See below.
+ *
+ * Decomposition. The recurrence `ss = ss*dA + (dt*B)*x` is, for a fixed
+ * (head h, head-dim row pp, state index nn), an independent scalar recurrence over t —
+ * dA depends only on (t,h), and nothing couples one nn to another. So one thread per
+ * (h,pp,nn) keeps `ss` in a REGISTER and walks t, and that part stays bit-exact: each
+ * thread issues the CPU's operand sequence for its own element.
+ *
+ * What does change is `y = Σ_nn ss*C`. The CPU sums the ds products strictly in nn
+ * order; here the block tree-reduces them. That reassociation is the only difference,
+ * and it is worth ~1 ULP on a 128-term f32 sum.
+ *
+ * Why accept it. The bit-identical form (one thread per (h,pp), serial over both t and
+ * nn) exposes only nh*hd = 8192 threads — 64 per block, ~2 blocks/SM once the head's
+ * state is staged — and MEASURED 7.57 s against the CPU scan's ~7.50 s, i.e. no win at
+ * all, on a GB10 that wants tens of thousands of threads resident. Neither shared-memory
+ * staging nor padding away a 32-way bank conflict moved it, because the limit was
+ * parallelism, not memory. Keeping ss per (h,pp,nn) instead exposes nh*hd*ds =
+ * 1,048,576 threads and makes every global access coalesced (consecutive nn are
+ * adjacent in state, B and C).
+ *
+ * Determinism is preserved: the tree order is fixed by block shape, so repeated runs
+ * agree exactly. Correctness is gated on TOKEN identity, not bit identity.
+ *
+ * Launch: grid (hd, nh), block ds threads, shared = 2*ds (B/C rows) + 32 (warp partials).
+ * Declines if ds exceeds the max block size — the caller then runs the CPU scan. */
+__global__ static void mamba2_scan_seq_kernel(float *state, float *y, const float *hidden,
+        const float *b, const float *c, const float *dt_h, const float *da_h,
+        const float *d, int nh, int hd, int ds, int ng, int seq) {
+    extern __shared__ float sh[];
+    float *sh_b = sh;             // [ds]
+    float *sh_c = sh_b + ds;      // [ds]
+    float *sh_red = sh_c + ds;    // [<=32] one slot per warp
+    int pp = blockIdx.x, h = blockIdx.y, nn = threadIdx.x;
+    if (h >= nh || pp >= hd || nn >= ds) return;
+    int hpg = nh / ng, grp = h / hpg;
+    size_t d_inner = (size_t)nh * hd;
+    // Coalesced: consecutive nn are adjacent.
+    size_t sidx = ((size_t)h * hd + pp) * ds + nn;
+    float ss = state[sidx];
+    float dh = d[h];
+    int lane = nn & 31, warp = nn >> 5, nwarps = (ds + 31) >> 5;
+    for (int t = 0; t < seq; t++) {
+        sh_b[nn] = b[((size_t)t * ng + grp) * ds + nn];
+        sh_c[nn] = c[((size_t)t * ng + grp) * ds + nn];
+        __syncthreads();
+        float dth = dt_h[(size_t)t * nh + h], dah = da_h[(size_t)t * nh + h];
+        float x_hp = hidden[(size_t)t * d_inner + (size_t)h * hd + pp];
+        // Per-element state update — identical operand order to the CPU scan.
+        ss = __fadd_rn(__fmul_rn(ss, dah), __fmul_rn(__fmul_rn(dth, sh_b[nn]), x_hp));
+        float prod = __fmul_rn(ss, sh_c[nn]);
+        // Tree reduction (the one reassociation).
+        for (int off = 16; off > 0; off >>= 1)
+            prod = __fadd_rn(prod, __shfl_down_sync(0xffffffffu, prod, off));
+        if (lane == 0) sh_red[warp] = prod;
+        __syncthreads();
+        if (nn == 0) {
+            float acc = 0.f;
+            for (int i = 0; i < nwarps; i++) acc = __fadd_rn(acc, sh_red[i]);
+            y[(size_t)t * d_inner + (size_t)h * hd + pp] =
+                __fadd_rn(acc, __fmul_rn(x_hp, dh));
+        }
+        __syncthreads();   // nobody may overwrite sh_b/sh_c/sh_red before all readers finish
+    }
+    state[sidx] = ss;
+}
+
 /* Standard grouped-query attention prefill (MiniMax-M3): Q[S,H,D], full K/V[T,Hkv,D]
  * (no MLA absorption). One block per (query s, head h); a query head maps to KV head
  * h/(H/Hkv). Causal over [0, T-S+s]. Shared-mem softmax, mirroring the absorb batch
@@ -1051,6 +1126,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if(ctx->ms_state)cudaFree(ctx->ms_state);if(ctx->ms_x)cudaFree(ctx->ms_x);if(ctx->ms_y)cudaFree(ctx->ms_y);
         if(ctx->ms_b)cudaFree(ctx->ms_b);if(ctx->ms_c)cudaFree(ctx->ms_c);
         if(ctx->ms_dth)cudaFree(ctx->ms_dth);if(ctx->ms_dah)cudaFree(ctx->ms_dah);if(ctx->ms_d)cudaFree(ctx->ms_d);
+        if(ctx->ms_pin_x)cudaFreeHost(ctx->ms_pin_x);if(ctx->ms_pin_y)cudaFreeHost(ctx->ms_pin_y);
+        if(ctx->ms_pin_state)cudaFreeHost(ctx->ms_pin_state);
         if(ctx->asel)cudaFree(ctx->asel);if(ctx->acnt)cudaFree(ctx->acnt);
         if(ctx->aqa)cudaFree(ctx->aqa);if(ctx->akb)cudaFree(ctx->akb);if(ctx->amsk)cudaFree(ctx->amsk);
         for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
@@ -1796,6 +1873,78 @@ extern "C" int coli_cuda_mamba2_scan(int device, float *state, float *y, const f
         !cuda_ok(cudaMemcpyAsync(y, dc->ms_y, xb, cudaMemcpyDeviceToHost, st), "mamba y download") ||
         !cuda_ok(cudaStreamSynchronize(st), "mamba sync"))
         return 0;
+    return 1;
+}
+
+/* Whole-sequence (prefill, S>1) twin of `coli_cuda_mamba2_scan`. Same uploads with the
+ * per-token axis added — hidden/y are [seq,nh*hd], B/C [seq,ng,ds], dt_h/dA_h [seq,nh]
+ * (all precomputed host-side so the softplus/exp stay bit-identical). One block per
+ * head, hd threads, the head's state resident in shared memory for the whole scan.
+ * Declines (returns 0, caller falls back to the CPU scan) if the state does not fit in
+ * shared memory rather than silently launching something slower or wrong. */
+extern "C" int coli_cuda_mamba2_scan_seq(int device, float *state, float *y, const float *hidden,
+        const float *b, const float *c, const float *dt_h, const float *da_h,
+        const float *d, int nh, int hd, int ds, int ng, int seq) {
+    if (!state || !y || !hidden || !b || !c || !dt_h || !da_h || !d) return 0;
+    if (nh < 1 || hd < 1 || ds < 1 || ds > 1024 || ng < 1 || nh % ng || seq < 1) return 0;
+    DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
+    cudaStream_t st = dc->stream;
+    size_t shmem = (2 * (size_t)ds + 32) * sizeof(float);
+    int shmax = 0;
+    if (!cuda_ok(cudaDeviceGetAttribute(&shmax, cudaDevAttrMaxSharedMemoryPerBlock, device),
+                 "mamba seq shmem query"))
+        return 0;
+    if (shmem > (size_t)shmax) return 0;   // decline; caller uses the CPU scan
+    // Staged, with PINNED host buffers. CUDA-event timing located the cost precisely:
+    // the kernel is 255 ms for all 40 layers, while download+sync was 5761 ms — ~840 MB
+    // of D2H at ~146 MB/s, because an async copy to a *pageable* destination degenerates
+    // into a synchronous trickle through a small internal bounce buffer. Compute was
+    // never the bottleneck; three earlier attempts (shared-memory staging, bank-conflict
+    // padding, 128x more threads) each optimized the 255 ms and moved nothing.
+    //
+    // ⚠️ Zero-copy (kernel straight onto host pointers, as the expert path does) was
+    // MEASURED WORSE: scan 7445 -> 13670 ms. Experts stream large buffers read once;
+    // this scan re-reads B/C/hidden across every one of `seq` timesteps, so it pays the
+    // coherent-link latency over and over. Do not retry it here.
+    size_t sq  = (size_t)seq;
+    size_t stt = (size_t)nh * hd * ds * sizeof(float);
+    size_t xb  = sq * (size_t)nh * hd * sizeof(float);
+    size_t bcb = sq * (size_t)ng * ds * sizeof(float);
+    size_t hsb = sq * (size_t)nh * sizeof(float);
+    size_t db  = (size_t)nh * sizeof(float);
+    if (!reserve(&dc->ms_state, &dc->ms_state_cap, stt) ||
+        !reserve(&dc->ms_x, &dc->ms_x_cap, xb) ||
+        !reserve(&dc->ms_y, &dc->ms_y_cap, xb) ||
+        !reserve(&dc->ms_b, &dc->ms_b_cap, bcb) ||
+        !reserve(&dc->ms_c, &dc->ms_c_cap, bcb) ||
+        !reserve(&dc->ms_dth, &dc->ms_dth_cap, hsb) ||
+        !reserve(&dc->ms_dah, &dc->ms_dah_cap, hsb) ||
+        !reserve(&dc->ms_d, &dc->ms_d_cap, db))
+        return 0;
+    if (!reserve_pinned(&dc->ms_pin_x, &dc->ms_pin_x_cap, xb) ||
+        !reserve_pinned(&dc->ms_pin_y, &dc->ms_pin_y_cap, xb) ||
+        !reserve_pinned(&dc->ms_pin_state, &dc->ms_pin_state_cap, stt))
+        return 0;
+    memcpy(dc->ms_pin_x, hidden, xb);
+    memcpy(dc->ms_pin_state, state, stt);
+    if (!cuda_ok(cudaMemcpyAsync(dc->ms_state, dc->ms_pin_state, stt, cudaMemcpyHostToDevice, st), "mamba seq state up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_x, dc->ms_pin_x, xb, cudaMemcpyHostToDevice, st), "mamba seq x up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_b, b, bcb, cudaMemcpyHostToDevice, st), "mamba seq b up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_c, c, bcb, cudaMemcpyHostToDevice, st), "mamba seq c up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_dth, dt_h, hsb, cudaMemcpyHostToDevice, st), "mamba seq dth up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_dah, da_h, hsb, cudaMemcpyHostToDevice, st), "mamba seq dah up") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_d, d, db, cudaMemcpyHostToDevice, st), "mamba seq d up"))
+        return 0;
+    mamba2_scan_seq_kernel<<<dim3(hd, nh), ds, shmem, st>>>(dc->ms_state, dc->ms_y, dc->ms_x,
+        dc->ms_b, dc->ms_c, dc->ms_dth, dc->ms_dah, dc->ms_d, nh, hd, ds, ng, seq);
+    if (!cuda_ok(cudaGetLastError(), "mamba seq launch")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(dc->ms_pin_state, dc->ms_state, stt, cudaMemcpyDeviceToHost, st), "mamba seq state down") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ms_pin_y, dc->ms_y, xb, cudaMemcpyDeviceToHost, st), "mamba seq y download") ||
+        !cuda_ok(cudaStreamSynchronize(st), "mamba seq sync"))
+        return 0;
+    memcpy(state, dc->ms_pin_state, stt);
+    memcpy(y, dc->ms_pin_y, xb);
     return 1;
 }
 

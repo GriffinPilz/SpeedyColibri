@@ -182,6 +182,24 @@ extern "C" {
         d_state: c_int,
         n_groups: c_int,
     ) -> c_int;
+    // Nemotron-H Mamba2 selective-scan over a whole prefill sequence (S>1).
+    #[allow(clippy::too_many_arguments)]
+    fn coli_cuda_mamba2_scan_seq(
+        device: c_int,
+        state: *mut f32,
+        y: *mut f32,
+        hidden: *const f32,
+        b: *const f32,
+        c: *const f32,
+        dt_h: *const f32,
+        da_h: *const f32,
+        d: *const f32,
+        n_heads: c_int,
+        head_dim: c_int,
+        d_state: c_int,
+        n_groups: c_int,
+        seq: c_int,
+    ) -> c_int;
     // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
     fn coli_cuda_dsa_indexer_scores(
         scores: *mut f32,
@@ -717,6 +735,34 @@ pub unsafe fn mamba2_scan_raw(
 ) -> bool {
     coli_cuda_mamba2_scan(
         0, state, y, hidden, b, c, dt_h, da_h, d, n_heads, head_dim, d_state, n_groups,
+    ) != 0
+}
+
+/// Whole-sequence (prefill) Mamba2 selective scan. `hidden`/`y` are `[seq, nh*hd]`,
+/// `b`/`c` `[seq, ng, ds]`, `dt_h`/`da_h` `[seq, nh]`, `d` `[nh]`. Returns false when
+/// the backend declines (e.g. the head state exceeds shared memory), in which case the
+/// caller must run the CPU scan.
+///
+/// # Safety
+/// `state`/`y` and the read-only inputs must be sized per `(seq, nh, hd, ds, ng)`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn mamba2_scan_seq_raw(
+    state: *mut f32,
+    y: *mut f32,
+    hidden: *const f32,
+    b: *const f32,
+    c: *const f32,
+    dt_h: *const f32,
+    da_h: *const f32,
+    d: *const f32,
+    n_heads: i32,
+    head_dim: i32,
+    d_state: i32,
+    n_groups: i32,
+    seq: i32,
+) -> bool {
+    coli_cuda_mamba2_scan_seq(
+        0, state, y, hidden, b, c, dt_h, da_h, d, n_heads, head_dim, d_state, n_groups, seq,
     ) != 0
 }
 

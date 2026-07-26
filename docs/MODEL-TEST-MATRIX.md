@@ -24,8 +24,8 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | lever | glm-5.2 | minimax-m3 | minimax-m2.7 | nemotron-3-super |
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
-| prefill bench | PASS | PASS | PASS | PASS 33.1 s / 15.5 tok/s |
-| decode bench | PASS | PASS 2.07 | PASS | PASS **8.3 tok/s** |
+| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **24.1 warm** tok/s — **23.8× behind vLLM**, see head-to-head |
+| decode bench | PASS | PASS 2.07 | PASS | PASS **9.27 tok/s** — 2.77× behind vLLM |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
 | chat template in serve | PASS | PASS (GLM-style) | PASS (M2 format) | PASS ChatML, PR #8 |
@@ -52,11 +52,13 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 88 layers = 40 Mamba2 + 40 latent-MoE + 8 GQA (NoPE, no qk-norm). 512 experts top-22,
 gateless ReLU² in a 1024-wide latent space. NVFP4 routed experts.
 
-- **prefill ~38 s**, **decode 7.11 tok/s** (after PR #13), **serve 3.60 tok/s** (measured pre-#13).
-- ⚠️ An earlier prefill figure of **33.1 s** does not reproduce — runs both *before* and *after*
-  PR #13 give ~38 s on the same box. NOT attributable to #13 (pre-change runs already showed
-  38.4 s). Treat 33.1 as measured in an unidentified state; re-run
-  `bench.sh nemotron-3-super prefill` for a current number.
+- **prefill 38.4 s cold / 23.1 s warm**, **decode 9.27 tok/s**, **serve 3.60 tok/s** (pre-#13).
+- ✅ **RESOLVED 2026-07-25 — the prefill figure that "does not reproduce" was a cache-state
+  artifact.** The old note flagged 33.1 s as unreproducible against ~38 s runs and blamed an
+  unidentified state. The state is the **in-process expert cache**: a cold `coli gen` pays
+  ~9.9 s refilling 53.5 GB (18 131 misses), so one-shot runs land at 38.4 s while a warm
+  `coli serve` request lands at 23.1 s. Anything in between — 33.1 included — is a partially
+  warm page cache. **Always say which of the two a prefill number is.**
 - **Experts are only ~59 GB against 121 GB of RAM (172% coverage) — they FIT.** Profiled:
   `18,179 resident, 0 evictions`; steady-state decode reads NOTHING from disk. It is *not* in
   GLM's disk-streaming regime, so GLM-derived "bytes-bound floor" reasoning does not transfer.
@@ -187,9 +189,16 @@ NGEN=24, arms interleaved, token-identity gated.
 resident matmuls dominate its decode and these kernels sit on the critical path. GLM and M3
 are expert-load-I/O bound (m3 ~51% expert-load), so the same kernels touch a small slice.
 
-⚠️ **Corollary that kills the planned follow-on work:** the S=2 verify cliff that blocks
-Nemotron MTP is this same number read backwards, so **small-S dispatch is a nemotron-shaped
-lever, worth ~8–19% elsewhere.** Do not build it expecting a general win.
+⚠️ **Corollary:** the S=2 verify cliff that blocks Nemotron MTP is this same number read
+backwards, so **small-S dispatch is a nemotron-shaped lever, worth ~8–19% elsewhere.** Do
+not build it expecting a *general* win.
+
+> **REVISED 2026-07-25 by the vLLM head-to-head (below).** This corollary originally read
+> "kills the planned follow-on work". That was right about generality and wrong as
+> guidance. Nemotron is the model we are benchmarked against, MTP is worth a measured
+> **1.80×** to vLLM on it, and small-S dispatch is the prerequisite for using our own MTP
+> head (which already reaches 77% acceptance). It is not a broad lever; it is the specific
+> unlock for the single largest decode win available. Build it — for nemotron.
 
 ⚠️ **GLM's #15 result is negative.** It is the one model where the dedicated GEMV loses
 ground the tile bypass had already won. If `i8a16_gemv` is ever tuned, re-measure GLM
@@ -289,6 +298,86 @@ needs a code change. **Do not cite a mechanism until someone measures it.**
 **Headroom remains.** 2.9 GB/s is still far under this drive's ~6.6–10.5 GB/s, and QD 11.5
 is under the ~32 buffered reads need. The lever did not exhaust the read path; it only
 stopped starving it.
+
+## Head-to-head vs vLLM on nemotron (2026-07-25)
+
+First real external baseline. Same model, same weights, same box — `vllm/vllm-openai:
+v0.20.0-aarch64-cu130-ubuntu2404` pointed at the local `Nemotron-3-Super-120B-src` (the
+NVFP4 checkpoint we convert from), TP=1 on 42b2, Marlin NVFP4 MoE + FlashInfer attention +
+FP8 KV + async scheduling, i.e. the shipped recipe. Client sends the **identical 512 token
+ids** we bench with, greedy, **one request at a time** — not concurrent, because our figure
+is single-sequence and `max_num_seqs: 10` would otherwise compare aggregate throughput to
+latency.
+
+| | prefill tok/s | decode tok/s |
+|---|---|---|
+| colibrì — `coli gen`, cold per-process cache | 13.3 | **9.27** |
+| **colibrì — `coli serve`, warm (the fair number)** | **24.1** | — |
+| vLLM, MTP off | 573 | 14.24 |
+| vLLM, MTP on (shipped) | **898** | **25.69** |
+
+**Decode: 2.77× behind, and it splits in two.** 1.80× is MTP alone (25.69/14.24); 1.54× is
+engine quality with speculation off (14.24/9.27). It is *not* all speculation — that was
+the hypothesis this A/B was built to test, and it failed.
+
+**Prefill: 23.8× behind** (573/24.1), against vLLM with speculation off.
+
+⚠️ **Compare warm against warm.** Every `coli gen` invocation refills the in-process expert
+cache from scratch — 18 131 misses, 53.5 GB, ~9.9 s — while vLLM is a *server* that paid
+that once at startup. Measuring one-shot `coli gen` against a warm vLLM endpoint inflated
+the gap to 42×. Under `coli serve` the first request costs 38.4 s and every later one
+**23.1 s (24.1 tok/s), reproducible to 0.06%**. Use the serving number for any comparison
+against a server.
+
+### Where a warm 23.1 s prefill goes (557 tok, request 3 minus request 2)
+
+| phase | ms | share | |
+|---|---|---|---|
+| **mamba** | **12 317** | **53%** | **scan 7 951 (CPU, 34% of prefill)** · conv+norm 3 162 · proj 1 203 |
+| **moe** | **10 583** | **46%** | **gpu-ffn 9 544** · shared 378 · router 201 · gather 66 · scatter 54 · **expert-load 2** |
+| attn | 71 | 0.3% | |
+
+⚠️ **Two corrections to the cold-cache reading, both mine.** First I predicted the CPU
+Mamba scan would dominate and the *cold* profile said no (19%) — so I re-prioritized MoE
+first. Warm, the scan is **34%** and mamba is **53%**: the original instinct was right and
+the cold profile was misleading. Second, the cold profile's headline MoE costs are almost
+entirely first-request artifacts — `expert-load` 9 933 → **2 ms**, shared expert 6 618 →
+**378 ms**. Only `gpu-ffn` survives at 9.5 s. This is trap 4 (never reuse a number from a
+different regime) committed against my own measurement an hour earlier.
+
+For scale: 12 B active params × 557 tokens ≈ 13.4 TFLOP. vLLM's 0.97 s at this length is
+~14 TFLOP/s; our 23.1 s is ~0.6 TFLOP/s. Attention is 0.3% — the tensor-core attention and
+DSA indexer work, both real wins on GLM, are noise on this model.
+
+For scale: 12 B active params × 512 tokens ≈ 12.3 TFLOP. vLLM's 0.57 s is ~21 TFLOP/s; our
+38.5 s is ~0.3 TFLOP/s, about 0.1% of this chip's NVFP4 peak. Attention is 0.2% of the
+total — the tensor-core attention and DSA indexer work, both real wins on GLM, are noise
+on this model.
+
+### The root cause is one decision, and it explains both gaps
+
+Four fast paths are gated on `S == 1`: the Mamba GPU scan (`forward.rs:348` — its own
+comment says "Prefill (S>1) … fall to the CPU `selective_scan`"), the tile bypass
+(`backend_cuda.cu:1192`), `i8a16_gemv` (`:1200`), and grouped NVFP4 relu² (`gpu.rs:919`).
+The engine is tuned for exactly one token and falls off a cliff for anything else. That
+single decision produces **both** results above: prefill at S=512 is catastrophic, *and*
+MTP verify at S=2 is a 1.18× regression, which is precisely why we cannot use the
+speculation worth 1.80× to vLLM.
+
+Priority by measured value, **on the warm numbers**:
+1. **Chunked GPU Mamba scan** — 34% of warm prefill, and the largest single block. The
+   kernel exists for S==1 only.
+2. **MoE `gpu-ffn`** — 41% of warm prefill. NOT the `expert-load`/shared-expert costs the
+   cold profile suggested; those are startup artifacts worth 2 ms and 378 ms warm.
+3. **Small-S dispatch** → unblocks our MTP head (77% acceptance) → ~1.8× decode.
+4. **CUDA graphs + kernel quality** → the residual 1.54×. Note `cudaGraph` appears **0
+   times** in this repo and there are 22 `cudaStreamSynchronize` sites, one per GPU entry.
+
+Together (1)+(2) are 87% of warm prefill, against a 23.8× gap.
+
+⚠️ **Also fix the per-process cache refill itself.** 9.9 s and 53.5 GB of re-read on every
+`coli gen` is invisible under `serve` but dominates one-shot CLI use, which is how most of
+this repo's benchmarking is done. Any prefill figure from `coli gen` carries it.
 
 ## Recurring traps (cost us real time; check these when adding a model)
 

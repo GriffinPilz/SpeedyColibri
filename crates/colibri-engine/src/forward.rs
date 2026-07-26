@@ -42,6 +42,10 @@ static MAMBA_US: AtomicU64 = AtomicU64::new(0);
 /// and the in_proj + out_proj matmuls. The remainder is conv1d + splits + gated norm.
 static MAMBA_SCAN_US: AtomicU64 = AtomicU64::new(0);
 static MAMBA_PROJ_US: AtomicU64 = AtomicU64::new(0);
+/// Further sub-totals of `MAMBA_US`, split out of what the profile used to report as one
+/// "conv+norm" remainder: the causal depthwise conv1d+silu and the gated per-group RMSNorm.
+static MAMBA_CONV_US: AtomicU64 = AtomicU64::new(0);
+static MAMBA_NORM_US: AtomicU64 = AtomicU64::new(0);
 static EMBED_US: AtomicU64 = AtomicU64::new(0);
 /// Time spent fetching experts through the provider (disk→RAM on a cache miss).
 /// A sub-total of `MOE_US`. Incremented from `moe`.
@@ -314,8 +318,9 @@ pub fn mamba2_mixer(
         aug[..hist * conv_dim].copy_from_slice(&cs[conv_dim..kk * conv_dim]);
     }
     aug[hist * conv_dim..].copy_from_slice(&hbc[..s * conv_dim]);
-    let conv_aug =
-        causal_conv1d_silu(&aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk);
+    let conv_aug = timed(&MAMBA_CONV_US, || {
+        causal_conv1d_silu(&aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk)
+    });
     let conv_out = &conv_aug[hist * conv_dim..aug_len * conv_dim]; // [s, conv_dim]
     // Next state = the last k input columns of the augmented buffer.
     kv.mamba_conv_row_mut(layer)
@@ -403,7 +408,9 @@ pub fn mamba2_mixer(
     });
 
     // ---- gated RMSNorm (per group, silu gate) then out_proj --------------
-    let yn = gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps);
+    let yn = timed(&MAMBA_NORM_US, || {
+        gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps)
+    });
     timed(&MAMBA_PROJ_US, || matmul_qt(out, &yn, out_proj, s));
 }
 
@@ -903,10 +910,16 @@ where
             ms(&ATTN_OPROJ_US),
         );
         eprintln!(
-            "[profile] mamba breakdown: scan {:.0} ms | in/out-proj {:.0} ms | conv+norm {:.0} ms",
+            "[profile] mamba breakdown: scan {:.0} ms | in/out-proj {:.0} ms | conv {:.0} ms | gated-norm {:.0} ms | other {:.0} ms",
             ms(&MAMBA_SCAN_US),
             ms(&MAMBA_PROJ_US),
-            ms(&MAMBA_US) - ms(&MAMBA_SCAN_US) - ms(&MAMBA_PROJ_US),
+            ms(&MAMBA_CONV_US),
+            ms(&MAMBA_NORM_US),
+            ms(&MAMBA_US)
+                - ms(&MAMBA_SCAN_US)
+                - ms(&MAMBA_PROJ_US)
+                - ms(&MAMBA_CONV_US)
+                - ms(&MAMBA_NORM_US),
         );
     }
     Ok(DecodeStats {

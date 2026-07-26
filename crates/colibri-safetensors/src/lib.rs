@@ -68,6 +68,29 @@ fn fadvise_enabled() -> bool {
     env || FADVISE_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Sub-chunk size, in bytes, that [`Shards::read_raw_shared`] tiles each span into.
+/// `COLI_READ_SUB_KB` overrides it (KiB); default 2 MiB.
+///
+/// This sets read *concurrency*, not request size — see the call site. Rounded down to
+/// a 512-multiple with a 512 B floor, because O_DIRECT requires every job's offset,
+/// address and length to be 512-aligned and the tiling inherits that from this value.
+/// A non-numeric or sub-512 setting falls back to the default rather than failing: this
+/// is a perf knob, and a typo should not stop the process from loading a model.
+fn read_sub_bytes() -> usize {
+    static SUB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SUB.get_or_init(|| parse_sub_kb(std::env::var("COLI_READ_SUB_KB").ok().as_deref()))
+}
+
+/// Pure half of [`read_sub_bytes`], split out so the alignment and fallback rules are
+/// testable without touching process-global env.
+fn parse_sub_kb(v: Option<&str>) -> usize {
+    const DEFAULT: usize = 2 << 20;
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|kb| kb.saturating_mul(1024) & !511)
+        .filter(|&b| b >= 512)
+        .unwrap_or(DEFAULT)
+}
+
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
 pub struct StTensor {
@@ -543,7 +566,16 @@ impl Shards {
         // 2. Tile every span into fixed sub-chunks and drain them all through one
         //    pool of `nthreads` workers pulling via an atomic cursor — the drive
         //    stays saturated with no per-span barrier.
-        const SUB: usize = 2 << 20; // 2 MiB — grid-optimal in-flight granularity
+        //
+        // The tile size is an I/O *concurrency* knob, not a request-size one: workers
+        // are handed whole jobs, so `nt = min(nthreads, jobs.len())` and the tile size
+        // decides how many of them a given span can occupy. A single m2.7 expert is
+        // ~7.6 MB contiguous, which at 2 MiB tiles decomposes into just 4 jobs — so an
+        // on-demand miss uses 4 of the 40 available read threads and the NVMe queue
+        // sits near 6 when it wants >= 32. Smaller tiles do not shrink the actual
+        // device requests: the block layer already splits these at ~112 KB.
+        // See `read_sub_bytes` for the override.
+        let sub = read_sub_bytes();
         struct Job {
             file: usize,
             off: u64,
@@ -553,13 +585,14 @@ impl Shards {
         let mut jobs: Vec<Job> = Vec::new();
         for s in spans.iter_mut() {
             let (file, read_off, total, skew) = (s.file, s.read_off, s.read_len, s.skew);
-            // Tiling starts at the aligned address, not the allocation base. `SUB` is a
-            // 512-multiple and `total` was rounded up, so every job — including the
-            // last — keeps its offset, address and length 512-aligned under O_DIRECT.
+            // Tiling starts at the aligned address, not the allocation base. `sub` is a
+            // 512-multiple (enforced by `read_sub_bytes`) and `total` was rounded up, so
+            // every job — including the last — keeps its offset, address and length
+            // 512-aligned under O_DIRECT.
             let base = s.buf.as_mut_slice().as_mut_ptr() as usize + skew;
             let mut o = 0usize;
             while o < total {
-                let clen = SUB.min(total - o);
+                let clen = sub.min(total - o);
                 jobs.push(Job { file, off: read_off + o as u64, ptr: base + o, len: clen });
                 o += clen;
             }
@@ -969,6 +1002,28 @@ mod tests {
         // contiguous on disk → still one shared buffer despite the query order
         assert!(Arc::ptr_eq(&r[0].0, &r[1].0));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The tile size feeds O_DIRECT's alignment requirement, so every accepted value
+    /// must be a 512-multiple and anything unusable must fall back rather than produce
+    /// a misaligned job (which fails the read at runtime, not at parse time).
+    #[test]
+    fn read_sub_kb_rounds_to_512_and_falls_back() {
+        const DEFAULT: usize = 2 << 20;
+        assert_eq!(parse_sub_kb(None), DEFAULT);
+        assert_eq!(parse_sub_kb(Some("512")), 512 * 1024);
+        assert_eq!(parse_sub_kb(Some(" 256 ")), 256 * 1024, "surrounding space tolerated");
+        // Not a 512-multiple in bytes -> rounded DOWN, never up past the request.
+        assert_eq!(parse_sub_kb(Some("1")), 1024);
+        // Unusable settings fall back to the default instead of erroring or yielding 0:
+        // a 0-length job would spin the tiling loop forever.
+        for bad in ["0", "", "-1", "abc", "1.5"] {
+            assert_eq!(parse_sub_kb(Some(bad)), DEFAULT, "{bad:?} should fall back");
+        }
+        // Every accepted value is 512-aligned, which is what the tiling relies on.
+        for kb in [1usize, 7, 64, 256, 1024, 4096] {
+            assert_eq!(parse_sub_kb(Some(&kb.to_string())) % 512, 0);
+        }
     }
 
     #[test]

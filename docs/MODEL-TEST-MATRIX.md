@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | lever | glm-5.2 | minimax-m3 | minimax-m2.7 | nemotron-3-super |
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
-| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **24.1 warm** tok/s — **23.8× behind vLLM**, see head-to-head |
+| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **25.9 warm** tok/s (21.47 s, was 24.1 / 22.9 s pre-#91) — **22.1× behind vLLM**, see head-to-head |
 | decode bench | PASS | PASS 2.07 | PASS | PASS **9.27 tok/s** — 2.77× behind vLLM |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
@@ -53,6 +53,8 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 gateless ReLU² in a 1024-wide latent space. NVFP4 routed experts.
 
 - **prefill 38.4 s cold / 23.1 s warm**, **decode 9.27 tok/s**, **serve 3.60 tok/s** (pre-#13).
+  Warm prefill is **21.47 s** as of `a95a5b9` (#91); re-measured against a 22.90 s baseline
+  in the same session, so the 23.1 above is the historical figure, not a second arm.
 - ✅ **RESOLVED 2026-07-25 — the prefill figure that "does not reproduce" was a cache-state
   artifact.** The old note flagged 33.1 s as unreproducible against ~38 s runs and blamed an
   unidentified state. The state is the **in-process expert cache**: a cold `coli gen` pays
@@ -312,9 +314,12 @@ latency.
 | | prefill tok/s | decode tok/s |
 |---|---|---|
 | colibrì — `coli gen`, cold per-process cache | 13.3 | **9.27** |
-| **colibrì — `coli serve`, warm (the fair number)** | **24.1** | — |
+| **colibrì — `coli serve`, warm (the fair number)** | **24.1** → **25.9** after #91 | — |
 | vLLM, MTP off | 573 | 14.24 |
 | vLLM, MTP on (shipped) | **898** | **25.69** |
+
+The 24.1 figure is the one this section was written against; #91 later moved it to 25.9
+(22.1× behind), measured the same way — see the GPU-scan section below.
 
 **Decode: 2.77× behind, and it splits in two.** 1.80× is MTP alone (25.69/14.24); 1.54× is
 engine quality with speculation off (14.24/9.27). It is *not* all speculation — that was
@@ -364,20 +369,148 @@ single decision produces **both** results above: prefill at S=512 is catastrophi
 MTP verify at S=2 is a 1.18× regression, which is precisely why we cannot use the
 speculation worth 1.80× to vLLM.
 
-Priority by measured value, **on the warm numbers**:
-1. **Chunked GPU Mamba scan** — 34% of warm prefill, and the largest single block. The
-   kernel exists for S==1 only.
-2. **MoE `gpu-ffn`** — 41% of warm prefill. NOT the `expert-load`/shared-expert costs the
-   cold profile suggested; those are startup artifacts worth 2 ms and 378 ms warm.
-3. **Small-S dispatch** → unblocks our MTP head (77% acceptance) → ~1.8× decode.
+Priority by measured value, **on the warm numbers** — with what each turned out to be worth
+once measured (2026-07-26):
+
+1. ~~**Chunked GPU Mamba scan**~~ — 34% of warm prefill. **DONE**, scan 7 462 → 794 ms
+   (9.4×). The win was not the kernel; see the pinned-memory trap below.
+2. **MoE `gpu-ffn`** — 41% of warm prefill, still open and now the whole story. NOT the
+   `expert-load`/shared-expert costs the cold profile suggested; those are startup
+   artifacts worth 2 ms and 378 ms warm. Its cause is settled — see the next section.
+3. ~~**Small-S dispatch**~~ → **DISPROVED.** It does not unblock MTP, which is 1.55×
+   *slower*, and lifting the S==1 gates recovers 1.6%. Same section.
 4. **CUDA graphs + kernel quality** → the residual 1.54×. Note `cudaGraph` appears **0
    times** in this repo and there are 22 `cudaStreamSynchronize` sites, one per GPU entry.
 
-Together (1)+(2) are 87% of warm prefill, against a 23.8× gap.
+Together (1)+(2) are 87% of warm prefill, against a 23.8× gap. **(1) is now landed, and it
+is worth 1.066× warm — not the 1.54× predicted from its own phase saving. See the next
+section: most of the scan's time was hiding other work.**
 
 ⚠️ **Also fix the per-process cache refill itself.** 9.9 s and 53.5 GB of re-read on every
 `coli gen` is invisible under `serve` but dominates one-shot CLI use, which is how most of
 this repo's benchmarking is done. Any prefill figure from `coli gen` carries it.
+
+## The GPU Mamba scan is worth 1.066× warm, not 1.54× — most of it was hiding work (2026-07-26)
+
+⚠️ **This section corrects a figure I published in PR #28**, which claimed warm prefill had
+gone 23.1 → ~15.0 s (1.54×). That number was **derived**, not measured: I subtracted the
+scan's phase saving from the warm total. This file's first rule exists precisely to catch
+that, and I broke it. Measured, both arms in one session with one script:
+
+| arm | warm prefill (median of 5) | spread | tok/s |
+|---|---|---|---|
+| baseline `63f500c` (pre-#91) | **22.895 s** | 0.90% | 24.3 |
+| merged main `a95a5b9` | **21.469 s** | 2.64% | 25.9 |
+
+**1.066×.** Same box, same 557-token prompt (`passage2.txt`), `coli serve`, request 1
+discarded as warm-up, identical output token on all 10 requests. The baseline reproduces
+the recorded 23.1 s to within 0.9%, so the protocol is sound and the comparison is fair.
+The vLLM prefill gap moves 23.8× → **22.1×**.
+
+### Where the other 5.8 s went
+
+Per-request phase deltas (consecutive cumulative `COLI_PROFILE` counters, warm requests
+only; profiling costs nothing here — the profiled baseline ran 22.75 s vs 22.90 unprofiled):
+
+| phase | baseline | merged main | Δ |
+|---|---|---|---|
+| **mamba scan** | 7 899 ms | **616 ms** | **−7 283** |
+| **shared expert** | 377 ms | **6 127 ms** | **+5 750** |
+| attn | 69 ms | 886 ms | +817 |
+| gpu-ffn | 9 595 ms | 9 567 ms | ~0 |
+| **total** | **22 746 ms** | **21 207 ms** | **−1 539** |
+
+The kernel did everything it promised — **the scan is 12.8× faster warm**, better than the
+9.4× measured cold. But the shared expert, whose code this branch never touched, grew by
+almost exactly what the scan gave back, and the two increases (+6 567 ms) account for 90%
+of the missing saving.
+
+**Inferred mechanism, not yet proven:** the CPU scan was *absorbing* GPU wait. For 7.9 s per
+request the CPU sat in `selective_scan` while previously-issued GPU work drained; with the
+scan on the GPU the CPU races ahead and blocks at the next sync, which is the shared
+expert's matmul. That is trap 18 (sync re-attribution) at full scale rather than the ~700 ms
+version already recorded. Supporting it: the shared-expert path is unmodified, gpu-ffn is
+unchanged to within 0.3%, and the increases sum to the decrease minus the net win. **To
+confirm, put an explicit `cudaStreamSynchronize` plus its own timer immediately after the
+scan** — if the wait moves there, it is queue drain and not a real regression.
+
+⚠️ **Consequence for how prefill work is ranked in this file.** A phase's measured time is
+an upper bound on what removing it can save, and on this engine it can be a *wildly* loose
+one. Every remaining prefill estimate here — including `gpu-ffn` at 41% below — is subject
+to the same discount until someone measures end-to-end. Cold `coli gen` does not show this:
+the same change is a clean 1.21× there (38.0 → 31.5 s), because cold the CPU scan also
+competes with the loader threads. **Two regimes, two different answers, and the warm one is
+the one a server delivers.**
+
+## MoE prefill `gpu-ffn`: the weight path, and four hypotheses that died (2026-07-26)
+
+`gpu-ffn` is the largest remaining prefill item. Four separate attacks on it produced four
+negatives, and the last one — a kernel built specifically to exploit the diagnosis — is what
+finally established the real constraint.
+
+**The answer: it is ~90% weight streaming.** Solving the 512- vs 2048-token scaling
+(8.916 s vs 12.966 s, where experts rise 1.13× and rows 4×) for its two components:
+
+| | | |
+|---|---|---|
+| **weight-read** | **7.91 s (89%)** | 47.2 GB at 5.97 GB/s |
+| row-compute | 1.01 s (11%) | |
+
+CUDA-event timing agrees from the other direction: H2D 72 ms | D2H+sync 184 | host memcpy
+18 | **kernel window 7 575 (84%)**.
+
+### What was ruled out
+
+| hypothesis | result | why it can't work |
+|---|---|---|
+| **Grouped dispatch at prefill** (`COLI_EXPERT_GROUP_PREFILL=1`) | 1.013× **slower** | The per-expert round-trip it eliminates is under 3% of the phase. It also still launches 3 kernels per expert. |
+| **`COLI_FFN_DEVCOPY`** weight staging | slight **loss** (gpu-ffn 8 911 → 8 375 ms with it **off**) | Stages one expert at a time from *pageable* memory. |
+| **Small-S dispatch / MTP** | MTP 1.55× **slower**; lifting the S==1 gate = 1.6% | See below. |
+| **Occupancy** (segmented GEMM, `COLI_EXPERT_SEG=1`) | token-identical, ~1% **slower** | 86 blocks and ~39 000 blocks perform *identically*. |
+
+### The occupancy disproof, and the reasoning error behind it
+
+The per-expert path launches **86 blocks** at ~25 rows/expert and sits at 2.3% of memory
+peak and 0.26% of compute peak — so it looked badly occupancy-starved. Varying rows per
+expert seemed to confirm it: 4× the prompt tokens cost only 1.45× the time, i.e. **2.75×
+better per token**, with no code change. A segmented GEMM (one grid per layer, row-tile
+descriptors, ~453× the blocks per launch) was built to capture that at any prompt length,
+and predicted to be worth ~5.7 s.
+
+It is worth nothing: prefill 31 084 → 31 354 ms, moe 26 194 → 26 378, tokens `[17054]`.
+
+⚠️ **The 2.75× was weight amortization, not parallelism.** As rows/expert go 25 → 88, the
+weight bytes per output row fall 118 → 33 KB. Longer prompts read the *same* weights for
+*more* rows. That is an arithmetic-intensity result, and a segmented GEMM changes launch
+structure while leaving that ratio exactly where it was. The experiment was sound; the
+inference drawn from it was not.
+
+### Why MTP is blocked on the same thing
+
+Matched-differential (N=13 minus N=1 tokens, so per 12 decode tokens):
+
+| phase | DRAFT=0 | DRAFT=1 | |
+|---|---|---|---|
+| **moe** | 758 ms | **1 761 ms** | **2.32×** — all of it |
+| mamba | 505 ms | 612 ms | 1.21× |
+| attn | 181 ms | 105 ms | 0.58× — amortizes, as speculation intends |
+| **total** | 1 444 ms | 2 478 ms | 1.72× |
+
+Attention amortizes correctly and mamba is nearly flat. MoE more than doubles for the
+**same 264 expert-touches per layer** — so it is not extra weight traffic and not the S==1
+gates. The MoE path is simply far less efficient at 1–2 rows per expert than at exactly 1.
+The 1.79× S==1 figure that motivated small-S dispatch measures the *resident matmuls*,
+which this profile shows are exactly the part that already amortizes.
+
+### What is left
+
+The weight path itself: 47 GB per prefill at ~6 GB/s against a ~51 GB/s zero-copy ceiling.
+The untried option is making a layer's experts **device-resident** before its GEMMs — 1.3
+GB/layer to VRAM, then ~TB/s reads. This is **not** `COLI_FFN_DEVCOPY`, which stages one
+expert at a time from pageable host memory. Before building it, check the arithmetic: 1.3
+GB × 40 layers is ~52 GB of H2D per prefill, which is not obviously cheaper than 47 GB of
+streaming reads. `COLI_EXPERT_SEG` is kept off-default because a device-resident version
+would reuse its tile descriptors and dispatch.
 
 ## Recurring traps (cost us real time; check these when adding a model)
 
@@ -455,3 +588,33 @@ this repo's benchmarking is done. Any prefill figure from `coli gen` carries it.
     `multispark` @ `d28bede` (`ffn_intermediate_slice` + `dense_tp_gather_is_byte_identical`),
     **not merged** — the primitive itself is expected to be a wash on a bytes-bound decode,
     so only the finding is recorded here. Cherry-pick that commit if Obj C wants the code.
+16. **An async H2D/D2H to a *pageable* host buffer is not async — it is a trickle.** It
+    degenerates into a synchronous copy through a small internal bounce buffer. The GPU
+    Mamba scan measured **~840 MB of D2H at ~146 MB/s**: kernel 255 ms for all 40 layers,
+    download+sync **5 761 ms**. `reserve_pinned` + a plain host memcpy is the whole 9.4×.
+    Four attempts were spent optimizing the 255 ms first — shared-memory staging, padding
+    away a *genuine* 32-way bank conflict, 128× more threads — each moving nothing.
+    **Instrument the transfer before touching the kernel**; CUDA events around the copy
+    take minutes and would have skipped all four.
+17. **A profile field computed as a remainder is not a measurement.** "conv+norm" was
+    `MAMBA_US − scan − proj` and silently absorbed **1 465 ms of allocation churn**, which
+    mis-scoped the conv/norm GPU port at 20% when the kernels are ~10%. Any field derived
+    by subtraction accumulates everything you forgot to time. Split it into direct timers
+    before ranking work against it.
+18. **A timer that stops before a device sync attributes its wait to whoever syncs next —
+    and a slow CPU phase can be *hiding* GPU work.** After the mamba scan moved to the GPU,
+    `attn` appeared to jump 82 → 789 ms with no change to the attention path; it had
+    inherited the sync mamba used to absorb, and the old 82 ms was fiction. The full-scale
+    version of the same effect cost **79% of a shipped optimization**: the scan fell 7 899 →
+    616 ms warm while the untouched shared expert rose 377 → 6 127 ms, turning a predicted
+    1.54× into a measured **1.066×**. **A phase's measured time is only an upper bound on
+    what removing it saves.** Before ranking work by phase cost, ask what that phase is
+    overlapping with; before believing a regression in a phase you did not touch, suspect
+    attribution.
+19. **Allocation churn is a recurring, invisible tax on this codebase.** Per-layer `Vec`
+    allocations cost **8.5% of a warm prefill** in the Mamba mixer (~128 MB zeroed per
+    layer × 40), and separately contaminated the grouped-expert A/B enough to move it from
+    1.05× to 1.013× slower — i.e. most of a "regression" under test was the measurement
+    path's own overhead. Both fixed the same way: a `thread_local` grow-never-shrink
+    scratch struct, with every consumer slicing to the *current* length because a stale
+    tail is always live. Check for this pattern before benchmarking any per-layer path.

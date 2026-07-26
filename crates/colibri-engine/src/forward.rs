@@ -252,6 +252,51 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     Ok(())
 }
 
+/// Reusable per-thread scratch for [`mamba2_mixer`].
+///
+/// The mixer used to allocate every intermediate fresh: at Nemotron's 557-token prefill
+/// that is ~128 MB of zeroed `Vec` per layer (`proj` alone is 41 MB), 40 layers deep, so
+/// ~5 GB of allocate-and-zero per prefill. It measured **8.5% of a warm prefill**, hidden
+/// inside what the profile reported as the "conv+norm" remainder until that field was
+/// split (see `MAMBA_CONV_US`).
+///
+/// The forward pass is single-threaded — the same assumption `gpu.rs` already makes for
+/// its GPU slot registry — so a `thread_local` needs no locking. Buffers only ever GROW,
+/// and every consumer must slice to the CURRENT length rather than trusting `.len()`:
+/// after a 557-token prefill the buffers stay 557 wide while decode calls with `s == 1`,
+/// so a stale tail is always live. `causal_conv1d_silu` and `selective_scan` both assert
+/// their input lengths, which turns a slicing mistake into an immediate panic rather than
+/// silent corruption — that is what makes this safe to do by hand.
+#[derive(Default)]
+struct MambaScratch {
+    proj: Vec<f32>,
+    gate: Vec<f32>,
+    hbc: Vec<f32>,
+    dt: Vec<f32>,
+    aug: Vec<f32>,
+    h: Vec<f32>,
+    b: Vec<f32>,
+    c: Vec<f32>,
+}
+
+thread_local! {
+    static MAMBA_SCRATCH: std::cell::Cell<MambaScratch> =
+        const { std::cell::Cell::new(MambaScratch {
+            proj: Vec::new(), gate: Vec::new(), hbc: Vec::new(), dt: Vec::new(),
+            aug: Vec::new(), h: Vec::new(), b: Vec::new(), c: Vec::new(),
+        }) };
+}
+
+/// Grow `v` to at least `n` and hand back exactly the first `n` elements. New space is
+/// zeroed; previously-used space keeps whatever was there, which is why callers must
+/// fully overwrite the slice they take.
+fn fit(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
+    if v.len() < n {
+        v.resize(n, 0.0);
+    }
+    &mut v[..n]
+}
+
 /// Nemotron-H Mamba2 mixer over the block-normed input `x[S, hidden]`, writing
 /// `out[S, hidden]`. Carries the layer's recurrent conv + ssm state in `kv`, so a
 /// single-shot prefill (`S = prompt`) and a run of one-token decode steps (`S = 1`)
@@ -288,12 +333,16 @@ pub fn mamba2_mixer(
     let in_proj = l.mamba_in_proj.as_ref().expect("mamba layer missing in_proj");
     let out_proj = l.mamba_out_proj.as_ref().expect("mamba layer missing out_proj");
 
+    // Reused across layers and calls — see `MambaScratch`. Moved out and back rather than
+    // held borrowed, so the body below is unchanged apart from the slice types.
+    let mut sc = MAMBA_SCRATCH.with(|c| c.take());
+
     // ---- in_proj, then split gate | hidden_B_C | dt ----------------------
-    let mut proj = vec![0f32; s * proj_out];
-    timed(&MAMBA_PROJ_US, || matmul_qt(&mut proj, x, in_proj, s));
-    let mut gate = vec![0f32; s * d_inner];
-    let mut hbc = vec![0f32; s * conv_dim];
-    let mut dt = vec![0f32; s * nh];
+    let proj = fit(&mut sc.proj, s * proj_out);
+    timed(&MAMBA_PROJ_US, || matmul_qt(proj, x, in_proj, s));
+    let gate = fit(&mut sc.gate, s * d_inner);
+    let hbc = fit(&mut sc.hbc, s * conv_dim);
+    let dt = fit(&mut sc.dt, s * nh);
     for t in 0..s {
         let base = t * proj_out;
         gate[t * d_inner..(t + 1) * d_inner].copy_from_slice(&proj[base..base + d_inner]);
@@ -310,7 +359,7 @@ pub fn mamba2_mixer(
     // and its per-token outputs are identical whether the sequence arrives whole or split.
     let hist = kk - 1;
     let aug_len = hist + s;
-    let mut aug = vec![0f32; aug_len * conv_dim];
+    let aug = fit(&mut sc.aug, aug_len * conv_dim);
     {
         // conv state is [k, conv_dim] time-major (row k-1 = most recent); the (k-1)
         // history columns before this chunk are rows [1, k).
@@ -319,7 +368,7 @@ pub fn mamba2_mixer(
     }
     aug[hist * conv_dim..].copy_from_slice(&hbc[..s * conv_dim]);
     let conv_aug = timed(&MAMBA_CONV_US, || {
-        causal_conv1d_silu(&aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk)
+        causal_conv1d_silu(aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk)
     });
     let conv_out = &conv_aug[hist * conv_dim..aug_len * conv_dim]; // [s, conv_dim]
     // Next state = the last k input columns of the augmented buffer.
@@ -327,9 +376,9 @@ pub fn mamba2_mixer(
         .copy_from_slice(&aug[(aug_len - kk) * conv_dim..aug_len * conv_dim]);
 
     // ---- split conv output into h | B | C, then the selective scan -------
-    let mut h = vec![0f32; s * d_inner];
-    let mut b = vec![0f32; s * gn];
-    let mut c = vec![0f32; s * gn];
+    let h = fit(&mut sc.h, s * d_inner);
+    let b = fit(&mut sc.b, s * gn);
+    let c = fit(&mut sc.c, s * gn);
     for t in 0..s {
         let base = t * conv_dim;
         h[t * d_inner..(t + 1) * d_inner].copy_from_slice(&conv_out[base..base + d_inner]);
@@ -369,19 +418,19 @@ pub fn mamba2_mixer(
             let mut yv = vec![0f32; s * d_inner];
             if s == 1 {
                 let (dt_h, da_h) =
-                    crate::mamba2::step_head_scalars(dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias);
+                    crate::mamba2::step_head_scalars(dims, dt, &l.mamba_a_log, &l.mamba_dt_bias);
                 let st = kv.mamba_ssm_mut(layer);
                 crate::gpu::try_mamba2_scan(
-                    &mut st.data, &mut yv, &h, &b, &c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng,
+                    &mut st.data, &mut yv, h, b, c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng,
                 )
                 .then_some(yv)
             } else {
                 let (dt_h, da_h) = crate::mamba2::seq_head_scalars(
-                    dims, &dt, &l.mamba_a_log, &l.mamba_dt_bias, s,
+                    dims, dt, &l.mamba_a_log, &l.mamba_dt_bias, s,
                 );
                 let st = kv.mamba_ssm_mut(layer);
                 crate::gpu::try_mamba2_scan_seq(
-                    &mut st.data, &mut yv, &h, &b, &c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng, s,
+                    &mut st.data, &mut yv, h, b, c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng, s,
                 )
                 .then_some(yv)
             }
@@ -395,10 +444,10 @@ pub fn mamba2_mixer(
             None => selective_scan(
                 dims,
                 kv.mamba_ssm_mut(layer),
-                &h,
-                &b,
-                &c,
-                &dt,
+                h,
+                b,
+                c,
+                dt,
                 &l.mamba_a_log,
                 &l.mamba_d,
                 &l.mamba_dt_bias,
@@ -412,6 +461,7 @@ pub fn mamba2_mixer(
         gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps)
     });
     timed(&MAMBA_PROJ_US, || matmul_qt(out, &yn, out_proj, s));
+    MAMBA_SCRATCH.with(|c| c.set(sc));
 }
 
 /// Run the transformer stack over `ids` (positions `pos_base..pos_base+S`),

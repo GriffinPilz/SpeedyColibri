@@ -838,6 +838,15 @@ pub fn try_expert_ffn_relu2(
 /// interleaved with a discarded warmup: decode 8.11 -> 8.31 tok/s (+2.5%, non-overlapping
 /// ranges), prefill 38.5 -> 38.6 s (unchanged), tokens byte-identical. `COLI_EXPERT_GROUP=0`
 /// turns it off.
+/// `COLI_EXPERT_GROUP_PREFILL=1` lets the grouped gateless-ReLU² path take multi-row
+/// (prefill) groups too. **Off by default** — see the recorded 4.7% prefill regression at
+/// the gate in [`try_expert_group_relu2`]. Exists so that number can be re-measured on a
+/// current binary instead of inherited.
+fn group_prefill_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP_PREFILL").ok().as_deref() == Some("1"))
+}
+
 pub fn expert_group_relu2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() != Some("0"))
@@ -981,13 +990,30 @@ pub fn try_expert_group_relu2(
     if active.is_empty() {
         return true; // nothing routed — `out` unchanged
     }
-    // DECODE ONLY. Grouping saves the per-expert H2D/D2H round-trip, which is a decode
-    // win (+5% end-to-end, MEASURED interleaved) — but at prefill the per-expert path can
-    // stage weights to the device (`COLI_FFN_DEVCOPY`, S>=16) and this one cannot: those
-    // ctx buffers are single, so a group would need one per expert. Reading zero-copy
-    // where the per-expert path would devcopy made prefill 38.5 -> 40.3 s (4.7% SLOWER).
-    // Restricting to single-row (decode) keeps the win and drops the regression.
-    if active.iter().any(|(_, rows, _)| rows.len() != 1) {
+    // Decode-only BY DEFAULT — the prefill regression is REAL, but the reason recorded here
+    // originally was WRONG, so read this before trying to "just group them".
+    //
+    // Grouping saves the per-expert H2D/D2H round-trip: a decode win (+5% end-to-end,
+    // measured interleaved). At prefill it LOSES, re-measured 2026-07-26 on a current
+    // binary via `COLI_EXPERT_GROUP_PREFILL=1`, 2 reps, token-identical [17054]:
+    //     off  31404 / 31098 ms      on  32273 / 32895 ms      ~1.05x SLOWER
+    //
+    // The old explanation — that grouping forfeits the `COLI_FFN_DEVCOPY` weight staging
+    // the per-expert path gets at S>=16 — does not survive measurement: devcopy is not
+    // helping. A/B'd on the per-expert path, turning it OFF was FASTER (gpu-ffn 8911 ->
+    // 8375 ms). So the loss is not about where the weights live.
+    //
+    // What the grouped path actually does at prefill: it still launches 3 kernels PER
+    // EXPERT (nvfp4_matmul / relu2 / nvfp4_matmul in a `for c<count` loop), so it removes
+    // transfers but not launches — and it gathers every routed row of the layer into one
+    // x_all buffer (~50 MB at 557 tokens) plus token/weight side arrays, freshly allocated
+    // per layer. Compare the per-expert path, whose gather+scatter total only 62+48 ms.
+    // Suspect that allocation churn first (it is the same thing that cost 8.5% in the mamba
+    // mixer, fixed in `MambaScratch`), and note that a real fix is a fused SEGMENTED GEMM —
+    // one launch per layer with per-expert tile ranges — not this loop.
+    //
+    // `COLI_EXPERT_GROUP_PREFILL=1` lifts the restriction so this stays re-measurable.
+    if !group_prefill_enabled() && active.iter().any(|(_, rows, _)| rows.len() != 1) {
         return false;
     }
     // `d` is the expert input width (the MoE latent for Nemotron-H, not the model hidden);

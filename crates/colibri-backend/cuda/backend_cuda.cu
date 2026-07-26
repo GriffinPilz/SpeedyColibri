@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <mutex>
 
 struct ColiCudaTensor {
@@ -34,6 +35,11 @@ typedef struct {
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
+    /* Segmented-expert descriptors (see coli_cuda_expert_seg_nvfp4_relu2): per-row-tile
+     * expert index + local row base, and per-expert offsets/rows/weight pointers/scales. */
+    int *sg_tile_e,*sg_tile_r0,*sg_off,*sg_rows; float *sg_ug,*sg_dg; void *sg_uw,*sg_ubs,*sg_dw,*sg_dbs;
+    size_t sg_tile_e_cap,sg_tile_r0_cap,sg_off_cap,sg_rows_cap,sg_ug_cap,sg_dg_cap,
+           sg_uw_cap,sg_ubs_cap,sg_dw_cap,sg_dbs_cap;
     /* Device scratch for expert weights, so the kernel reads clean device memory
      * instead of zero-copy from freshly-pread (dirty, coherence-heavy) host pages. */
     uint8_t *ewg,*ewu,*ewd; size_t ewg_cap,ewu_cap,ewd_cap;
@@ -343,6 +349,71 @@ __global__ static void nvfp4_gemv(float *y,const float *x,const uint8_t *w,
 }
 
 /* Tiled WMMA down-proj (S>1 prefill). Mirror of `fp8a16_matmul` with the nvfp4 decode. */
+/* SEGMENTED NVFP4 matmul: one launch covers EVERY expert in a layer.
+ *
+ * Identical math and tiling to `nvfp4_matmul` below — 16 rows x 64 output columns per
+ * block, WMMA over K in steps of 16 — but each block first looks up WHICH expert it
+ * belongs to, so a layer's ~453 experts become one grid instead of ~453 launches.
+ *
+ * Why: the per-expert launch is OCCUPANCY-bound, not bandwidth- or compute-bound. At
+ * I~2700 and ~25 rows/expert its grid is dim3((I+63)/64,(S+15)/16) = 43 x 2 = 86 blocks
+ * (~11k threads), which cannot keep enough memory requests in flight to hide host-memory
+ * latency: measured 6.2 GB/s, 2.3% of this chip's ~273 GB/s and 12% of the ~51 GB/s
+ * zero-copy host ceiling, while compute sat at 0.26% of peak. Feeding the same kernel 4x
+ * the rows per expert (2048- vs 512-token prompt) improved per-token cost 2.75x with no
+ * code change, which is what this kernel buys at any prompt length: ~453x the blocks.
+ *
+ * Tile descriptors: `tile_e[t]` is the expert owning row-tile t and `tile_r0[t]` its
+ * first row WITHIN that expert. `e_off[e]` is where expert e's rows start in the packed
+ * x/y buffers, `e_rows[e]` how many it has. Weight pointers are per expert and may be
+ * host (zero-copy) or device — the kernel does not care. */
+__global__ static void nvfp4_matmul_seg(float *y, const float *x,
+        const uint8_t *const *ws, const uint8_t *const *bss, const float *gs,
+        const int *tile_e, const int *tile_r0, const int *e_off, const int *e_rows,
+        int K, int N) {
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda; int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int t = blockIdx.y, e = tile_e[t];
+    const uint8_t *w = ws[e], *bs = bss[e];
+    float g = gs[e];
+    int M = e_rows[e];                       // rows this expert owns
+    int m0 = tile_r0[t];                     // first row of this tile, expert-local
+    size_t base = (size_t)e_off[e];          // expert's first row in the packed buffers
+    int n0 = blockIdx.x * 64 + warp * 16;
+    int Kh = (K + 1) >> 1, nb = (K + 15) >> 4;
+    __shared__ __half ah[256], bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc; wmma::fill_fragment(acc, 0.f);
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        for (int z = threadIdx.x; z < 256; z += blockDim.x) {
+            int m = z / 16, k = z % 16, gm = m0 + m, gk = k0 + k;
+            ah[z] = (gm < M && gk < K)
+                ? __float2half(x[(base + gm) * (size_t)K + gk]) : __float2half(0.f);
+        }
+        for (int z = lane; z < 256; z += 32) {
+            int nn = z / 16, gk = k0 + (z % 16), gn = n0 + nn; float v = 0.f;
+            if (gn < N && gk < K) {
+                uint8_t byte = w[(size_t)gn * Kh + (gk >> 1)];
+                int nib = (gk & 1) ? (byte >> 4) : (byte & 0xF);
+                v = e2m1f(nib) * e4m3f(bs[(size_t)gn * nb + (gk >> 4)]) * g;
+            }
+            bh[warp][z] = __float2half(v);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af, ah, 16); wmma::load_matrix_sync(bf, bh[warp], 16);
+        wmma::mma_sync(acc, af, bf, acc); __syncthreads();
+    }
+    __shared__ float out[4][256];
+    wmma::store_matrix_sync(out[warp], acc, 16, wmma::mem_row_major); __syncwarp();
+    for (int z = lane; z < 256; z += 32) {
+        int m = z / 16, nn = z % 16;
+        if (m0 + m < M && n0 + nn < N)
+            y[(base + m0 + m) * (size_t)N + n0 + nn] = out[warp][z];
+    }
+#endif
+}
+
 __global__ static void nvfp4_matmul(float *y,const float *x,const uint8_t *w,
                                     const uint8_t *bs,float g,int M,int K,int N){
 #if __CUDA_ARCH__ >= 700
@@ -1679,6 +1750,106 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
  * anyway, so staging would be pure added copy. No GroupDesc upload either: each expert
  * gets its own launch trio with host-side pointers, so there is no ≤64 count cap here
  * (the Rust caller still chunks at 64 to share the shape of the fp8 group path). */
+/* SEGMENTED gateless-ReLU2 NVFP4 experts (Nemotron-H): the whole layer in THREE launches
+ * (up / relu2 / down) instead of three per expert.
+ *
+ * Same contract as coli_cuda_expert_group_nvfp4_relu2 — x and y hold sum(rows) rows of
+ * `ups[i]->I` floats in call order — but instead of looping experts on the stream it
+ * builds row-tile descriptors and issues one `nvfp4_matmul_seg` grid covering all of them.
+ * At ~453 experts that is ~453x the blocks per launch, which is the point: the per-expert
+ * form is occupancy-bound (86 blocks, 6.2 GB/s, 2.3% of memory peak).
+ *
+ * Weights stay zero-copy host pointers, as in the per-expert path — COLI_FFN_DEVCOPY is
+ * deliberately NOT applied here, having been A/B'd as a slight loss (gpu-ffn 8911 -> 8375
+ * ms with it OFF).
+ *
+ * Returns 0 (caller falls back) on any shape mismatch, so this is a pure fast path. */
+extern "C" int coli_cuda_expert_seg_nvfp4_relu2(ColiCudaTensor *const *ups,
+        ColiCudaTensor *const *downs, const int *rows, int count,
+        float *y, const float *x) {
+    if (!ups || !downs || !rows || count < 1 || !x || !y) return 0;
+    ColiCudaTensor *u0 = ups[0];
+    if (!u0 || u0->fmt != 5) return 0;
+    int device = u0->device, D = u0->I, I = u0->O;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx) || ctx->compute_major < 7) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    // Uniform shape + device is required: one grid, one (K,N) pair.
+    long total = 0;
+    for (int c = 0; c < count; c++) {
+        ColiCudaTensor *u = ups[c], *d = downs[c];
+        if (!u || !d || rows[c] < 1 || u->fmt != 5 || d->fmt != 5 ||
+            u->device != device || d->device != device ||
+            u->I != D || u->O != I || d->I != I || d->O != D) return 0;
+        total += rows[c];
+    }
+    if (total < 1) return 0;
+
+    // Row-tile descriptors: 16 rows per tile, per expert (partial tiles are masked).
+    std::vector<int> h_tile_e, h_tile_r0, h_off(count), h_rows(count);
+    std::vector<const uint8_t *> h_uw(count), h_ubs(count), h_dw(count), h_dbs(count);
+    std::vector<float> h_ug(count), h_dg(count);
+    int off = 0;
+    for (int c = 0; c < count; c++) {
+        h_off[c] = off; h_rows[c] = rows[c];
+        h_uw[c] = (const uint8_t *)ups[c]->weights;  h_ubs[c] = (const uint8_t *)ups[c]->bscale;
+        h_dw[c] = (const uint8_t *)downs[c]->weights; h_dbs[c] = (const uint8_t *)downs[c]->bscale;
+        h_ug[c] = ups[c]->gscale; h_dg[c] = downs[c]->gscale;
+        for (int r = 0; r < rows[c]; r += 16) { h_tile_e.push_back(c); h_tile_r0.push_back(r); }
+        off += rows[c];
+    }
+    int ntiles = (int)h_tile_e.size();
+
+    size_t xb = (size_t)total * D * sizeof(float), ib = (size_t)total * I * sizeof(float);
+    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->up, &ctx->up_cap, ib) ||
+        !reserve(&ctx->y, &ctx->y_cap, xb) ||
+        !reserve_pinned(&ctx->host_x, &ctx->host_x_cap, xb) ||
+        !reserve_pinned(&ctx->host_y, &ctx->host_y_cap, xb)) return 0;
+    // Descriptor + pointer arrays (small: a few KB at 453 experts).
+    size_t ib_i = (size_t)ntiles * sizeof(int), cb_i = (size_t)count * sizeof(int);
+    size_t cb_p = (size_t)count * sizeof(void *), cb_f = (size_t)count * sizeof(float);
+    if (!reserve_bytes((void **)&ctx->sg_tile_e, &ctx->sg_tile_e_cap, ib_i) ||
+        !reserve_bytes((void **)&ctx->sg_tile_r0, &ctx->sg_tile_r0_cap, ib_i) ||
+        !reserve_bytes((void **)&ctx->sg_off, &ctx->sg_off_cap, cb_i) ||
+        !reserve_bytes((void **)&ctx->sg_rows, &ctx->sg_rows_cap, cb_i) ||
+        !reserve_bytes((void **)&ctx->sg_uw, &ctx->sg_uw_cap, cb_p) ||
+        !reserve_bytes((void **)&ctx->sg_ubs, &ctx->sg_ubs_cap, cb_p) ||
+        !reserve_bytes((void **)&ctx->sg_dw, &ctx->sg_dw_cap, cb_p) ||
+        !reserve_bytes((void **)&ctx->sg_dbs, &ctx->sg_dbs_cap, cb_p) ||
+        !reserve_bytes((void **)&ctx->sg_ug, &ctx->sg_ug_cap, cb_f) ||
+        !reserve_bytes((void **)&ctx->sg_dg, &ctx->sg_dg_cap, cb_f)) return 0;
+
+    cudaStream_t st = ctx->stream;
+    std::memcpy(ctx->host_x, x, xb);
+    bool ok = cuda_ok(cudaMemcpyAsync(ctx->x, ctx->host_x, xb, cudaMemcpyHostToDevice, st), "seg x up") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_tile_e, h_tile_e.data(), ib_i, cudaMemcpyHostToDevice, st), "seg tile_e") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_tile_r0, h_tile_r0.data(), ib_i, cudaMemcpyHostToDevice, st), "seg tile_r0") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_off, h_off.data(), cb_i, cudaMemcpyHostToDevice, st), "seg off") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_rows, h_rows.data(), cb_i, cudaMemcpyHostToDevice, st), "seg rows") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_uw, h_uw.data(), cb_p, cudaMemcpyHostToDevice, st), "seg uw") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_ubs, h_ubs.data(), cb_p, cudaMemcpyHostToDevice, st), "seg ubs") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_dw, h_dw.data(), cb_p, cudaMemcpyHostToDevice, st), "seg dw") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_dbs, h_dbs.data(), cb_p, cudaMemcpyHostToDevice, st), "seg dbs") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_ug, h_ug.data(), cb_f, cudaMemcpyHostToDevice, st), "seg ug") &&
+        cuda_ok(cudaMemcpyAsync(ctx->sg_dg, h_dg.data(), cb_f, cudaMemcpyHostToDevice, st), "seg dg");
+    if (!ok) return 0;
+
+    dim3 gup((unsigned)((I + 63) / 64), (unsigned)ntiles);
+    dim3 gdn((unsigned)((D + 63) / 64), (unsigned)ntiles);
+    nvfp4_matmul_seg<<<gup, 128, 0, st>>>(ctx->up, ctx->x,
+        (const uint8_t *const *)ctx->sg_uw, (const uint8_t *const *)ctx->sg_ubs, ctx->sg_ug,
+        ctx->sg_tile_e, ctx->sg_tile_r0, ctx->sg_off, ctx->sg_rows, D, I);
+    relu2_inplace<<<(unsigned)(((size_t)total * I + 255) / 256), 256, 0, st>>>(ctx->up, (size_t)total * I);
+    nvfp4_matmul_seg<<<gdn, 128, 0, st>>>(ctx->y, ctx->up,
+        (const uint8_t *const *)ctx->sg_dw, (const uint8_t *const *)ctx->sg_dbs, ctx->sg_dg,
+        ctx->sg_tile_e, ctx->sg_tile_r0, ctx->sg_off, ctx->sg_rows, I, D);
+    if (!cuda_ok(cudaGetLastError(), "seg launch") ||
+        !cuda_ok(cudaMemcpyAsync(ctx->host_y, ctx->y, xb, cudaMemcpyDeviceToHost, st), "seg y down") ||
+        !cuda_ok(cudaStreamSynchronize(st), "seg sync")) return 0;
+    std::memcpy(y, ctx->host_y, xb);
+    return 1;
+}
+
 extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
         ColiCudaTensor *const *downs,const int *rows,int count,float *y,const float *x){
     if(!ups||!downs||!rows||!x||!y||count<1)return 0;

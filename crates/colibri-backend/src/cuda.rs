@@ -127,6 +127,15 @@ extern "C" {
         y: *mut f32,
         x: *const f32,
     ) -> c_int;
+    // Segmented gateless-ReLU2 NVFP4 experts: whole layer in one grid.
+    fn coli_cuda_expert_seg_nvfp4_relu2(
+        ups: *const *mut ColiCudaTensor,
+        downs: *const *mut ColiCudaTensor,
+        rows: *const c_int,
+        count: c_int,
+        y: *mut f32,
+        x: *const f32,
+    ) -> c_int;
     fn coli_cuda_expert_group_nvfp4_relu2(
         ups: *const *mut ColiCudaTensor,
         downs: *const *mut ColiCudaTensor,
@@ -640,6 +649,32 @@ pub unsafe fn expert_group_raw(
 /// # Safety
 /// The two slices are `count`-long arrays of resident fmt==5 handles on one device;
 /// `x`/`y` hold `sum(rows)*up.I` floats. Handles must outlive the call.
+/// Segmented twin of [`expert_group_nvfp4_relu2_raw`]: one grid for the whole layer.
+/// Returns false when the backend declines (mixed shapes/devices), so the caller falls
+/// back to the grouped or per-expert path.
+///
+/// # Safety
+/// `ups`/`downs` stay resident for the call; `x`/`y` hold `sum(rows)` rows of `ups[0].I`.
+pub unsafe fn expert_seg_nvfp4_relu2_raw(
+    ups: &[*mut ColiCudaTensor],
+    downs: &[*mut ColiCudaTensor],
+    rows: &[i32],
+    y: *mut f32,
+    x: *const f32,
+) -> bool {
+    if ups.len() != downs.len() || ups.len() != rows.len() || ups.is_empty() {
+        return false;
+    }
+    coli_cuda_expert_seg_nvfp4_relu2(
+        ups.as_ptr(),
+        downs.as_ptr(),
+        rows.as_ptr(),
+        ups.len() as c_int,
+        y,
+        x,
+    ) != 0
+}
+
 pub unsafe fn expert_group_nvfp4_relu2_raw(
     ups: &[*mut ColiCudaTensor],
     downs: &[*mut ColiCudaTensor],

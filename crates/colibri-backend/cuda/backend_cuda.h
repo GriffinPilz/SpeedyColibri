@@ -100,6 +100,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
  * ONE D2H — the per-expert round-trip is ~44 us of the ~54 us a call costs at decode.
  * Requires fmt==5 on every up/down. Inputs and outputs contain sum(rows) consecutive
  * [up->I] rows in call order. */
+/* SEGMENTED gateless-ReLU2 NVFP4 experts: a whole layer in THREE launches (up / relu2 /
+ * down) rather than three per expert, via row-tile descriptors that tell each block which
+ * expert it belongs to. Same packing contract as the grouped call below. Exists because
+ * the per-expert form is OCCUPANCY-bound: 86 blocks at ~25 rows/expert, 6.2 GB/s, 2.3% of
+ * memory peak. Returns 0 on any shape mismatch so the caller can fall back. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_seg_nvfp4_relu2(ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           float *y, const float *x);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
                            ColiCudaTensor *const *downs,
                            const int *rows, int count,

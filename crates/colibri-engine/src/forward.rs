@@ -525,6 +525,14 @@ pub fn forward<P: ExpertProvider>(
     assert_eq!(hidden_out.len(), s * d);
     FWD_STEP.fetch_add(1, Ordering::Relaxed);
 
+    // Small multi-token forwards (the MTP verify / replay) run the routed NVFP4 experts on
+    // the bit-exact per-row gemv path, so a collided expert (>1 row) matches sequential
+    // decode to the bit — pairs with the Mamba `exact` scan gate. Held for this forward's
+    // scope; large-S prefill keeps the fast WSMM/WMMA path. See gpu::ExactExpertsGuard.
+    #[cfg(feature = "cuda")]
+    let _exact_guard =
+        crate::gpu::ExactExpertsGuard::new(s > 1 && s <= mamba_exact_seq_max());
+
     // token embeddings
     let mut x = vec![0f32; s * d];
     timed(&EMBED_US, || {

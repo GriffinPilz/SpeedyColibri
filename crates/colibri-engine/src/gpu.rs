@@ -100,6 +100,30 @@ thread_local! {
     static GPU_MATMULS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_FFN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_ATTN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // When set, routed NVFP4 relu² experts run per-row gemv even at S>1, so a multi-row
+    // (collided-expert) call is bit-identical to S sequential decode calls. The MTP verify
+    // forward sets it via `ExactExpertsGuard`; see forward.rs.
+    static EXACT_EXPERTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether routed NVFP4 relu² experts must run the bit-exact per-row gemv path (verify).
+pub fn exact_experts() -> bool {
+    EXACT_EXPERTS.with(|c| c.get())
+}
+
+/// RAII scope that forces (or restores) the bit-exact routed-expert path. Set around the
+/// MTP verify forward so its S>1 expert logits match sequential decode to the bit.
+pub struct ExactExpertsGuard(bool);
+impl ExactExpertsGuard {
+    pub fn new(on: bool) -> ExactExpertsGuard {
+        let prev = EXACT_EXPERTS.with(|c| c.replace(on));
+        ExactExpertsGuard(prev)
+    }
+}
+impl Drop for ExactExpertsGuard {
+    fn drop(&mut self) {
+        EXACT_EXPERTS.with(|c| c.set(self.0));
+    }
 }
 
 /// Whether the zero-copy wrap path is usable: a CUDA device is available and it
@@ -823,7 +847,9 @@ pub fn try_expert_ffn_relu2(
     // SAFETY: u/d live until end of scope, covering the synchronous kernel + download in
     // expert_mlp_nvfp4_relu2_raw; out/x sized [nr, up.I]/[nr, up.I] by ffn() (latent-space).
     let ok = unsafe {
-        cuda::expert_mlp_nvfp4_relu2_raw(u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        cuda::expert_mlp_nvfp4_relu2_raw(
+            u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32, exact_experts(),
+        )
     };
     if ok {
         GPU_FFN.with(|c| c.set(c.get() + 1));

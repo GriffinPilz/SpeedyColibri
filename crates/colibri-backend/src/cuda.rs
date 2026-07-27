@@ -117,6 +117,7 @@ extern "C" {
         y: *mut f32,
         x: *const f32,
         s: c_int,
+        exact: c_int,
     ) -> c_int;
     fn coli_cuda_expert_group(
         gates: *const *mut ColiCudaTensor,
@@ -590,8 +591,9 @@ pub unsafe fn expert_mlp_nvfp4_relu2_raw(
     y: *mut f32,
     x: *const f32,
     s: i32,
+    exact: bool,
 ) -> bool {
-    coli_cuda_expert_mlp_nvfp4_relu2(up, down, y, x, s) != 0
+    coli_cuda_expert_mlp_nvfp4_relu2(up, down, y, x, s, exact as i32) != 0
 }
 
 /// Tiled int8 (W8A16) fused expert/MLP FFN — tensor-core replacement for the naive

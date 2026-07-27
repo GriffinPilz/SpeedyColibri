@@ -85,7 +85,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate, ColiCud
  * activation between the up and down projections. Requires up/down at fmt==5, with
  * down the transpose of up. */
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
-                         ColiCudaTensor *down, float *y, const float *x, int S);
+                         ColiCudaTensor *down, float *y, const float *x, int S, int exact);
 
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */

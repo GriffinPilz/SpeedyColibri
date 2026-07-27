@@ -1648,7 +1648,7 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
  * instead of the SwiGLU gate*up combine. Requires up/down at fmt==5, with down the
  * transpose of up (down->I==up->O, down->O==up->I). x is [S, up->I] (latent). */
 extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
-        ColiCudaTensor *down,float *y,const float *x,int S){
+        ColiCudaTensor *down,float *y,const float *x,int S,int exact){
     if(!up||!down||!x||!y||S<1||up->fmt!=5||down->fmt!=5||
        up->device!=down->device||down->I!=up->O||down->O!=up->I)return 0;
     DeviceContext *ctx=find_ctx(up->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
@@ -1706,14 +1706,23 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
     if(s_evt) cudaEventRecord(s_e1,ctx->stream);
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
-    if(S==1&&!s_tiled){
+    // `exact`: force the per-row gemv path for EVERY row, even at S>1. This makes a
+    // multi-row (collided-expert) call bit-identical to S separate S==1 decode calls —
+    // needed by the MTP verify forward, whose S>1 logits must match sequential decode to
+    // the bit or a near-tie argmax forks the accepted token from DRAFT=0. The WSMM/WMMA
+    // paths below reduce over K in a different order, so they cannot be used for verify.
+    // S is tiny at verify, so the lost row-parallelism costs nothing there.
+    if((S==1&&!s_tiled)||exact){
         int tpb=256,wpb=tpb>>5;
-        // t = up·x  → ctx->up [I]
-        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
-        // t = relu(t)²
-        relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)I);
-        // y = down·t → ctx->y [D]
-        nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->up,dw,dbs,dg,I,D);
+        for(int r=0;r<S;r++){
+            const float *xr=ctx->x+(size_t)r*D; float *tr=ctx->up+(size_t)r*I; float *yr=ctx->y+(size_t)r*D;
+            // t = up·x  → tr [I]
+            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
+            // t = relu(t)²
+            relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tr,(size_t)I);
+            // y = down·t → yr [D]
+            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
+        }
     }else{
         // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32): reads each
         // weight once and amortizes the dequant across all S rows, vs the WMMA path's

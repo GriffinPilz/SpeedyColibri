@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | lever | glm-5.2 | minimax-m3 | minimax-m2.7 | nemotron-3-super |
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
-| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **25.9 warm** tok/s (21.47 s, was 24.1 / 22.9 s pre-#91) — **22.1× behind vLLM**, see head-to-head |
+| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **27.7 warm** tok/s (20.1 s on `ce53d25`; was 21.47 s quoted, 23.3 s pre-#91) — **~21× behind vLLM**. #98 would take it to ~15.5 s |
 | decode bench | PASS | PASS 2.07 | PASS | PASS **9.27 tok/s** — 2.77× behind vLLM |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
@@ -390,7 +390,79 @@ section: most of the scan's time was hiding other work.**
 `coli gen` is invisible under `serve` but dominates one-shot CLI use, which is how most of
 this repo's benchmarking is done. Any prefill figure from `coli gen` carries it.
 
-## The GPU Mamba scan is worth 1.066× warm, not 1.54× — most of it was hiding work (2026-07-26)
+## RESOLVED (#97): the scan is worth 1.43×, and PR #28 shipped a 1.24× regression (2026-07-26)
+
+⚠️ **This supersedes the section below, which is kept for the reasoning trail.** The "1.066×"
+and the queue-drain hypothesis were both wrong, and they were wrong for the same reason:
+they came from comparing **two binaries that differ by more than the scan**. Separating the
+two effects took three experiments.
+
+**1 — Hold the binary constant, switch the scan with `COLI_MAMBA_CPU`.** One build
+(`ce53d25`), mirrored blocks gpu,cpu,cpu,gpu, 6 warm requests each, token-identical:
+
+| arm | warm prefill | scan | shared |
+|---|---|---|---|
+| GPU scan | **19.98 / 20.20 s** | 620 ms | 5 258 ms |
+| CPU scan | 28.66 / 28.68 s | 7 982 ms | 6 129 ms |
+
+**The scan is worth 1.43×**, and nothing moves to the shared expert — it is *cheaper* in the
+GPU arm. **Queue drain is dead as an explanation.** It never could have worked: every CUDA
+entry point in `backend_cuda.cu` already ends in `cudaStreamSynchronize` on the one
+per-device stream, so there is no outstanding queue for a later call to absorb. Reading the
+code would have killed the hypothesis before any measurement.
+
+**2 — Hold the scan constant, switch the binary.** Both arms on the CPU scan, so the only
+difference is everything else between `63f500c` and `ce53d25`:
+
+| phase | 63f500c | ce53d25 | Δ |
+|---|---|---|---|
+| **shared** | **380 ms** | **5 698 ms** | **+5 318** |
+| attn | 70 ms | 804 ms | +735 |
+| mamba | 12 318 ms | 10 938 ms | −1 380 (#96's real win) |
+| gpu-ffn | 9 602 ms | 9 595 ms | +7 |
+| **wall** | **23.28 s** | **27.96 s** | **+4.68 s** |
+
+The phase deltas sum to the wall delta. So the shared-expert cost is **real time, not
+re-attribution and not drain** — a 1.20× prefill regression.
+
+**3 — Bisect it.** One block per commit, `COLI_MAMBA_CPU=1` throughout:
+
+| commit | wall | shared | attn |
+|---|---|---|---|
+| `63f500c` base | 23.39 s | 1 547 | 72 |
+| `9ed41bd` #26 | 23.03 s | 1 478 | 72 |
+| `f36f798` #27 (the scan) | 23.05 s | 1 518 | 71 |
+| **`a95a5b9` #28** | **28.65 s** | **6 296** | **886** |
+| `ce53d25` | 29.00 s | 6 504 | 872 |
+
+**PR #28 is the regression** — flat across #26 and #27, one step at #28. (These `shared`
+figures are means over all requests including the warm-up, so they read higher than the
+medians above; only the step between commits matters.)
+
+It costs **~120 ms on each of 40 shared-expert calls and ~100 ms on each of 8 attention
+calls** — a constant per-GPU-call penalty — while `gpu-ffn`, which dominates, is untouched.
+`moe.rs` and `try_expert_ffn_relu2` are **byte-identical** across the range, so the cause is
+runtime state, not the shared-expert code. #28 added: the mamba scratch `thread_local`
+(#96), the profile split, and the `COLI_EXPERT_SEG`/grouped-relu² scratch and kernels. The
+last of those is the only one that allocates new device and pinned-host buffers. Root cause
+is **open — see task #98**, and it is worth ~1.30× of warm prefill (20.1 → ~15.5 s), which
+makes it a bigger prefill lever than anything left in #90.
+
+**What the numbers actually are, on `ce53d25` today:** warm prefill **20.1 s / 27.7 tok/s**
+(the 21.5 s / 25.9 tok/s in the README was measured with a warmer page cache; re-measure
+before quoting either). Base `63f500c` is 23.3 s, so main is genuinely ahead — just by
+1.16× instead of the 1.43× the scan alone delivers.
+
+⚠️ **Method note.** The first attempt at experiment 1 compared `target/release/coli` against
+itself: that binary was a stale pre-#91 build left by an earlier bisect, so `COLI_MAMBA_CPU`
+had nothing to switch off. Wall clock looked plausible (0.6% apart, tight spreads, token gate
+green) and only the phase table — scan ≈ 7.9 s in *both* arms — gave it away. **Assert on a
+phase counter that must move, not on the env var you set.** The A/B script now fails loudly
+if the gpu arm's scan is over 3 s. Two further traps in the same session: `pkill -f "coli
+serve"` never matches `/tmp/coli_base serve …` (kill by argv signature, not by binary name),
+and a server holding 59 GB does not release its port within 3 s.
+
+## Superseded: "the GPU Mamba scan is worth 1.066× warm, not 1.54×" (2026-07-26)
 
 ⚠️ **This section corrects a figure I published in PR #28**, which claimed warm prefill had
 gone 23.1 → ~15.0 s (1.54×). That number was **derived**, not measured: I subtracted the
@@ -424,6 +496,11 @@ The kernel did everything it promised — **the scan is 12.8× faster warm**, be
 9.4× measured cold. But the shared expert, whose code this branch never touched, grew by
 almost exactly what the scan gave back, and the two increases (+6 567 ms) account for 90%
 of the missing saving.
+
+**❌ DISPROVED by #97 — the section above has the measured answer.** The mechanism below was
+inferred from a two-binary comparison and is wrong twice over: the scan is worth 1.43×, not
+1.066×, and the shared-expert cost is a real regression from PR #28, not queue drain. Kept
+verbatim because the reasoning error is instructive.
 
 **Inferred mechanism, not yet proven:** the CPU scan was *absorbing* GPU wait. For 7.9 s per
 request the CPU sat in `selective_scan` while previously-issued GPU work drained; with the
@@ -536,6 +613,12 @@ expert at a time from pageable host memory. Before building it, check the arithm
 GB × 40 layers is ~52 GB of H2D per prefill, which is not obviously cheaper than 47 GB of
 streaming reads. `COLI_EXPERT_SEG` is kept off-default because a device-resident version
 would reuse its tile descriptors and dispatch.
+
+⚠️ **Do #98 before any of this.** The PR that closed those four hypotheses also shipped a
+~4.7 s prefill regression (see the #97 section at the top) — a bigger, cheaper win than the
+device-resident experts sketched here, and it has to be removed before any new prefill
+number from this section means anything. `COLI_EXPERT_SEG`'s device and pinned-host buffers
+are the leading suspect for it, which makes them suspect as a foundation too.
 
 ## Serving context ceiling per model, and the hybrid's advantage (2026-07-26)
 

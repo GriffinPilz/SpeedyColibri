@@ -660,6 +660,36 @@ Stacked context: warm prefill is now **12.8 s** vs 15.6 s (pre-#90), 20.1 s (pre
 x-restage and byte-load granularity (one nibble per byte-load); a future pass can chase it,
 but re-measure against **12.8 s**.
 
+### #92: WSMM does NOT unblock MTP either — re-measured, still a loss (2026-07-27)
+
+The open question after #90 was whether the WSMM kernel makes the S=2 MTP verify cheap
+enough to flip nemotron speculation from its recorded ~1.18× *slowdown* to a win. It does
+not, and the reason is structural: **WSMM is a compute win; MTP decode is expert-load
+(bytes) bound.** Measured through `coli serve`, `DRAFT=0` vs `DRAFT=1`, WSMM binary:
+
+- **Per-step cost ~3×.** Baseline S=1 decode is ~0.13 s/step; the MTP step (draft-head
+  forward **+** S=2 verify) is ~0.42 s/step, emitting 1.17 tok — i.e. ~2.6× the work per
+  emitted token. Each step streams the draft head's experts *and* the ~1.6× expert union of
+  the 2-token verify; WSMM speeds the ~13 % compute slice of a decode step but touches none
+  of that byte streaming.
+- **Acceptance collapsed to 17 %** (1/6), from the pre-divergence 77 %, because the
+  Mamba-state rollback bug ([[nemotron-mtp-blocked]]) corrupts the verification target — the
+  "true" tokens the drafts are checked against are themselves wrong. So the output is still
+  incorrect *and* the acceptance that would justify the cost is gone.
+
+Even granting a fixed 77 % acceptance (1.77 tok/verify), a step costing ~2.6× a baseline
+forward is ~1.5× **slower** per token. This confirms the task title and extends it past
+"small-S dispatch": **neither small-S dispatch nor the WSMM compute win unblocks MTP,
+because single-sequence speculation adds expert-byte streaming to a bytes-bound decode.**
+MTP stays parked; it only pays batched (weights amortized across sequences —
+[[batched-decode-curve]]). Not chased further.
+
+**Separately found:** the nemotron prompt in `scripts/models.toml` carries 3 out-of-vocab
+token ids (151399, 151521×2; vocab is 131072), so `coli gen` — and `bench.sh nemotron
+decode`/`batch` — panic on prefill in `embed_row` (index OOB). `coli serve` is unaffected
+(it tokenizes text at request time). Filed as its own task; re-tokenize with nemotron's
+tokenizer and add a clamp so an out-of-vocab id errors cleanly instead of panicking.
+
 > **#98 is RESOLVED — jump to the “#98 RESOLVED” section just below this one.** The step
 > function was a real characterisation, but the root cause was found afterward (per-call
 > scratch allocation, not the GPU) and the whole 65 GB regression is now fixed at 1.32×.

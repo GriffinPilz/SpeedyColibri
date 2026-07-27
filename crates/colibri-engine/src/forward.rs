@@ -90,6 +90,19 @@ pub(crate) fn draft_budget() -> usize {
         std::env::var("DRAFT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(63)
     })
 }
+/// Largest sequence length that runs the Mamba2 seq scan in BIT-exact (strict
+/// nn-order) reduction mode. The MTP verify forward (S = 1 + draft_budget, capped at
+/// 64) must match the S==1 decode path to the bit; above this, prefill keeps the faster
+/// tree-sum. Default 64 covers any draft budget; `COLI_MAMBA_EXACT_SEQ` overrides.
+pub(crate) fn mamba_exact_seq_max() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_MAMBA_EXACT_SEQ")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64)
+    })
+}
 /// Time `f` into `acc` when profiling is enabled (else just run it).
 #[inline]
 fn timed<T>(acc: &AtomicU64, f: impl FnOnce() -> T) -> T {
@@ -446,8 +459,14 @@ pub fn mamba2_mixer(
                     dims, dt, &l.mamba_a_log, &l.mamba_dt_bias, s,
                 );
                 let st = kv.mamba_ssm_mut(layer);
+                // Small S (MTP verify / tiny prefills) reduces d_state in strict nn-order so
+                // the S>1 logits are BIT-identical to the S==1 decode path — otherwise a
+                // near-tie argmax in verify forks the accepted token from DRAFT=0. Large-S
+                // prefill keeps the fast tree-sum (the strict serial sum would bottleneck it).
+                let exact = s <= mamba_exact_seq_max();
                 crate::gpu::try_mamba2_scan_seq(
                     &mut st.data, &mut yv, h, b, c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng, s,
+                    exact,
                 )
                 .then_some(yv)
             }

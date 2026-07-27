@@ -208,6 +208,7 @@ extern "C" {
         d_state: c_int,
         n_groups: c_int,
         seq: c_int,
+        exact: c_int,
     ) -> c_int;
     // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
     fn coli_cuda_dsa_indexer_scores(
@@ -795,9 +796,11 @@ pub unsafe fn mamba2_scan_seq_raw(
     d_state: i32,
     n_groups: i32,
     seq: i32,
+    exact: bool,
 ) -> bool {
     coli_cuda_mamba2_scan_seq(
         0, state, y, hidden, b, c, dt_h, da_h, d, n_heads, head_dim, d_state, n_groups, seq,
+        exact as i32,
     ) != 0
 }
 

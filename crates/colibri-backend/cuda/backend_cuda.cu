@@ -783,13 +783,20 @@ __global__ static void mamba2_scan_kernel(float *state, float *y, const float *h
  *
  * Launch: grid (hd, nh), block ds threads, shared = 2*ds (B/C rows) + 32 (warp partials).
  * Declines if ds exceeds the max block size — the caller then runs the CPU scan. */
+/* `exact`: when nonzero, `y`'s sum over d_state is done in STRICT nn-ascending order by
+ * thread 0 (bit-identical to the S==1 kernel and the CPU scan) instead of the warp/block
+ * tree. This is what the MTP verify forward needs: its S>1 logits must match the S==1
+ * decode path to the bit, or a near-tie argmax forks the accepted token from DRAFT=0. The
+ * strict sum serializes ds adds on one thread, so it is only chosen at small seq (verify /
+ * tiny prefills) where the tree's parallelism buys nothing anyway; large-S prefill keeps
+ * the tree. In exact mode the third shared region holds prod[ds] (host sizes it max(ds,32)). */
 __global__ static void mamba2_scan_seq_kernel(float *state, float *y, const float *hidden,
         const float *b, const float *c, const float *dt_h, const float *da_h,
-        const float *d, int nh, int hd, int ds, int ng, int seq) {
+        const float *d, int nh, int hd, int ds, int ng, int seq, int exact) {
     extern __shared__ float sh[];
     float *sh_b = sh;             // [ds]
     float *sh_c = sh_b + ds;      // [ds]
-    float *sh_red = sh_c + ds;    // [<=32] one slot per warp
+    float *sh_red = sh_c + ds;    // tree: [<=32] one slot per warp; exact: prod[ds]
     int pp = blockIdx.x, h = blockIdx.y, nn = threadIdx.x;
     if (h >= nh || pp >= hd || nn >= ds) return;
     int hpg = nh / ng, grp = h / hpg;
@@ -808,16 +815,28 @@ __global__ static void mamba2_scan_seq_kernel(float *state, float *y, const floa
         // Per-element state update — identical operand order to the CPU scan.
         ss = __fadd_rn(__fmul_rn(ss, dah), __fmul_rn(__fmul_rn(dth, sh_b[nn]), x_hp));
         float prod = __fmul_rn(ss, sh_c[nn]);
-        // Tree reduction (the one reassociation).
-        for (int off = 16; off > 0; off >>= 1)
-            prod = __fadd_rn(prod, __shfl_down_sync(0xffffffffu, prod, off));
-        if (lane == 0) sh_red[warp] = prod;
-        __syncthreads();
-        if (nn == 0) {
-            float acc = 0.f;
-            for (int i = 0; i < nwarps; i++) acc = __fadd_rn(acc, sh_red[i]);
-            y[(size_t)t * d_inner + (size_t)h * hd + pp] =
-                __fadd_rn(acc, __fmul_rn(x_hp, dh));
+        if (exact) {
+            // Strict nn-ascending sum: bit-identical to the S==1 kernel / CPU scan.
+            sh_red[nn] = prod;
+            __syncthreads();
+            if (nn == 0) {
+                float acc = 0.f;
+                for (int i = 0; i < ds; i++) acc = __fadd_rn(acc, sh_red[i]);
+                y[(size_t)t * d_inner + (size_t)h * hd + pp] =
+                    __fadd_rn(acc, __fmul_rn(x_hp, dh));
+            }
+        } else {
+            // Tree reduction (the one reassociation) — fast path for large-S prefill.
+            for (int off = 16; off > 0; off >>= 1)
+                prod = __fadd_rn(prod, __shfl_down_sync(0xffffffffu, prod, off));
+            if (lane == 0) sh_red[warp] = prod;
+            __syncthreads();
+            if (nn == 0) {
+                float acc = 0.f;
+                for (int i = 0; i < nwarps; i++) acc = __fadd_rn(acc, sh_red[i]);
+                y[(size_t)t * d_inner + (size_t)h * hd + pp] =
+                    __fadd_rn(acc, __fmul_rn(x_hp, dh));
+            }
         }
         __syncthreads();   // nobody may overwrite sh_b/sh_c/sh_red before all readers finish
     }
@@ -2176,13 +2195,15 @@ extern "C" int coli_cuda_mamba2_scan(int device, float *state, float *y, const f
  * shared memory rather than silently launching something slower or wrong. */
 extern "C" int coli_cuda_mamba2_scan_seq(int device, float *state, float *y, const float *hidden,
         const float *b, const float *c, const float *dt_h, const float *da_h,
-        const float *d, int nh, int hd, int ds, int ng, int seq) {
+        const float *d, int nh, int hd, int ds, int ng, int seq, int exact) {
     if (!state || !y || !hidden || !b || !c || !dt_h || !da_h || !d) return 0;
     if (nh < 1 || hd < 1 || ds < 1 || ds > 1024 || ng < 1 || nh % ng || seq < 1) return 0;
     DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
     std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     cudaStream_t st = dc->stream;
-    size_t shmem = (2 * (size_t)ds + 32) * sizeof(float);
+    // Third shared region: tree needs <=32 warp partials; exact needs prod[ds].
+    size_t red_slots = exact ? (size_t)ds : 32;
+    size_t shmem = (2 * (size_t)ds + red_slots) * sizeof(float);
     int shmax = 0;
     if (!cuda_ok(cudaDeviceGetAttribute(&shmax, cudaDevAttrMaxSharedMemoryPerBlock, device),
                  "mamba seq shmem query"))
@@ -2229,7 +2250,7 @@ extern "C" int coli_cuda_mamba2_scan_seq(int device, float *state, float *y, con
         !cuda_ok(cudaMemcpyAsync(dc->ms_d, d, db, cudaMemcpyHostToDevice, st), "mamba seq d up"))
         return 0;
     mamba2_scan_seq_kernel<<<dim3(hd, nh), ds, shmem, st>>>(dc->ms_state, dc->ms_y, dc->ms_x,
-        dc->ms_b, dc->ms_c, dc->ms_dth, dc->ms_dah, dc->ms_d, nh, hd, ds, ng, seq);
+        dc->ms_b, dc->ms_c, dc->ms_dth, dc->ms_dah, dc->ms_d, nh, hd, ds, ng, seq, exact);
     if (!cuda_ok(cudaGetLastError(), "mamba seq launch")) return 0;
     if (!cuda_ok(cudaMemcpyAsync(dc->ms_pin_state, dc->ms_state, stt, cudaMemcpyDeviceToHost, st), "mamba seq state down") ||
         !cuda_ok(cudaMemcpyAsync(dc->ms_pin_y, dc->ms_y, xb, cudaMemcpyDeviceToHost, st), "mamba seq y download") ||

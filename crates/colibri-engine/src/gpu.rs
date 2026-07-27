@@ -274,6 +274,7 @@ pub fn try_mamba2_scan_seq(
     d_state: usize,
     n_groups: usize,
     seq: usize,
+    exact: bool,
 ) -> bool {
     if !available() || !mamba_scan_gpu_enabled() || seq == 0 {
         return false;
@@ -310,6 +311,7 @@ pub fn try_mamba2_scan_seq(
             d_state as i32,
             n_groups as i32,
             seq as i32,
+            exact,
         )
     }
 }

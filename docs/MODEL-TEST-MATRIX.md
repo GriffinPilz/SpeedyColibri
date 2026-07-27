@@ -537,6 +537,39 @@ GB × 40 layers is ~52 GB of H2D per prefill, which is not obviously cheaper tha
 streaming reads. `COLI_EXPERT_SEG` is kept off-default because a device-resident version
 would reuse its tile descriptors and dispatch.
 
+## Serving context ceiling per model, and the hybrid's advantage (2026-07-26)
+
+`coli capacity <container>` reads `config.json` alone — no model load — so the KV cost of
+every model is cheap to check. Measured on the 121 GiB box:
+
+| model | layers that cache KV | KV / token | fixed per sequence | max served `COLI_CTX` |
+|---|---|---|---|---|
+| **nemotron-3-super** | **8 of 88** | **24.0 KB** | 166 MB Mamba2 state | **262,144 = its architectural max**, 6.2 GB KV |
+| minimax-m3 | 60 of 60 | 270 KB | — | ~402,690 (RAM-clamped, arch max 1M) |
+| glm-5.2 | 78 of 78 | 351 KB | — | ~290k (RAM-clamped, arch max 1M) |
+| minimax-m2.7 | 62 of 62 | 527 KB | — | ~190k (arch max 196,608) |
+
+The nemotron row is a real startup clamp — `COLI_CTX=1m coli serve` printed
+`context length: 262144 tokens (model max 262144; up to 6.2 GB KV)`, i.e. the RAM clamp
+never fired. **A hybrid inverts the usual ranking.** Caching KV on 8 layers instead of 88
+makes it ~11–22× cheaper per token than the GQA/MLA models, so it is the only one of the
+four whose ceiling is the model's rather than the box's. The Mamba2 state is flat per
+sequence, so it does not scale with context — but it is ~7× a full 32k-token KV, which is
+why folding it into a per-token figure over-charged short prompts by 3.7× before PR #10.
+
+### The deploy path had no nemotron in it (fixed)
+
+Worth logging as a coverage gap of a different kind: every measured nemotron number above
+was produced with a locally built binary against a locally converted container, and
+nobody checked the *documented* path. `docker/run-dgx.sh -m` knew only `m2.7 | m3 | glm`,
+and `scripts/models.toml` carried no `hf_repo` for nemotron **or** m3 — so the registry
+that calls itself the single source of truth could not re-materialize half the models it
+lists. The fastest model in the matrix was unreachable by the command the README tells
+people to run. Verified after the fix: `-m nemotron` resolves to
+`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4`, and `coli probe` classifies that
+checkpoint `nvfp4`, so the entrypoint's download → convert → serve chain applies to it
+unchanged. **When adding a model, run its documented deploy command, not just its bench.**
+
 ## Recurring traps (cost us real time; check these when adding a model)
 
 1. **An unhandled arch silently inherits a GLM-shaped default.** Four instances on Nemotron

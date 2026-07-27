@@ -22,6 +22,9 @@ Every figure is a median of repeated runs on one build, token-identity gated.
 | **`minimax-m3`** | 229 GB | **16.8 tok/s** (30.4 s) | **1.9 tok/s** | **1.8 tok/s** |
 | **`glm-5.2`** (744B) | 403 GB | **7.4 tok/s** (69.5 s) | **0.6 tok/s** | **0.6 tok/s** |
 
+**Serve any row with one command** — `docker/run-dgx.sh -h <hf_token> -p 8080 -m nemotron`
+(or `-m m2.7` / `-m m3` / `-m glm`). See [Quick start](#quick-start-dgx-spark).
+
 **Read these as a disk-streaming ladder, not a quality ranking.** Decode on one Spark is
 bound by how many expert bytes each token pulls, so throughput tracks *model size against
 121 GB of RAM* almost perfectly: M2.7 nearly fits and runs fast, GLM-5.2 is 3.6× RAM and
@@ -38,9 +41,22 @@ streams every token from NVMe.
   Deliberately not one prompt repeated, which warms the cache on a tiny working set and
   flatters throughput ~2×.
 
-Reproduce any row with `scripts/bench.sh <model> [prefill|decode|serve]`. Full
-per-lever history, including the negative results, is in
-[docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
+**Reproduce any cell** — these are the exact commands the table came from. Each suite
+gates on token identity across reps, so a "faster" number that changed the output fails
+loudly instead of being reported as a win:
+
+```bash
+BENCH_REPS=3 scripts/bench.sh nemotron-3-super prefill   # the prefill column
+BENCH_REPS=8 scripts/bench.sh nemotron-3-super decode    # the decode column (4 for glm-5.2)
+scripts/bench.sh nemotron-3-super serve                  # the serving column, over real HTTP
+scripts/bench.sh nemotron-3-super all                    # all of it, plus batched decode
+```
+
+Swap in `minimax-m2.7`, `minimax-m3`, or `glm-5.2` for the other rows; `scripts/model.py
+list` prints what's registered. **8 reps is not decoration** — ~25% of decode runs on this
+box land well below the mode, so a 3-rep median has a ~16% chance of being wrong. Full
+per-lever history, including the negative results and the measurement traps that produced
+them, is in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
 
 > ### Rooted in colibrì — with gratitude
 >
@@ -116,7 +132,10 @@ everything — the image build, GPU passthrough (even on a stock shared Spark wi
 
 > **Prerequisites:** a DGX Spark (GB10) with Docker and the NVIDIA driver ≥ 580 (both
 > ship with DGX OS), a Hugging Face token for the first download, and free disk for the
-> model (~130 GB `m2.7` · ~230 GB `m3` · ~360 GB `glm`). No root required.
+> model. The **container** sizes are measured — 69 GB `nemotron` · 122 GB `m2.7` ·
+> 229 GB `m3` · 403 GB `glm` — but conversion holds the source checkpoint alongside it,
+> so budget **roughly twice the container** until you delete the source (nemotron
+> measured 75 GB source → 69 GB container). No root required.
 
 **1 — Get the code**
 
@@ -135,7 +154,20 @@ docker/run-dgx.sh -h hf_xxxxxxxxxxxxxxxxxxxx -p 8080 -m m2.7
 |---|---|---|
 | `-h <token>` | Hugging Face token — first download only (or the `HF_TOKEN` env var) | none |
 | `-p <port>` | port to serve on | `8080` |
-| `-m <model>` | `m2.7` · `m3` · `glm`  (or any `org/repo` checkpoint) | `glm` |
+| `-m <model>` | `nemotron` · `m2.7` · `m3` · `glm`  (or any `org/repo` checkpoint) | `glm` |
+
+Each short name resolves to a checkpoint on the Hub — the same ones every number in
+[How fast is it?](#how-fast-is-it) was measured on:
+
+| `-m` | checkpoint | container |
+|---|---|---|
+| `nemotron` | [`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4) | 69 GB |
+| `m2.7` | [`nvidia/MiniMax-M2.7-NVFP4`](https://huggingface.co/nvidia/MiniMax-M2.7-NVFP4) | 122 GB |
+| `m3` | [`nvidia/MiniMax-M3-NVFP4`](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) | 229 GB |
+| `glm` | [`nvidia/GLM-5.2-NVFP4`](https://huggingface.co/nvidia/GLM-5.2-NVFP4) | 403 GB |
+
+**`-m nemotron` is the one to start with** — smallest download, and the fastest of the
+four on a single Spark.
 
 First run builds the image (~10 min) and downloads + converts the model (a one-time
 30–90 min, cached in your HF cache); later runs skip both and reach a ready server in
@@ -208,7 +240,8 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_RAM_GB` | **manual override** of the adaptive default ([RAM residency](#ram-residency-adaptive-by-default) below). Forces a fixed expert-cache budget and disables the adaptive monitor. Rarely needed; on a ≫-RAM model, setting it *higher* drives the box into swap (measured on GLM: 85 GB → ~0.11 tok/s vs ~0.46 at the safe budget). | adaptive (see below) |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
-| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): M3 ~400k · GLM ~290k · M2.7 ~190k | `32768` |
+| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): nemotron 262,144 (its own max) · M3 ~400k · GLM ~290k · M2.7 ~190k | `32768` |
+| `COLI_ALLOW_LONG_CTX` | `1` → serve past the model's advertised `max_position_embeddings`. Meaningful only for a **NoPE** model like Nemotron-3-Super, which has no positional table to overflow (its 262,144 is an advisory default; the model card documents up to 1M). The RAM clamp still applies. Quality past the validated length is not guaranteed — this is a quality decision, not a memory one | off |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
 | `COLI_VRAM_GB` | cap the VRAM expert store | all free VRAM |
@@ -246,10 +279,14 @@ NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
 # Always confirm: `coli backend` must print `backend: cuda (Cuda(0))`, not `cpu`.
 
 # Which models are registered (scripts/models.toml) — serve any of them by name:
-scripts/model.py list
-#   glm-5.2       MLA + DSA lightning indexer, 256 experts top-8
-#   minimax-m3    GQA (64Q/4KV), 128 experts top-4
-#   minimax-m2.7  GQA (48Q/8KV), 256 experts top-8
+scripts/model.py list                     # name + arch notes (abbreviated here)
+#   glm-5.2           MLA + DSA lightning indexer, 256 experts top-8, NVFP4 routed…
+#   minimax-m2.7      GQA (48Q/8KV, head_dim 128, partial rope 64), 256 experts top-8…
+#   minimax-m3        GQA (64Q/4KV, head_dim 128, partial rope 64), 128 experts top-4…
+#   nemotron-3-super  Hybrid: 88 layers = 40 Mamba2 + 40 latent-MoE + 8 GQA…
+
+# Where a model comes from and where it lands on this host:
+scripts/model.py env nemotron-3-super     # CONTAINER / SOURCE / HF_REPO / convert flags
 
 # Serve a specific registered model by NAME — resolves its container from the
 # registry, waits until it's loaded + listening, and prints the client curl:
@@ -302,9 +339,10 @@ One `coli` process serves one model — the model is the container you point it 
 **Docker.** Pick the model with `-m`; everything else is the same command:
 
 ```bash
-docker/run-dgx.sh -h <hf_token> -p 8080 -m glm     # GLM-5.2 (default)
-docker/run-dgx.sh -h <hf_token> -p 8080 -m m3      # MiniMax-M3
-docker/run-dgx.sh -h <hf_token> -p 8080 -m m2.7    # MiniMax-M2.7
+docker/run-dgx.sh -h <hf_token> -p 8080 -m glm       # GLM-5.2 (default)
+docker/run-dgx.sh -h <hf_token> -p 8080 -m m3        # MiniMax-M3
+docker/run-dgx.sh -h <hf_token> -p 8080 -m m2.7      # MiniMax-M2.7
+docker/run-dgx.sh -h <hf_token> -p 8080 -m nemotron  # Nemotron-3-Super (fastest)
 
 # any other checkpoint by its HF repo:
 docker/run-dgx.sh -h <hf_token> -p 8080 -m unsloth/GLM-5.2-FP8
@@ -365,11 +403,20 @@ make it *lighter* per token than GLM's latent:
 
 | model | attention | KV / token (host + GB10 device shadow) | max `COLI_CTX` on a 121 GB Spark |
 |---|---|---|---|
-| **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | ~260 KB | **~400k** (measured clamp 402,690) |
+| **Nemotron-3-Super** | hybrid — only **8 of 88** layers cache KV | **24 KB** + 166 MB/seq Mamba2 state | **262,144 — its full architectural max** (measured; 6.2 GB KV) |
+| **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | ~270 KB | **~400k** (measured clamp 402,690) |
 | **GLM-5.2** | MLA (compressed), mirrored | ~350 KB | ~290k |
-| **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | ~530 KB | ~190k |
+| **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | ~527 KB | ~190k |
 
-(architectural maxima are 1M / 1M / 196,608 respectively; only M2.7 is near-reachable.) These are ceilings where the experts are nearly all evicted, so throughput there is low;
+**The hybrid is in a different class here.** Nemotron caches KV on 8 attention layers
+instead of all 88, so it costs **~11–22× less per token** than the GQA/MLA models — the
+only one of the four whose ceiling is the *model's* limit rather than the box's, and it
+reaches it with 6.2 GB of KV to spare. The Mamba2 state is a flat per-sequence cost, not
+per-token, so it does not scale with context. Check any model's numbers without loading
+it: `coli capacity <container>` reads `config.json` alone.
+
+(architectural maxima are 262,144 / 1M / 1M / 196,608 respectively; only Nemotron and
+M2.7 are reachable.) These are ceilings where the experts are nearly all evicted, so throughput there is low;
 practical high-throughput context is lower. The default `COLI_CTX` stays **32,768** — a small KV
 keeps the most RAM for resident experts and the lowest latency. `max_tokens` defaults to 128 and
 is bounded only by the remaining context (no fixed cap).

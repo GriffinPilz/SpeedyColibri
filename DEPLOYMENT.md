@@ -35,6 +35,23 @@ docker/run-dgx.sh hf_abc123 gen 100 200 300
 docker/run-dgx.sh gen 100 200 300
 ```
 
+### Picking a model: `-m <short name>`
+
+The one-line serving form takes a short model name and resolves it to its checkpoint
+on the Hub — these are the four models with measured numbers in the
+[README](README.md#how-fast-is-it):
+
+```bash
+docker/run-dgx.sh -h <hf_token> -p 8080 -m nemotron   # nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+docker/run-dgx.sh -h <hf_token> -p 8080 -m m2.7       # nvidia/MiniMax-M2.7-NVFP4
+docker/run-dgx.sh -h <hf_token> -p 8080 -m m3         # nvidia/MiniMax-M3-NVFP4
+docker/run-dgx.sh -h <hf_token> -p 8080 -m glm        # nvidia/GLM-5.2-NVFP4  (default)
+```
+
+`-m` also takes any `org/repo`; see `--model` below for the full resolution rules.
+Outside Docker the registry does the same job by name — `scripts/model.py list`,
+then `scripts/serve.sh <name> <port>`.
+
 The model resolves in this order: a snapshot mounted at `/model`
 (`COLI_MODEL_DIR=<dir> docker/run-dgx.sh ...`), the HF cache (the launcher
 mounts the host's `~/.cache/huggingface`, so the 358 GB download happens at most
@@ -83,8 +100,11 @@ Supported source layouts: FP8 with 128×128 `weight_scale_inv` block scales
 modelopt NVFP4 (`weight_scale` per-16-block + `weight_scale_2` global). NVFP4 in
 **compressed-tensors/llm-compressor** form is *rejected* rather than silently
 mis-scaled — it stores the reciprocal global scale and divides, where modelopt
-multiplies. The DSA indexer and the MTP head are dropped by the conversion, so the
-container loads with `has_dsa=false has_mtp=false` (exact dense attention).
+multiplies. The **MTP head is kept** by default (`has_mtp=true`, so `DRAFT=n` works —
+though it only pays when batching). The **DSA indexer is dropped** by default, so the
+container loads `has_dsa=false` and runs exact dense attention; `COLI_KEEP_INDEXER=1`
+retains it and enables DSA sparse attention (this is what `glm-5.2` is converted with —
+see its `convert_env` in [`scripts/models.toml`](scripts/models.toml)).
 
 `run-dgx.sh` picks the GPU passthrough that the host supports: CDI
 (`--device nvidia.com/gpu=all`), the nvidia runtime (`--gpus all`), or — on a
@@ -109,8 +129,12 @@ no external dependency):
 
 Streaming replies use Server-Sent Events (the OpenAI chunk protocol, terminated
 by `data: [DONE]`), so tokens appear live — important at ~1 tok/s. Text in/out
-goes through the ported tokenizer (`tokenizer.json` from the snapshot); chat
-messages are assembled with the GLM template (`[gMASK]<sop><|role|>…<|assistant|>`).
+goes through the ported tokenizer (`tokenizer.json` from the snapshot); chat messages
+are assembled with **the served model's own template**, selected from the container's
+arch — GLM's `[gMASK]<sop><|role|>…<|assistant|>`, MiniMax's `]~!b[`-delimited
+reasoning format, or Nemotron's ChatML (`<|im_start|>role\n…`). Each also carries its
+own end-of-turn stop ids from `generation_config.json`, so a turn terminates correctly
+whichever model is loaded.
 
 Generation is served **one request at a time** — a single GPU streaming a 744B
 model runs one forward pass anyway, so connections are handled sequentially.

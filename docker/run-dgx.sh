@@ -6,7 +6,8 @@
 #   docker/run-dgx.sh -h hf_xxxxxxxxxxxxxxxxxxxx -p 8080 -m m2.7
 #     -h <token>   Hugging Face token (first download only; also HF_TOKEN env)
 #     -p <port>    port to serve on                    (default 8080)
-#     -m <model>   m2.7 | m3 | glm   (or any org/repo) (default glm)
+#     -m <model>   nemotron | m2.7 | m3 | glm          (or any org/repo)
+#                  (default glm)
 #   With flags and no subcommand it runs `serve`.
 #
 # Advanced / positional form (any coli subcommand):
@@ -35,6 +36,8 @@ IMAGE=${COLI_IMAGE:-speedycolibri:latest}
 # Short model names resolve to their HF checkpoint; a full `org/repo` also works.
 model_repo() {
   case "$1" in
+    nemotron|nemotron-h|nemotron-3-super|nemotron3)
+      echo "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4" ;;
     m2.7|m2|minimax-m2.7|minimax-m2)     echo "nvidia/MiniMax-M2.7-NVFP4" ;;
     m3|minimax-m3)                       echo "nvidia/MiniMax-M3-NVFP4" ;;
     glm|glm-5.2|glm5.2|glm52)            echo "nvidia/GLM-5.2-NVFP4" ;;
@@ -49,7 +52,7 @@ while [[ "${1:-}" == -[hpm] || "${1:-}" == --hf-token || "${1:-}" == --port || "
     -p|--port)     export COLI_PORT="${2:?-p needs a port}"; shift 2 ;;
     -m|--model)
       repo="$(model_repo "${2:?-m needs a model}")"
-      [[ -n "$repo" ]] || { echo "[run-dgx] unknown model '$2' — try: m2.7, m3, glm, or an org/repo" >&2; exit 2; }
+      [[ -n "$repo" ]] || { echo "[run-dgx] unknown model '$2' — try: nemotron, m2.7, m3, glm, or an org/repo" >&2; exit 2; }
       export COLI_MODEL_REPO="$repo"; shift 2 ;;
   esac
   used_flags=1

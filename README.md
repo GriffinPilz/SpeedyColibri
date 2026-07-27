@@ -5,10 +5,42 @@
 <h1 align="center">SpeedyColibri</h1>
 
 **Run huge Mixture-of-Experts models on a single NVIDIA DGX Spark** — GLM-5.2
-(744B), MiniMax-M3, and MiniMax-M2.7 today — with a Rust engine tuned for the GB10
-Grace-Blackwell superchip and the whole hot path on the GPU. Experts stream from
-disk on demand; the dense part stays resident in low precision; add a second Spark
-and the experts split across both.
+(744B), MiniMax-M3, MiniMax-M2.7, and Nemotron-3-Super today — with a Rust engine
+tuned for the GB10 Grace-Blackwell superchip and the whole hot path on the GPU.
+Experts stream from disk on demand; the dense part stays resident in low precision;
+add a second Spark and the experts split across both.
+
+### How fast is it?
+
+One Spark (GB10, 121.7 GiB), single sequence, greedy, 512-token prompt, **2026-07-26**.
+Every figure is a median of repeated runs on one build, token-identity gated.
+
+| model | on disk | prefill | decode | serving |
+|---|---|---|---|---|
+| **`nemotron-3-super`** | 69 GB | **16.5 tok/s** (31.0 s) | **8.3 tok/s** | **5.5 tok/s** |
+| **`minimax-m2.7`** | 122 GB | **18.8 tok/s** (27.2 s) | **4.0 tok/s** | **4.4 tok/s** |
+| **`minimax-m3`** | 229 GB | **16.8 tok/s** (30.4 s) | **1.9 tok/s** | **1.8 tok/s** |
+| **`glm-5.2`** (744B) | 403 GB | **7.4 tok/s** (69.5 s) | **0.6 tok/s** | **0.6 tok/s** |
+
+**Read these as a disk-streaming ladder, not a quality ranking.** Decode on one Spark is
+bound by how many expert bytes each token pulls, so throughput tracks *model size against
+121 GB of RAM* almost perfectly: M2.7 nearly fits and runs fast, GLM-5.2 is 3.6× RAM and
+streams every token from NVMe.
+
+- **prefill** — one-shot `coli gen`, which refills the in-process expert cache on every
+  invocation. A **server pays that once**: under `coli serve` nemotron's warm prefill is
+  **21.5 s / 25.9 tok/s**, reproducible to 2.6%. Use the warm number when comparing against
+  another server.
+- **decode** — steady-state `tok/s`, median over 8 reps (4 for GLM). The best single token
+  is meaningfully higher (nemotron 9.4, m2.7 4.8, m3 2.9, GLM 0.79) since expert-cache
+  misses spike individual steps.
+- **serving** — `scripts/bench.sh <model> serve`: real HTTP, twelve **diverse** prompts.
+  Deliberately not one prompt repeated, which warms the cache on a tiny working set and
+  flatters throughput ~2×.
+
+Reproduce any row with `scripts/bench.sh <model> [prefill|decode|serve]`. Full
+per-lever history, including the negative results, is in
+[docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
 
 > ### Rooted in colibrì — with gratitude
 >
@@ -25,7 +57,8 @@ and the experts split across both.
 > kernels, a NVFP4 4-bit expert format, adaptive RAM residency, multi-Spark
 > expert-parallel over RoCE/RDMA, and support for model families colibrì doesn't
 > cover — the MiniMax GQA models (M3, M2.7), each a different attention shape, norm,
-> activation, and router. If you want the mature, portable, multi-platform original,
+> activation, and router, and Nemotron-3-Super, a Mamba2/attention hybrid that is not a
+> transformer at all. If you want the mature, portable, multi-platform original,
 > start with colibrì; SpeedyColibri is the DGX-Spark line taken deep and broadened to
 > more models.
 
@@ -66,6 +99,7 @@ Registered in [`scripts/models.toml`](scripts/models.toml) — serve any by name
 | **`glm-5.2`** | 744B | MLA + DSA lightning indexer | 256, top-8 | NVFP4 | the original target; ≫ RAM, streams from disk |
 | **`minimax-m3`** | — | GQA (64Q/4KV, head_dim 128, partial rope 64) | 128, top-4 | NVFP4 | gemma-norm, swigluoai, per-head QK-norm; ~229 GB |
 | **`minimax-m2.7`** | — | GQA (48Q/8KV, head_dim 128, partial rope 64) | 256, top-8 | NVFP4 | per-layer QK-norm, plain SwiGLU, no shared expert, all-MoE; ~122 GB (**fits RAM**) |
+| **`nemotron-3-super`** | 120B-A12B | **hybrid**: 88 layers = 40 Mamba2 + 40 latent-MoE + 8 GQA (NoPE, no QK-norm) | 512, top-22 | NVFP4 | the only non-transformer here — a state-space/attention hybrid. Gateless ReLU² experts in a 1024-wide latent space; ~69 GB, the fastest of the four |
 
 **Which one loads** is chosen by the container you point `serve` at — one model per
 process. With Docker, set `COLI_MODEL_REPO` (and `COLI_MODEL_DIR` for a local snapshot);
@@ -404,9 +438,12 @@ in the Expert quantization section (a different held-out text, so not comparable
 
 ### Throughput — decode, diverse prompts, short context
 
+GLM-5.2 specifically. For all four models side by side see
+[How fast is it?](#how-fast-is-it) at the top.
+
 | nodes | starting tok/s | current tok/s | how measured |
 |---|---|---|---|
-| 1 | 0.46 | **0.46** | counterbalanced, n ≥ 6, auto budget |
+| 1 | 0.46 | **0.59** | `bench.sh glm-5.2 serve`, 2026-07-26 (was 0.46 counterbalanced, n ≥ 6, auto budget) |
 | 2 | — | *not yet measured on 8/4* | prior repeated-prompt runs read ~1.95, but on the old model and inflated — not comparable; re-measure with RDMA-A |
 
 The single-node number is flat from a 20 GB to a 55 GB cache (diverse traffic barely

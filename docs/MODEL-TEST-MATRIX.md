@@ -442,6 +442,31 @@ the same change is a clean 1.21× there (38.0 → 31.5 s), because cold the CPU 
 competes with the loader threads. **Two regimes, two different answers, and the warm one is
 the one a server delivers.**
 
+### Cross-model gate: the merged prefill work is inert off nemotron (2026-07-26)
+
+Only one merged change reaches a non-nemotron model — `COLI_READ_SUB_KB` modified
+`read_raw_shared` in `colibri-safetensors`, which every model loads through. It defaults to
+the pre-existing 2 MiB tile, so it *should* be a no-op. Verified rather than assumed, both
+binaries built from the two commits and run interleaved against each model's registry
+prompt:
+
+| model | token gate | prefill ratio (main/base) | main prefill |
+|---|---|---|---|
+| minimax-m2.7 | **PASS** `[39341]` ×4 | 0.9986× | 27.16 s (18.8 tok/s) |
+| minimax-m3 | **PASS** `[67732]` ×10 | 0.978× fwd / **0.997× reversed** | 30.40 s (16.8 tok/s) |
+| glm-5.2 | **PASS** `[374]` ×8 | 0.968× fwd / **1.037× reversed** | ~69 s (7.4 tok/s) |
+
+Every run of both arms produced the identical token. **The change is inert, as designed.**
+
+The two "regressions" are the ordering artifact now recorded in trap 10 — GLM mirrors almost
+exactly (0.968 ↔ 1.037) when the within-pair order flips, with the same binaries. Pooled
+across both orderings all three models are neutral to within ~1.5%.
+
+Everything else that merged is architecturally nemotron-only: the GPU Mamba scan and
+`MambaScratch` (nemotron is the only Mamba arch), `GroupScratch` and
+`COLI_EXPERT_GROUP_PREFILL` (gateless-relu² NVFP4 path), and `COLI_EXPERT_SEG` (same, and
+off by default).
+
 ## MoE prefill `gpu-ffn`: the weight path, and four hypotheses that died (2026-07-26)
 
 `gpu-ffn` is the largest remaining prefill item. Four separate attacks on it produced four
@@ -544,6 +569,12 @@ would reuse its tile descriptors and dispatch.
    before comparing to a non-speculative arm — raw, DRAFT=2 looks 2.6× slower than it is.
 10. **Interleave A/B arms (0 1 0 1), never all-of-A then all-of-B.** A cold post-rebuild run landed
    entirely on one arm and turned a true 1.12× into an apparent 1.5×. Discard a warmup too.
+   ⚠️ **Interleaving is not sufficient if the order *within* each pair is fixed** — the arm that
+   runs second is systematically penalized, by ~3% on a streaming-bound model. Demonstrated on
+   GLM with identical binaries and a passing token gate: `(base, main)` per pair gives 0.968×,
+   `(main, base)` gives **1.037×**, a mirror image. The same shape produced an apparent 2.2%
+   m3 regression that vanished on reversal. **Alternate the order too (ABBA, not ABAB)**, or
+   report the pooled median of both orderings.
 11. **The synthetic bench prompt (`seq 100 611`) is a defect, not a fixture.** That id range
    drives models into degenerate repetition, where argmax near-ties flip on harmless FP
    reassociation — so a **token-identity gate fires on benign noise**. It has produced two

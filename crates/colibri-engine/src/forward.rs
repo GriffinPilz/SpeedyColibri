@@ -839,6 +839,13 @@ where
     // what makes `DRAFT=0` byte-identical to `DRAFT=n`.
     let mut budget = if model.has_mtp { budget } else { 0 };
     let (mut proposed, mut accepted, mut forwards) = (0u64, 0u64, 0u64);
+    // Nemotron-H carries recurrent Mamba2 state that a rejected draft would corrupt;
+    // snapshot it around each verify forward and roll back partial accepts. The env
+    // switch (default on) exists only to A/B the fix — COLI_MTP_ROLLBACK=0 reproduces
+    // the pre-fix corruption, so a token-identity gate can prove it detects the bug.
+    let track_mamba =
+        kv.has_mamba() && std::env::var("COLI_MTP_ROLLBACK").map_or(true, |v| v != "0");
+    let mut mamba_snap = crate::model::MambaSnapshot::default();
 
     let mut decode_ms: Vec<f64> = Vec::with_capacity(n_new);
     let mut emitted = 0usize;
@@ -885,6 +892,13 @@ where
         batch.extend_from_slice(&drafts[..g]);
         let sb = batch.len();
         let mut h_all = vec![0f32; sb * d];
+        // Speculating over Mamba layers is destructive: the verify forward advances every
+        // Mamba2 layer's recurrent state by all `sb` tokens. Snapshot it first so a
+        // partial accept can be rolled back to the accepted prefix (attention KV needs no
+        // such save — it is position-indexed and overwritten by the next forward).
+        if track_mamba && g > 0 {
+            kv.snapshot_mamba_into(&mut mamba_snap);
+        }
         let t = std::time::Instant::now();
         forward(model, kv, provider, &batch, pos, &mut h_all)?;
         forwards += 1;
@@ -916,6 +930,17 @@ where
             }
         }
         accepted += k as u64;
+
+        // Roll the Mamba recurrent state back over the rejected drafts. The verify forward
+        // advanced it by all `1+g` tokens; only `1+k` were accepted. Restore the pre-verify
+        // snapshot and replay the accepted prefix `[next, drafts[..k]]` so the state lands
+        // exactly at `pos+k`. `k == g` needs no restore — the full advance already IS the
+        // accepted state; and if we're stopping (`done`) the state is never read again.
+        if track_mamba && k < g && !done {
+            kv.restore_mamba_from(&mamba_snap);
+            let mut h_replay = vec![0f32; (1 + k) * d];
+            forward(model, kv, provider, &batch[..1 + k], pos, &mut h_replay)?;
+        }
 
         // Keep the head's KV in sync with the VERIFIED tokens only.
         if k >= 1 {

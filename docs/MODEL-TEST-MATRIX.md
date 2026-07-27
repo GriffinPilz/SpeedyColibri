@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | lever | glm-5.2 | minimax-m3 | minimax-m2.7 | nemotron-3-super |
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
-| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **35.4 warm** tok/s (15.7 s at the default budget after #98's shared-scratch pool; was 20.1 s pre-fix, 23.3 s pre-#91) — the residency memory-pressure tax is gone, so the default budget now gives fast prefill *and* fast decode |
+| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **43.5 warm** tok/s (12.8 s at the default budget: #98 shared-scratch pool → 15.7 s, then #90 weight-stationary NVFP4 expert GEMM → 12.8 s; was 20.1 s pre-#98, 23.3 s pre-#91). `gpu-ffn` is still the largest phase but no longer catastrophic |
 | decode bench | PASS | PASS 2.07 | PASS | PASS **9.27 tok/s** — 2.77× behind vLLM |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
@@ -560,6 +560,13 @@ finally established the real constraint.
 | **weight-read** | **7.91 s (89%)** | 47.2 GB at 5.97 GB/s |
 | row-compute | 1.01 s (11%) | |
 
+> **Refined by #90 (see “#90 RESOLVED” above).** That 5.97 GB/s is not memory bandwidth —
+> the routed weights are device-staged and read at TB/s. It is the **dequant throughput**:
+> the WMMA path re-dequantizes each weight once per 16-row m-tile at ~26 rows/expert. The
+> weight-stationary kernel reads + dequantizes each weight once and amortizes it across all
+> rows, cutting the kernel 1.48× (1.24× warm prefill). "Device-resident experts" was the
+> wrong lever — the bottleneck was dequant, not the read.
+
 CUDA-event timing agrees from the other direction: H2D 72 ms | D2H+sync 184 | host memcpy
 18 | **kernel window 7 575 (84%)**.
 
@@ -621,6 +628,37 @@ was not `COLI_EXPERT_SEG`'s buffers (the leading suspect here) but the shared ex
 scratch faulting under expert-cache pressure; pooling it took the default budget to **15.7 s**.
 So the untried device-resident-experts idea below must be re-measured against the *new* 15.7 s
 baseline, not the old 20 s one, before it can claim anything.
+
+## #90 RESOLVED: weight-stationary NVFP4 expert GEMM — 1.24× warm prefill (2026-07-27)
+
+After #98, `gpu-ffn` is the largest warm-prefill phase — **9646 ms of 15.56 s (62%)**, of
+which RELU2_EVT attributes 8.16 s/req to the kernel and only 0.82 s to the H2D stage. The
+routed experts are device-staged (`COLI_FFN_DEVCOPY`), so this is **not** streaming
+bandwidth: doing the arithmetic, ~52 GB of weight reads and ~5.3 TFLOP/req in 8.16 s is
+**~0.26 % of the GB10's tensor peak**. The WMMA path (`nvfp4_matmul`) is the wrong shape for
+a routed expert: at ~26 rows/expert it runs its 16×16 MMA at ~1/8 utilization **and**
+re-dequantizes the whole weight once per 16-row m-tile.
+
+**Fix (`nvfp4_wsmm`, `COLI_NVFP4_WSMM`, default on for S≤32):** a weight-stationary kernel —
+one warp per output column, 32 lanes split K, each lane holds `MT` per-row accumulators
+(templated bucket ∈ {8,16,32} so they stay in registers) — so each weight element is read
+and dequantized **exactly once** and reused across all rows. x is staged to shared per
+K-tile (L2-resident, ~104 KB/expert). S>32 falls back to WMMA.
+
+One binary, `COLI_NVFP4_WSMM` switches the arm, ABBA ×2, default budget, token-identical:
+
+| | warm prefill | relu² kernel (cumulative, 6 req) |
+|---|---|---|
+| WSMM **on** | **12.71 / 12.85 s (≈43.5 tok/s)** | 33.7 / 34.1 s |
+| WSMM off (WMMA) | 15.80 / 15.90 s | 50.2 / 50.4 s |
+
+**1.24× prefill, 1.48× on the kernel.** Cross-arm token-identical (48-token greedy gen
+byte-for-byte). Decode (S==1) is untouched — it uses `nvfp4_gemv`.
+
+Stacked context: warm prefill is now **12.8 s** vs 15.6 s (pre-#90), 20.1 s (pre-#98),
+23.3 s (pre-#91). The kernel still holds ~5.6 s/req — remaining headroom is the per-block
+x-restage and byte-load granularity (one nibble per byte-load); a future pass can chase it,
+but re-measure against **12.8 s**.
 
 > **#98 is RESOLVED — jump to the “#98 RESOLVED” section just below this one.** The step
 > function was a real characterisation, but the root cause was found afterward (per-call

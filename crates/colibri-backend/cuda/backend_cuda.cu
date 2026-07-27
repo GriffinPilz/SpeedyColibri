@@ -483,6 +483,81 @@ __global__ static void nvfp4_gate_up(float *gate,float *up,const float *x,
 #endif
 }
 
+/* Weight-stationary small-M NVFP4 matmul: y[M,N] = x[M,K] @ dequant(W[N,K])^T, the
+ * SAME contract as `nvfp4_matmul`. One warp per output column `n`; the 32 lanes split K,
+ * and each lane holds MT per-row accumulators so a weight element is read + dequantized
+ * EXACTLY ONCE and reused across all M rows. The WMMA path instead re-dequantizes the
+ * weight once per 16-row m-tile and, at the ~26 rows/expert of a routed prefill, runs its
+ * 16x16 MMA at ~1/8 utilization — measured 0.26% of tensor peak, weight-read bound (#90).
+ * Reading the weight once amortizes the dequant over M rows, which is the whole cost.
+ *
+ * MT is a compile-time bucket so `acc[MT]` stays in registers (a runtime length spills to
+ * local memory and erases the win); the caller dispatches the smallest bucket >= M and the
+ * kernel zero-pads rows [M,MT). x is staged into shared per K-tile so it is read from
+ * device once per block, not once per column. M > the largest bucket falls back to WMMA. */
+template<int MT>
+__global__ static void nvfp4_wsmm(float *y,const float *x,const uint8_t *w,
+        const uint8_t *bs,float g,int M,int K,int N){
+    const int KT=128;
+    extern __shared__ float wsmm_xs[];      // [MT][KT], row-major m*KT+kk
+    int warp=threadIdx.x>>5, lane=threadIdx.x&31, wpb=blockDim.x>>5;
+    int n=blockIdx.x*wpb+warp;              // output column this warp owns
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=w+(size_t)(n<N?n:0)*Kh;
+    const uint8_t *br=bs+(size_t)(n<N?n:0)*nb;
+    float acc[MT];
+    #pragma unroll
+    for(int m=0;m<MT;m++) acc[m]=0.f;
+    for(int k0=0;k0<K;k0+=KT){
+        int kt=min(KT,K-k0);
+        for(int idx=threadIdx.x; idx<M*kt; idx+=blockDim.x){
+            int m=idx/kt, kk=idx-m*kt;
+            wsmm_xs[m*KT+kk]=x[(size_t)m*K+k0+kk];
+        }
+        __syncthreads();
+        if(n<N){
+            for(int kk=lane;kk<kt;kk+=32){
+                int k=k0+kk;
+                uint8_t byte=wr[k>>1];
+                int nib=(k&1)?(byte>>4):(byte&0xF);
+                float wv=e2m1f(nib)*e4m3f(br[k>>4]);
+                #pragma unroll
+                for(int m=0;m<MT;m++){
+                    float xv=(m<M)?wsmm_xs[m*KT+kk]:0.f;
+                    acc[m]+=xv*wv;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if(n<N){
+        #pragma unroll
+        for(int m=0;m<MT;m++){
+            if(m>=M) continue;
+            float a=acc[m];
+            #pragma unroll
+            for(int o=16;o>0;o>>=1) a+=__shfl_down_sync(0xffffffff,a,o);
+            if(lane==0) y[(size_t)m*N+n]=a*g;
+        }
+    }
+}
+
+/* Dispatch the weight-stationary kernel at the smallest MT bucket >= M. Returns false if
+ * M exceeds the largest bucket (caller keeps the WMMA path). blockDim = 128 (4 warps). */
+static bool nvfp4_wsmm_launch(float *y,const float *x,const uint8_t *w,const uint8_t *bs,
+        float g,int M,int K,int N,cudaStream_t s){
+    const int TPB=128, wpb=TPB>>5;
+    dim3 grid((unsigned)((N+wpb-1)/wpb));
+    #define WSMM_CASE(MT) do{ size_t sh=(size_t)(MT)*128*sizeof(float); \
+        nvfp4_wsmm<MT><<<grid,TPB,sh,s>>>(y,x,w,bs,g,M,K,N); }while(0)
+    if(M<=8) WSMM_CASE(8);
+    else if(M<=16) WSMM_CASE(16);
+    else if(M<=32) WSMM_CASE(32);
+    else return false;
+    #undef WSMM_CASE
+    return true;
+}
+
 /* Single-row decode GEMV (S==1) for int8 W8A16 — mirror of `fp8a16_gemv` with the
  * weight decode swapped e4m3 -> signed int8 (1 byte/weight, direct K stride). One warp
  * per output column; all 32 lanes sweep the row coalesced, so the grid is O/warps-per-
@@ -1621,12 +1696,27 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
         // y = down·t → ctx->y [D]
         nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->up,dw,dbs,dg,I,D);
     }else{
-        // Single up projection (no gate) via the tiled WMMA matmul, then relu², then down.
-        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
-        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
-        nvfp4_matmul<<<hidden,128,0,ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,S,D,I);
-        relu2_inplace<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)S*I);
-        nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->up,dw,dbs,dg,S,I,D);
+        // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32): reads each
+        // weight once and amortizes the dequant across all S rows, vs the WMMA path's
+        // per-16-row-m-tile re-dequant at ~1/8 MMA utilization (#90). Falls through to WMMA
+        // for S>32 (large-M experts, where the MMA amortizes) or when disabled.
+        static int s_ws=-1;
+        if(s_ws<0){const char*e=getenv("COLI_NVFP4_WSMM");s_ws=(!e||atoi(e));}
+        bool did_ws=false;
+        if(s_ws){
+            if(nvfp4_wsmm_launch(ctx->up,ctx->x,uw,ubs,ug,S,D,I,ctx->stream)){
+                relu2_inplace<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)S*I);
+                did_ws=nvfp4_wsmm_launch(ctx->y,ctx->up,dw,dbs,dg,S,I,D,ctx->stream);
+            }
+        }
+        if(!did_ws){
+            // Single up projection (no gate) via the tiled WMMA matmul, then relu², then down.
+            dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+            dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+            nvfp4_matmul<<<hidden,128,0,ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,S,D,I);
+            relu2_inplace<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)S*I);
+            nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->up,dw,dbs,dg,S,I,D);
+        }
     }
     if(s_evt) cudaEventRecord(s_e2,ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert nvfp4 relu2 launch")||

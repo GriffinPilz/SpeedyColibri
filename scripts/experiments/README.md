@@ -15,6 +15,7 @@ model harness (`scripts/bench.sh`) and are not run by CI. Paths assume gx10-42b2
 | `relu2_evt.sh` | Is the shared-expert cost GPU or CPU? Runs `COLI_RELU2_EVT=1`, which splits the fused NVFP4 relu² kernel's device time into stage-H2D vs kernel, bucketed by input width `D`. Proved the routed (`D=1024`) device time is **identical** across budgets and the shared expert (`D=4096`) never reaches that kernel at all — so the #98 regression is entirely CPU-side. |
 | `fix_ab.sh` | Does pooling the shared-expert scratch remove the regression? `COLI_SHARED_SCRATCH` switches the arm on one binary; ABBA-mirrored at 65 GB (the pressure regime) plus a 20 GB no-pressure control. **1.32×**, token-identical, neutral without pressure (#98). |
 | `decode_ab.sh` | Does the pooled scratch (which also runs at S=1) stay token-identical and no slower in decode? Greedy 64-token gens, `COLI_SHARED_SCRATCH` on vs off, byte-compares the generated text. |
+| `wsmm_ab.sh` | Does the weight-stationary NVFP4 expert GEMM beat the WMMA path? `COLI_NVFP4_WSMM` on vs off on one binary, ABBA at the default budget, reads the RELU2_EVT kernel seconds alongside the wall clock. **1.24× warm prefill, 1.48× on the kernel** (#90), token-identical. |
 
 ## What these encode
 

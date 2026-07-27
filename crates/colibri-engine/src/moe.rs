@@ -42,6 +42,44 @@ struct ActCfg {
 
 static ACTIVATION: OnceLock<ActCfg> = OnceLock::new();
 
+/// Whether the shared-expert FFN reuses scratch buffers across calls (default) or
+/// allocates fresh every layer (`COLI_SHARED_SCRATCH=0`, the pre-#98 behaviour).
+///
+/// Task #98: at a full expert-cache budget the process holds ~59 GB of pinned experts
+/// with the rest of RAM as page cache, so every fresh multi-MB `vec![0f32; …]` in the
+/// CPU-side prefill path pays a page-fault cost on a near-full machine (direct reclaim,
+/// and the zero-fill/page-table work that persists even when reclaim does not — the
+/// `fadvise` arm had `pgsteal_direct` at 0 yet was still slow). The shared expert allocates
+/// ~21 MB/layer (`uu` [S,inter] + `sh` [S,hidden]) × 40 MoE layers; measured, its wall time
+/// balloons 16× (372 → 6189 ms) between a 20 GB and a 65 GB budget while its GPU matmuls
+/// stay bit-for-bit flat (RELU2_EVT: routed device time identical across budgets). Hoisting
+/// the two buffers into a grown-never-shrunk thread-local removes the per-call fault — the
+/// same lever #96 applied to the mamba mixer, which is why mamba is the least
+/// pressure-sensitive CPU phase. Kept switchable so the win is A/B-able on one binary.
+fn shared_scratch_reuse() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_SHARED_SCRATCH").ok().as_deref() != Some("0"))
+}
+
+thread_local! {
+    /// Shared-expert output `sh` [S, hidden], reused across layers/calls. Separate cell
+    /// from [`RELU2_UU`] so `nemotron_moe` can hold `sh` borrowed across the [`ffn`] call
+    /// that borrows `uu`. Grown-never-shrunk; every consumer is fully overwritten by
+    /// `matmul_qt` before use, so a stale tail is never read (see MambaScratch).
+    static SHARED_SH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// ReLU² intermediate `uu` [S, inter] for the gateless shared expert in [`ffn_cpu`].
+    static RELU2_UU: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Grow `v` to at least `n` and return the first `n` elements. New space is zeroed;
+/// callers must fully overwrite the slice they take (matmul_qt does).
+fn fit_scratch(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
+    if v.len() < n {
+        v.resize(n, 0.0);
+    }
+    &mut v[..n]
+}
+
 /// Record the model's SwiGLU variant for the FFN path. Call once after building
 /// the [`Config`] (first value wins — one model per process).
 pub fn set_activation(cfg: &Config) {
@@ -817,13 +855,20 @@ fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, o
     if a.relu2 {
         // Gateless ReLU²: one up-projection, square the ReLU, one down-projection.
         let inter = up.o as usize;
-        let mut uu = vec![0f32; nr * inter];
-        matmul_qt(&mut uu, x, up, nr);
-        for u in uu.iter_mut() {
-            let r = u.max(0.0);
-            *u = r * r;
+        let mut relu2 = |uu: &mut [f32]| {
+            matmul_qt(uu, x, up, nr);
+            for u in uu.iter_mut() {
+                let r = u.max(0.0);
+                *u = r * r;
+            }
+            matmul_qt(out, uu, down, nr);
+        };
+        // Pool `uu` across calls under memory pressure — see [`shared_scratch_reuse`].
+        if shared_scratch_reuse() {
+            RELU2_UU.with(|c| relu2(fit_scratch(&mut c.borrow_mut(), nr * inter)));
+        } else {
+            relu2(&mut vec![0f32; nr * inter]);
         }
-        matmul_qt(out, &uu, down, nr);
         return;
     }
     let inter = gate.o as usize; // moe_inter (or shared intermediate)
@@ -1299,13 +1344,21 @@ pub fn nemotron_moe<P: ExpertProvider>(
     matmul_qt(out, &moe_lat, fc2, s_len);
 
     // ---- shared expert (gateless ReLU², on the original hidden) -----------
-    let _st = std::time::Instant::now();
-    let mut sh = vec![0f32; s_len * d];
     // `l.gate_proj` is empty for a Nemotron MoE layer and ignored under ReLU²; the
     // shared expert is `l.up_proj`/`l.down_proj` (hidden -> shared_inter -> hidden).
-    ffn(&l.gate_proj, &l.up_proj, &l.down_proj, x, s_len, &mut sh);
-    for (o, &sv) in out.iter_mut().zip(sh.iter()) {
-        *o += sv;
+    // `sh` is pooled across layers/calls to avoid the direct-reclaim tax under a full
+    // expert-cache budget (task #98 — see [`shared_scratch_reuse`]).
+    let _st = std::time::Instant::now();
+    let mut add_shared = |sh: &mut [f32]| {
+        ffn(&l.gate_proj, &l.up_proj, &l.down_proj, x, s_len, sh);
+        for (o, &sv) in out.iter_mut().zip(sh.iter()) {
+            *o += sv;
+        }
+    };
+    if shared_scratch_reuse() {
+        SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+    } else {
+        add_shared(&mut vec![0f32; s_len * d]);
     }
     if crate::forward::profile_on() {
         crate::forward::SHARED_US

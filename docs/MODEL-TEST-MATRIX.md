@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | lever | glm-5.2 | minimax-m3 | minimax-m2.7 | nemotron-3-super |
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
-| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **27.7 warm** tok/s (20.1 s on `ce53d25`; was 21.47 s quoted, 23.3 s pre-#91) — **~21× behind vLLM**. `COLI_RAM_GB=20` measures 16.8 s / 33.2 tok/s — see #98, unexplained and untested against decode |
+| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **35.4 warm** tok/s (15.7 s at the default budget after #98's shared-scratch pool; was 20.1 s pre-fix, 23.3 s pre-#91) — the residency memory-pressure tax is gone, so the default budget now gives fast prefill *and* fast decode |
 | decode bench | PASS | PASS 2.07 | PASS | PASS **9.27 tok/s** — 2.77× behind vLLM |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
@@ -35,7 +35,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | **prefill scratch reservation** | TODO (method too slow) | PASS-ish **1.98×** 533.8 vs 270 | PASS **1.11×** 583.2 vs 527 | **BROKEN** 210 vs 24 KB/tok (8.75×) |
 | **MTP / speculative decode** | PASS (break-even) | N/A no head | N/A no head in quant | **NEG (blocked)** head loads + 77% accept, but output DIVERGES and it is 1.18× SLOWER |
 | COLI_PREFETCH_AHEAD | PASS 1.58× | PASS 1.26× | PASS **1.43×** | **NEUTRAL 1.00×** (RAM-resident) |
-| COLI_RAM_GB sweep | PASS (flat) | TODO | TODO | **PASS, and it is a TRADE** — 35 GB: prefill 1.22× / decode 0.87×; step in `shared` between 50 and 58 GB, see #98 |
+| COLI_RAM_GB sweep | PASS (flat) | TODO | TODO | **PASS — the trade is GONE after #98.** The old 35 GB prefill win was the residency memory-pressure tax; pooling the shared-expert scratch recovers it at the full budget (65 GB 1.32×), so the default keeps fast prefill *and* fast decode. Keep the default |
 | hot-expert autopin | **NEG** ~10% loss | TODO | TODO | TODO |
 | sliding-window attention | **NEG** lose-lose | N/A | N/A | TODO |
 | 2-node expert-parallel | PASS 1.38× | TODO | TODO | TODO |
@@ -445,8 +445,10 @@ calls** — a constant per-GPU-call penalty — while `gpu-ffn`, which dominates
 runtime state, not the shared-expert code. #28 added: the mamba scratch `thread_local`
 (#96), the profile split, and the `COLI_EXPERT_SEG`/grouped-relu² scratch and kernels. The
 last of those is the only one that allocates new device and pinned-host buffers. Root cause
-is **open — see task #98**, and it is worth ~1.30× of warm prefill (20.1 → ~15.5 s), which
-makes it a bigger prefill lever than anything left in #90.
+was **RESOLVED in #98**: it was not #28's code but the shared expert's per-call scratch
+faulting under the memory pressure of a full expert cache. Pooling it (default on) took warm
+prefill 20.1 → **15.7 s (1.32×)** — a bigger prefill lever than anything left in #90, and it
+made the residency budget a free choice rather than a trade.
 
 **What the numbers actually are, on `ce53d25` today:** warm prefill **20.1 s / 27.7 tok/s**
 (the 21.5 s / 25.9 tok/s in the README was measured with a warmer page cache; re-measure
@@ -614,11 +616,17 @@ GB × 40 layers is ~52 GB of H2D per prefill, which is not obviously cheaper tha
 streaming reads. `COLI_EXPERT_SEG` is kept off-default because a device-resident version
 would reuse its tile descriptors and dispatch.
 
-⚠️ **Do #98 before any of this.** The PR that closed those four hypotheses also shipped a
-~4.7 s prefill regression (see the #97 section at the top) — a bigger, cheaper win than the
-device-resident experts sketched here, and it has to be removed before any new prefill
-number from this section means anything. `COLI_EXPERT_SEG`'s device and pinned-host buffers
-are the leading suspect for it, which makes them suspect as a foundation too.
+✅ **#98 is done — the baseline this section builds on has moved.** The ~5 s prefill "regression"
+was not `COLI_EXPERT_SEG`'s buffers (the leading suspect here) but the shared expert's per-call
+scratch faulting under expert-cache pressure; pooling it took the default budget to **15.7 s**.
+So the untried device-resident-experts idea below must be re-measured against the *new* 15.7 s
+baseline, not the old 20 s one, before it can claim anything.
+
+> **#98 is RESOLVED — jump to the “#98 RESOLVED” section just below this one.** The step
+> function was a real characterisation, but the root cause was found afterward (per-call
+> scratch allocation, not the GPU) and the whole 65 GB regression is now fixed at 1.32×.
+
+<details><summary>Superseded characterisation — the five eliminations still hold, kept for the trail</summary>
 
 ## #98: the expert-cache budget is a step function on prefill — five causes eliminated (2026-07-27)
 
@@ -667,15 +675,67 @@ Also note the regression **does not exist cold**: cold `coli gen` is 37.8 s on c
 current does not. Nothing got slower — **a warm-up effect was lost**, and whatever provides
 it stops working once the budget passes ~50 GB.
 
-### Next
+</details>
 
-The remaining suspect is the GPU's zero-copy read path itself: the shared expert reads
-NVFP4 weights directly out of host memory, and something about that access degrades once
-the expert cache is large — with no reclaim, no faults, and no change in dispatch. Test by
-putting CUDA events *inside* `try_expert_ffn_relu2` at 20 GB vs 65 GB to see whether the
-time is in the kernel window or around it, and compare against `gpu-ffn`, which reads host
-memory the same way and does **not** degrade. That asymmetry is the real question: same
-mechanism, same regime, one slows down and the other does not.
+## #98 RESOLVED: the shared expert's per-call scratch, not the GPU — 1.32× (2026-07-27)
+
+The suspect above (a degrading GPU zero-copy read) was **wrong, and testably so.** Two
+measurements settled it, then a one-file fix took the whole 65 GB regression back.
+
+### The GPU is not involved — RELU2_EVT proves it
+
+`COLI_RELU2_EVT=1` splits `coli_cuda_expert_mlp_nvfp4_relu2`'s device timeline into
+stage-H2D vs kernel, bucketed by input width `D`. Two facts fell out:
+
+- The routed-expert device time is **identical** at 20 GB and 65 GB — `D=1024`, stage
+  5.04 s, kernel 50.18 s at 112 000 calls, to the digit in both arms. The GPU path is
+  perfectly pressure-immune; `gpu-ffn` being flat was never a coincidence.
+- **There is no `D=4096` bucket at all.** The shared expert (hidden = 4096) never reaches
+  this kernel. It is int8 (`U8 [22020096]` = 5376×4096 + per-row F32 scales, fmt=1), and a
+  `relu2` model only tries the fmt=5 fused kernel — so the shared expert runs `ffn_cpu`,
+  whose two `matmul_qt` calls dispatch to the GPU int8 path (`up_proj`/`down_proj` are
+  `gpu_eligible`) but whose scaffolding is on the CPU.
+
+So the entire 16→21 s swing is CPU-side, and the GPU is flat throughout.
+
+### The mechanism: fresh per-call allocation on a nearly-full machine
+
+`ffn_cpu` (relu²) allocates `uu` [S, inter] and `nemotron_moe` allocates `sh` [S, hidden]
+**every layer** — ~21 MB × 40 MoE layers ≈ 840 MB of fresh, zero-filled `Vec` per request.
+At a 20 GB budget that is free. At 65 GB the process holds ~59 GB of pinned experts and the
+rest is page cache, so each allocation must fault in new anonymous pages against a full
+machine. That is why *every* CPU phase inflated in proportion to how much it allocates
+(attn 12×, shared 16×, mamba only 1.27× — the one #96 already pooled), and it is why the
+"direct reclaim" elimination above was half-right: `pgsteal_direct` can be 0 (the fadvise
+arm) while the fault cost is still real. A buffer that is never freed is never re-faulted.
+
+### The fix and the numbers
+
+Hoist `sh` and `uu` into grown-never-shrunk thread-locals, exactly as #96 did for the mamba
+mixer (`moe.rs`, gated by `COLI_SHARED_SCRATCH`, default on). Warm prefill through
+`coli serve`, one binary, `COLI_SHARED_SCRATCH` switches the arm, token-identical throughout:
+
+| budget | pooling **on** (fix) | pooling off (pre-#98) | |
+|---|---|---|---|
+| 65 GB, ABBA ×2 | **15.72 / 15.79 s** | 21.44 / 20.29 s | **1.32× (≈5.1 s)** |
+| 20 GB control | 16.92 s | 16.81 s | neutral — no pressure, no win |
+
+Decode is token-identical between arms (64-token gen, default budget) and, since decode
+also allocates `sh`/`uu` per token, modestly faster with pooling (2.78 vs 2.13 tok/s
+end-to-end) — never slower. Workspace tests: 237 pass.
+
+**This dissolves the "trade" from the #35 section below.** The fixed 65 GB prefill (15.7 s)
+is *faster* than the low-RAM 20 GB prefill (16.8 s), so the default (all experts resident →
+fast decode) now also gives the fast prefill. The `COLI_RAM_GB=35` prefill/decode tradeoff
+is no longer the way to get fast prefill — keep the default.
+
+### Also found: `COLI_FFN_DEVCOPY` is a mild loss on this model
+
+The devcopy A/B (four arms × two blocks) that opened this investigation showed the staging
+copy is innocent of the regression (its delta lands in `gpu-ffn`, which is flat) **and** is
+itself slightly negative here: devcopy off is faster at both budgets (20 GB 16.12 vs 16.75,
+65 GB ~19.3 vs 21.4). Not changed in this PR — flagged for a separate, decode-inclusive
+measurement before flipping a default.
 
 ## Serving context ceiling per model, and the hybrid's advantage (2026-07-26)
 

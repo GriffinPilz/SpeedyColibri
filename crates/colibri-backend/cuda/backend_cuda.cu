@@ -1564,9 +1564,30 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
        !reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
        !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    // Optional per-call GPU-timeline split (COLI_RELU2_EVT=1), mirroring COLI_FFN_EVT on
+    // the fp8 path but with one more event so the weight STAGING is separated from the
+    // kernels. Task #98: the shared expert's cost grows ~7x with the expert-cache budget
+    // while gpu-ffn — which reads host memory the same way — does not, and the two
+    // candidate locations for that time are the staging H2D and the kernels' own reads.
+    // Diagnostic only; the events add a stream marker each, no serialization.
+    //
+    // Bucketed by input width D, because the shared expert and the routed experts both
+    // arrive here and the asymmetry between them IS the question: on Nemotron-3-Super the
+    // shared expert is D=4096 (hidden) and the routed experts are D=1024 (MoE latent).
+    static int s_evt=-1; static cudaEvent_t s_e0=0,s_e1=0,s_e2=0;
+    struct Relu2Evt { int d; double stage_ms,kern_ms; long calls,rows,wbytes; };
+    static Relu2Evt s_ev[4]={}; static int s_nev=0;
+    if(s_evt<0){ const char*e=getenv("COLI_RELU2_EVT"); s_evt=e&&atoi(e);
+        if(s_evt){cudaEventCreate(&s_e0);cudaEventCreate(&s_e1);cudaEventCreate(&s_e2);} }
+    Relu2Evt *ev=nullptr;
+    if(s_evt){
+        for(int i=0;i<s_nev;i++) if(s_ev[i].d==D){ ev=&s_ev[i]; break; }
+        if(!ev&&s_nev<4){ s_ev[s_nev].d=D; ev=&s_ev[s_nev++]; }
+    }
     std::memcpy(ctx->host_x,x,xb);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                                "expert nvfp4 relu2 input upload"))return 0;
+    if(s_evt) cudaEventRecord(s_e0,ctx->stream);
     const uint8_t *uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const uint8_t *ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
     float ug=up->gscale,dg=down->gscale;
@@ -1585,8 +1606,10 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
             cudaMemcpyAsync(ctx->ebsu,ubs,usb,cudaMemcpyHostToDevice,ctx->stream);
             cudaMemcpyAsync(ctx->ebsd,dbs,dsb,cudaMemcpyHostToDevice,ctx->stream);
             uw=ctx->ewu;dw=ctx->ewd;ubs=ctx->ebsu;dbs=ctx->ebsd;
+            if(ev) ev->wbytes+=(long)(unb+dnb+usb+dsb);
         }
     }
+    if(s_evt) cudaEventRecord(s_e1,ctx->stream);
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     if(S==1&&!s_tiled){
@@ -1605,10 +1628,18 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
         relu2_inplace<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)S*I);
         nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->up,dw,dbs,dg,S,I,D);
     }
+    if(s_evt) cudaEventRecord(s_e2,ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert nvfp4 relu2 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "expert nvfp4 relu2 output download")||
        !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert nvfp4 relu2 synchronize"))return 0;
+    if(ev){ float sm=0,km=0; cudaEventElapsedTime(&sm,s_e0,s_e1); cudaEventElapsedTime(&km,s_e1,s_e2);
+        ev->stage_ms+=sm; ev->kern_ms+=km; ev->calls++; ev->rows+=S;
+        if(ev->calls%2000==0) for(int i=0;i<s_nev;i++){ Relu2Evt *e=&s_ev[i]; fprintf(stderr,
+            "[relu2-evt] D=%d calls=%ld rows=%ld stage=%.2fs (%.2f GB, %.2f GB/s) kernel=%.2fs avg_rows=%.1f\n",
+            e->d,e->calls,e->rows,e->stage_ms/1e3,e->wbytes/1e9,
+            e->stage_ms>0?(e->wbytes/1e9)/(e->stage_ms/1e3):0.0,e->kern_ms/1e3,
+            e->calls?(double)e->rows/e->calls:0.0); } }
     std::memcpy(y,ctx->host_y,xb);
     return 1;
 }

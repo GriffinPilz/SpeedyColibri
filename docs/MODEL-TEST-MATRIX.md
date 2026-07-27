@@ -660,29 +660,36 @@ Stacked context: warm prefill is now **12.8 s** vs 15.6 s (pre-#90), 20.1 s (pre
 x-restage and byte-load granularity (one nibble per byte-load); a future pass can chase it,
 but re-measure against **12.8 s**.
 
-### #92: WSMM does NOT unblock MTP either — re-measured, still a loss (2026-07-27)
+### #92: MTP is still blocked on CORRECTNESS; the perf calculus can't be re-measured yet (2026-07-27)
 
-The open question after #90 was whether the WSMM kernel makes the S=2 MTP verify cheap
-enough to flip nemotron speculation from its recorded ~1.18× *slowdown* to a win. It does
-not, and the reason is structural: **WSMM is a compute win; MTP decode is expert-load
-(bytes) bound.** Measured through `coli serve`, `DRAFT=0` vs `DRAFT=1`, WSMM binary:
+The open question after #90: does the WSMM kernel make the S=2 MTP verify cheap enough to
+flip nemotron speculation from its recorded ~1.18× *slowdown* to a win? **Answer: not
+cleanly measurable yet, and the hard blocker is unchanged.** Two facts:
 
-- **Per-step cost ~3×.** Baseline S=1 decode is ~0.13 s/step; the MTP step (draft-head
-  forward **+** S=2 verify) is ~0.42 s/step, emitting 1.17 tok — i.e. ~2.6× the work per
-  emitted token. Each step streams the draft head's experts *and* the ~1.6× expert union of
-  the 2-token verify; WSMM speeds the ~13 % compute slice of a decode step but touches none
-  of that byte streaming.
-- **Acceptance collapsed to 17 %** (1/6), from the pre-divergence 77 %, because the
-  Mamba-state rollback bug ([[nemotron-mtp-blocked]]) corrupts the verification target — the
-  "true" tokens the drafts are checked against are themselves wrong. So the output is still
-  incorrect *and* the acceptance that would justify the cost is gone.
+- **The Mamba-rollback correctness bug is untouched by #90, and it poisons the very
+  measurement.** The verify forward advances the Mamba conv/SSM state by all 1+g tokens and
+  never rolls it back to the accepted prefix, so the output diverges. Measured through
+  `coli serve`, `DRAFT=1`: acceptance **collapsed to 17 %** (from the head's real 77 %) and
+  generation ran off after ~6 tokens — because the "true" tokens each draft is checked
+  against are themselves corrupted. You cannot observe MTP's true speed at 77 % acceptance
+  while the output is wrong, so any tok/s from this arm is not a verdict on the compute
+  calculus — it is the divergence bug.
 
-Even granting a fixed 77 % acceptance (1.77 tok/verify), a step costing ~2.6× a baseline
-forward is ~1.5× **slower** per token. This confirms the task title and extends it past
-"small-S dispatch": **neither small-S dispatch nor the WSMM compute win unblocks MTP,
-because single-sequence speculation adds expert-byte streaming to a bytes-bound decode.**
-MTP stays parked; it only pays batched (weights amortized across sequences —
-[[batched-decode-curve]]). Not chased further.
+- **What #90 does and does not do to the S=2 penalty.** The recorded penalty was *compute*,
+  not bytes — [[nemotron-mtp-blocked]] measured aggregate expert-load **unchanged** between
+  DRAFT arms (8077 vs 8060 ms; same tokens ⇒ same expert bytes), the slowdown being that
+  S=2 falls off three S==1 fast paths (tile bypass, i8a16 gemv, grouped relu²). #90's
+  weight-stationary kernel is a genuine fast path for **one** of those — the routed-expert
+  GEMM at S≤32 — but the Mamba scan and the dense/shared i8a16 GEMV at S=2 still take their
+  slow paths. So #90 *reduces* the S=2 compute penalty without eliminating it.
+
+**Conclusion:** MTP remains gated on the Mamba-state rollback fix (snapshot conv+SSM ~166
+MiB, restore, replay the scan for the accepted prefix — see [[nemotron-mtp-blocked]]), which
+#90 does not provide. Whether the reduced S=2 penalty now nets positive at 77 % acceptance
+is **only measurable after correctness lands** — do that A/B then, not before. Correcting an
+earlier draft of this section that called it a clean "bytes-bound loss": that contradicted
+the measured compute-bound decomposition and read a confounded (17 %-acceptance) number as a
+verdict. Not chased further this session.
 
 **Separately found:** the nemotron prompt in `scripts/models.toml` carries 3 out-of-vocab
 token ids (151399, 151521×2; vocab is 131072), so `coli gen` — and `bench.sh nemotron

@@ -35,7 +35,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | **prefill scratch reservation** | TODO (method too slow) | PASS-ish **1.98×** 533.8 vs 270 | PASS **1.11×** 583.2 vs 527 | **BROKEN** 210 vs 24 KB/tok (8.75×) |
 | **MTP / speculative decode** | PASS (break-even) | N/A no head | N/A no head in quant | **NEG (blocked)** head loads + 77% accept, but output DIVERGES and it is 1.18× SLOWER |
 | COLI_PREFETCH_AHEAD | PASS 1.58× | PASS 1.26× | PASS **1.43×** | **NEUTRAL 1.00×** (RAM-resident) |
-| COLI_RAM_GB sweep | PASS (flat) | TODO | TODO | TODO |
+| COLI_RAM_GB sweep | PASS (flat) | TODO | TODO | **PASS, and it is a TRADE** — 35 GB: prefill 1.22× / decode 0.87×; step in `shared` between 50 and 58 GB, see #98 |
 | hot-expert autopin | **NEG** ~10% loss | TODO | TODO | TODO |
 | sliding-window attention | **NEG** lose-lose | N/A | N/A | TODO |
 | 2-node expert-parallel | PASS 1.38× | TODO | TODO | TODO |
@@ -620,51 +620,62 @@ device-resident experts sketched here, and it has to be removed before any new p
 number from this section means anything. `COLI_EXPERT_SEG`'s device and pinned-host buffers
 are the leading suspect for it, which makes them suspect as a foundation too.
 
-## #98 in progress: three eliminations and one large, unexplained cache cliff (2026-07-26)
+## #98: the expert-cache budget is a step function on prefill — five causes eliminated (2026-07-27)
 
-Chasing the #28 regression. **Root cause not found**; recording so the eliminations are not
-repeated. Everything below is nemotron warm prefill through `coli serve`, token-identical.
+Chasing the #28 regression from #97. **Root cause still open**, but the effect is now
+characterised precisely and five hypotheses are dead. Nemotron, warm prefill through
+`coli serve`, 5 requests, token-identical throughout.
 
-**Eliminated — it is NOT:**
+### The effect: a step, not a gradient
 
-| hypothesis | test | result |
+| `COLI_RAM_GB` | warm prefill | `shared` / request | direct reclaim (pgsteal) |
+|---|---|---|---|
+| 20 | **16.75 s (33.3 tok/s)** | **858 ms** | 0 |
+| 35 | **17.54 s (31.8 tok/s)** | 1 280 ms | 0 |
+| 50 | 21.94 s | 1 546 ms | 2 539 582 |
+| 58 | 21.81 s | **6 567 ms** | 5 663 871 |
+| 65 | 20.29 s | 5 755 ms | 4 685 122 |
+| 65 + `COLI_FADVISE=1` | 21.66 s | 6 660 ms | **0** |
+| default (near-fit, fill ~101 GB, fadvise) | 21.3–21.7 s | 6 395–6 510 ms | — |
+
+`gpu-ffn` is identical in every arm. The step in `shared` lands between 50 and 58 GB —
+next to the **59 GB the expert set occupies** — which is the strongest structural clue.
+
+### It is a trade, not a free win
+
+| | prefill | decode (8 reps) |
 |---|---|---|
-| the shared expert fell back to CPU | `coli gen` prints `gpu::ffn_count()` | **identical** — 297 matmuls, 18 131 fused expert FFNs on both binaries |
-| the retained `MambaScratch` (#96) | new `COLI_MAMBA_SCRATCH=0` bypass, one binary, mirrored | **backwards** — reuse is a **3.1 s win** (20.14 s on vs 23.43/23.05 off), so the regression is ~7 s gross, not 4.7 |
-| the profile split / instrumentation | cold `coli gen`, `COLI_PROFILE` 0 vs 1, both binaries | no effect (38.6/37.6 unprofiled, 38.7/37.8 profiled) |
+| default | 21.3–21.7 s | **8.2 tok/s** |
+| `COLI_RAM_GB=35` | **17.5 s (1.22×)** | 7.1 tok/s (0.87×) |
+| `COLI_RAM_GB=65 COLI_FADVISE=1` | 21.66 s | **8.2 tok/s** |
 
-**The regression does not exist cold.** Cold `coli gen`: base 38.9 s, current 37.8 s — current
-is *faster*. And cold, `shared` is ~7 s on **both** (6992 vs 6668 ms). What differs is that
-base collapses to **380 ms** once warm and current stays at ~5700. So nothing got slower;
-**a warm-up effect was lost.**
+So a prefill-heavy deployment wants a small budget and a generation-heavy one wants the
+default. Do not change the default on the prefill number alone.
 
-**The handle: expert-cache size, and it is a cliff.** Per-request phases, 5 warm requests:
+### Eliminated — do not retry
 
-| cache | warm prefill | shared | attn | expert-load |
-|---|---|---|---|---|
-| default (fill ~101 GB) | 21.3–21.7 s | 6395–6510 ms | 822–932 ms | 1431 ms |
-| `COLI_RAM_GB=80` | 21.65 s | 6487 ms | 943 ms | 1122 ms |
-| `COLI_RAM_GB=65` | 20.20 s | 5660 ms | 826 ms | 1557 ms |
-| **`COLI_RAM_GB=20`** | **16.76 s (33.2 tok/s)** | **873 ms** | **137 ms** | 3771 ms |
+| hypothesis | how it died |
+|---|---|
+| shared expert fell back to CPU | `gpu::ffn_count()` identical on both binaries (297 matmuls, 18 131 fused FFNs) |
+| the retained `MambaScratch` (#96) | `COLI_MAMBA_SCRATCH=0` bypass: reuse is a **3.1 s win** (20.14 on vs 23.43/23.05 off) — it was *masking* part of the regression, so #28 is ~7 s gross |
+| the profile split / instrumentation | cold `coli gen`, `COLI_PROFILE` 0 vs 1, both binaries: no effect |
+| **direct reclaim / memory pressure** | **`RAM_GB=65 + fadvise` has `pgscan_direct` and `pgsteal_direct` at exactly 0 and is still slow (6 660 ms).** Reclaim correlated with the slow arms; it does not cause them |
+| resident weights being page-cache-evicted | the loader uses **`pread`, not mmap** (`colibri-safetensors` line 4), so the resident tier is anonymous memory — nothing can drop it |
 
-**`COLI_RAM_GB=20` is 1.29× on warm prefill** — shared 7.5× cheaper, attn 6.8× cheaper, for
-+1.7 s of expert-load. `gpu-ffn` is identical everywhere (47.9 s cumulative both), as
-expected for zero-copy reads.
+Also note the regression **does not exist cold**: cold `coli gen` is 37.8 s on current vs
+38.9 s on base, and cold `shared` is ~7 s on *both*. Base collapses to 380 ms warm and
+current does not. Nothing got slower — **a warm-up effect was lost**, and whatever provides
+it stops working once the budget passes ~50 GB.
 
-⚠️ **The obvious explanation is wrong.** "Filling RAM reclaims the pages behind the resident
-tier" predicts a gradient, and 65 GB (comfortably above the 59 GB of experts, 56 GB of
-headroom) should already be clean. It is not — 65 and 80 GB behave like the default. Only
-the small-cache regime collapses, so something else distinguishes it. Do not write the
-pressure story into the docs until it predicts the 65 GB point.
+### Next
 
-**Do not ship `COLI_RAM_GB=20` on this evidence.** Nemotron's experts are 59 GB and fit; a
-20 GB cache must cost decode, which was not measured here. The prefill number is real, the
-trade is unquantified.
-
-Next: instrument what the shared expert actually waits on at 101 GB versus 20 GB (CUDA
-event timing inside `try_expert_ffn_relu2`, plus `/proc/vmstat` compaction and THP counters
-across the two arms), and check whether the 380 ms warm base number survives on a box that
-has been up as long as this one. Harnesses: `scripts/experiments/`.
+The remaining suspect is the GPU's zero-copy read path itself: the shared expert reads
+NVFP4 weights directly out of host memory, and something about that access degrades once
+the expert cache is large — with no reclaim, no faults, and no change in dispatch. Test by
+putting CUDA events *inside* `try_expert_ffn_relu2` at 20 GB vs 65 GB to see whether the
+time is in the kernel window or around it, and compare against `gpu-ffn`, which reads host
+memory the same way and does **not** degrade. That asymmetry is the real question: same
+mechanism, same regime, one slows down and the other does not.
 
 ## Serving context ceiling per model, and the hybrid's advantage (2026-07-26)
 

@@ -287,6 +287,13 @@ thread_local! {
         }) };
 }
 
+/// Whether [`mamba2_mixer`] reuses its scratch across calls (default) or allocates fresh
+/// each time (`COLI_MAMBA_SCRATCH=0`, the pre-#96 behaviour). See the call site.
+fn mamba_scratch_reuse() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_MAMBA_SCRATCH").ok().as_deref() != Some("0"))
+}
+
 /// Grow `v` to at least `n` and hand back exactly the first `n` elements. New space is
 /// zeroed; previously-used space keeps whatever was there, which is why callers must
 /// fully overwrite the slice they take.
@@ -335,7 +342,17 @@ pub fn mamba2_mixer(
 
     // Reused across layers and calls — see `MambaScratch`. Moved out and back rather than
     // held borrowed, so the body below is unchanged apart from the slice types.
-    let mut sc = MAMBA_SCRATCH.with(|c| c.take());
+    //
+    // `COLI_MAMBA_SCRATCH=0` bypasses the reuse and allocates fresh, i.e. the pre-#96
+    // behaviour. This exists to A/B the retained buffers: #96 measured them worth ~1.4 s of
+    // a warm prefill, but the same PR is where a ~4.7 s shared-expert regression appeared
+    // (task #98), and the retained allocation is the only always-on change in it. Keeping
+    // the old path reachable is what makes that testable on one binary.
+    let mut sc = if mamba_scratch_reuse() {
+        MAMBA_SCRATCH.with(|c| c.take())
+    } else {
+        MambaScratch::default()
+    };
 
     // ---- in_proj, then split gate | hidden_B_C | dt ----------------------
     let proj = fit(&mut sc.proj, s * proj_out);
@@ -461,7 +478,11 @@ pub fn mamba2_mixer(
         gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps)
     });
     timed(&MAMBA_PROJ_US, || matmul_qt(out, &yn, out_proj, s));
-    MAMBA_SCRATCH.with(|c| c.set(sc));
+    // Under the bypass `sc` is a local that drops here, freeing the buffers exactly as the
+    // pre-#96 code did; storing it would resurrect the retention this arm exists to remove.
+    if mamba_scratch_reuse() {
+        MAMBA_SCRATCH.with(|c| c.set(sc));
+    }
 }
 
 /// Run the transformer stack over `ids` (positions `pos_base..pos_base+S`),

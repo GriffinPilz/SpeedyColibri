@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | lever | glm-5.2 | minimax-m3 | minimax-m2.7 | nemotron-3-super |
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
-| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **27.7 warm** tok/s (20.1 s on `ce53d25`; was 21.47 s quoted, 23.3 s pre-#91) — **~21× behind vLLM**. #98 would take it to ~15.5 s |
+| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **27.7 warm** tok/s (20.1 s on `ce53d25`; was 21.47 s quoted, 23.3 s pre-#91) — **~21× behind vLLM**. `COLI_RAM_GB=20` measures 16.8 s / 33.2 tok/s — see #98, unexplained and untested against decode |
 | decode bench | PASS | PASS 2.07 | PASS | PASS **9.27 tok/s** — 2.77× behind vLLM |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
@@ -619,6 +619,52 @@ would reuse its tile descriptors and dispatch.
 device-resident experts sketched here, and it has to be removed before any new prefill
 number from this section means anything. `COLI_EXPERT_SEG`'s device and pinned-host buffers
 are the leading suspect for it, which makes them suspect as a foundation too.
+
+## #98 in progress: three eliminations and one large, unexplained cache cliff (2026-07-26)
+
+Chasing the #28 regression. **Root cause not found**; recording so the eliminations are not
+repeated. Everything below is nemotron warm prefill through `coli serve`, token-identical.
+
+**Eliminated — it is NOT:**
+
+| hypothesis | test | result |
+|---|---|---|
+| the shared expert fell back to CPU | `coli gen` prints `gpu::ffn_count()` | **identical** — 297 matmuls, 18 131 fused expert FFNs on both binaries |
+| the retained `MambaScratch` (#96) | new `COLI_MAMBA_SCRATCH=0` bypass, one binary, mirrored | **backwards** — reuse is a **3.1 s win** (20.14 s on vs 23.43/23.05 off), so the regression is ~7 s gross, not 4.7 |
+| the profile split / instrumentation | cold `coli gen`, `COLI_PROFILE` 0 vs 1, both binaries | no effect (38.6/37.6 unprofiled, 38.7/37.8 profiled) |
+
+**The regression does not exist cold.** Cold `coli gen`: base 38.9 s, current 37.8 s — current
+is *faster*. And cold, `shared` is ~7 s on **both** (6992 vs 6668 ms). What differs is that
+base collapses to **380 ms** once warm and current stays at ~5700. So nothing got slower;
+**a warm-up effect was lost.**
+
+**The handle: expert-cache size, and it is a cliff.** Per-request phases, 5 warm requests:
+
+| cache | warm prefill | shared | attn | expert-load |
+|---|---|---|---|---|
+| default (fill ~101 GB) | 21.3–21.7 s | 6395–6510 ms | 822–932 ms | 1431 ms |
+| `COLI_RAM_GB=80` | 21.65 s | 6487 ms | 943 ms | 1122 ms |
+| `COLI_RAM_GB=65` | 20.20 s | 5660 ms | 826 ms | 1557 ms |
+| **`COLI_RAM_GB=20`** | **16.76 s (33.2 tok/s)** | **873 ms** | **137 ms** | 3771 ms |
+
+**`COLI_RAM_GB=20` is 1.29× on warm prefill** — shared 7.5× cheaper, attn 6.8× cheaper, for
++1.7 s of expert-load. `gpu-ffn` is identical everywhere (47.9 s cumulative both), as
+expected for zero-copy reads.
+
+⚠️ **The obvious explanation is wrong.** "Filling RAM reclaims the pages behind the resident
+tier" predicts a gradient, and 65 GB (comfortably above the 59 GB of experts, 56 GB of
+headroom) should already be clean. It is not — 65 and 80 GB behave like the default. Only
+the small-cache regime collapses, so something else distinguishes it. Do not write the
+pressure story into the docs until it predicts the 65 GB point.
+
+**Do not ship `COLI_RAM_GB=20` on this evidence.** Nemotron's experts are 59 GB and fit; a
+20 GB cache must cost decode, which was not measured here. The prefill number is real, the
+trade is unquantified.
+
+Next: instrument what the shared expert actually waits on at 101 GB versus 20 GB (CUDA
+event timing inside `try_expert_ffn_relu2`, plus `/proc/vmstat` compaction and THP counters
+across the two arms), and check whether the 380 ms warm base number survives on a box that
+has been up as long as this one. Harnesses: `scripts/experiments/`.
 
 ## Serving context ceiling per model, and the hybrid's advantage (2026-07-26)
 

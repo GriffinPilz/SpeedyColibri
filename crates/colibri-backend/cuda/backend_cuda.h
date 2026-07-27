@@ -155,7 +155,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_mamba2_scan(int device,float *state,float *y,c
 COLI_CUDA_DLLEXPORT int coli_cuda_mamba2_scan_seq(int device,float *state,float *y,
                                      const float *hidden,const float *b,const float *c,
                                      const float *dt_h,const float *da_h,const float *d,
-                                     int n_heads,int head_dim,int d_state,int n_groups,int seq);
+                                     int n_heads,int head_dim,int d_state,int n_groups,int seq,
+                                     int exact);
 
 /* DSA sparse prefill attention: like the batch variant but each query attends only
  * to its indexer selection. sel_idx is [S, maxsel] int (row s holds the chosen

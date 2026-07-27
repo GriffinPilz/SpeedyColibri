@@ -110,7 +110,13 @@ resolve_model() {
   # died on the first missing tensor (e.g. `model.norm.weight`). Progress → stderr;
   # the snapshot path → stdout, captured here.
   echo "[coli] resolving ${COLI_MODEL_REPO} — fetching any missing files from the Hub..." >&2
-  echo "[coli] (mount the host HF cache to persist it: -v ~/.cache/huggingface:/root/.cache/huggingface)" >&2
+  # Only nag about the cache mount when there isn't one. `run-dgx.sh` always mounts it,
+  # so printing this unconditionally told people to do something already done — and it
+  # printed directly above a 75 GB download, exactly where a false alarm is expensive.
+  if ! mountpoint -q /root/.cache/huggingface 2>/dev/null; then
+    echo "[coli] (this download is NOT persisted — mount the host HF cache to keep it:" >&2
+    echo "[coli]  -v ~/.cache/huggingface:/root/.cache/huggingface)" >&2
+  fi
   if snap=$("$hf_bin" download "$COLI_MODEL_REPO" | snap_path) \
      && [[ -n "$snap" && -f "$snap/config.json" ]]; then
     echo "$snap"
@@ -174,7 +180,11 @@ ensure_container() {
   echo "[coli] source format: $fmt — converting to the ${xfmt} container (one time)" >&2
   echo "[coli]   $src" >&2
   echo "[coli]   -> $dest   (cache: \$COLI_CONVERT_DIR=$COLI_CONVERT_DIR)" >&2
-  echo "[coli]   this takes a while (~20-60 min for GLM-5.2) and needs ~450 GB free" >&2
+  # Scales with the checkpoint, and the spread is wide enough that one number misleads:
+  # measured 3.5 min / 73 GB out for Nemotron-3-Super (69 GB in), ~20-60 min / ~450 GB
+  # for GLM-5.2. The output lands beside the source, so free disk needs to cover both.
+  echo "[coli]   one time, roughly as long as the download; the container is written" >&2
+  echo "[coli]   alongside the source, so keep ~2x the checkpoint size free" >&2
   # A partial dir from an interrupted run must not be reused: rebuild from scratch,
   # and only mark complete after convert exits 0.
   rm -rf "$dest"

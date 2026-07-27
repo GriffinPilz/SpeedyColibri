@@ -131,8 +131,10 @@ everything — the image build, GPU passthrough (even on a stock shared Spark wi
 `--gpus` runtime and no root), the model download **and conversion**, and serving.
 
 > **Prerequisites:** a DGX Spark (GB10) with Docker and the NVIDIA driver ≥ 580 (both
-> ship with DGX OS), a Hugging Face token for the first download, and free disk for the
-> model. The **container** sizes are measured — 69 GB `nemotron` · 122 GB `m2.7` ·
+> ship with DGX OS), and free disk for the model. **No Hugging Face token is needed for
+> the four models above** — all four checkpoints report public and ungated on the Hub,
+> and `nemotron` was downloaded and served end-to-end with `HF_TOKEN` empty. `-h` is only
+> for a gated or private repo you point `-m` at yourself. The **container** sizes are measured — 69 GB `nemotron` · 122 GB `m2.7` ·
 > 229 GB `m3` · 403 GB `glm` — but conversion holds the source checkpoint alongside it,
 > so budget **roughly twice the container** until you delete the source (nemotron
 > measured 75 GB source → 69 GB container). No root required.
@@ -147,12 +149,15 @@ cd SpeedyColibri
 **2 — Download and serve, one command**
 
 ```bash
-docker/run-dgx.sh -h hf_xxxxxxxxxxxxxxxxxxxx -p 8080 -m m2.7
+docker/run-dgx.sh -p 8080 -m nemotron
 ```
+
+This exact command was run end-to-end on a DGX Spark with an empty cache and no token —
+it downloaded, converted, served, and answered. Add `-h <token>` only for a gated repo.
 
 | flag | meaning | default |
 |---|---|---|
-| `-h <token>` | Hugging Face token — first download only (or the `HF_TOKEN` env var) | none |
+| `-h <token>` | Hugging Face token — **not needed for the four models below**, only for a gated or private repo (or the `HF_TOKEN` env var) | none |
 | `-p <port>` | port to serve on | `8080` |
 | `-m <model>` | `nemotron` · `m2.7` · `m3` · `glm`  (or any `org/repo` checkpoint) | `glm` |
 
@@ -169,12 +174,24 @@ Each short name resolves to a checkpoint on the Hub — the same ones every numb
 **`-m nemotron` is the one to start with** — smallest download, and the fastest of the
 four on a single Spark.
 
-First run builds the image (~10 min) and downloads + converts the model (a one-time
-30–90 min, cached in your HF cache); later runs skip both and reach a ready server in
-~1–2 min — and once cached you can drop `-h`. Wait for:
+First run builds the image and downloads + converts the model, all cached afterwards.
+**Measured end-to-end for `-m nemotron` on a DGX Spark, from nothing:** ~10 min image
+build, ~11 min to fetch the 69 GB checkpoint, **3.5 min to convert** it (17 shards →
+73 GB), then load and serve. Bigger checkpoints scale up from there — GLM-5.2's
+conversion alone is ~20–60 min. Later runs skip all of it and reach a ready server in
+~1–2 min. Wait for:
 
 ```
-[serve] OpenAI-compatible server on http://0.0.0.0:8080  (model: MiniMax-M2.7-container)
+[serve] coli v0.1.0 — OpenAI-compatible server on http://0.0.0.0:8080  (model: nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4-xnvfp4-e8io8)
+[serve]   context length: 32768 tokens (model max 262144; up to 0.9 GB KV) — set COLI_CTX to change
+```
+
+Then:
+
+```bash
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? Answer in one sentence."}]}'
+# {"choices":[{"message":{"role":"assistant","content":"The capital of France is Paris."},"finish_reason":"stop"}], ...}
 ```
 
 The advanced positional form — `docker/run-dgx.sh [hf_TOKEN] <coli-command> [args...]` —

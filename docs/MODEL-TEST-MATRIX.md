@@ -570,6 +570,37 @@ people to run. Verified after the fix: `-m nemotron` resolves to
 checkpoint `nvfp4`, so the entrypoint's download → convert → serve chain applies to it
 unchanged. **When adding a model, run its documented deploy command, not just its bench.**
 
+### The documented command, run from nothing (2026-07-26)
+
+`docker/run-dgx.sh -p 8099 -m nemotron` on gx10-42b2, empty HF cache, **no token**:
+
+| stage | measured |
+|---|---|
+| image build | ~10 min (`docker build -f docker/Dockerfile`) |
+| fetch checkpoint | ~11 min, 36 files, 69 GB |
+| convert | **210 s**, 17 shards, 42 267 tensors quantized → 73.3 GB |
+| serve | up on :8099, `context length: 32768 (model max 262144)` |
+| answer | `"The capital of France is Paris."`, `finish_reason: "stop"`, 7 tokens |
+
+So the whole path is **~25 min from `git clone` to a served answer**, and the README's
+"one-time 30–90 min" was a GLM figure applied to every model. Three things this caught
+that a bench never would:
+
+- **No token is required.** All four checkpoints report `gated: false` on the Hub; the
+  full nemotron download ran with `HF_TOKEN` empty. The README had been telling people
+  to get a token before starting.
+- **The cache-mount warning fired when the cache *was* mounted.** `run-dgx.sh` always
+  mounts `~/.cache/huggingface`, but the entrypoint printed "mount the host HF cache to
+  persist it" unconditionally — directly above a 69 GB download, which is the worst
+  possible place for a false alarm. Now gated on an actual `mountpoint` check.
+- **Docker had never served this model at all.** GPU passthrough, the ChatML template,
+  and the stop id all work through the container; none of it had been exercised.
+
+⚠️ **Method note:** the first attempt to wait for the image keyed on `docker image
+inspect speedycolibri:latest` succeeding — which returned a *stale tag* while the build
+was still compiling. Same shape as trap 8: the gate passed, nothing had been built. Wait
+on the build **process**, not on an artifact whose name can pre-exist.
+
 ## Recurring traps (cost us real time; check these when adding a model)
 
 1. **An unhandled arch silently inherits a GLM-shaped default.** Four instances on Nemotron

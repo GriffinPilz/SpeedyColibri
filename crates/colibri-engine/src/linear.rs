@@ -210,6 +210,15 @@ pub fn qt_matvec_rows(w: &QTensor, row0: usize, nrows: usize, vec: &[f32], out: 
 pub fn embed_row(embed: &QTensor, tok: usize, out: &mut [f32]) {
     let d = embed.i as usize;
     assert_eq!(out.len(), d, "out must be [hidden]");
+    // An out-of-vocab id here would otherwise slice-panic with an opaque byte offset
+    // (e.g. "range start 620130304 out of range for slice of length 536870912"). Name the
+    // token and the vocab so the real cause — usually a prompt tokenized with the wrong
+    // tokenizer, or feeding one model's token ids to another — is obvious at a glance.
+    assert!(
+        tok < embed.o as usize,
+        "embed_row: token id {tok} out of range for vocab {} (wrong tokenizer, or another model's token ids?)",
+        embed.o
+    );
     match embed.fmt_code {
         0 => out.copy_from_slice(&embed.qf[tok * d..(tok + 1) * d]),
         1 => {

@@ -18,14 +18,14 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=COLI_GIT_SHA");
-    // Re-stamp when the checked-out commit changes (HEAD) or the index does (which
-    // is what flips the -dirty marker in practice).
-    for p in [".git/HEAD", ".git/index"] {
-        let repo = std::path::Path::new("../..").join(p);
-        if repo.exists() {
-            println!("cargo:rerun-if-changed={}", repo.display());
-        }
-    }
+    // Re-run this script on EVERY build so the stamp can never lag the checked-out
+    // commit. The previous approach watched `.git/HEAD`/`.git/index` by mtime, but that
+    // missed a detached-HEAD commit move and shipped a binary labelled with an ancestor
+    // sha — the exact "stale source looks fresh" trap this stamp exists to prevent. A
+    // rerun-if-changed on a path that never exists forces cargo to re-run us each build;
+    // the cost is one `git rev-parse` (~ms), and the crate only *recompiles* when the
+    // resolved sha actually changed (COLI_BUILD_REV differs).
+    println!("cargo:rerun-if-changed=.coli-build-rev-always-rerun");
 
     let rev = std::env::var("COLI_GIT_SHA")
         .ok()

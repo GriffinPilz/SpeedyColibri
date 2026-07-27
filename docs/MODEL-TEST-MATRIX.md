@@ -691,11 +691,15 @@ earlier draft of this section that called it a clean "bytes-bound loss": that co
 the measured compute-bound decomposition and read a confounded (17 %-acceptance) number as a
 verdict. Not chased further this session.
 
-**Separately found:** the nemotron prompt in `scripts/models.toml` carries 3 out-of-vocab
-token ids (151399, 151521×2; vocab is 131072), so `coli gen` — and `bench.sh nemotron
-decode`/`batch` — panic on prefill in `embed_row` (index OOB). `coli serve` is unaffected
-(it tokenizes text at request time). Filed as its own task; re-tokenize with nemotron's
-tokenizer and add a clamp so an out-of-vocab id errors cleanly instead of panicking.
+**Correction (a false alarm of mine):** an earlier draft here claimed the *nemotron* prompt
+in `scripts/models.toml` had out-of-vocab tokens and crashed `bench.sh nemotron decode`. It
+does **not** — every model's prompt is valid for its own model (nemotron L89 max 104209 <
+vocab 131072; verified `coli gen` runs decode at 8.49 tok/s). The `embed_row` index panic I
+hit came from a throwaway MTP-measurement script of mine reading the *first* prompt in the
+file — minimax-m3's (max 151521) — and feeding it to the nemotron container (vocab 131072).
+The `coli serve` MTP numbers above are unaffected (serve tokenizes text correctly). Real
+takeaway kept: `embed_row` now asserts `tok < vocab` with a named error instead of an opaque
+slice panic, so this class of mistake self-diagnoses (separate branch).
 
 > **#98 is RESOLVED — jump to the “#98 RESOLVED” section just below this one.** The step
 > function was a real characterisation, but the root cause was found afterward (per-call

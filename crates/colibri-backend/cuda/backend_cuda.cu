@@ -390,6 +390,42 @@ __global__ static void nvfp4_gemv_wide(float *y,const float *x,const uint8_t *w,
     if(lane==0) y[n]=acc*g;
 }
 
+/* Wide-read NVFP4 GEMV with NO shared staging of x — the occupancy variant.
+ *
+ * `nvfp4_gemv{,_wide}` stage x in shared memory: K floats, i.e. 16 KB per block at K=4096
+ * and 32 KB at K=8192. That is a hard occupancy cap — at 32 KB an SM holds only ~3 blocks
+ * (24 warps) where it could hold 8-16 — so far fewer memory requests are in flight than
+ * the memory system can track. Resident NVFP4 decode achieves ~65 GB/s against a measured
+ * 146 GB/s zero-copy ceiling, and too few concurrent readers is the likeliest reason.
+ *
+ * The trade is favourable: the WEIGHTS are the traffic (GB per token), while x is only
+ * K floats (16-32 KB) shared by every warp in the grid — small enough to sit in L2, so
+ * re-reading it from global costs little. Dropping the shared allocation lets many more
+ * warps be resident, which is what actually raises memory-level parallelism.
+ *
+ * Same per-lane byte assignment (and shared block-scale) as `nvfp4_gemv_wide`. */
+__global__ static void nvfp4_gemv_wide_g(float *y,const float *x,const uint8_t *w,
+                                         const uint8_t *bs,float g,int K,int N){
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int kb=lane;kb<Kh;kb+=32){
+        uint8_t byte=wr[kb];
+        int k0=kb<<1;
+        float sc=e4m3f(br[k0>>4]);
+        float a=x[k0]*e2m1f(byte&0xF);
+        float b=(k0+1<K)?x[k0+1]*e2m1f(byte>>4):0.f;
+        acc+=(a+b)*sc;
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
 /* Tiled WMMA down-proj (S>1 prefill). Mirror of `fp8a16_matmul` with the nvfp4 decode. */
 /* SEGMENTED NVFP4 matmul: one launch covers EVERY expert in a layer.
  *
@@ -1542,17 +1578,22 @@ extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
     const uint8_t *w = (const uint8_t *)t->weights;
     const uint8_t *bs = (const uint8_t *)t->bscale;
     size_t gemv_shmem = (size_t)I * sizeof(float);
-    if (S == 1 && gemv_shmem <= 48u * 1024u) {
+    if (S == 1) {
         /* COLI_NVFP4_WIDE=0 selects the original narrow-read GEMV for A/B. */
-        static int s_wide = -1;
-        if (s_wide < 0) { const char *e = getenv("COLI_NVFP4_WIDE"); s_wide = !e || strcmp(e, "0") != 0; }
+        /* COLI_NVFP4_GEMV: 0=narrow (original), 1=wide read + shared x, 2=wide read and
+         * NO shared x (occupancy variant, default). */
+        static int s_mode = -1;
+        if (s_mode < 0) { const char *e = getenv("COLI_NVFP4_GEMV"); s_mode = e ? atoi(e) : 2; }
         const int tpb = 256, wpb = tpb >> 5;
         unsigned blocks = (unsigned)((O + wpb - 1) / wpb);
-        if (s_wide)
+        if (s_mode == 0)
+            nvfp4_gemv<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        else if (s_mode == 1)
             nvfp4_gemv_wide<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
                 ctx->y, ctx->x, w, bs, t->gscale, I, O);
         else
-            nvfp4_gemv<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
+            nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(
                 ctx->y, ctx->x, w, bs, t->gscale, I, O);
     } else {
         dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));

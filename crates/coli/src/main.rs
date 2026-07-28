@@ -2279,10 +2279,14 @@ where
         fill_target >> 30,
         ADAPTIVE_HARD_FLOOR >> 30
     );
-    // Preload is safe only on the automatic near-fit path (fill_target = natural_fill holds
-    // the whole set with no eviction). An explicit COLI_RAM_GB means the user is managing
-    // residency; don't eagerly fill past what they asked for.
-    near_fit && explicit.is_none()
+    // Preload is safe only when the whole expert set fits the fill target with COMFORTABLE
+    // headroom — not merely "near-fit". `near_fit` fires at ~92% coverage (the fadvise-tiering
+    // decision), but eagerly loading ALL experts then overfills: M2.7 at 109 GB experts on a
+    // 121 GB box preloaded to residency and THRASHED to 0.97 tok/s (vs ~4.3 lazy). Require
+    // experts ≤ 85% of natural_fill so KV + working + page cache keep real room. An explicit
+    // COLI_RAM_GB means the user is managing residency — leave preload to them.
+    let fits_with_headroom = total_expert_bytes <= natural_fill / 100 * 85;
+    near_fit && explicit.is_none() && fits_with_headroom
 }
 
 /// Eagerly load EVERY routed expert into the cache at startup, so decode never pays a cold

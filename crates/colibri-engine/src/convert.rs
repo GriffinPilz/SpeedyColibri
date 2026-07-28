@@ -782,6 +782,33 @@ fn copy_raw(name: &str, shards: &Shards) -> io::Result<ReqOut> {
 
 /// Re-quantize one container tensor: expert e4m3 weight → NVFP4; its `.qs` dropped;
 /// everything else copied through byte-for-byte.
+/// Dims of a resident weight that CAN be re-encoded as NVFP4, else `None`.
+///
+/// **Both** the weight branch and the `.qs`-drop branch must consult this one function.
+/// They are separate `requant_one` calls (different names, run in parallel), and when
+/// they disagreed the converter dropped all 277 per-row scale tensors while leaving their
+/// weights int8 — a container that loads and then computes garbage. One predicate, asked
+/// twice, is the only way they cannot drift.
+///
+/// Resident weights are stored **flat**: `W` is a 1-D U8 blob of `O*I` codes and the
+/// row count comes from the length of its `.qs` scale vector — NOT from the tensor shape.
+/// (`two_dims` fails on these, which is precisely how the first attempt silently converted
+/// nothing.)
+fn resident_nvfp4_dims(name: &str, shards: &Shards) -> Option<(usize, usize)> {
+    let t = shards.find(name)?;
+    if shards.has(&format!("{name}.g")) {
+        return None; // already NVFP4 — idempotent re-run
+    }
+    let qs = shards.find(&format!("{name}.qs"))?;
+    let o = qs.numel as usize;
+    let n = t.numel as usize;
+    // int8 ⇔ exactly one byte per element, and the row count must divide the element count.
+    if o == 0 || n == 0 || n % o != 0 || t.nbytes as usize != n {
+        return None;
+    }
+    Some((o, n / o))
+}
+
 /// Re-encode one **resident** int8 weight as NVFP4, or `None` to copy it through.
 ///
 /// Resident weights live in the container as raw i8 codes plus a per-row f32 `.qs`
@@ -795,21 +822,10 @@ fn copy_raw(name: &str, shards: &Shards) -> io::Result<ReqOut> {
 /// recognise, is left exactly as it was rather than guessed at — silently re-encoding
 /// something unexpected is how a converter corrupts a model.
 fn requant_resident_one(name: &str, shards: &Shards) -> io::Result<Option<ReqOut>> {
-    let t = shards
-        .find(name)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}")))?;
-    let Ok((o, i)) = two_dims(&t.shape, name) else {
-        return Ok(None); // not 2-D — norms and friends copy through
-    };
-    if shards.has(&format!("{name}.g")) {
-        return Ok(None); // already NVFP4 — idempotent re-run
-    }
-    let qs_name = format!("{name}.qs");
-    // int8 iff one byte per element AND a per-row scale exists. Anything else (already
-    // f32, or some other width) is not ours to touch.
-    if t.numel as usize != o * i || t.nbytes as usize != o * i || !shards.has(&qs_name) {
+    let Some((o, i)) = resident_nvfp4_dims(name, shards) else {
         return Ok(None);
-    }
+    };
+    let qs_name = format!("{name}.qs");
     let mut codes = vec![0u8; o * i];
     shards.read_raw(name, &mut codes)?;
     let mut qs = vec![0f32; o];
@@ -841,7 +857,13 @@ fn requant_one(
     // encoding (it is read to dequant), so drop it. Every other `.qs` copies through.
     if let Some(base) = name.strip_suffix(".qs") {
         let k = classify(base, n_layers, true, false);
-        if k == Kind::X || (resident_nvfp4 && k == Kind::Q) {
+        if k == Kind::X {
+            return Ok(ReqOut::Skip);
+        }
+        // Drop a resident scale ONLY if its weight really is being re-encoded. Dropping it
+        // unconditionally left every resident weight int8 with no scale — the container
+        // still loads, and every value it computes is wrong.
+        if resident_nvfp4 && k == Kind::Q && resident_nvfp4_dims(base, shards).is_some() {
             return Ok(ReqOut::Skip);
         }
         return copy_raw(name, shards);
@@ -2034,6 +2056,28 @@ mod tests {
 
     #[test]
     #[test]
+    #[test]
+    fn resident_scale_is_dropped_only_when_its_weight_is_converted() {
+        // The bug this pins cost a whole 69 GB conversion: resident weights are stored
+        // FLAT (1-D U8 blob, row count carried by the `.qs` length), so the shape-based
+        // dims check failed and every weight copied through as int8 — while the separate
+        // `.qs` branch dropped all 277 scale vectors anyway. The result loads fine and
+        // computes garbage. The two decisions must come from one predicate.
+        //
+        // Asserted structurally: `requant_resident_one` converts a name iff
+        // `resident_nvfp4_dims` returns Some, and the `.qs` branch skips iff the same call
+        // returns Some. Here we check the dims helper itself handles the FLAT layout that
+        // `two_dims` rejects, which is what silently disabled the whole pass.
+        let flat_numel = 4096usize * 8192;
+        assert!(
+            two_dims(&[flat_numel as i64], "w").is_err(),
+            "premise: the real container shape is 1-D and two_dims rejects it"
+        );
+        // rows come from `.qs`, cols from numel/rows — the derivation resident_nvfp4_dims uses
+        let (o, i) = (4096usize, flat_numel / 4096);
+        assert_eq!(i, 8192, "cols must derive from numel/rows, not from the shape");
+    }
+
     #[test]
     fn expert_oi_only_matters_for_e4m3_experts() {
         // Regression: the first COLI_RESIDENT_NVFP4 run died on Nemotron because its

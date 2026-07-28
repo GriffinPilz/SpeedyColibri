@@ -25,6 +25,15 @@
 # Resumable: a shard whose output already exists is skipped, so re-running after an
 # interruption picks up where it stopped.
 #
+# Shard layout, read off the index (layer N is in shard N+1):
+#   1..93  one transformer layer each
+#   94     embed_tokens + lm_head + model.norm + output_attn_res_{norm,proj}
+#   95..96 vision_tower (165 tensors) + mm_projector — VISION ONLY
+# `convert` drops every vision tensor, so shards 95-96 convert to nothing at all and are
+# not fetched by default: the text-only container is shards 1..94. Ask for them
+# explicitly if a VL container is ever wanted; the loop tolerates their empty output
+# rather than treating it as a failed conversion.
+#
 #   Usage: scripts/k3_fetch_convert.sh [first_shard] [last_shard]
 #   Env:   K3_SRC, K3_OUT, COLI_BIN, MIN_FREE_GB (default 150)
 set -euo pipefail
@@ -34,9 +43,11 @@ OUT=${K3_OUT:-$HOME/models/Kimi-K3-container}
 COLI_BIN=${COLI_BIN:-$(dirname "$0")/../target/release/coli}
 BASE=https://huggingface.co/unsloth/Kimi-K3/resolve/main
 NSHARD=96
+# Last shard carrying text-model weights; 95-96 are vision-only (see the header).
+TEXT_LAST=94
 MIN_FREE_GB=${MIN_FREE_GB:-150}
 FIRST=${1:-1}
-LAST=${2:-$NSHARD}
+LAST=${2:-$TEXT_LAST}
 
 META=(config.json generation_config.json tokenizer_config.json added_tokens.json
       tiktoken.model chat_template.jinja tokenization_kimi.py configuration_kimi_k3.py)
@@ -130,7 +141,17 @@ for ((n=FIRST; n<=LAST; n++)); do
   "$COLI_BIN" convert "$stage" "$tmp" || die "convert failed on shard $n"
 
   produced=("$tmp"/out-*.safetensors)
-  [[ -s ${produced[0]} ]] || die "convert produced no shard for $n"
+  if [[ ! -s ${produced[0]} ]]; then
+    # A vision-only shard converts to nothing — every tensor is dropped — which is a
+    # correct outcome, not a failure. Anywhere in the text range it means the mapping
+    # skipped tensors it should have kept, and that must be loud.
+    if (( n > TEXT_LAST )); then
+      log "shard $n/$NSHARD: vision-only, nothing to convert (expected)"
+      rm -rf "$stage" "$tmp"; rm -f "$SRC/$(shard_name "$n")"
+      continue
+    fi
+    die "convert produced no shard for $n (text shard: the name mapping dropped everything)"
+  fi
   (( ${#produced[@]} == 1 )) || die "expected 1 output shard for input $n, got ${#produced[@]}"
   mv "${produced[0]}" "$o"
 
@@ -156,5 +177,7 @@ if [[ ! -s $OUT/tokenizer.json && -s $SRC/tiktoken.model ]]; then
     || log "WARNING: tokenizer.json generation failed — run it by hand"
 fi
 
-log "complete: $(ls "$OUT"/out-*.safetensors 2>/dev/null | wc -l)/$NSHARD shards in $OUT"
+# Count against TEXT_LAST, not NSHARD: a complete text-only container is 94 shards, and
+# reporting "94/96" would read like two are missing.
+log "complete: $(ls "$OUT"/out-*.safetensors 2>/dev/null | wc -l)/$TEXT_LAST text shards in $OUT"
 log "container size: $(du -sh "$OUT" | cut -f1)"

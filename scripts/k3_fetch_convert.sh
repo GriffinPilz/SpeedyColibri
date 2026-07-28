@@ -46,6 +46,8 @@ NSHARD=96
 # Last shard carrying text-model weights; 95-96 are vision-only (see the header).
 TEXT_LAST=94
 MIN_FREE_GB=${MIN_FREE_GB:-150}
+# Concurrent shard downloads to keep in flight ahead of the converter. See the loop.
+PREFETCH_DEPTH=${PREFETCH_DEPTH:-3}
 FIRST=${1:-1}
 LAST=${2:-$TEXT_LAST}
 
@@ -54,6 +56,10 @@ META=(config.json generation_config.json tokenizer_config.json added_tokens.json
 
 die() { echo "[k3] FATAL: $*" >&2; exit 1; }
 log() { echo "[k3] $*"; }
+
+# `declare -A` (the in-flight download table) needs bash 4+. macOS ships bash 3.2, so
+# say so plainly rather than failing with "declare: -A: invalid option".
+(( ${BASH_VERSINFO[0]:-0} >= 4 )) || die "needs bash >= 4 (found ${BASH_VERSION:-unknown})"
 
 # Don't leave a prefetch writing into $SRC after the script dies — a later run would
 # find a stale `.part` and `curl -C -` would resume it against a possibly different file.
@@ -97,38 +103,58 @@ for f in "${META[@]}"; do
 done
 
 # ---- shard loop ------------------------------------------------------------------
-prefetch_pid=""; prefetch_idx=""
+# Downloads in flight, keyed by shard index.
+declare -A DL_PID
+
+# Start a download for shard $1 unless one is already running, the file is already here,
+# or the shard is already converted. Bounded by PREFETCH_DEPTH at the call site.
+ensure_dl() {
+  local n=$1
+  (( n > LAST )) && return 0
+  [[ -n ${DL_PID[$n]:-} ]] && return 0
+  [[ -s $SRC/$(shard_name "$n") ]] && return 0
+  [[ -s $OUT/$(out_name "$n") ]] && return 0
+  fetch_shard "$n" &
+  DL_PID[$n]=$!
+  return 0
+}
+
+# Block until shard $1's download (if any) has finished.
+wait_dl() {
+  local n=$1
+  [[ -n ${DL_PID[$n]:-} ]] || return 0
+  wait "${DL_PID[$n]}" || die "download of shard $n failed"
+  unset "DL_PID[$n]"
+  return 0
+}
+
 t_start=$(date +%s)
 for ((n=FIRST; n<=LAST; n++)); do
   o=$OUT/$(out_name "$n")
   if [[ -s $o ]]; then
     log "shard $n/$NSHARD: already converted, skipping"
-    # A prefetch aimed at this shard is now wasted work — let it finish (killing it
-    # mid-write leaves a .part) and drop the file, or it sits on disk for the whole run.
-    if [[ "$prefetch_idx" == "$n" && -n "$prefetch_pid" ]]; then
-      wait "$prefetch_pid" || true
+    # An in-flight download for this shard is wasted work. Let it finish rather than
+    # killing it mid-write (which strands a .part), then drop the file.
+    if [[ -n ${DL_PID[$n]:-} ]]; then
+      wait "${DL_PID[$n]}" || true
+      unset "DL_PID[$n]"
       rm -f "$SRC/$(shard_name "$n")" "$SRC/$(shard_name "$n").part"
-      prefetch_pid=""; prefetch_idx=""
     fi
     continue
-  fi
-
-  # A prefetch of THIS shard from the previous iteration must finish before we use it.
-  if [[ "$prefetch_idx" == "$n" && -n "$prefetch_pid" ]]; then
-    wait "$prefetch_pid" || die "prefetch of shard $n failed"
-    prefetch_pid=""; prefetch_idx=""
   fi
 
   avail=$(free_gb)
   (( avail >= MIN_FREE_GB )) || die "only ${avail}GB free, need >= ${MIN_FREE_GB}GB"
 
-  log "shard $n/$NSHARD: fetching (${avail}GB free)"
-  fetch_shard "$n"
+  # Keep PREFETCH_DEPTH downloads in flight. A single connection is throttled well below
+  # the link: measured on 42b2, a second concurrent stream pulled 32.8 MB/s while the
+  # first held ~46 MB/s, so depth is what sets the wall-clock here, not bandwidth.
+  # Each extra depth costs one shard of disk (~17 GB) while in flight.
+  for ((k=n; k<=n+PREFETCH_DEPTH && k<=LAST; k++)); do ensure_dl "$k"; done
 
-  # Overlap the next download with this conversion.
-  if (( n < LAST )); then
-    fetch_shard $((n+1)) & prefetch_pid=$!; prefetch_idx=$((n+1))
-  fi
+  log "shard $n/$NSHARD: fetching (${avail}GB free, ${#DL_PID[@]} in flight)"
+  wait_dl "$n"
+  fetch_shard "$n"   # no-op when the prefetch already landed it
 
   # Stage exactly one shard plus the config the converter needs. Hardlink the shard so
   # staging costs no space (same filesystem).

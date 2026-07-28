@@ -339,3 +339,51 @@ fn kimi_routed_experts_load_in_latent_space() {
     assert_eq!(e.down.o as usize, DL, "expert output width must be moe_latent");
     assert_eq!(e.down.i as usize, MOE_INTER);
 }
+
+/// Every dense weight K3 actually computes with must be GPU-eligible.
+///
+/// This is the `gpu_eligible` trap, which has now bitten three arches: a resident weight
+/// missing from the list in `mark_gpu_eligible` silently takes the single-threaded CPU
+/// matmul. It cost 84% of an M3 prefill (q/k/v projections), 94% of Nemotron's mamba
+/// time (in/out_proj) and 62% of its MoE phase (fc1/fc2_latent) — each found only by
+/// profiling, because nothing fails and the output is identical.
+///
+/// K3 inherits most of the list, but `attn_gate`, `kda_b_proj`, `kda_f_a` and `kda_f_b`
+/// have no analogue in any other arch. `attn_gate` alone is 8.19B params across the
+/// stack — the same order as `q_b`/`kv_b`. Asserting over the whole layer rather than
+/// naming the four means a future K3 tensor is covered the day it is added.
+#[test]
+fn kimi_dense_weights_are_all_gpu_eligible() {
+    let dir = temp_dir();
+    let model = tiny_model(&dir);
+
+    let mut checked = 0usize;
+    for (li, l) in model.layers.iter().enumerate() {
+        // Non-Option slots: populated ones have real dimensions, defaults are 0x0.
+        let fixed: [(&str, &colibri_engine::QTensor); 9] = [
+            ("q_a", &l.q_a), ("q_b", &l.q_b), ("kv_a", &l.kv_a), ("kv_b", &l.kv_b),
+            ("o", &l.o), ("gate_proj", &l.gate_proj), ("up_proj", &l.up_proj),
+            ("down_proj", &l.down_proj), ("sh_gate", &l.sh_gate),
+        ];
+        for (name, t) in fixed {
+            if t.o > 0 && t.i > 0 {
+                assert!(t.gpu_eligible, "L{li} {name} ({}x{}) is not gpu_eligible", t.o, t.i);
+                checked += 1;
+            }
+        }
+        let opts: [(&str, &Option<colibri_engine::QTensor>); 8] = [
+            ("q_proj", &l.q_proj), ("k_proj", &l.k_proj), ("v_proj", &l.v_proj),
+            ("attn_gate", &l.attn_gate), ("kda_b_proj", &l.kda_b_proj),
+            ("kda_f_a", &l.kda_f_a), ("kda_f_b", &l.kda_f_b),
+            ("fc1_latent", &l.fc1_latent),
+        ];
+        for (name, t) in opts {
+            if let Some(t) = t {
+                assert!(t.gpu_eligible, "L{li} {name} ({}x{}) is not gpu_eligible", t.o, t.i);
+                checked += 1;
+            }
+        }
+    }
+    // Guard against the assertions vacuously passing on an empty model.
+    assert!(checked >= 40, "expected many weights to check, saw {checked}");
+}

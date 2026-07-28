@@ -724,6 +724,25 @@ fn mark_gpu_eligible(l: &mut Layer) {
             t.gpu_eligible = true;
         }
     }
+    // Kimi-K3's own resident projections. K3 inherits most of this list already — its
+    // KDA q/k/v reuse the GQA fields above, `o` comes from the GLM list, and the latent
+    // MoE reuses Nemotron's fc1/fc2 — but these four have no analogue anywhere else and
+    // would otherwise be the ONLY dense weights left on the single-threaded CPU matmul:
+    //
+    //   attn_gate (g_proj)  12288x7168  = 88.1M/layer x 93 = 8.19B params
+    //   kda_f_b             12288x128   =  1.6M/layer x 69 = 0.11B
+    //   kda_f_a               128x7168  =  0.9M/layer x 69 = 0.06B
+    //   kda_b_proj             96x7168  =  0.7M/layer x 69 = 0.05B
+    //
+    // `attn_gate` is the one that matters: it runs on EVERY layer (both mixers carry the
+    // output gate) and is the same order as `q_b`/`kv_b`. Leaving it off is the same
+    // omission that cost 84% of an M3 prefill and 94% of Nemotron's mamba time — the
+    // tell is a phase total far exceeding the sum of its GPU sub-timers.
+    for t in [&mut l.attn_gate, &mut l.kda_b_proj, &mut l.kda_f_a, &mut l.kda_f_b] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
 }
 
 /// Load a model snapshot, materializing the **dense** weights (embeddings,

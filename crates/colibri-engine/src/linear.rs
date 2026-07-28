@@ -393,7 +393,7 @@ mod tests {
         for r in 0..o {
             let mut want = 0f32;
             for k in 0..i {
-                let nib = ((k + r * 3) % 16) as usize;
+                let nib = (k + r * 3) % 16;
                 want += E2M1[nib] * f8e8m0_to_f32(bs[r * nb + k / 32]) * x[k];
             }
             want *= g;

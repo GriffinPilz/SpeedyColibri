@@ -122,6 +122,17 @@ fn m3_sparse_enabled() -> bool {
 /// reference). `COLI_GQA_KERNEL=naive|scalar|0` forces the reference kernel; anything
 /// else (or unset) uses flash. Read once.
 #[cfg(feature = "cuda")]
+/// Whether the S==1 (decode) GQA core runs on the GPU. `COLI_GQA_DECODE_GPU=0` forces the
+/// scalar CPU core back — the A/B switch for the gate opened in `attention_gqa`.
+///
+/// Not free of consequence: the GPU core reduces over keys in a different order than the
+/// CPU loop, so decode logits move by ~1 ULP and a near-tie argmax can fork the sampled
+/// token. That is the same trade prefill already makes on this path.
+fn gqa_decode_gpu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_GQA_DECODE_GPU").ok().as_deref() != Some("0"))
+}
+
 fn gqa_kernel_mode() -> u32 {
     static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *M.get_or_init(|| match std::env::var("COLI_GQA_KERNEL").ok().as_deref() {
@@ -340,11 +351,18 @@ pub fn attention_gqa(
     let st0 = kv.kv_start[layer];
     let mut ctx = vec![0f32; s_len * h * hd];
 
-    // GPU dense prefill core (MiniMax-M3): fresh-cache single-shot prefill only. The
-    // block-sparse path and decode (S=1) stay on the CPU core below.
+    // GPU dense core over a fresh cache. Only the block-sparse path stays on the CPU.
+    //
+    // This used to read `s_len > 1` — GPU for prefill, CPU for decode. The CPU core below
+    // is a scalar triple loop with no threading and no SIMD, and its cost is
+    // O(heads x context x head_dim) per *token*, so decode paid ~0.2 ms per 1k of context
+    // per layer: on MiniMax-M2.7 (48 heads, 62 layers) that is ~5 ms/token at a 32-token
+    // context but ~100 ms/token at 512 — 21% of the decode step, growing without bound.
+    // Prefill never showed it because prefill was already on the GPU. The kernel is
+    // shape-general (S is a kernel argument), so decode only ever needed the gate opened.
     let mut gpu_done = false;
     #[cfg(feature = "cuda")]
-    if block_sel.is_none() && s_len > 1 && st0 == 0 {
+    if block_sel.is_none() && st0 == 0 && (s_len > 1 || gqa_decode_gpu()) {
         let t_full = pos_base + s_len;
         gpu_done = crate::gpu::try_gqa_attn(
             &mut ctx,

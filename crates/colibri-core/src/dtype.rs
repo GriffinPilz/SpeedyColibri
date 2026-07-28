@@ -98,6 +98,26 @@ pub fn f8e4m3_to_f32(b: u8) -> f32 {
     }
 }
 
+/// Decode an OCP **E8M0** block-scale byte to f32: an unsigned, mantissa-less
+/// power of two, `2^(b - 127)`. `0xFF` is the sole NaN.
+///
+/// This is the MX scale encoding — the shared per-32 exponent of an MXFP4 block (and
+/// the per-32 scale of the MX-FP8 checkpoints the M3 converter already reads). Unlike
+/// e4m3 it carries no mantissa, so every scale is exactly a power of two; that is what
+/// makes an MXFP4 -> NVFP4 transcode lossless when the target block scale is constrained
+/// to a power of two, and lossy (measured 6.4% rel-RMS on real Kimi-K3 experts) when it
+/// is chosen as `blockmax/6` in the usual way.
+///
+/// `2^-127` is the smallest normal here, which is within f32 range, so no value
+/// underflows; `powi` is exact for every power of two in range.
+#[inline]
+pub fn f8e8m0_to_f32(b: u8) -> f32 {
+    if b == 0xFF {
+        return f32::NAN;
+    }
+    2.0f32.powi(b as i32 - 127)
+}
+
 /// Decode a float8 **e5m2** bit pattern to f32. Layout: 1 sign / 5 exponent
 /// (bias 15) / 2 mantissa; `S.11111.00` is ±inf and `S.11111.xx` (xx≠0) is NaN.
 #[inline]
@@ -202,6 +222,39 @@ mod tests {
         // smallest positive subnormal: man1, exp0 -> 2^-9
         assert_eq!(f8e4m3_to_f32(0x01), 2f32.powi(-9));
         assert_eq!(f8e4m3_to_f32(0x80), 0.0); // -0 reads as 0.0 == -0.0
+    }
+
+    #[test]
+    fn f8e8m0_known_values() {
+        // Unsigned, mantissa-less: the whole byte is a biased exponent, value 2^(b-127).
+        assert_eq!(f8e8m0_to_f32(127), 1.0);
+        assert_eq!(f8e8m0_to_f32(128), 2.0);
+        assert_eq!(f8e8m0_to_f32(126), 0.5);
+        assert_eq!(f8e8m0_to_f32(0), 2f32.powi(-127));
+        assert_eq!(f8e8m0_to_f32(254), 2f32.powi(127));
+        assert!(f8e8m0_to_f32(0xFF).is_nan());
+        // Every value is exactly a power of two — no mantissa to round. This is the
+        // property the lossless MXFP4 -> NVFP4 transcode depends on.
+        //
+        // Checked over b >= 1 only: b == 0 is 2^-127, and f32's smallest NORMAL is
+        // 2^-126, so that one value is stored subnormal (0.5 x 2^-126) and carries a
+        // set mantissa bit despite being an exact power of two. It is still exact and
+        // still round-trips — real K3 expert scales sit in 2^-16..2^-5, nowhere near it.
+        for b in 1u8..=254 {
+            let v = f8e8m0_to_f32(b);
+            assert!(v > 0.0 && v.is_finite());
+            assert_eq!(v.to_bits() & 0x007F_FFFF, 0, "byte {b} is not a power of two");
+        }
+        assert!(!f8e8m0_to_f32(0).is_normal() && f8e8m0_to_f32(0) > 0.0);
+        // Independent construction: halving from 1.0 must reproduce the decode exactly.
+        let mut expect = 1.0f32;
+        for b in (1..=127u8).rev() {
+            assert_eq!(f8e8m0_to_f32(b), expect, "byte {b}");
+            expect /= 2.0;
+        }
+        // The real Kimi-K3 expert scales measured on disk span 2^-16..2^-5.
+        assert_eq!(f8e8m0_to_f32(127 - 16), 2f32.powi(-16));
+        assert_eq!(f8e8m0_to_f32(127 - 5), 2f32.powi(-5));
     }
 
     #[test]

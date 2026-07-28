@@ -189,12 +189,18 @@ pub struct QTensor {
     pub q4: Bytes,
     /// per-row scales (length `O`), empty for `F32`
     pub s: Vec<f32>,
-    /// NVFP4 (`fmt_code == 5`) only: ue4m3 per-16-input block scales, `O × ceil(I/16)`
-    /// bytes row-major. The effective scale of the 16-wide block containing column `c`
-    /// of row `r` is `f8e4m3_to_f32(bs[r*ceil(I/16) + c/16]) * g`. Empty otherwise.
+    /// Block-scaled FP4 (`fmt_code == 5` NVFP4, `== 6` MXFP4) only: per-block scale
+    /// bytes, `O × ceil(I/BLK)` row-major, where `BLK` is 16 for NVFP4 and 32 for MXFP4.
+    /// The effective scale of the block containing column `c` of row `r` is
+    /// `decode(bs[r*ceil(I/BLK) + c/BLK]) * g`, with `decode` = `f8e4m3_to_f32` for
+    /// NVFP4 and `2^(byte - 127)` (OCP E8M0) for MXFP4. Empty otherwise.
     pub bs: Bytes,
-    /// NVFP4 (`fmt_code == 5`) only: per-tensor global scale (modelopt-style; the block
-    /// scales above are multiplied by it). `0.0` / unused for every other format.
+    /// Block-scaled FP4 (`fmt_code == 5` / `6`) only: per-tensor global scale, which the
+    /// block scales above are multiplied by. `0.0` / unused for every other format.
+    ///
+    /// NVFP4 uses it modelopt-style (`amax / (6 * 448)`). MXFP4 has no global scale of
+    /// its own — the E8M0 byte already spans 2^±127 — so a native MXFP4 tensor carries
+    /// `g == 1.0`. It stays in the layout so both formats share one decode signature.
     pub g: f32,
     /// rows (output dim)
     pub o: i32,
@@ -225,8 +231,16 @@ impl QTensor {
                     + self.o as i64 * ((self.i as i64 + 15) / 16)
                     + 4
             }
+            // MXFP4: same e2m1 nibbles, but one E8M0 byte per 32 inputs instead of per 16.
+            // That is 4.25 bits/weight vs NVFP4's 4.5 — the reason a natively-MXFP4
+            // checkpoint (Kimi-K3) is 5.9% smaller kept as-is than transcoded to NVFP4.
+            6 => {
+                self.o as i64 * ((self.i as i64 + 1) / 2)
+                    + self.o as i64 * ((self.i as i64 + 31) / 32)
+                    + 4
+            }
             3 => self.o as i64 * ((self.i as i64 + 3) / 4) + self.o as i64 * 4,
-            // Every real format (0,1,3,4,5) has an explicit arm above; an unknown
+            // Every real format (0,1,3,4,5,6) has an explicit arm above; an unknown
             // code contributes no resident bytes.
             _ => 0,
         }

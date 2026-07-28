@@ -113,6 +113,38 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
                 }
             }
         }
+        6 => {
+            // MXFP4: the same e2m1 nibbles as NVFP4, but one OCP E8M0 (power-of-two)
+            // block scale per 32 inputs instead of a ue4m3 one per 16 — 4.25 bits/weight
+            // vs 4.5. W[o,k] = E2M1[nib] · 2^(bs[o*nb + k/32] - 127) · g.
+            //
+            // This is Kimi-K3's native expert format, passed through convert bit-exact,
+            // so it is not a fallback for a GPU kernel the way arms 4 and 5 are — there
+            // is no MXFP4 expert kernel yet, and this IS the path K3 experts take.
+            //
+            // `g` is 1.0 for a natively-MXFP4 tensor (the E8M0 byte already spans
+            // 2^±127, so there is nothing left for a global scale to carry); it stays in
+            // the expression so both block-scaled formats share one shape.
+            let q4 = &w.q4;
+            let bs = &w.bs;
+            let g = w.g;
+            let rb = (i + 1) / 2;
+            let nb = (i + 31) / 32;
+            for row in 0..o {
+                let wr = &q4[row * rb..(row + 1) * rb];
+                let br = &bs[row * nb..(row + 1) * nb];
+                for si in 0..s {
+                    let xs = &x[si * i..(si + 1) * i];
+                    let mut a = 0f32;
+                    for k in 0..i {
+                        let byte = wr[k >> 1];
+                        let nib = if k & 1 == 1 { byte >> 4 } else { byte & 0x0f } as usize;
+                        a += E2M1[nib] * colibri_core::f8e8m0_to_f32(br[k >> 5]) * xs[k];
+                    }
+                    y[si * o + row] = a * g;
+                }
+            }
+        }
         other => panic!("matmul_qt: unknown QTensor format {other}"),
     }
 }
@@ -311,6 +343,61 @@ mod tests {
         for k in 0..4 {
             let expect = qt.q8[2 * 4 + k] as f32 * s;
             assert!((row[k] - expect).abs() < 1e-6);
+        }
+    }
+
+    /// MXFP4 (`fmt_code == 6`) must reconstruct through `matmul_qt`.
+    ///
+    /// Kimi-K3's routed experts are natively MXFP4 and pass through convert bit-exact, so
+    /// this is not a fallback path — it IS the path K3 experts take, and there is no GPU
+    /// MXFP4 kernel to cover for it. Before this arm existed `matmul_qt` panicked with
+    /// "unknown QTensor format 6" on the first routed expert, which no unit test caught
+    /// because every other format reaches the same function by a different arm.
+    ///
+    /// Checks the two things the arm can get wrong independently of each other: the
+    /// nibble order (low nibble = even column) and the block stride (one E8M0 byte per
+    /// 32 inputs, not per 16 as NVFP4).
+    #[test]
+    fn matmul_qt_reconstructs_mxfp4() {
+        use colibri_core::f8e8m0_to_f32;
+        let (o, i) = (2usize, 64usize); // 2 blocks of 32 per row
+        let nb = i / 32;
+        // Nibble k of row r cycles the e2m1 codebook; block scales differ per block AND
+        // per row so a stride mistake cannot coincide.
+        let mut q4 = vec![0u8; o * i / 2];
+        let mut bs = vec![0u8; o * nb];
+        for r in 0..o {
+            for k in 0..i {
+                let nib = ((k + r * 3) % 16) as u8;
+                let idx = r * (i / 2) + (k >> 1);
+                if k & 1 == 1 { q4[idx] |= nib << 4 } else { q4[idx] |= nib }
+            }
+            for b in 0..nb {
+                bs[r * nb + b] = (127 + (b as i32) - (r as i32)) as u8; // 2^0, 2^1, ...
+            }
+        }
+        let g = 0.5f32;
+        let w = colibri_core::QTensor {
+            fmt_code: 6,
+            q4: colibri_core::Bytes::Owned(q4),
+            bs: colibri_core::Bytes::Owned(bs.clone()),
+            g,
+            o: o as i32,
+            i: i as i32,
+            ..Default::default()
+        };
+        let x: Vec<f32> = (0..i).map(|k| ((k % 7) as f32 - 3.0) * 0.25).collect();
+        let mut y = vec![0f32; o];
+        matmul_qt(&mut y, &x, &w, 1);
+
+        for r in 0..o {
+            let mut want = 0f32;
+            for k in 0..i {
+                let nib = ((k + r * 3) % 16) as usize;
+                want += E2M1[nib] * f8e8m0_to_f32(bs[r * nb + k / 32]) * x[k];
+            }
+            want *= g;
+            assert!((y[r] - want).abs() < 1e-4, "row {r}: got {} want {want}", y[r]);
         }
     }
 }

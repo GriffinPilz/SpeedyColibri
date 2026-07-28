@@ -11,6 +11,6 @@ pub mod quant;
 pub mod tier;
 
 pub use config::{Arch, Config, ConfigError, LayerKind};
-pub use dtype::{bf16_to_f32, f16_to_f32, DType};
+pub use dtype::{bf16_to_f32, f16_to_f32, f8e8m0_to_f32, DType};
 pub use quant::{Bytes, QFormat, QTensor, SharedBuf};
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};

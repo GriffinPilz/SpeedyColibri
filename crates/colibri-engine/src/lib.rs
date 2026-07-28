@@ -26,6 +26,7 @@ pub mod model;
 pub mod moe;
 pub mod mtp;
 pub mod preload;
+pub mod qsim;
 pub mod quantize;
 pub mod sampling;
 pub mod usage;
@@ -665,6 +666,10 @@ pub fn load_model_with(
     for l in &mut model.layers {
         mark_gpu_eligible(l);
     }
+    // Optional load-time simulated requantization (COLI_QSIM). No-op unless set; it
+    // rewrites resident VALUES to carry a target precision's error so `coli ppl` can
+    // price a quantization choice without a container rebuild. See `qsim`.
+    crate::qsim::apply_qsim(&mut model);
     Ok(model)
 }
 

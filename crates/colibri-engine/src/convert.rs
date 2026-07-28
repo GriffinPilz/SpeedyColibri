@@ -1087,6 +1087,16 @@ pub(crate) fn quantize_nvfp4_sim(w: &[f32], o: usize, i: usize) -> Vec<f32> {
 
 /// Reconstruct the f32 values a [`QTensor`] actually represents — the inverse of
 /// [`qtensor_from_f32`], i.e. what the kernels will really multiply.
+/// `dequantize_qtensor` for the `qsim` load-time simulator (same crate, different module).
+pub(crate) fn dequantize_qtensor_pub(t: &QTensor) -> Vec<f32> {
+    dequantize_qtensor(t)
+}
+
+/// `quantize_nvfp4_sim` for the `qsim` load-time simulator.
+pub(crate) fn quantize_nvfp4_sim_pub(w: &[f32], o: usize, i: usize) -> Vec<f32> {
+    quantize_nvfp4_sim(w, o, i)
+}
+
 fn dequantize_qtensor(t: &QTensor) -> Vec<f32> {
     let (o, i) = (t.o as usize, t.i as usize);
     let mut out = vec![0f32; o * i];

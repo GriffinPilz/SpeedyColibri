@@ -839,6 +839,14 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
 /// Selection uses `sigmoid(logit) + bias`; the returned weights are the raw
 /// `sigmoid(logit)` of the chosen experts, then optionally renormalized and
 /// scaled by `routed_scaling_factor`.
+///
+/// The bias applies to SELECTION ONLY — the weight is the unbiased score. Verified
+/// against `KimiMoEGate.forward` in the reference `modeling_kimi_linear.py`
+/// (2026-07-28), which picks `topk(scores + e_score_correction_bias)` and then
+/// `scores.gather(1, topk_idx)`. Folding the bias into the weight too would still
+/// produce a plausible distribution, so nothing downstream would catch it. K3 also maps
+/// `moe_renormalize` (not GLM's `norm_topk_prob`) onto `cfg.norm_topk`, and its
+/// `num_expert_group == 1` disables the grouped path in both implementations.
 pub fn route(cfg: &Config, logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32>) {
     let e_n = logits.len();
     let k = (cfg.topk as usize).min(e_n);

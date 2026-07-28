@@ -158,6 +158,15 @@ pub fn swiglu_oai(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
 ///
 /// `linear_beta <= 0` means "unset" (the reference's `linear_beta is None`), leaving `up`
 /// untouched. K3 ships `beta = 4.0`, `linear_beta = 25.0`.
+///
+/// Checked line-by-line against `SituAndMul` in the reference `modeling_kimi_linear.py`
+/// (2026-07-28), including which projection is which: the reference builds
+/// `cat([gate_proj(x), up_proj(x)])` and splits at the halfway point, so `gate` is
+/// `gate_proj` and `up` is `up_proj` — and for the routed experts the source comments
+/// spell it out as `w1 # gate`, `w2 # down`, `w3 # up`, which is what `convert`'s
+/// `.w1.`->`.gate_proj.` / `.w3.`->`.up_proj.` rewrite assumes. Getting that pair
+/// backwards is silent: `situ` is ASYMMETRIC (the gate half gets `tanh * sigmoid`, the up
+/// half only `tanh`), so a swap stays finite and merely produces the wrong model.
 #[inline]
 pub fn situ(gate: f32, up: f32, beta: f32, linear_beta: f32) -> f32 {
     let a = beta * (gate / beta).tanh() * sigmoid(gate);

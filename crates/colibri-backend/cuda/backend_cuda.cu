@@ -1464,6 +1464,12 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* Defined further down (with the other tensor-wrap entry points); forward-declared here
+ * because this translation unit is compiled as one pass and the matmul below calls it. */
+extern "C" int coli_cuda_tensor_wrap_nvfp4(ColiCudaTensor **tensor,
+        const void *weights, const void *bscale, float gscale,
+        int I, int O, int device);
+
 /* Resident NVFP4 matmul: y[S,O] = x[S,I] @ W[O,I]^T with W in NVFP4.
  *
  * The DEVICE kernels for this already existed (`nvfp4_gemv` / `nvfp4_matmul`) — they are

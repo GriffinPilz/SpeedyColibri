@@ -32,26 +32,38 @@
 //! per token are unchanged — a `COLI_QSIM` run tells you nothing about tok/s. Pair it
 //! with the byte arithmetic (`bits_target / bits_stored × class bytes`) for that half.
 //!
-//! # The caveat that bites — read before trusting a result
+//! # RMS does not rank formats — read before trusting a comparison
 //!
-//! The container we serve is *already* quantized (int8 for resident weights), so this
-//! simulates P **on top of int8**, not P on the original bf16. An earlier version of this
-//! note claimed the compounded error is `sqrt(int8² + P²)` and therefore dominated by P.
-//! **That is wrong**: it assumes the two quantization grids are independent, and they are
-//! not. NVFP4's per-16 fine scales can substantially *re-represent* values that int8 has
-//! already snapped onto a coarse grid, so `nvfp4-on-int8` can land near identity — while
-//! `int6-on-int8`, a genuine 4× row-wise coarsening, degrades for real.
+//! Every rule reports the **relative RMS perturbation it actually applied**, and that
+//! number exists to be checked against `coli qerr` for the same scheme. An arm whose rms
+//! is far below the reference is near-identity, and its perplexity means nothing; the
+//! tool warns below 1%.
 //!
-//! Measured on Nemotron-3-Super: every NVFP4 arm drifted *around* baseline perplexity
-//! (some better, which is not physically possible for added noise), while the int6 arm
-//! degraded cleanly. The NVFP4 arms were measuring almost nothing.
+//! But the headline lesson from the first real sweep is different, and sharper:
+//! **equal RMS across different formats does NOT mean equal damage.** Measured on
+//! Nemotron-3-Super (6000 tokens, deterministic, baseline byte-identical twice):
 //!
-//! So: **every rule reports the relative RMS perturbation it actually applied.** Compare
-//! it against the `coli qerr` figure for the same scheme against the true source. If the
-//! qsim rms is far lower, that arm is near-identity and its perplexity means nothing —
-//! the tool warns when it drops below 1%. This is a screening tool for schemes that
-//! genuinely coarsen the stored values; the final candidate still needs a real requant
-//! from source before anyone ships it.
+//! | resident scheme | rms applied | perplexity |
+//! |---|---|---|
+//! | baseline int8   | —       | 6.781 |
+//! | nvfp4           | 0.0943  | **6.697** (unharmed) |
+//! | int6            | 0.0596  | 7.044 (+3.9%) |
+//! | int5            | 0.1176  | 7.075 (+4.3%) |
+//!
+//! NVFP4 perturbs *more* than int6 by RMS and costs *nothing*, while the int family
+//! degrades monotonically. The reason is the error's **structure**, not its size: per-row
+//! int puts one scale on a whole row, so each weight's error is proportional to that
+//! row's max — small weights take large *relative* damage. NVFP4's per-16 block scales
+//! make each weight's error proportional to its own local magnitude. Relative error
+//! preserves the structure of small weights; absolute error destroys it.
+//!
+//! So do not rank schemes by `qerr` RMS across format families — it is valid *within* a
+//! family (int8 < int6 < int5) and misleading *across* one. Rank by perplexity here.
+//!
+//! Remaining caveat: this simulates P on top of the container's existing int8. The
+//! measured rms (0.0943) landing on the qerr-vs-source figure (0.0935) says the
+//! compounding is mild, as `sqrt(int8² + P²)` predicts — but a shippable decision still
+//! wants a real requant from source and more than one corpus.
 
 use crate::model::{Layer, Model};
 use colibri_core::QTensor;

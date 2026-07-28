@@ -38,6 +38,14 @@ static MOE_US: AtomicU64 = AtomicU64::new(0);
 static DENSE_US: AtomicU64 = AtomicU64::new(0);
 /// Nemotron-H Mamba2 mixer wall time (its analog of `ATTN_US` for attention layers).
 static MAMBA_US: AtomicU64 = AtomicU64::new(0);
+/// Kimi-K3 KDA (delta-rule linear attention) mixer wall time — the analog of `ATTN_US`
+/// for the 69 KDA layers, kept separate so a K3 profile does not blend two mixers with
+/// completely different cost models into one number.
+static KDA_US: AtomicU64 = AtomicU64::new(0);
+/// Kimi-K3 attention-residual wall time: every `apply_attn_res` call, which on K3 is
+/// twice per layer plus once at the model level (187 per forward pass). Its own line
+/// because it is a cost centre no other arch has.
+static ATTNRES_US: AtomicU64 = AtomicU64::new(0);
 /// Sub-totals of `MAMBA_US`: the selective scan (GPU kernel or CPU `selective_scan`)
 /// and the in_proj + out_proj matmuls. The remainder is conv1d + splits + gated norm.
 static MAMBA_SCAN_US: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +163,20 @@ pub fn layer_forward_kind<P: ExpertProvider>(
         let kind = kind.unwrap_or_else(|| cfg.layer_kind[li]);
         return nemotron_layer_forward(model, kv, provider, l, li, kind, x, s, pos_base, nrm, tmp);
     }
+    // Kimi-K3 cannot be run one layer at a time. Its layers consume and return
+    // (prefix_sum, block_residual) — stack-level state this signature has nowhere to
+    // carry — so there is no `x` to update in place. Refuse rather than fall through to
+    // the two-sublayer driver below, which would compute a plausible but wrong result
+    // (ordinary residual adds, no attention-residual mixing) with no visible symptom.
+    // The real driver is [`kimi_forward`], which `forward` dispatches to.
+    if cfg.arch == Arch::KimiK3 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Kimi-K3 has no per-layer forward: its layers thread (prefix_sum, \
+             block_residual) through the whole stack. Use `forward`, which dispatches \
+             to `kimi_forward`.",
+        ));
+    }
     let d = cfg.hidden as usize;
     // in_ln -> attention -> residual
     for si in 0..s {
@@ -259,6 +281,241 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     for j in 0..s * d {
         x[j] += tmp[j];
     }
+    Ok(())
+}
+
+/// Kimi-K3's "attention residual": a softmax attention over the stack's saved states
+/// that produces the **input** to a sublayer. Port of the reference `_apply_attn_res`:
+///
+/// ```text
+///   v      = [blocks... ; prefix]           # [S, n_blocks+1, hidden] candidates
+///   k      = v * rsqrt(mean(v^2) + eps)     # RMSNorm, WITHOUT its weight
+///   sw     = norm * proj                    # the two [hidden] vectors, multiplied
+///   scores = (k * sw).sum(-1)               # [S, n_blocks+1]
+///   out    = softmax(scores) @ v            # weighted average of the RAW v, not of k
+/// ```
+///
+/// Two things here are easy to get wrong from the tensor shapes alone. `norm` and `proj`
+/// are multiplied elementwise into ONE `[hidden]` score vector — not applied in sequence
+/// as a norm and then a projection, which is what the `[1, hidden]` shape of
+/// `*_res_proj` suggests; that is also why `k` is a weightless RMSNorm (the weight is
+/// already folded into `sw`). And the output averages the **raw** `v`, not the
+/// normalised `k` — the norm exists only to score.
+///
+/// Each token mixes only its OWN candidates, so this is `S` independent attentions of
+/// width `n_blocks + 1`. Nothing crosses positions, which is why it needs no mask and
+/// behaves identically at prefill and decode.
+///
+/// With `blocks` empty this is the identity — one candidate, `softmax` over one score is
+/// 1.0, so `out == prefix`. That is exactly the case the reference's
+/// `block_residual.shape[1] > 0` guard skips, so the caller needs no special case.
+#[allow(clippy::too_many_arguments)]
+fn apply_attn_res(
+    prefix: &[f32],
+    blocks: &[Vec<f32>],
+    norm: &[f32],
+    proj: &[f32],
+    eps: f32,
+    s: usize,
+    d: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(norm.len(), d, "attn-res norm is [hidden]");
+    assert_eq!(proj.len(), d, "attn-res proj is [1, hidden]");
+    let nc = blocks.len() + 1;
+    // Shared by every token and candidate, so hoist it out of the loop.
+    let sw: Vec<f32> = (0..d).map(|j| norm[j] * proj[j]).collect();
+    let mut scores = vec![0f32; nc];
+    for i in 0..s {
+        let cand = |c: usize| -> &[f32] {
+            let v: &[f32] = if c < blocks.len() { &blocks[c] } else { prefix };
+            &v[i * d..(i + 1) * d]
+        };
+        for (c, sc) in scores.iter_mut().enumerate() {
+            let v = cand(c);
+            let mean_sq = v.iter().map(|&x| x * x).sum::<f32>() / d as f32;
+            let r = 1.0 / (mean_sq + eps).sqrt();
+            // Elementwise `k * sw` then sum, matching the reference's shape of the
+            // computation rather than the algebraically-equal `r * dot(v, sw)`.
+            *sc = (0..d).map(|j| (v[j] * r) * sw[j]).sum::<f32>();
+        }
+        crate::math::softmax(&mut scores);
+        let o = &mut out[i * d..(i + 1) * d];
+        o.fill(0.0);
+        for (c, &p) in scores.iter().enumerate() {
+            let v = cand(c);
+            for j in 0..d {
+                o[j] += p * v[j];
+            }
+        }
+    }
+}
+
+/// The stack-level state Kimi-K3 threads between layers, in place of a hidden state.
+///
+/// This is a separate type because its rules are the part of K3 that is easiest to get
+/// wrong and hardest to notice: every alternative below still runs, still produces
+/// finite output, and still agrees between prefill and decode. Only a direct test of the
+/// state transitions distinguishes them.
+///
+/// * `prefix` is an accumulator of sublayer outputs, NOT a residual stream — nothing
+///   norms it and adds back into it.
+/// * At a block boundary it is snapshotted into `blocks` and then **reset**: the next
+///   sublayer output replaces it rather than adding to it. That is the reference's
+///   `prefix_sum = None`, which `have_prefix == false` represents.
+/// * The snapshot happens before the layer's mixer runs, so a candidate is the state as
+///   it ENTERED that layer.
+struct AttnResState {
+    prefix: Vec<f32>,
+    blocks: Vec<Vec<f32>>,
+    /// `false` means "just snapshotted, not yet restarted" — the reference's `None`.
+    have_prefix: bool,
+    /// `attn_res_block_size`.
+    bs: usize,
+}
+
+impl AttnResState {
+    fn new(embeddings: Vec<f32>, bs: usize) -> Self {
+        assert!(bs > 0, "kimi: attn_res_block_size must be > 0");
+        AttnResState { prefix: embeddings, blocks: Vec::new(), have_prefix: true, bs }
+    }
+
+    /// Snapshot the accumulator if `li` is a block boundary. Call once per layer, after
+    /// that layer's attention mix and before its mixer.
+    fn maybe_snapshot(&mut self, li: usize) {
+        if li % self.bs == 0 {
+            self.blocks.push(self.prefix.clone());
+            self.have_prefix = false;
+        }
+    }
+
+    /// Fold one sublayer's output in: added to the accumulator, or — immediately after a
+    /// snapshot — becoming it.
+    fn accumulate(&mut self, out: &[f32]) {
+        if self.have_prefix {
+            for (p, &o) in self.prefix.iter_mut().zip(out.iter()) {
+                *p += o;
+            }
+        } else {
+            self.prefix.copy_from_slice(out);
+            self.have_prefix = true;
+        }
+    }
+}
+
+/// Run the Kimi-K3 stack. K3 does not have an ordinary residual stream, so it cannot
+/// reuse [`layer_forward`]; this is the whole-stack driver, a port of the reference
+/// `KimiLinearModel.forward` + `KimiDecoderLayer._forward_attn_residual`.
+///
+/// Two pieces of state thread through every layer, which is the reason this exists:
+///
+/// * `prefix` — the accumulator. It sums sublayer outputs, and **resets** at each block
+///   boundary (the reference sets `prefix_sum = None` there and the next sublayer output
+///   becomes the new accumulator, rather than being added to the old one). `have_prefix`
+///   is that `None`.
+/// * `blocks` — the candidate set. Every `attn_res_block_size`-th layer snapshots the
+///   accumulator **as it entered the layer** into it. On K3 that is layers 0, 12, ..., 84
+///   → 8 candidates by the end.
+///
+/// Each sublayer's input is [`apply_attn_res`] over `(prefix, blocks)`; the sublayer's
+/// output goes back into `prefix`. So a layer reads a mix of the whole stack's history
+/// and contributes to a running sum — the norm→mixer→add shape of an ordinary
+/// transformer is not what happens here.
+///
+/// Cost note: `blocks` is `n_blocks * S * hidden` f32 and lives for the whole pass —
+/// **~939 MB at a 4096-token prefill** on the real geometry (8 x 4096 x 7168 x 4), on
+/// top of the KV cache and the expert cache. It is 229 KB at decode (`S == 1`), so this
+/// only bites prefill. No capacity estimate for K3 has counted it yet.
+///
+/// `hidden_out` is the RAW hidden state — the model-level attention residual is applied
+/// here, but `final_norm` is not, matching [`forward`] and what [`logits`] expects.
+pub fn kimi_forward<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    ids: &[i32],
+    pos_base: usize,
+    hidden_out: &mut [f32],
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    let s = ids.len();
+    assert_eq!(hidden_out.len(), s * d);
+
+    let mut embeddings = vec![0f32; s * d];
+    timed(&EMBED_US, || {
+        for (i, &tok) in ids.iter().enumerate() {
+            embed_row(&model.embed, tok as usize, &mut embeddings[i * d..(i + 1) * d]);
+        }
+    });
+    // `from_json_kimi` range-checks `attn_res_block_size`, so it cannot be 0 here.
+    let mut st = AttnResState::new(embeddings, cfg.attn_res_block_size as usize);
+
+    let mut h = vec![0f32; s * d]; // sublayer input, after the attn-res mix
+    let mut nrm = vec![0f32; s * d];
+    let mut tmp = vec![0f32; s * d];
+
+    for (li, l) in model.layers.iter().enumerate() {
+        // ---- attention sublayer -------------------------------------------
+        timed(&ATTNRES_US, || {
+            apply_attn_res(
+                &st.prefix, &st.blocks, &l.attn_res_norm, &l.attn_res_proj, cfg.eps, s, d, &mut h,
+            )
+        });
+        // After that mix and before the mixer, so a candidate is the state as it
+        // ENTERED this layer — the reference's ordering exactly.
+        st.maybe_snapshot(li);
+        for si in 0..s {
+            rmsnorm(&mut nrm[si * d..(si + 1) * d], &h[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
+        }
+        match cfg.layer_kind[li] {
+            LayerKind::Kda => {
+                timed(&KDA_US, || crate::kda::kda_mixer(cfg, l, kv, li, &nrm, s, &mut tmp))
+            }
+            // Gated MLA. K3 ships no DSA indexer, so `attention_with` finds `ix_wk`
+            // absent and runs dense — no selection to thread between layers.
+            _ => {
+                timed(&ATTN_US, || {
+                    attention_with(
+                        cfg, l, li, kv, &nrm, s, pos_base, &mut tmp, AttnCore::Reconstruct, None,
+                    )
+                });
+            }
+        }
+        st.accumulate(&tmp);
+
+        // ---- FFN sublayer -------------------------------------------------
+        // No `blocks.is_empty()` guard: layer 0 is always a block boundary, so by here
+        // there is always at least one candidate.
+        timed(&ATTNRES_US, || {
+            apply_attn_res(
+                &st.prefix, &st.blocks, &l.mlp_res_norm, &l.mlp_res_proj, cfg.eps, s, d, &mut h,
+            )
+        });
+        for si in 0..s {
+            rmsnorm(&mut nrm[si * d..(si + 1) * d], &h[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
+        }
+        if l.sparse {
+            timed(&MOE_US, || crate::moe::kimi_moe(cfg, l, li, &nrm, s, &mut tmp, provider))?;
+        } else {
+            timed(&DENSE_US, || dense_mlp(l, &nrm, s, &mut tmp));
+        }
+        st.accumulate(&tmp);
+    }
+
+    // Model-level attention residual, then hand back the RAW state.
+    timed(&ATTNRES_US, || {
+        apply_attn_res(
+            &st.prefix,
+            &st.blocks,
+            &model.output_attn_res_norm,
+            &model.output_attn_res_proj,
+            cfg.eps,
+            s,
+            d,
+            hidden_out,
+        )
+    });
     Ok(())
 }
 
@@ -515,6 +772,13 @@ pub fn forward<P: ExpertProvider>(
     let s = ids.len();
     assert_eq!(hidden_out.len(), s * d);
     FWD_STEP.fetch_add(1, Ordering::Relaxed);
+
+    // Kimi-K3 threads (prefix_sum, block_residual) through the whole stack instead of
+    // carrying one hidden state, so it owns the layer loop rather than plugging into
+    // the one below. Counted as a forward step above, like every other arch.
+    if cfg.arch == Arch::KimiK3 {
+        return kimi_forward(model, kv, provider, ids, pos_base, hidden_out);
+    }
 
     // token embeddings
     let mut x = vec![0f32; s * d];
@@ -965,9 +1229,11 @@ where
         // Totals across prefill + all decode steps (microseconds -> ms).
         let ms = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e3;
         eprintln!(
-            "[profile] totals: attn {:.0} ms | mamba {:.0} ms | moe {:.0} ms (of which expert-load {:.0} ms) | dense {:.0} ms | embed {:.0} ms | logits {:.0} ms",
+            "[profile] totals: attn {:.0} ms | mamba {:.0} ms | kda {:.0} ms | attn-res {:.0} ms | moe {:.0} ms (of which expert-load {:.0} ms) | dense {:.0} ms | embed {:.0} ms | logits {:.0} ms",
             ms(&ATTN_US),
             ms(&MAMBA_US),
+            ms(&KDA_US),
+            ms(&ATTNRES_US),
             ms(&MOE_US),
             ms(&LOAD_US),
             ms(&DENSE_US),
@@ -1169,5 +1435,162 @@ mod tests {
         for i in 0..s * d {
             assert!((out[i] - expect[i]).abs() < 1e-5, "at {i}: {} vs {}", out[i], expect[i]);
         }
+    }
+
+    // ---- Kimi-K3 attention residuals ------------------------------------------------
+
+    /// The fixture the reference transcription below was evaluated on.
+    #[allow(clippy::type_complexity)]
+    fn attn_res_fixture() -> (Vec<f32>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+        let prefix = vec![0.1, -0.2, 0.3, 0.5, 1.0, 0.5, -0.5, 0.25];
+        let blocks = vec![
+            vec![0.2, 0.1, -0.1, 0.4, -0.3, 0.2, 0.6, 0.1],
+            vec![-0.5, 0.3, 0.2, 0.1, 0.4, -0.4, 0.2, 0.3],
+        ];
+        let norm = vec![1.5, 0.5, 2.0, 1.0];
+        let proj = vec![0.3, -0.7, 1.1, 0.2];
+        (prefix, blocks, norm, proj)
+    }
+
+    /// [`apply_attn_res`] must reproduce the reference `_apply_attn_res` numerically.
+    ///
+    /// The expected values are NOT a second Rust implementation — re-implementing it
+    /// here would just re-encode whatever I understood the formula to be. They were
+    /// produced by evaluating a line-by-line transcription of the reference Python on
+    /// this fixture, so the test fails if my *reading* of the reference is wrong, not
+    /// only if the Rust is.
+    #[test]
+    fn attn_res_matches_the_reference_numerically() {
+        let (prefix, blocks, norm, proj) = attn_res_fixture();
+        let (s, d) = (2usize, 4usize);
+        let mut out = vec![0f32; s * d];
+        apply_attn_res(&prefix, &blocks, &norm, &proj, 1e-5, s, d, &mut out);
+
+        let expect = [
+            0.055048401, -0.14826655, 0.27699308, 0.46382627, //
+            -0.069_257_09, 0.013403297, 0.46532293, 0.16417568,
+        ];
+        for i in 0..s * d {
+            assert!(
+                (out[i] - expect[i]).abs() < 1e-6,
+                "at {i}: got {} want {}",
+                out[i],
+                expect[i]
+            );
+        }
+    }
+
+    /// With no saved blocks there is a single candidate, so the softmax is 1.0 and the
+    /// result is the accumulator untouched. This is what lets the driver skip the
+    /// reference's `block_residual.shape[1] > 0` guard — if it ever stopped holding,
+    /// layer 0 would silently mix something else into its attention input.
+    #[test]
+    fn attn_res_with_no_blocks_is_the_identity() {
+        let (prefix, _, norm, proj) = attn_res_fixture();
+        let (s, d) = (2usize, 4usize);
+        let mut out = vec![0f32; s * d];
+        apply_attn_res(&prefix, &[], &norm, &proj, 1e-5, s, d, &mut out);
+        assert_eq!(out, prefix, "one candidate must pass through unchanged");
+    }
+
+    /// `norm` and `proj` are MULTIPLIED into one score vector, so swapping them cannot
+    /// change the result. A norm-then-project reading — which is what the `[1, hidden]`
+    /// shape of `*_res_proj` suggests, and what these fields were documented as for
+    /// four commits — is not symmetric, so this pins the distinction that shapes alone
+    /// cannot.
+    #[test]
+    fn attn_res_score_weight_is_symmetric_in_norm_and_proj() {
+        let (prefix, blocks, norm, proj) = attn_res_fixture();
+        let (s, d) = (2usize, 4usize);
+        let mut a = vec![0f32; s * d];
+        let mut b = vec![0f32; s * d];
+        apply_attn_res(&prefix, &blocks, &norm, &proj, 1e-5, s, d, &mut a);
+        apply_attn_res(&prefix, &blocks, &proj, &norm, 1e-5, s, d, &mut b);
+        assert_eq!(a, b, "score weight is norm*proj — swapping them must be a no-op");
+    }
+
+    /// Every token mixes only its OWN candidates. Perturbing token 1's state must leave
+    /// token 0's output bit-identical; if the mix ever crossed positions it would need a
+    /// causal mask, and decode (which sees one token at a time) could not agree with
+    /// prefill.
+    #[test]
+    fn attn_res_does_not_mix_across_positions() {
+        let (prefix, blocks, norm, proj) = attn_res_fixture();
+        let (s, d) = (2usize, 4usize);
+        let mut base = vec![0f32; s * d];
+        apply_attn_res(&prefix, &blocks, &norm, &proj, 1e-5, s, d, &mut base);
+
+        let mut perturbed = prefix.clone();
+        for v in perturbed[d..].iter_mut() {
+            *v += 3.0;
+        }
+        let mut got = vec![0f32; s * d];
+        apply_attn_res(&perturbed, &blocks, &norm, &proj, 1e-5, s, d, &mut got);
+
+        assert_eq!(got[..d], base[..d], "token 0 must not see token 1");
+        assert_ne!(got[d..], base[d..], "token 1 must actually have changed");
+    }
+
+    /// Drive [`AttnResState`] over a stack the way `kimi_forward` does, with `outs` as
+    /// the sublayer outputs in order (two per layer). Returns the final accumulator and
+    /// the saved candidates. `d == 1`, so every value is checkable by hand.
+    fn run_state(bs: usize, embed: f32, n_layers: usize, outs: &[f32]) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let mut st = AttnResState::new(vec![embed], bs);
+        for li in 0..n_layers {
+            st.maybe_snapshot(li);
+            st.accumulate(&[outs[2 * li]]);
+            st.accumulate(&[outs[2 * li + 1]]);
+        }
+        (st.prefix, st.blocks)
+    }
+
+    /// The accumulator RESETS at a block boundary: the sublayer output that follows a
+    /// snapshot replaces it rather than adding to it (the reference's `prefix_sum =
+    /// None`). Without the reset everything still runs and prefill still matches decode
+    /// — both would just be wrong together — so this is the only thing that catches it.
+    #[test]
+    fn attn_res_state_resets_the_accumulator_at_a_block_boundary() {
+        // bs = 2, so layers 0 and 2 are boundaries.
+        // L0: snapshot [10] -> reset -> 1 -> 1+2=3
+        // L1: no snapshot   -> 3+4=7 -> 7+5=12
+        // L2: snapshot [12] -> reset -> 6 -> 6+7=13
+        let (prefix, blocks) = run_state(2, 10.0, 3, &[1.0, 2.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(prefix, vec![13.0], "post-boundary output must REPLACE the accumulator");
+        assert_eq!(blocks, vec![vec![10.0], vec![12.0]]);
+    }
+
+    /// A snapshot captures the accumulator as it ENTERED the layer — before that layer's
+    /// own sublayers contribute. Snapshotting after the mixer instead would save
+    /// `10 + 1` here.
+    #[test]
+    fn attn_res_state_snapshots_the_state_entering_the_layer() {
+        let (_, blocks) = run_state(2, 10.0, 1, &[1.0, 2.0]);
+        assert_eq!(blocks, vec![vec![10.0]], "candidate must predate this layer's mixer");
+    }
+
+    /// Layer 0 is always a boundary, so there is always ≥1 candidate by the time the FFN
+    /// sublayer mixes. That is what lets the driver skip the reference's
+    /// `block_residual.shape[1] > 0` guard on the second mix.
+    #[test]
+    fn attn_res_state_always_snapshots_at_layer_zero() {
+        for bs in 1..=5 {
+            let mut st = AttnResState::new(vec![1.0], bs);
+            st.maybe_snapshot(0);
+            assert_eq!(st.blocks.len(), 1, "layer 0 must be a boundary at bs={bs}");
+        }
+    }
+
+    /// The real geometry: 93 layers at `attn_res_block_size` 12 saves 8 candidates
+    /// (layers 0, 12, ..., 84). That count sets the transient `block_residual` footprint
+    /// — 8 x S x hidden f32, ~939 MB at a 4096-token prefill.
+    #[test]
+    fn attn_res_state_saves_eight_candidates_on_the_real_geometry() {
+        let mut st = AttnResState::new(vec![0.0], 12);
+        for li in 0..93 {
+            st.maybe_snapshot(li);
+            st.accumulate(&[1.0]);
+            st.accumulate(&[1.0]);
+        }
+        assert_eq!(st.blocks.len(), 8, "93 layers / block 12 -> boundaries at 0,12,..,84");
     }
 }

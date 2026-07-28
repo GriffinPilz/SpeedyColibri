@@ -44,7 +44,7 @@ pub use usage::UsageHistory;
 pub use colibri_core::{Config, QTensor};
 pub use forward::{
     forward, forward_batched, generate_greedy, generate_stream, generate_stream_drafting,
-    layer_forward, layer_forward_kind, logits, mamba2_mixer, DecodeStats,
+    kimi_forward, layer_forward, layer_forward_kind, logits, mamba2_mixer, DecodeStats,
 };
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load};
@@ -389,7 +389,8 @@ fn load_layer_kimi(
 
     l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
     l.post_ln = ld(shards, &p("post_attention_layernorm.weight"))?;
-    // The second residual path, on both sublayers.
+    // Attention-residual score vectors, one pair per sublayer. NOT a residual — see the
+    // note on `Layer` and `forward::apply_attn_res`.
     l.attn_res_norm = ld(shards, &p("self_attention_res_norm.weight"))?;
     l.attn_res_proj = ld(shards, &p("self_attention_res_proj.weight"))?;
     l.mlp_res_norm = ld(shards, &p("mlp_res_norm.weight"))?;
@@ -786,6 +787,16 @@ pub fn load_model_with(
     let lm_head = qt_load(&shards, "lm_head.weight", cfg.vocab as usize, d, io_bits)?;
     let final_norm = ld(&shards, "model.norm.weight")?;
 
+    // Kimi-K3's model-level attention residual, applied after the last layer. Loaded
+    // unconditionally for K3 rather than probed: a K3 container missing these cannot be
+    // run (the stack's final mix would silently become "just the accumulator"), so a
+    // missing-tensor error here is the right failure.
+    let (output_attn_res_norm, output_attn_res_proj) = if cfg.arch == Arch::KimiK3 {
+        (ld(&shards, "model.output_attn_res_norm.weight")?, ld(&shards, "model.output_attn_res_proj.weight")?)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     let mut layers = Vec::with_capacity(cfg.n_layers as usize);
     for i in 0..cfg.n_layers as usize {
         let sparse = i as i32 >= cfg.first_dense;
@@ -808,6 +819,8 @@ pub fn load_model_with(
         lm_head,
         final_norm,
         layers,
+        output_attn_res_norm,
+        output_attn_res_proj,
         has_dsa,
         has_mtp: mtp.is_some(),
         mtp,

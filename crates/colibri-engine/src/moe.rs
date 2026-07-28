@@ -276,11 +276,15 @@ impl ExpertLayout {
 }
 
 /// The outer (input/output) dimension of a routed expert: the model `hidden` for the
-/// 3-tensor SwiGLU arches, but the low-rank `moe_latent` bottleneck for Nemotron-H,
-/// whose experts run entirely in latent space (`up: moe_latent→moe_inter`,
-/// `down: moe_inter→moe_latent`).
+/// plain SwiGLU arches, but the low-rank `moe_latent` bottleneck for the latent-MoE ones
+/// (Nemotron-H, Kimi-K3), whose experts run entirely in latent space
+/// (`up: moe_latent→moe_inter`, `down: moe_inter→moe_latent`).
+///
+/// This MUST agree with what the arch's MoE block computes with — `kimi_moe` and
+/// `nemotron_moe` both call `compute_experts_partial` with `moe_latent` as the width.
+/// Getting it wrong reads each expert at the wrong shape.
 fn expert_outer_dim(cfg: &Config) -> usize {
-    if matches!(cfg.arch, Arch::NemotronH) {
+    if cfg.arch.routed_experts_are_latent() {
         cfg.moe_latent as usize
     } else {
         cfg.hidden as usize
@@ -1585,7 +1589,7 @@ mod tests {
                   "moe_router_activation_func":"sigmoid","num_expert_group":1,
                   "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":5,
                   "mla_use_nope":true,"hidden_act":"situ","activation_situ_beta":4.0,
-                  "activation_situ_linear_beta":25.0,
+                  "activation_situ_linear_beta":25.0,"attn_res_block_size":12,
                   "linear_attn_config":{"head_dim":2,"num_heads":2,
                     "short_conv_kernel_size":4,"full_attn_layers":[2]}}}"#,
         )

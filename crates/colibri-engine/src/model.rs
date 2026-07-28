@@ -672,6 +672,13 @@ pub struct Model {
     pub final_norm: Vec<f32>,
     pub layers: Vec<Layer>,
 
+    /// Kimi-K3's model-level attention-residual score vectors (`model.output_attn_res_*`),
+    /// applied once after the last layer and before [`Model::final_norm`]. Same
+    /// norm-times-proj form as the per-layer pair on [`Layer`]. Empty on every other
+    /// arch — K3 is the only one with attention residuals.
+    pub output_attn_res_norm: Vec<f32>,
+    pub output_attn_res_proj: Vec<f32>,
+
     /// whether the DSA lightning indexer weights are present
     pub has_dsa: bool,
     /// whether the native MTP speculative head is present and loaded
@@ -808,6 +815,7 @@ mod kv_accounting_tests {
                   "activation_situ_beta":4.0,"activation_situ_linear_beta":25.0,
                   "moe_router_activation_func":"sigmoid","num_expert_group":1,
                   "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":163586,
+                  "attn_res_block_size":12,
                   "linear_attn_config":{"head_dim":128,"num_heads":96,
                     "short_conv_kernel_size":4,
                     "full_attn_layers":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,

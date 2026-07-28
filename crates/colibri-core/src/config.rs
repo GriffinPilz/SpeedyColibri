@@ -86,6 +86,20 @@ impl Arch {
     pub fn is_gqa(&self) -> bool {
         matches!(self, Arch::MinimaxM3 | Arch::MinimaxM2)
     }
+
+    /// Whether routed experts live in the low-rank `moe_latent` space rather than at
+    /// the model `hidden`. Nemotron-H and Kimi-K3 both bottleneck the MoE block
+    /// (`fc1_latent` down, experts, `fc2_latent` back up), so their expert tensors are
+    /// `[moe_inter, moe_latent]` / `[moe_latent, moe_inter]`.
+    ///
+    /// This is a named predicate, not an inline `matches!`, because it has to agree in
+    /// two far-apart places: the loader that reads expert tensors off disk
+    /// (`expert_outer_dim`) and the MoE block that computes with them. When they
+    /// disagree the expert is read at the wrong width — a shape error at best, and
+    /// silently wrong rows at worst.
+    pub fn routed_experts_are_latent(&self) -> bool {
+        matches!(self, Arch::NemotronH | Arch::KimiK3)
+    }
 }
 
 /// GLM-5.2 / MiniMax-M3 hyperparameters.
@@ -218,6 +232,13 @@ pub struct Config {
     /// The conv history is `[kda_d_conv, 3 * kda_n_heads * kda_head_dim]` — q, k and v
     /// each carry their own `*_conv1d`, hence the factor of 3.
     pub kda_d_conv: i32,
+    /// `attn_res_block_size` (12 on K3): how often the stack snapshots its accumulator
+    /// into the attention-residual candidate set — every `n`-th layer, `layer_idx % n
+    /// == 0`. **0 means the arch has no attention residuals at all**, which is what
+    /// every non-K3 arch sets and what the reference's `getattr(config,
+    /// "attn_res_block_size", None) is not None` tests for. The driver divides by it,
+    /// so 0 must never reach a K3 forward pass — `from_json_kimi` range-checks it.
+    pub attn_res_block_size: i32,
 }
 
 /// Error from loading/validating a config.
@@ -450,6 +471,7 @@ impl Config {
             kda_n_heads: 0,
             kda_head_dim: 0,
             kda_d_conv: 0,
+            attn_res_block_size: 0,
         };
 
         // rope theta lives under rope_parameters.rope_theta
@@ -624,6 +646,7 @@ impl Config {
             kda_n_heads: 0,
             kda_head_dim: 0,
             kda_d_conv: 0,
+            attn_res_block_size: 0,
         };
 
         // eos/stop ids may sit in text_config or at the root.
@@ -775,6 +798,7 @@ impl Config {
             kda_n_heads: lg("num_heads", 0),
             kda_head_dim: lg("head_dim", 0),
             kda_d_conv: lg("short_conv_kernel_size", 0),
+            attn_res_block_size: gt("attn_res_block_size"),
         };
 
         parse_stop_ids(t, &mut c.stop_ids);
@@ -815,6 +839,11 @@ impl Config {
         ckr!("linear_attn_config.short_conv_kernel_size", c.kda_d_conv, 1, 1 << 8);
         ckr!("routed_expert_hidden_size", c.moe_latent, 0, 1 << 24);
         ckr!("kv_lora_rank", c.kv_lora, 1, 1 << 16);
+        // The driver takes `layer_idx % attn_res_block_size`, so 0 would divide by zero,
+        // and the whole attention-residual mechanism is mandatory on K3 (there is no
+        // ordinary residual stream to fall back to). Reject it here rather than in the
+        // forward pass.
+        ckr!("attn_res_block_size", c.attn_res_block_size, 1, 1 << 16);
         Ok(c)
     }
 
@@ -918,6 +947,7 @@ impl Config {
             kda_n_heads: 0,
             kda_head_dim: 0,
             kda_d_conv: 0,
+            attn_res_block_size: 0,
         };
 
         parse_stop_ids(r, &mut c.stop_ids);
@@ -1353,6 +1383,7 @@ mod tests {
                   "activation_situ_beta":4.0,"activation_situ_linear_beta":25.0,
                   "moe_router_activation_func":"sigmoid","num_expert_group":1,
                   "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":163586,
+                  "attn_res_block_size":12,
                   "linear_attn_config":{{"head_dim":128,"num_heads":96,
                     "short_conv_kernel_size":4,"full_attn_layers":[{attn}]}}}},
                 "vision_config":{{"vt_hidden_size":1024}}}}"#

@@ -140,6 +140,13 @@ pub fn silu(x: f32) -> f32 {
 /// shift. NOTE: verify the exact formulation against the reference at end-to-end
 /// validation (task #56) before trusting generations.
 #[inline]
+pub fn swiglu_oai(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
+    let g = gate.min(limit); // clamp upper only
+    let u = up.clamp(-limit, limit);
+    let gated = g / (1.0 + (-alpha * g).exp()); // g * sigmoid(alpha * g)
+    gated * (u + 1.0)
+}
+
 /// Kimi-K3's `situ` gated activation:
 /// `beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)`.
 ///
@@ -156,13 +163,6 @@ pub fn situ(gate: f32, up: f32, beta: f32, linear_beta: f32) -> f32 {
     let a = beta * (gate / beta).tanh() * sigmoid(gate);
     let u = if linear_beta > 0.0 { linear_beta * (up / linear_beta).tanh() } else { up };
     a * u
-}
-
-pub fn swiglu_oai(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
-    let g = gate.min(limit); // clamp upper only
-    let u = up.clamp(-limit, limit);
-    let gated = g / (1.0 + (-alpha * g).exp()); // g * sigmoid(alpha * g)
-    gated * (u + 1.0)
 }
 
 #[cfg(test)]

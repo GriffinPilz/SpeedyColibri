@@ -151,35 +151,38 @@ fn parse_rules(spec: &str) -> Result<Vec<Rule>, String> {
 /// Returns `(weights touched, Σ squared delta, Σ squared original)` so the caller can
 /// report the **relative RMS perturbation actually applied**.
 ///
-/// That number is not decoration — it is the tool's own validity check. This simulates
-/// P on top of the container's existing quantization, and the two grids are NOT
-/// independent: NVFP4's per-16 fine scales can largely re-represent values that int8
-/// already snapped to a coarse grid, so `nvfp4-on-int8` can approach identity while
-/// `int6-on-int8` is a genuine coarsening. An arm that perturbed nothing will produce a
-/// perplexity indistinguishable from baseline and read as "this precision is free."
-/// Always compare an arm's reported rms against the `qerr` figure for the same scheme
-/// measured against the ORIGINAL source; if it is far lower, the arm is measuring noise.
+/// That number is not decoration — it is the tool's own validity check. An arm that
+/// perturbed nothing produces a perplexity indistinguishable from baseline, which reads
+/// as "this precision is free": the most expensive way this tool could mislead. Compare
+/// the reported rms against `coli qerr` for the same scheme against the ORIGINAL source;
+/// far lower means the arm is measuring noise, and the caller warns below 1%.
+///
+/// (This check earned its keep immediately: it refuted a plausible hypothesis that
+/// `nvfp4-on-int8` was near-identity because the two grids interact. The measured rms
+/// came out at 0.0943 against a 0.0935 reference — the perturbation was entirely real,
+/// and the surprising perplexity result was a genuine format effect. See the module
+/// header.)
 fn simulate(t: &mut QTensor, scheme: SimScheme) -> (usize, f64, f64) {
     let (o, i) = (t.o as usize, t.i as usize);
     if o == 0 || i == 0 {
         return (0, 0.0, 0.0);
     }
+    // Decide the re-store width FIRST, and bail on anything we cannot faithfully read.
+    // `dequantize_qtensor` returns ZEROS for formats it doesn't decode (int2, nvfp4), so
+    // dequantizing before this check would silently replace such a tensor with zeros —
+    // a model-destroying no-op that reports success. Resident weights are f32 or int8;
+    // anything else belongs to the streamed-expert path, which never comes through here.
+    let bits = match t.fmt_code {
+        0 => 32,
+        1 => 8,
+        _ => return (0, 0.0, 0.0),
+    };
     let w = crate::convert::dequantize_qtensor_pub(t);
     let approx = match scheme {
         SimScheme::Nvfp4 => crate::convert::quantize_nvfp4_sim_pub(&w, o, i),
         SimScheme::Int(bits) => {
             crate::convert::dequantize_qtensor_pub(&crate::quantize::qtensor_from_f32(&w, o, i, bits))
         }
-    };
-    // Re-store in the ORIGINAL width so the kernels and the byte cost are untouched;
-    // only the values now carry the target scheme's error. Resident weights are int8
-    // (fmt 1) or f32 (fmt 0); anything else here would be a streamed expert, which this
-    // path never sees.
-    let bits = match t.fmt_code {
-        0 => 32,
-        1 => 8,
-        3 => 2,
-        _ => return (0, 0.0, 0.0), // unknown/streamed format — leave alone, don't corrupt
     };
     let mut re = crate::quantize::qtensor_from_f32(&approx, o, i, bits);
     re.gpu_eligible = t.gpu_eligible;
@@ -326,6 +329,21 @@ mod tests {
         assert!(parse_rules("mamba:99").is_err(), "out-of-range width must error");
         // ...and the valid form it is easy to typo *into* must still parse.
         assert!(parse_rules("mamba:nvfp4").is_ok());
+    }
+
+    #[test]
+    fn refuses_formats_it_cannot_decode_instead_of_zeroing_them() {
+        // `dequantize_qtensor` yields ZEROS for formats it does not decode (int2, nvfp4).
+        // Simulating such a tensor would re-store those zeros — silently destroying the
+        // weights while reporting success. Bail before the dequant instead.
+        let w: Vec<f32> = (0..(4 * 32)).map(|k| ((k as f32) * 0.21).cos()).collect();
+        let mut t2 = crate::quantize::qtensor_from_f32(&w, 4, 32, 2); // int2, fmt 3
+        assert_eq!(t2.fmt_code, 3);
+        let before = t2.clone();
+        let r = simulate(&mut t2, SimScheme::Nvfp4);
+        assert_eq!(r.0, 0, "int2 must be skipped, not simulated");
+        assert_eq!(t2.fmt_code, before.fmt_code);
+        assert_eq!(t2.q4, before.q4, "tensor must be left byte-identical");
     }
 
     #[test]

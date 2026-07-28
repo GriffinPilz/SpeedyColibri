@@ -130,16 +130,26 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
             let g = w.g;
             let rb = (i + 1) / 2;
             let nb = (i + 31) / 32;
+            // Decode each row's block scales ONCE, not once per element. `f8e8m0_to_f32`
+            // is a `powi`, and the naive form re-evaluates it for all 32 elements of a
+            // block and again for every one of the S rows. This is not a GPU fallback —
+            // there is no MXFP4 expert kernel, so this loop IS K3's expert compute, and
+            // it runs single-threaded (the only threading in `moe` is the cluster path).
+            // Hoisting is bit-identical: the same byte decodes to the same f32.
+            let mut sc = vec![0f32; nb];
             for row in 0..o {
                 let wr = &q4[row * rb..(row + 1) * rb];
                 let br = &bs[row * nb..(row + 1) * nb];
+                for (d, &b) in sc.iter_mut().zip(br) {
+                    *d = colibri_core::f8e8m0_to_f32(b);
+                }
                 for si in 0..s {
                     let xs = &x[si * i..(si + 1) * i];
                     let mut a = 0f32;
                     for k in 0..i {
                         let byte = wr[k >> 1];
                         let nib = if k & 1 == 1 { byte >> 4 } else { byte & 0x0f } as usize;
-                        a += E2M1[nib] * colibri_core::f8e8m0_to_f32(br[k >> 5]) * xs[k];
+                        a += E2M1[nib] * sc[k >> 5] * xs[k];
                     }
                     y[si * o + row] = a * g;
                 }

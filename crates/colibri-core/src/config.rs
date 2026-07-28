@@ -204,6 +204,12 @@ pub struct Config {
     /// state is `[kda_n_heads, kda_head_dim, kda_head_dim]` per KDA layer — the
     /// square `d_k x d_v` association matrix a delta rule carries between steps.
     pub kda_head_dim: i32,
+    /// Kimi-K3 `hidden_act == "situ"`: the gated activation in `math::situ`. Applies to
+    /// the dense MLP, the shared experts AND the routed experts.
+    pub situ: bool,
+    /// `activation_situ_beta` (gate clamp) and `activation_situ_linear_beta` (up clamp).
+    pub situ_beta: f32,
+    pub situ_linear_beta: f32,
     /// MLA runs WITHOUT rotary embeddings (`mla_use_nope`). The `qk_rope_head_dim`
     /// split still exists in the projections — those dims are simply carried
     /// un-rotated — so this cannot be inferred from the shapes. Kimi-K3 asserts it.
@@ -437,6 +443,9 @@ impl Config {
             relu2: false,
             mamba_dt_min: 0.0,
             // Kimi-K3-only fields.
+            situ: false,
+            situ_beta: 0.0,
+            situ_linear_beta: 0.0,
             mla_nope: false,
             kda_n_heads: 0,
             kda_head_dim: 0,
@@ -608,6 +617,9 @@ impl Config {
             relu2: false,
             mamba_dt_min: 0.0,
             // Kimi-K3-only fields.
+            situ: false,
+            situ_beta: 0.0,
+            situ_linear_beta: 0.0,
             mla_nope: false,
             kda_n_heads: 0,
             kda_head_dim: 0,
@@ -753,6 +765,12 @@ impl Config {
             moe_latent: gt("routed_expert_hidden_size"),
             relu2: false,
             mamba_dt_min: 0.0,
+            situ: t.get("hidden_act").and_then(Json::as_str) == Some("situ"),
+            situ_beta: t.get("activation_situ_beta").and_then(Json::as_f64).unwrap_or(1.0) as f32,
+            situ_linear_beta: t
+                .get("activation_situ_linear_beta")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as f32,
             mla_nope: t.get("mla_use_nope").and_then(Json::as_bool).unwrap_or(false),
             kda_n_heads: lg("num_heads", 0),
             kda_head_dim: lg("head_dim", 0),
@@ -893,6 +911,9 @@ impl Config {
             // `torch.clamp(dt, self.time_step_min)`); default 0.0 (no floor) if absent.
             mamba_dt_min: gf("time_step_min", 0.0) as f32,
             // Kimi-K3-only fields.
+            situ: false,
+            situ_beta: 0.0,
+            situ_linear_beta: 0.0,
             mla_nope: false,
             kda_n_heads: 0,
             kda_head_dim: 0,
@@ -1328,7 +1349,8 @@ mod tests {
                   "qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
                   "vocab_size":163840,"max_position_embeddings":1048576,
                   "rms_norm_eps":1e-05,"rope_theta":10000.0,"moe_renormalize":true,
-                  "mla_use_nope":true,"mla_use_output_gate":true,
+                  "mla_use_nope":true,"mla_use_output_gate":true,"hidden_act":"situ",
+                  "activation_situ_beta":4.0,"activation_situ_linear_beta":25.0,
                   "moe_router_activation_func":"sigmoid","num_expert_group":1,
                   "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":163586,
                   "linear_attn_config":{{"head_dim":128,"num_heads":96,
@@ -1380,6 +1402,10 @@ mod tests {
         // rope dims still exist in the projections, so nothing about the SHAPES reveals
         // this — only the config flag does.
         assert!(c.mla_nope, "K3 MLA is NoPE");
+        // `situ` applies to the dense MLP, the shared experts AND the routed experts.
+        assert!(c.situ, "hidden_act = situ");
+        assert_eq!((c.situ_beta, c.situ_linear_beta), (4.0, 25.0));
+        assert!(!c.swiglu_oai && !c.relu2, "situ must not also select another variant");
         assert!((c.attn_scale - 1.0 / 192f32.sqrt()).abs() < 1e-9, "scale = q_head_dim^-0.5");
         assert_eq!((c.kda_n_heads, c.kda_head_dim, c.kda_d_conv), (96, 128, 4));
         assert_eq!((c.first_dense, c.max_ctx, c.vocab), (1, 1048576, 163840));

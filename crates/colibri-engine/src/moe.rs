@@ -38,6 +38,11 @@ struct ActCfg {
     /// Gateless ReLU² (Nemotron-H `mlp_hidden_act == "relu2"`): the FFN is
     /// `down(relu(up·x)²)` with **no gate projection**. Overrides `oai` when set.
     relu2: bool,
+    /// Kimi-K3 `situ` (see [`crate::math::situ`]). Like `oai` it is a gated SwiGLU
+    /// shape, but it also transforms the `up` half, so it cannot reuse that branch.
+    situ: bool,
+    situ_beta: f32,
+    situ_linear_beta: f32,
 }
 
 static ACTIVATION: OnceLock<ActCfg> = OnceLock::new();
@@ -85,6 +90,9 @@ fn fit_scratch(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
 pub fn set_activation(cfg: &Config) {
     let _ = ACTIVATION.set(ActCfg {
         oai: cfg.swiglu_oai,
+        situ: cfg.situ,
+        situ_beta: cfg.situ_beta,
+        situ_linear_beta: cfg.situ_linear_beta,
         alpha: cfg.swiglu_alpha,
         limit: cfg.swiglu_limit,
         relu2: cfg.relu2,
@@ -98,7 +106,15 @@ pub fn set_activation(cfg: &Config) {
 /// The active SwiGLU variant (defaults to SiLU when unset — the GLM path and
 /// unit tests that never call [`set_activation`]).
 fn activation() -> ActCfg {
-    *ACTIVATION.get().unwrap_or(&ActCfg { oai: false, alpha: 0.0, limit: 0.0, relu2: false })
+    *ACTIVATION.get().unwrap_or(&ActCfg {
+        oai: false,
+        alpha: 0.0,
+        limit: 0.0,
+        relu2: false,
+        situ: false,
+        situ_beta: 0.0,
+        situ_linear_beta: 0.0,
+    })
 }
 
 /// Process-wide expert-parallel context. `serve`/`worker` set this once at startup
@@ -834,11 +850,16 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
     // format, or out-of-range).
     #[cfg(feature = "cuda")]
     {
-        if activation().relu2 {
+        let a = activation();
+        if a.relu2 {
             if crate::gpu::try_expert_ffn_relu2(up, down, x, nr, out) {
                 return;
             }
-        } else if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
+        } else if !a.situ && crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
+            // `situ` is deliberately excluded: the fused SwiGLU kernels apply `oai`-or-SiLU
+            // (gpu::set_activation carries no situ params), so letting a K3 model take this
+            // path would compute a DIFFERENT activation and still return success. Until a
+            // situ kernel exists, K3 experts run the CPU reference below.
             return;
         }
     }
@@ -877,7 +898,9 @@ fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, o
     matmul_qt(&mut gg, x, gate, nr);
     matmul_qt(&mut uu, x, up, nr);
     for (g, &u) in gg.iter_mut().zip(uu.iter()) {
-        *g = if a.oai {
+        *g = if a.situ {
+            crate::math::situ(*g, u, a.situ_beta, a.situ_linear_beta)
+        } else if a.oai {
             crate::math::swiglu_oai(*g, u, a.alpha, a.limit)
         } else {
             silu(*g) * u

@@ -140,6 +140,24 @@ pub fn silu(x: f32) -> f32 {
 /// shift. NOTE: verify the exact formulation against the reference at end-to-end
 /// validation (task #56) before trusting generations.
 #[inline]
+/// Kimi-K3's `situ` gated activation:
+/// `beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)`.
+///
+/// Two soft clamps rather than one. The gate half is a tanh-bounded SiLU — it saturates
+/// at `+/-beta` instead of growing linearly — and, unlike every other gated activation in
+/// this engine, the **`up` half is transformed too**, bounded to `+/-linear_beta`.
+/// Treating `up` as a plain passthrough (as SwiGLU/OAI-SwiGLU do) is the easy mistake and
+/// only shows up as drift on large activations.
+///
+/// `linear_beta <= 0` means "unset" (the reference's `linear_beta is None`), leaving `up`
+/// untouched. K3 ships `beta = 4.0`, `linear_beta = 25.0`.
+#[inline]
+pub fn situ(gate: f32, up: f32, beta: f32, linear_beta: f32) -> f32 {
+    let a = beta * (gate / beta).tanh() * sigmoid(gate);
+    let u = if linear_beta > 0.0 { linear_beta * (up / linear_beta).tanh() } else { up };
+    a * u
+}
+
 pub fn swiglu_oai(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
     let g = gate.min(limit); // clamp upper only
     let u = up.clamp(-limit, limit);
@@ -222,5 +240,57 @@ mod tests {
         let g2 = 2.0f32;
         let expect_neg = (g2 / (1.0 + (-alpha * g2).exp())) * (-limit + 1.0);
         assert!((neg - expect_neg).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod situ_tests {
+    use super::*;
+
+    /// Values from the reference `SituAndMul.forward` with K3's beta = 4.0 /
+    /// linear_beta = 25.0.
+    #[test]
+    fn situ_matches_reference() {
+        let (b, lb) = (4.0f32, 25.0f32);
+        for (g, u, want) in [
+            (0.0f32, 1.0f32, 0.0f32),
+            (1.0, 2.0, 1.4293511),
+            (-1.5, 3.0, -0.78073848),
+            (0.5, -4.0, -1.2280138),
+            (2.0, 0.0, 0.0),
+        ] {
+            let got = situ(g, u, b, lb);
+            assert!((got - want).abs() < 1e-6, "situ({g},{u}) = {got}, want {want}");
+        }
+    }
+
+    /// The `up` half is CLAMPED, not passed through the way it is in every other gated
+    /// activation here. This is the property most likely to be ported wrong, and it only
+    /// diverges once `up` is large relative to `linear_beta`.
+    #[test]
+    fn situ_clamps_the_up_half() {
+        let (b, lb) = (4.0f32, 25.0f32);
+        let big = situ(100.0, 100.0, b, lb);
+        assert!((big - 99.93293).abs() < 1e-3, "saturated value {big}");
+        assert!(big < b * lb, "must be bounded by beta*linear_beta = {}", b * lb);
+        // Doubling a large `up` must NOT double the output (a passthrough would).
+        let (a1, a2) = (situ(1.0, 200.0, b, lb), situ(1.0, 400.0, b, lb));
+        assert!((a2 / a1) < 1.05, "up half is not clamped: ratio {}", a2 / a1);
+
+        // linear_beta <= 0 means "unset": `up` passes through untouched.
+        assert!((situ(1.0, 2.0, b, 0.0) - 1.43239911).abs() < 1e-6);
+        let lin = situ(1.0, 400.0, b, 0.0) / situ(1.0, 200.0, b, 0.0);
+        assert!((lin - 2.0).abs() < 1e-4, "unset linear_beta must be linear, got {lin}");
+    }
+
+    /// The gate half saturates at +/-beta rather than growing like SiLU.
+    #[test]
+    fn situ_gate_saturates_at_beta() {
+        let (b, lb) = (4.0f32, 25.0f32);
+        let u = 1.0f32;
+        let uu = lb * (u / lb).tanh();
+        assert!((situ(50.0, u, b, lb) / uu - b).abs() < 1e-3, "gate should saturate to beta");
+        // Large negative gate -> ~0 (sigmoid kills it), never a large negative value.
+        assert!(situ(-100.0, 5.0, b, lb).abs() < 1e-6);
     }
 }

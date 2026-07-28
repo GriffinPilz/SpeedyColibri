@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Fetch and convert the full unsloth/Kimi-K3 checkpoint ONE SHARD AT A TIME.
+#
+# Why not just download it and run `coli convert`: the source is 1561 GB and the
+# container is ~1500 GB, so holding both needs ~3.0 TB and the box has ~2.36 TB free.
+# Converting shard-by-shard and deleting each source as it lands keeps the peak at
+# `container-so-far + 2 shards` (~1.54 TB).
+#
+# This is only sound because of three properties of the checkpoint, verified against
+# `model.safetensors.index.json` before the script was written:
+#   1. every `*.weight_packed` is in the SAME shard as its `*.weight_scale`
+#      (247,296 pairs, zero cross-shard) — so a shard converts without its neighbours;
+#   2. no layer spans more than one shard (93 layers, one per shard);
+#   3. the non-layer tensors (embed / lm_head / norms / output_attn_res) live in
+#      shards 94-96.
+# If a future repack breaks (1), per-shard conversion silently loses scales. Re-check
+# it before pointing this at a different repo.
+#
+# `convert_snapshot` names its output `out-<input-file-index>.safetensors`, and the index
+# is assigned over whatever is in the input dir — so converting one shard at a time always
+# yields `out-00000`. Each is renamed to the true shard number on the way into the
+# container. The loader globs `*.safetensors` and the shards are self-describing, so only
+# uniqueness matters.
+#
+# Resumable: a shard whose output already exists is skipped, so re-running after an
+# interruption picks up where it stopped.
+#
+#   Usage: scripts/k3_fetch_convert.sh [first_shard] [last_shard]
+#   Env:   K3_SRC, K3_OUT, COLI_BIN, MIN_FREE_GB (default 150)
+set -euo pipefail
+
+SRC=${K3_SRC:-$HOME/models/Kimi-K3-src}
+OUT=${K3_OUT:-$HOME/models/Kimi-K3-container}
+COLI_BIN=${COLI_BIN:-$(dirname "$0")/../target/release/coli}
+BASE=https://huggingface.co/unsloth/Kimi-K3/resolve/main
+NSHARD=96
+MIN_FREE_GB=${MIN_FREE_GB:-150}
+FIRST=${1:-1}
+LAST=${2:-$NSHARD}
+
+META=(config.json generation_config.json tokenizer_config.json added_tokens.json
+      tiktoken.model chat_template.jinja tokenization_kimi.py configuration_kimi_k3.py)
+
+die() { echo "[k3] FATAL: $*" >&2; exit 1; }
+log() { echo "[k3] $*"; }
+
+# Don't leave a prefetch writing into $SRC after the script dies — a later run would
+# find a stale `.part` and `curl -C -` would resume it against a possibly different file.
+cleanup() { local j; j=$(jobs -p); [[ -n $j ]] && kill $j 2>/dev/null; return 0; }
+trap cleanup EXIT INT TERM
+
+[[ -x $COLI_BIN ]] || die "coli binary not found/executable: $COLI_BIN (build it first)"
+mkdir -p "$SRC" "$OUT"
+
+shard_name() { printf 'model-%05d-of-000096.safetensors' "$1"; }
+out_name()   { printf 'out-%05d.safetensors' "$1"; }
+free_gb()    { df -BG --output=avail "$SRC" | tail -1 | tr -dc '0-9'; }
+
+# Content-Length for a remote file, so a truncated download is caught rather than
+# converted into garbage. A short safetensors file can still parse its header and yield
+# silently wrong tensors, so this is a real gate, not belt-and-braces.
+remote_size() {
+  curl -sIL "$BASE/$1" | awk 'tolower($1)=="content-length:"{v=$2} END{printf "%d", v+0}'
+}
+
+# Download to `.part` and rename only on success: the loop below treats "final name
+# exists" as "complete", so an in-flight prefetch must never occupy that name.
+fetch_shard() {
+  local n=$1 f want got
+  f=$(shard_name "$n")
+  [[ -s $SRC/$f ]] && return 0
+  want=$(remote_size "$f")
+  [[ $want -gt 0 ]] || die "could not get Content-Length for $f"
+  curl -sL --retry 8 --retry-delay 5 --retry-all-errors -C - \
+       -o "$SRC/$f.part" "$BASE/$f" || die "download failed: $f"
+  got=$(stat -c %s "$SRC/$f.part")
+  [[ "$got" == "$want" ]] || die "$f truncated: got $got want $want (delete the .part and rerun)"
+  mv "$SRC/$f.part" "$SRC/$f"
+}
+
+# ---- metadata, once --------------------------------------------------------------
+for f in "${META[@]}"; do
+  [[ -s $SRC/$f ]] && continue
+  log "fetch $f"
+  curl -sL --retry 8 --retry-all-errors -o "$SRC/$f" "$BASE/$f" || die "fetch $f"
+done
+
+# ---- shard loop ------------------------------------------------------------------
+prefetch_pid=""; prefetch_idx=""
+t_start=$(date +%s)
+for ((n=FIRST; n<=LAST; n++)); do
+  o=$OUT/$(out_name "$n")
+  if [[ -s $o ]]; then
+    log "shard $n/$NSHARD: already converted, skipping"
+    # A prefetch aimed at this shard is now wasted work — let it finish (killing it
+    # mid-write leaves a .part) and drop the file, or it sits on disk for the whole run.
+    if [[ "$prefetch_idx" == "$n" && -n "$prefetch_pid" ]]; then
+      wait "$prefetch_pid" || true
+      rm -f "$SRC/$(shard_name "$n")" "$SRC/$(shard_name "$n").part"
+      prefetch_pid=""; prefetch_idx=""
+    fi
+    continue
+  fi
+
+  # A prefetch of THIS shard from the previous iteration must finish before we use it.
+  if [[ "$prefetch_idx" == "$n" && -n "$prefetch_pid" ]]; then
+    wait "$prefetch_pid" || die "prefetch of shard $n failed"
+    prefetch_pid=""; prefetch_idx=""
+  fi
+
+  avail=$(free_gb)
+  (( avail >= MIN_FREE_GB )) || die "only ${avail}GB free, need >= ${MIN_FREE_GB}GB"
+
+  log "shard $n/$NSHARD: fetching (${avail}GB free)"
+  fetch_shard "$n"
+
+  # Overlap the next download with this conversion.
+  if (( n < LAST )); then
+    fetch_shard $((n+1)) & prefetch_pid=$!; prefetch_idx=$((n+1))
+  fi
+
+  # Stage exactly one shard plus the config the converter needs. Hardlink the shard so
+  # staging costs no space (same filesystem).
+  stage=$SRC/.stage; tmp=$SRC/.out
+  rm -rf "$stage" "$tmp"; mkdir -p "$stage"
+  ln "$SRC/$(shard_name "$n")" "$stage/" || die "hardlink failed (same filesystem?)"
+  for f in "${META[@]}"; do [[ -s $SRC/$f ]] && cp "$SRC/$f" "$stage/"; done
+
+  log "shard $n/$NSHARD: converting"
+  "$COLI_BIN" convert "$stage" "$tmp" || die "convert failed on shard $n"
+
+  produced=("$tmp"/out-*.safetensors)
+  [[ -s ${produced[0]} ]] || die "convert produced no shard for $n"
+  (( ${#produced[@]} == 1 )) || die "expected 1 output shard for input $n, got ${#produced[@]}"
+  mv "${produced[0]}" "$o"
+
+  # config/tokenizer land in the container on the first pass; harmless to refresh.
+  for f in config.json generation_config.json tokenizer_config.json added_tokens.json \
+           chat_template.jinja; do
+    [[ -s $tmp/$f ]] && cp "$tmp/$f" "$OUT/" || true
+  done
+
+  rm -rf "$stage" "$tmp"
+  rm -f "$SRC/$(shard_name "$n")"
+  log "shard $n/$NSHARD: done -> $(basename "$o") ($(du -h "$o" | cut -f1)), $(free_gb)GB free, $(( ($(date +%s)-t_start)/60 ))min elapsed"
+done
+
+# ---- tokenizer.json --------------------------------------------------------------
+# K3 ships tiktoken.model and no tokenizer.json; colibrì's tokenizer needs the latter.
+# The engine picks the K3 pre-tokenizer off the pattern this script writes.
+if [[ ! -s $OUT/tokenizer.json && -s $SRC/tiktoken.model ]]; then
+  log "building tokenizer.json from tiktoken.model"
+  python3 "$(dirname "$0")/tiktoken_to_tokenizer_json.py" \
+      "$SRC/tiktoken.model" "$OUT/tokenizer.json" \
+      --specials-from "$SRC/tokenizer_config.json" --verify \
+    || log "WARNING: tokenizer.json generation failed — run it by hand"
+fi
+
+log "complete: $(ls "$OUT"/out-*.safetensors 2>/dev/null | wc -l)/$NSHARD shards in $OUT"
+log "container size: $(du -sh "$OUT" | cut -f1)"

@@ -51,7 +51,8 @@ pub use loader::{ld, qt_load};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
 pub use model::{KvCache, Layer, Model, MtpBlock, MtpHead, KV_UNSET};
 pub use moe::{
-    cluster_ctx, compute_experts_partial, dense_mlp, moe, moe_sharded, nemotron_moe, route,
+    cluster_ctx, compute_experts_partial, dense_mlp, kimi_moe, moe, moe_sharded, nemotron_moe,
+    route,
     set_activation, set_cluster, ClusterCtx, Expert, ExpertLayout, ExpertProvider,
     ShardsExpertProvider,
 };

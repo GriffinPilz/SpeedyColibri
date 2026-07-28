@@ -1390,6 +1390,98 @@ pub fn nemotron_moe<P: ExpertProvider>(
     Ok(())
 }
 
+/// Kimi-K3's latent MoE. Same skeleton as [`nemotron_moe`] — router on the hidden
+/// state, project down to `moe_latent`, run the routed experts there, project back —
+/// with three K3-specific differences, all of which come from the reference
+/// (`KimiSparseMoeBlock.forward`) rather than from anything the shapes reveal:
+///
+/// 1. **`routed_expert_norm` runs AFTER the experts**, in latent space, immediately
+///    before the up-projection. Normalising the latent *input* instead is the natural
+///    guess and is wrong; the reference order is
+///    `down_proj -> moe_infer -> norm -> up_proj`.
+/// 2. **The shared experts see the ORIGINAL hidden state**, not the latent, and their
+///    output is added to the up-projected routed result. They are a full 3-tensor gated
+///    FFN (`n_shared * moe_inter` = 6144 wide), unlike Nemotron's gateless pair.
+/// 3. **The routed experts are 3-tensor gated too**, running `situ` — handled by [`ffn`]
+///    reading the process-global activation, so nothing here branches on it.
+///
+/// The router reads `hidden`, NOT the latent: the top-k choice is made before the
+/// down-projection, so routing is unaffected by the bottleneck.
+pub fn kimi_moe<P: ExpertProvider>(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    x: &[f32],
+    s_len: usize,
+    out: &mut [f32],
+    provider: &P,
+) -> io::Result<()> {
+    let d = cfg.hidden as usize;
+    let dl = cfg.moe_latent as usize;
+    let e_n = cfg.n_experts as usize;
+    let k = (cfg.topk as usize).min(e_n);
+
+    // ---- router, on the HIDDEN state (before the bottleneck) --------------
+    let mut logits = vec![0f32; s_len * e_n];
+    let _rt = std::time::Instant::now();
+    router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
+    if crate::forward::profile_on() {
+        crate::forward::ROUTER_US
+            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut idxs = vec![0usize; s_len * k];
+    let mut ws = vec![0f32; s_len * k];
+    for s in 0..s_len {
+        let (idx, w) = route(cfg, &logits[s * e_n..(s + 1) * e_n], &l.router_bias);
+        idxs[s * k..s * k + k].copy_from_slice(&idx);
+        ws[s * k..s * k + k].copy_from_slice(&w);
+    }
+    log_routing(layer, s_len, k, &idxs);
+
+    // ---- down-project into the latent space -------------------------------
+    let fc1 = l.fc1_latent.as_ref().expect("kimi MoE layer missing fc1_latent");
+    let fc2 = l.fc2_latent.as_ref().expect("kimi MoE layer missing fc2_latent");
+    let mut h_lat = vec![0f32; s_len * dl];
+    matmul_qt(&mut h_lat, x, fc1, s_len);
+
+    // ---- routed experts, in latent space ----------------------------------
+    let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
+    let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+    let mut moe_lat =
+        compute_experts_partial(provider, layer, &uniq_u32, &w_mat, &h_lat, s_len, dl)?;
+
+    // ---- normalise IN latent space, then project back ---------------------
+    // `latent_moe_use_norm`; skipped when the container ships no such weight.
+    if !l.routed_expert_norm.is_empty() {
+        for row in moe_lat.chunks_mut(dl) {
+            crate::math::rmsnorm_inplace(row, &l.routed_expert_norm, cfg.eps);
+        }
+    }
+    matmul_qt(out, &moe_lat, fc2, s_len);
+
+    // ---- shared experts, on the ORIGINAL hidden state ---------------------
+    // Gated 3-tensor FFN over `sh_gate`/`sh_up`/`sh_down` with the model's activation
+    // (situ), added to the routed result. Scratch pooled for the same reason as
+    // Nemotron's (task #98).
+    let _st = std::time::Instant::now();
+    let mut add_shared = |sh: &mut [f32]| {
+        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, sh);
+        for (o, &sv) in out.iter_mut().zip(sh.iter()) {
+            *o += sv;
+        }
+    };
+    if shared_scratch_reuse() {
+        SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+    } else {
+        add_shared(&mut vec![0f32; s_len * d]);
+    }
+    if crate::forward::profile_on() {
+        crate::forward::SHARED_US
+            .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,6 +1561,132 @@ mod tests {
             up: mk(inter, d, seed + 1),
             down: mk(d, inter, seed + 2),
         }
+    }
+
+    /// Kimi-K3 latent MoE: `routed_expert_norm` must be applied to the expert OUTPUT,
+    /// in latent space, immediately before the up-projection — NOT to the latent input.
+    ///
+    /// Both orderings type-check and produce same-shaped output, so this is asserted by
+    /// construction: the test computes the two candidate results itself and requires
+    /// `kimi_moe` to match the reference order and to DIFFER from the wrong one. A norm
+    /// weight far from 1.0 makes the two provably distinguishable.
+    #[test]
+    fn kimi_latent_moe_normalises_expert_output_not_latent_input() {
+        let json = colibri_json::Json::parse(
+            r#"{"model_type":"kimi_k3","architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{
+                  "hidden_size":4,"num_hidden_layers":2,"num_attention_heads":2,
+                  "num_key_value_heads":2,"num_experts":4,"num_experts_per_token":2,
+                  "num_shared_experts":1,"moe_intermediate_size":2,"intermediate_size":4,
+                  "routed_expert_hidden_size":3,"first_k_dense_replace":1,"q_lora_rank":2,
+                  "kv_lora_rank":2,"qk_nope_head_dim":2,"qk_rope_head_dim":2,"v_head_dim":2,
+                  "vocab_size":8,"max_position_embeddings":64,"rms_norm_eps":1e-5,
+                  "rope_theta":10000.0,"moe_renormalize":true,
+                  "moe_router_activation_func":"sigmoid","num_expert_group":1,
+                  "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":5,
+                  "mla_use_nope":true,"hidden_act":"situ","activation_situ_beta":4.0,
+                  "activation_situ_linear_beta":25.0,
+                  "linear_attn_config":{"head_dim":2,"num_heads":2,
+                    "short_conv_kernel_size":4,"full_attn_layers":[2]}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::from_json(&json).unwrap();
+        let _ = ACTIVATION.set(ActCfg {
+            oai: false, alpha: 0.0, limit: 0.0, relu2: false,
+            situ: cfg.situ, situ_beta: cfg.situ_beta, situ_linear_beta: cfg.situ_linear_beta,
+        });
+        let (d, dl, inter, e_n) = (4usize, 3usize, 2usize, 4usize);
+        let s_len = 2usize;
+
+        let mk = |o: usize, i: usize, seed: usize| {
+            let w: Vec<f32> =
+                (0..o * i).map(|k| (((k + seed) % 7) as f32 - 3.0) * 0.1).collect();
+            qtensor_from_f32(&w, o, i, 8)
+        };
+        let mut l = Layer::default();
+        l.sparse = true;
+        l.router = (0..e_n * d).map(|k| ((k % 5) as f32 - 2.0) * 0.2).collect();
+        l.router_bias = vec![0.0; e_n];
+        l.fc1_latent = Some(mk(dl, d, 1));
+        l.fc2_latent = Some(mk(d, dl, 2));
+        // Deliberately far from 1.0 so the two orderings cannot coincide.
+        l.routed_expert_norm = vec![3.0, 0.25, 2.0];
+        l.sh_gate = mk(inter, d, 3);
+        l.sh_up = mk(inter, d, 4);
+        l.sh_down = mk(d, inter, 5);
+
+        let mut experts = HashMap::new();
+        for e in 0..e_n {
+            // Experts live in LATENT space: [inter, dl] / [dl, inter].
+            experts.insert(
+                (1usize, e),
+                Arc::new(Expert {
+                    gate: mk(inter, dl, 10 + e),
+                    up: mk(inter, dl, 20 + e),
+                    down: mk(dl, inter, 30 + e),
+                }),
+            );
+        }
+        let prov = MapProvider { experts };
+        let x: Vec<f32> = (0..s_len * d).map(|k| ((k % 5) as f32 - 2.0) * 0.3).collect();
+
+        let mut got = vec![0f32; s_len * d];
+        kimi_moe(&cfg, &l, 1, &x, s_len, &mut got, &prov).unwrap();
+
+        // --- reference: down -> experts -> NORM -> up -> (+ shared) ---------
+        let route_all = |xx: &[f32]| {
+            let mut logits = vec![0f32; s_len * e_n];
+            router_matmul(&mut logits, xx, &l.router, s_len, d, e_n);
+            let k = cfg.topk as usize;
+            let (mut idxs, mut ws) = (vec![0usize; s_len * k], vec![0f32; s_len * k]);
+            for s in 0..s_len {
+                let (idx, w) = route(&cfg, &logits[s * e_n..(s + 1) * e_n], &l.router_bias);
+                idxs[s * k..s * k + k].copy_from_slice(&idx);
+                ws[s * k..s * k + k].copy_from_slice(&w);
+            }
+            (idxs, ws)
+        };
+        let (idxs, ws) = route_all(&x);
+        let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, cfg.topk as usize, e_n);
+        let uniq32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+
+        let mut h_lat = vec![0f32; s_len * dl];
+        matmul_qt(&mut h_lat, &x, l.fc1_latent.as_ref().unwrap(), s_len);
+
+        let build = |norm_input: bool| {
+            let mut lat = h_lat.clone();
+            if norm_input {
+                for r in lat.chunks_mut(dl) {
+                    crate::math::rmsnorm_inplace(r, &l.routed_expert_norm, cfg.eps);
+                }
+            }
+            let mut y =
+                compute_experts_partial(&prov, 1, &uniq32, &w_mat, &lat, s_len, dl).unwrap();
+            if !norm_input {
+                for r in y.chunks_mut(dl) {
+                    crate::math::rmsnorm_inplace(r, &l.routed_expert_norm, cfg.eps);
+                }
+            }
+            let mut o = vec![0f32; s_len * d];
+            matmul_qt(&mut o, &y, l.fc2_latent.as_ref().unwrap(), s_len);
+            let mut sh = vec![0f32; s_len * d];
+            ffn(&l.sh_gate, &l.sh_up, &l.sh_down, &x, s_len, &mut sh);
+            for (a, b) in o.iter_mut().zip(sh.iter()) {
+                *a += b;
+            }
+            o
+        };
+        let want_after = build(false); // reference order
+        let want_before = build(true); // the plausible wrong order
+
+        for (i, (g, w)) in got.iter().zip(want_after.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-5, "out[{i}]: {g} vs {w} (norm-after-experts)");
+        }
+        let diff: f32 =
+            want_after.iter().zip(want_before.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-3, "test is not discriminating: orderings agree ({diff})");
+        let wrong: f32 = got.iter().zip(want_before.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(wrong > 1e-3, "kimi_moe matched the WRONG ordering (norm on latent input)");
     }
 
     // Fused GPU expert FFN vs CPU at GLM expert sizes (hidden 6144, moe_inter 2048).

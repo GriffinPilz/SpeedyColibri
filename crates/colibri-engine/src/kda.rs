@@ -313,6 +313,12 @@ mod tests {
     /// that are easy to get subtly wrong and impossible to spot downstream: that the
     /// decay scales S row-wise by key-dim, that the update subtracts kᵀS *before*
     /// writing, and that the output reads the UPDATED state.
+    ///
+    /// The constants below are only worth anything if they really came from the
+    /// reference rather than from an earlier run of this same code, so that is
+    /// re-checkable: `python3 scripts/kda_ref_check.py` reproduces all 27 of them from an
+    /// independent transcription of the fla source (verified 2026-07-28, max diff
+    /// < 2e-6). Re-run it if you change the inputs or the expectations.
     #[test]
     fn recurrence_matches_fla_naive_reference() {
         let d = dims();

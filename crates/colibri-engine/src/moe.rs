@@ -275,6 +275,35 @@ impl ExpertLayout {
     }
 }
 
+/// The block-scaled-FP4 sidecar for `base`, if the container has one:
+/// `(sidecar name, fmt_code, block size)`.
+///
+/// Both 4-bit formats store the weight blob as `nibbles ++ block-scales` and drop `.qs`
+/// entirely, so the sidecar name is what tells them apart:
+///   * `.g`  — NVFP4: ue4m3 scales, one per **16** inputs, real per-tensor global
+///   * `.mx` — MXFP4 (Kimi-K3): OCP E8M0 scales, one per **32**, identity global
+///
+/// One function rather than a `.g` check repeated at each call site: the marker test and
+/// the block size have to agree, and when they drifted apart K3's experts fell through to
+/// the int2 branch and then failed reading a `.qs` that does not exist.
+fn fp4_sidecar(shards: &Shards, base: &str) -> Option<(String, i32, usize)> {
+    let g = format!("{base}.g");
+    if shards.has(&g) {
+        return Some((g, 5, 16));
+    }
+    let mx = format!("{base}.mx");
+    if shards.has(&mx) {
+        return Some((mx, 6, 32));
+    }
+    None
+}
+
+/// Whether `first` (an expert's first projection) looks like a pre-quantized container:
+/// `.qs` for int/e4m3 per-row scales, or a block-scaled FP4 sidecar.
+fn has_prequant_marker(shards: &Shards, first: &str) -> bool {
+    shards.has(&format!("{first}.qs")) || fp4_sidecar(shards, first).is_some()
+}
+
 /// The outer (input/output) dimension of a routed expert: the model `hidden` for the
 /// plain SwiGLU arches, but the low-rank `moe_latent` bottleneck for the latent-MoE ones
 /// (Nemotron-H, Kimi-K3), whose experts run entirely in latent space
@@ -482,9 +511,9 @@ pub fn load_expert(
 ) -> io::Result<Expert> {
     let projs = layout.projs();
     let first = layout.weight_name(layer, eid, projs[0]);
-    // Container marker is `.qs` (int/e4m3 per-row scales) OR `.g` (NVFP4 global scale);
-    // NVFP4 experts drop `.qs` entirely, so both must count as "pre-quantized container".
-    let mut ex = if shards.has(&format!("{first}.qs")) || shards.has(&format!("{first}.g")) {
+    // Container marker is `.qs` (int/e4m3 per-row scales) or a block-scaled FP4 sidecar
+    // (`.g` NVFP4 / `.mx` MXFP4), which drop `.qs` entirely — see `fp4_sidecar`.
+    let mut ex = if has_prequant_marker(shards, &first) {
         // Pre-quantized container: the projections are contiguous on disk (~18 MB for the
         // 3-tensor case), so read the whole group (2 gateless / 3 SwiGLU) in ONE coalesced
         // read into a shared buffer the tensors view — instead of a separate read +
@@ -595,21 +624,22 @@ fn expert_from_views(
               w: &(Arc<colibri_core::SharedBuf>, usize, usize),
               sname: String|
      -> io::Result<QTensor> {
-        // NVFP4 experts: the weight blob is `nibbles ++ ue4m3 block-scales`, read as ONE
-        // coalesced buffer together with gate/up/down (a separate `.bs` read cost one
-        // uncoalesced random-seek pread per expert — 15x slower decode). Recognized by
-        // the `.g` (per-tensor global scale) sidecar. Both halves are zero-copy views
-        // into the shared buffer. See convert::requant_experts_nvfp4.
+        // Block-scaled FP4 experts (NVFP4 `.g` / MXFP4 `.mx`): the weight blob is
+        // `nibbles ++ block-scales`, read as ONE coalesced buffer together with
+        // gate/up/down (a separate `.bs` read cost one uncoalesced random-seek pread per
+        // expert — 15x slower decode). Both halves are zero-copy views into the shared
+        // buffer. The only difference between the two formats here is the scale block
+        // size, which `fp4_sidecar` returns alongside the format code.
+        // See convert::requant_experts_nvfp4 and convert::mxfp4_passthrough_out.
         let base = sname.strip_suffix(".qs").unwrap_or(&sname);
-        let g_name = format!("{base}.g");
-        if shards.has(&g_name) {
+        if let Some((sidecar, fmt, blk)) = fp4_sidecar(shards, base) {
             let (buf, off, _len) = w;
             let nib_bytes = o * i.div_ceil(2);
-            let bs_bytes = o * i.div_ceil(16);
+            let bs_bytes = o * i.div_ceil(blk);
             let mut g = [0f32; 1];
-            shards.read_f32(&g_name, &mut g)?;
+            shards.read_f32(&sidecar, &mut g)?;
             return Ok(QTensor {
-                fmt_code: 5,
+                fmt_code: fmt,
                 o: o as i32,
                 i: i as i32,
                 q4: Bytes::Shared { buf: buf.clone(), off: *off, len: nib_bytes },
@@ -710,9 +740,9 @@ pub fn load_experts_batch(
     let projs = layout.projs();
     // The pooled path applies only to the pre-quantized container (contiguous
     // projections + sidecar scales). Detect via the first expert's first projection
-    // scale sidecar: `.qs` (int/e4m3) or `.g` (NVFP4, which has no `.qs`).
+    // scale sidecar: `.qs` (int/e4m3) or a block-scaled FP4 tag (`.g` / `.mx`).
     let first = layout.weight_name(layer, eids[0], projs[0]);
-    if !shards.has(&format!("{first}.qs")) && !shards.has(&format!("{first}.g")) {
+    if !has_prequant_marker(shards, &first) {
         return eids
             .iter()
             .map(|&e| load_expert(shards, layout, hidden, moe_inter, ebits, layer, e, read_threads))
@@ -2424,5 +2454,88 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An MXFP4 (`.mx`) expert must load as `fmt_code == 6` with the block scales sliced
+    /// at the MXFP4 stride.
+    ///
+    /// Kimi-K3's routed experts are natively MXFP4 and pass through convert bit-exact.
+    /// The loader recognised only NVFP4's `.g`, so a K3 expert fell past that branch into
+    /// the int/int2 path — where the blob length matches neither `o*i` nor the int2 size,
+    /// and the subsequent `.qs` read fails for a sidecar that does not exist. Nothing in
+    /// the suite covered it because no test built an `.mx` container.
+    ///
+    /// The two strides differ (16 vs 32 inputs per scale byte), so a format mix-up shows
+    /// up as a wrong `bs` length rather than as a silent numeric drift.
+    #[test]
+    fn mxfp4_expert_loads_as_fmt6_with_the_right_block_stride() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Square so gate `[moe_inter, hidden]`, up `[moe_inter, hidden]` and down
+        // `[hidden, moe_inter]` share one blob shape; 64 inputs is 2 MXFP4 blocks per row
+        // (stride 32), which would be 4 under NVFP4's stride of 16.
+        const O: usize = 64;
+        const I: usize = 64;
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()))
+            .join(format!("colibri-mx-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // nibbles ++ E8M0 block scales, the layout convert writes for a passthrough.
+        let nib_bytes = O * I / 2;
+        let bs_bytes = O * I / 32;
+        let mut blob = vec![0u8; nib_bytes + bs_bytes];
+        for (k, b) in blob[..nib_bytes].iter_mut().enumerate() {
+            *b = ((k * 7 + 3) % 256) as u8;
+        }
+        for b in blob[nib_bytes..].iter_mut() {
+            *b = 127; // 2^0
+        }
+
+        let p = |suf: &str| format!("model.layers.0.mlp.experts.0.{suf}");
+        let (gw, uw, dw) = (p("gate_proj.weight"), p("up_proj.weight"), p("down_proj.weight"));
+        let (gg, ug, dg) = (format!("{gw}.mx"), format!("{uw}.mx"), format!("{dw}.mx"));
+        let one = 1.0f32.to_le_bytes().to_vec();
+        let entries: [(&str, &str, Vec<u8>); 6] = [
+            (gw.as_str(), "U8", blob.clone()),
+            (uw.as_str(), "U8", blob.clone()),
+            (dw.as_str(), "U8", blob.clone()),
+            (gg.as_str(), "F32", one.clone()),
+            (ug.as_str(), "F32", one.clone()),
+            (dg.as_str(), "F32", one.clone()),
+        ];
+        let mut hjson = String::from("{");
+        let mut off = 0usize;
+        for (i, (name, dtype, b)) in entries.iter().enumerate() {
+            if i > 0 { hjson.push(','); }
+            let numel = if *dtype == "F32" { b.len() / 4 } else { b.len() };
+            hjson.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{numel}],\"data_offsets\":[{off},{}]}}",
+                off + b.len()));
+            off += b.len();
+        }
+        hjson.push('}');
+        let hb = hjson.as_bytes();
+        let mut f = File::create(dir.join("model.safetensors")).unwrap();
+        f.write_all(&(hb.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(hb).unwrap();
+        for (_, _, b) in &entries { f.write_all(b).unwrap(); }
+        drop(f);
+
+        let shards = Shards::open(&dir).expect("open shards");
+        let layout = ExpertLayout::for_arch(Arch::KimiK3);
+        let e = load_expert(&shards, layout, I, O, 8, 0, 0, 1).expect("load mxfp4 expert");
+
+        for (name, t) in [("gate", &e.gate), ("up", &e.up), ("down", &e.down)] {
+            assert_eq!(t.fmt_code, 6, "{name} should be MXFP4 (fmt 6), got {}", t.fmt_code);
+            assert_eq!(t.q4.len(), nib_bytes, "{name} nibble slice");
+            // The stride is the whole point: NVFP4's 16 would give twice this.
+            assert_eq!(t.bs.len(), bs_bytes, "{name} block-scale slice (MXFP4 stride 32)");
+            assert_eq!(t.g, 1.0, "{name} MXFP4 global is the identity");
+        }
     }
 }

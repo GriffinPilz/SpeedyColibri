@@ -121,15 +121,27 @@ fn missing(name: &str) -> io::Error {
 /// of projections that share the same input `x` can run as ONE matmul instead of N. Used
 /// to fuse MiniMax-M3's q/k/v projections: at S=1 decode each was a separate synchronized
 /// GPU dispatch (measured ~25% of decode across q/k/v/o × 60 layers), and one fused
-/// matmul cuts the q/k/v three into one. All parts must share `i` and `fmt_code`; supports
-/// the resident formats f32 (0) and int8 (1) — the only ones projections ship as.
-pub fn concat_rows(parts: &[&QTensor]) -> QTensor {
+/// matmul cuts the q/k/v three into one.
+///
+/// Returns `None` when the parts cannot be fused (mismatched `i`/`fmt_code`, or a format
+/// whose scales are not row-local — NVFP4's global is per TENSOR). Callers keep the
+/// separate projections in that case; the unfused path exists and is correct.
+pub fn concat_rows(parts: &[&QTensor]) -> Option<QTensor> {
     assert!(!parts.is_empty(), "concat_rows: no parts");
     let (i, fmt) = (parts[0].i, parts[0].fmt_code);
-    assert!(
-        parts.iter().all(|p| p.i == i && p.fmt_code == fmt),
-        "concat_rows: all parts must share i and fmt_code"
-    );
+    if !parts.iter().all(|p| p.i == i && p.fmt_code == fmt) {
+        return None;
+    }
+    // NVFP4 (fmt 5) carries a PER-TENSOR global scale, so three separately-encoded
+    // projections have three different globals and cannot be concatenated without
+    // re-rounding every block scale onto a common one — which would silently add error
+    // to weights we are in the middle of validating. Decline instead: `attention_gqa`
+    // already has an unfused q/k/v path, so declining costs one extra matmul per layer
+    // and nothing else. (This used to `panic!`, which is how the first loadable
+    // resident-NVFP4 container died.)
+    if !matches!(fmt, 0 | 1) {
+        return None;
+    }
     let mut out = parts[0].clone();
     out.o = parts.iter().map(|p| p.o).sum();
     match fmt {
@@ -140,10 +152,10 @@ pub fn concat_rows(parts: &[&QTensor]) -> QTensor {
             out.q8 = parts.iter().flat_map(|p| p.q8.iter().copied()).collect();
             out.s = parts.iter().flat_map(|p| p.s.iter().copied()).collect();
         }
-        _ => panic!("concat_rows: unsupported fmt_code {fmt} (projections ship f32/int8)"),
+        _ => unreachable!("guarded above"),
     }
     out.gpu_eligible = parts.iter().all(|p| p.gpu_eligible);
-    out
+    Some(out)
 }
 
 #[cfg(test)]

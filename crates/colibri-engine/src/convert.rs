@@ -801,6 +801,9 @@ fn requant_resident_one(name: &str, shards: &Shards) -> io::Result<Option<ReqOut
     let Ok((o, i)) = two_dims(&t.shape, name) else {
         return Ok(None); // not 2-D — norms and friends copy through
     };
+    if shards.has(&format!("{name}.g")) {
+        return Ok(None); // already NVFP4 — idempotent re-run
+    }
     let qs_name = format!("{name}.qs");
     // int8 iff one byte per element AND a per-row scale exists. Anything else (already
     // f32, or some other width) is not ours to touch.
@@ -854,6 +857,14 @@ fn requant_one(
         }
     }
     if name.ends_with(".weight") && classify(name, n_layers, true, false) == Kind::X {
+        // Already NVFP4 (a `.g` global sits beside it) → copy through. This pass must be
+        // idempotent: Nemotron ships NVFP4 experts already, and re-running the e4m3 decode
+        // on them mis-reads the blob (it would demand `o*i` e4m3 codes and find a 4-bit
+        // blob half the size, in latent space rather than hidden). Idempotency is also what
+        // lets `COLI_RESIDENT_NVFP4` convert ONLY the resident tier on such a container.
+        if shards.has(&format!("{name}.g")) {
+            return copy_raw(name, shards);
+        }
         let (o, i) = expert_oi(name, hidden, moe_inter);
         let t = shards.find(name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}"))
@@ -2023,6 +2034,25 @@ mod tests {
 
     #[test]
     #[test]
+    #[test]
+    fn expert_oi_only_matters_for_e4m3_experts() {
+        // Regression: the first COLI_RESIDENT_NVFP4 run died on Nemotron because its
+        // experts are ALREADY NVFP4 — the e4m3 branch demanded `o*i` codes (computed from
+        // hidden, not moe_latent) and found a 4-bit blob less than a seventh the size:
+        //   "expected 4096x2688=11010048 e4m3 codes, got 1548288".
+        // The `.g` sibling is the marker that a weight is already converted; keying on it
+        // makes the pass idempotent and lets a resident-only requant run on such a
+        // container. This pins the marker name both sides rely on.
+        let (o, i) = (2usize, 32usize);
+        let w: Vec<f32> = (0..o * i).map(|k| (k as f32) * 0.01).collect();
+        let (blob, bsc, _g) = quantize_nvfp4(&w, o, i);
+        assert_ne!(
+            blob.len() + bsc.len(),
+            o * i,
+            "an NVFP4 blob must NOT be o*i bytes — that is the e4m3 shape the old check assumed"
+        );
+    }
+
     fn resident_nvfp4_blob_matches_the_loader_layout() {
         // The converter and the runtime loader agree by CONVENTION, not by a shared type:
         // the weight blob is nibbles ++ block-scales and `.g` carries the global. If either

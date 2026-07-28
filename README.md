@@ -269,6 +269,9 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_PREFETCH` | speculative next-layer expert prefetch. **Leave off**: measured *slower* at every degree (0.82–0.99 vs 1.01 tok/s) — speculative loads evict the working set and contend for an already-saturated NVMe | off |
 | `DRAFT` | MTP speculative decoding: draft this many tokens per step with the model's own next-token (MTP) head, then verify them in one main-model forward. **Measured break-even at best on single-sequence NVFP4** (decode is bytes-bound, not compute-bound — drafting *adds* expert reads), and **not bit-exact while drafting** (`DRAFT=0` is exact; drafting's multi-token verify runs a different attention path than S=1 decode, so ~1 token in 16 can differ). Only pays in batched serving. Auto-disables below 10% acceptance. See [Speculative decoding + batched decode](#speculative-decoding-mtp--batched-decode). | off (`0`) |
 | `MTP` | `0` force-disables the MTP head even if the container ships one (equivalent to `DRAFT=0`) | on when present |
+| `COLI_RESIDENT_NVFP4` | **converter** knob (`coli requant-nvfp4`): `1` → also re-encode the **resident** weights (attention q/k/v/o, Mamba in/out-proj, fc1/fc2-latent, shared experts) from int8 to NVFP4. Embeddings and `lm_head` are never touched. Cuts Nemotron's decode traffic 8.87 → 6.18 GB/token and measures **+9.4% decode** (10.09 → 11.04 tok/s) at **0 ± 1.5% perplexity** across three corpora. Note the win is far below what the byte count alone suggests: NVFP4 decodes slower per byte than int8, and resident matmuls are only part of a decode step | off |
+| `COLI_NVFP4_GEMV` | resident-NVFP4 decode kernel: `0` original, `1` wide read (one byte/lane), `2` wide read without shared staging of `x`, `3` uint32/lane (full cache line). The original read only **16 B per warp** (lanes 2j and 2j+1 fetched the same byte) and staged `x` in 16–32 KB of shared memory, capping an SM at ~3 blocks. Fixing both is most of the gain above; width stops paying past 32 B/warp | `3` |
+| `COLI_QSIM` | **quality-sweep tool**, not a serving knob. `class:scheme[,…]` (e.g. `mamba:nvfp4`, `resident:6`) round-trips the named resident tensors through a target precision at load time, so `coli ppl` can price a quantization choice without rebuilding a container. Storage is unchanged, so it measures **quality only, never speed**. Each rule reports the RMS perturbation it actually applied and warns below 1% — an arm that perturbs nothing yields a perplexity that reads as "this precision is free" | off |
 
 Multi-node variables (`COLI_NUM_NODES`, `COLI_PEERS`, …) are in
 [Multi-Spark](#multi-spark-expert-parallel) below.
@@ -317,7 +320,11 @@ SERVE_DETACH=1 scripts/serve.sh minimax-m2.7 8081     # any registered name, any
 ./target/release/coli convert nvidia/GLM-5.2-NVFP4 /path/to/container
 
 # Re-quantize an existing e4m3 container's experts to NVFP4 (in place, ~18 min, ~2× faster
-# decode + prefill at <1% perplexity — see the Expert quantization section below):
+# decode + prefill at <1% perplexity — see the Expert quantization section below).
+# The pass is idempotent: a weight that is already NVFP4 (it has a `.g` global scale beside
+# it) is copied through, so re-running is safe and a container whose experts are ALREADY
+# NVFP4 — like Nemotron's — can still have its RESIDENT tier converted with
+# COLI_RESIDENT_NVFP4=1 (+9.4% decode on Nemotron, quality-neutral):
 ./target/release/coli requant-nvfp4 /path/to/e4m3-container /path/to/nvfp4-container
 ```
 
@@ -645,6 +652,20 @@ split across nodes: each Spark owns half, loads and computes only its own half, 
 answers its peers over the ConnectX/RoCE fabric. The dense part (attention, shared
 expert, embeddings) is replicated per node, so only expert activations cross the wire
 (~24 KB each way, not expert weights).
+
+**All four model families are supported**, including Nemotron-3-Super's hybrid
+latent-MoE. Nemotron splits over its `moe_latent` space rather than `hidden` — its
+routed experts consume the post-`fc1` latent vector — so it is *cheaper* to shard than
+the others: fewer floats per token on the wire, with `fc2` and the shared expert staying
+local as replicated dense weights.
+
+**Measured EP overhead** (2-rank TCP loopback on one box, residency held constant so the
+only variable is the exchange, 3 reps): **0.9% on prefill, ~15% on decode**,
+token-identical to single-node. Prefill amortizes the per-layer round trips across the
+whole batch; decode pays them for a single token, which is the entire difference. That
+15% is measured with *both ranks sharing one GPU* — on two real Sparks the peer's expert
+compute runs on its own GPU in parallel — so treat it as a pessimistic bound on the
+transport cost, and small either way against the residency win below.
 
 > ⚠️ **These 2-Spark numbers are superseded and not comparable to the record above.**
 > They were taken with a *repeated single prompt* (which reads ~1.5–2× high because the

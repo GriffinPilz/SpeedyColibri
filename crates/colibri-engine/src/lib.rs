@@ -138,6 +138,12 @@ fn load_layer(
     if cfg.arch == Arch::NemotronH {
         return load_layer_nemotron(shards, cfg, i, dbits);
     }
+    // Kimi-K3 is hybrid on the mixer axis (KDA / gated MLA) and carries an output gate
+    // plus the attention-residual pair on every layer, so it takes its own path rather
+    // than the MLA/GQA branch below. `sparse` is derived from `first_dense` inside.
+    if cfg.arch == Arch::KimiK3 {
+        return load_layer_kimi(shards, cfg, i, dbits);
+    }
     let d = cfg.hidden as usize;
     let h = cfg.n_heads as usize;
     let p = |s: &str| format!("model.layers.{i}.{s}");
@@ -341,6 +347,134 @@ fn load_layer_nemotron_kind(
         LayerKind::Kda => {
             return Err(EngineError::NotImplemented("Kimi-K3 KDA layer loading"));
         }
+    }
+    Ok(l)
+}
+
+/// Load one Kimi-K3 layer. Two mixers share the layer shape — `in_ln` -> mixer ->
+/// residual -> `post_ln` -> FFN -> residual, the ordinary two-sublayer form — and
+/// which mixer runs is `cfg.layer_kind[i]`, never the tensor names.
+///
+/// * **KDA** ([`LayerKind::Kda`], 69 layers): q/k/v projections (reusing the GQA
+///   fields), a per-head decay projection `b_proj`, a factored forget gate
+///   `f_a`/`f_b`, a short causal depthwise conv on each of q/k/v, and the `A_log`
+///   / `dt_bias` / `o_norm` vectors. Structurally a delta rule, so the vectors
+///   parallel Mamba2's — but the state is a `[head_dim, head_dim]` matrix per head,
+///   not a selective scan (see `KvCache::enable_kda`).
+/// * **gated MLA** ([`LayerKind::Attn`], 24 layers): the same q_a/q_b/kv_a/kv_b
+///   latent projections GLM uses, so those fields are reused verbatim.
+///
+/// Both carry `g_proj`, the output gate, on top of the shared `o` projection — the
+/// header sweep confirmed it on all 93 layers, not just one mixer's.
+///
+/// Every layer also carries the attention-residual pair (`*_res_norm` + a
+/// `[1, hidden]` `*_res_proj`), which no other arch has.
+fn load_layer_kimi(
+    shards: &colibri_safetensors::Shards,
+    cfg: &Config,
+    i: usize,
+    dbits: u32,
+) -> Result<Layer, EngineError> {
+    let d = cfg.hidden as usize;
+    let p = |s: &str| format!("model.layers.{i}.{s}");
+    let mut l = Layer::default();
+
+    l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
+    l.post_ln = ld(shards, &p("post_attention_layernorm.weight"))?;
+    // The second residual path, on both sublayers.
+    l.attn_res_norm = ld(shards, &p("self_attention_res_norm.weight"))?;
+    l.attn_res_proj = ld(shards, &p("self_attention_res_proj.weight"))?;
+    l.mlp_res_norm = ld(shards, &p("mlp_res_norm.weight"))?;
+    l.mlp_res_proj = ld(shards, &p("mlp_res_proj.weight"))?;
+
+    // Mixer output width, feeding both `o` and the gate. The two mixers reach it by
+    // different routes — KDA via its own head geometry, MLA via `n_heads * v_head` —
+    // and they happen to coincide at 12288 on K3. Deriving it per kind rather than
+    // reusing one for both means a checkpoint where they diverge fails in `qt_load`
+    // with a shape error instead of silently reading the wrong number of rows.
+    let kind = cfg.layer_kind.get(i).copied();
+    let c = match kind {
+        Some(LayerKind::Kda) => cfg.kda_n_heads as usize * cfg.kda_head_dim as usize,
+        _ => cfg.n_heads as usize * cfg.v_head as usize,
+    };
+    l.o = qt_load(shards, &p("self_attn.o_proj.weight"), d, c, dbits)?;
+    l.attn_gate = Some(qt_load(shards, &p("self_attn.g_proj.weight"), c, d, dbits)?);
+
+    match kind {
+        Some(LayerKind::Kda) => {
+            let (nh, hd) = (cfg.kda_n_heads as usize, cfg.kda_head_dim as usize);
+            l.q_proj = Some(qt_load(shards, &p("self_attn.q_proj.weight"), c, d, dbits)?);
+            l.k_proj = Some(qt_load(shards, &p("self_attn.k_proj.weight"), c, d, dbits)?);
+            l.v_proj = Some(qt_load(shards, &p("self_attn.v_proj.weight"), c, d, dbits)?);
+            l.kda_b_proj = Some(qt_load(shards, &p("self_attn.b_proj.weight"), nh, d, dbits)?);
+            // Factored forget gate: hidden -> r -> n_heads*head_dim. `r` is read from
+            // f_a's row count rather than assumed — it is not any other config field.
+            let r = shards
+                .find(&p("self_attn.f_a_proj.weight"))
+                .and_then(|t| t.shape.first().copied())
+                .unwrap_or(hd as i64) as usize;
+            l.kda_f_a = Some(qt_load(shards, &p("self_attn.f_a_proj.weight"), r, d, dbits)?);
+            l.kda_f_b = Some(qt_load(shards, &p("self_attn.f_b_proj.weight"), c, r, dbits)?);
+            // `[C, 1, k]` on disk; read flat it is exactly the `[C, k]` the mixer wants
+            // (same trick as Nemotron's `conv1d.weight`).
+            l.kda_conv_q = ld(shards, &p("self_attn.q_conv1d.weight"))?;
+            l.kda_conv_k = ld(shards, &p("self_attn.k_conv1d.weight"))?;
+            l.kda_conv_v = ld(shards, &p("self_attn.v_conv1d.weight"))?;
+            l.kda_a_log = ld(shards, &p("self_attn.A_log"))?;
+            l.kda_dt_bias = ld(shards, &p("self_attn.dt_bias"))?;
+            l.kda_o_norm = ld(shards, &p("self_attn.o_norm.weight"))?;
+        }
+        _ => {
+            // Gated MLA — the GLM latent projections verbatim, plus `attn_gate` above.
+            let (nh, ql, kl) = (cfg.n_heads as usize, cfg.q_lora as usize, cfg.kv_lora as usize);
+            l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), ql, d, dbits)?;
+            l.q_b = qt_load(
+                shards,
+                &p("self_attn.q_b_proj.weight"),
+                nh * (cfg.qk_nope + cfg.qk_rope) as usize,
+                ql,
+                dbits,
+            )?;
+            l.kv_a = qt_load(
+                shards,
+                &p("self_attn.kv_a_proj_with_mqa.weight"),
+                kl + cfg.qk_rope as usize,
+                d,
+                dbits,
+            )?;
+            l.kv_b = qt_load(
+                shards,
+                &p("self_attn.kv_b_proj.weight"),
+                nh * (cfg.qk_nope + cfg.v_head) as usize,
+                kl,
+                dbits,
+            )?;
+            l.q_a_ln = ld(shards, &p("self_attn.q_a_layernorm.weight"))?;
+            l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
+        }
+    }
+
+    // FFN: the `first_dense` prefix is a plain MLP, everything after it is latent MoE.
+    // Read off `first_dense`, NOT `layer_kind` — MoE-ness is not on the mixer axis
+    // for K3 (see `Config::moe_layers`).
+    if (i as i32) < cfg.first_dense {
+        let di = cfg.dense_inter as usize;
+        l.gate_proj = qt_load(shards, &p("mlp.gate_proj.weight"), di, d, dbits)?;
+        l.up_proj = qt_load(shards, &p("mlp.up_proj.weight"), di, d, dbits)?;
+        l.down_proj = qt_load(shards, &p("mlp.down_proj.weight"), d, di, dbits)?;
+    } else {
+        l.sparse = true;
+        let (dl, si) = (cfg.moe_latent as usize, cfg.shared_inter as usize);
+        l.router = ld(shards, &p("mlp.gate.weight"))?;
+        l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))?;
+        l.fc1_latent = Some(qt_load(shards, &p("mlp.fc1_latent_proj.weight"), dl, d, dbits)?);
+        l.fc2_latent = Some(qt_load(shards, &p("mlp.fc2_latent_proj.weight"), d, dl, dbits)?);
+        l.routed_expert_norm = ld(shards, &p("mlp.routed_expert_norm.weight"))?;
+        // Shared experts: ONE fused pair, `shared_inter = n_shared * moe_inter` wide.
+        l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), si, d, dbits)?;
+        l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), si, d, dbits)?;
+        l.sh_down = qt_load(shards, &p("mlp.shared_experts.down_proj.weight"), d, si, dbits)?;
+        // Routed experts stream through the ExpertProvider.
     }
     Ok(l)
 }
@@ -691,6 +825,129 @@ mod tests {
             Err(EngineError::Config(_)) => {}
             Err(other) => panic!("expected config error, got: {other}"),
             Ok(_) => panic!("expected an error for a missing snapshot"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod kimi_container_tests {
+    use super::*;
+
+    /// Load real Kimi-K3 layers out of a converted container.
+    ///
+    /// This is the check that `load_layer_kimi`'s tensor names and dimensions match what
+    /// `coli convert` actually writes — the two are written from the same understanding of
+    /// the checkpoint, so a shared misreading would pass every unit test and only surface
+    /// here. Ignored by default because it needs a container on disk; on a box with one:
+    ///
+    /// ```text
+    /// COLI_K3_CONTAINER=$HOME/models/Kimi-K3-slice-container \
+    ///   cargo test -p colibri-engine --lib kimi_loads_real -- --ignored --nocapture
+    /// ```
+    ///
+    /// The 4-shard slice container holds layers 0 (KDA + dense MLP), 1 (KDA + latent MoE)
+    /// and 3 (gated MLA + latent MoE), so one run covers both mixers and both FFN kinds.
+    #[test]
+    #[ignore]
+    fn kimi_loads_real_container_layers() {
+        let Ok(dir) = std::env::var("COLI_K3_CONTAINER") else {
+            eprintln!("COLI_K3_CONTAINER unset — skipping");
+            return;
+        };
+        let cfg = Config::load(&dir).expect("load config.json");
+        assert_eq!(cfg.arch, Arch::KimiK3, "container is not Kimi-K3");
+        let shards = colibri_safetensors::Shards::open(&dir).expect("open shards");
+
+        let d = cfg.hidden as usize;
+        let c = cfg.kda_n_heads as usize * cfg.kda_head_dim as usize;
+        for li in [0usize, 1, 3] {
+            let l = load_layer_kimi(&shards, &cfg, li, 8)
+                .unwrap_or_else(|e| panic!("layer {li} failed to load: {e}"));
+
+            // Shared by both mixers.
+            assert_eq!((l.o.o as usize, l.o.i as usize), (d, c), "L{li} o_proj");
+            let g = l.attn_gate.as_ref().unwrap_or_else(|| panic!("L{li} has no g_proj"));
+            assert_eq!((g.o as usize, g.i as usize), (c, d), "L{li} g_proj");
+            assert_eq!(l.in_ln.len(), d, "L{li} in_ln");
+            assert_eq!(l.post_ln.len(), d, "L{li} post_ln");
+            // The attention-residual pair: a norm plus a single-row projection.
+            assert_eq!(l.attn_res_norm.len(), d, "L{li} attn_res_norm");
+            assert_eq!(l.attn_res_proj.len(), d, "L{li} attn_res_proj is [1, hidden]");
+            assert_eq!(l.mlp_res_norm.len(), d, "L{li} mlp_res_norm");
+            assert_eq!(l.mlp_res_proj.len(), d, "L{li} mlp_res_proj is [1, hidden]");
+
+            match cfg.layer_kind[li] {
+                LayerKind::Kda => {
+                    let (nh, hd) = (cfg.kda_n_heads as usize, cfg.kda_head_dim as usize);
+                    for (nm, t) in [("q", &l.q_proj), ("k", &l.k_proj), ("v", &l.v_proj)] {
+                        let t = t.as_ref().unwrap_or_else(|| panic!("L{li} no {nm}_proj"));
+                        assert_eq!((t.o as usize, t.i as usize), (c, d), "L{li} {nm}_proj");
+                    }
+                    let b = l.kda_b_proj.as_ref().expect("b_proj");
+                    assert_eq!((b.o as usize, b.i as usize), (nh, d), "L{li} b_proj");
+                    // The forget gate is factored through a rank read off f_a's rows.
+                    let (fa, fb) = (l.kda_f_a.as_ref().unwrap(), l.kda_f_b.as_ref().unwrap());
+                    assert_eq!(fa.i as usize, d, "L{li} f_a input");
+                    assert_eq!(fb.o as usize, c, "L{li} f_b output");
+                    assert_eq!(fa.o, fb.i, "L{li} f_a/f_b rank must agree");
+                    // `[C, 1, k]` read flat is `[C, k]`.
+                    let k = cfg.kda_d_conv as usize;
+                    for (nm, v) in [("q", &l.kda_conv_q), ("k", &l.kda_conv_k), ("v", &l.kda_conv_v)]
+                    {
+                        assert_eq!(v.len(), c * k, "L{li} {nm}_conv1d");
+                    }
+                    assert_eq!(l.kda_a_log.len(), hd, "L{li} A_log");
+                    assert_eq!(l.kda_dt_bias.len(), c, "L{li} dt_bias");
+                    assert_eq!(l.kda_o_norm.len(), hd, "L{li} o_norm");
+                    assert!(l.q_a.qf.is_empty() && l.q_a.q8.is_empty(), "L{li} KDA has no MLA q_a");
+                }
+                _ => {
+                    let (nh, ql, kl) =
+                        (cfg.n_heads as usize, cfg.q_lora as usize, cfg.kv_lora as usize);
+                    assert_eq!((l.q_a.o as usize, l.q_a.i as usize), (ql, d), "L{li} q_a");
+                    assert_eq!(
+                        (l.q_b.o as usize, l.q_b.i as usize),
+                        (nh * (cfg.qk_nope + cfg.qk_rope) as usize, ql),
+                        "L{li} q_b"
+                    );
+                    assert_eq!(
+                        (l.kv_a.o as usize, l.kv_a.i as usize),
+                        (kl + cfg.qk_rope as usize, d),
+                        "L{li} kv_a"
+                    );
+                    assert_eq!(
+                        (l.kv_b.o as usize, l.kv_b.i as usize),
+                        (nh * (cfg.qk_nope + cfg.v_head) as usize, kl),
+                        "L{li} kv_b"
+                    );
+                    assert_eq!(l.q_a_ln.len(), ql, "L{li} q_a_layernorm");
+                    assert_eq!(l.kv_a_ln.len(), kl, "L{li} kv_a_layernorm");
+                    assert!(l.kda_a_log.is_empty(), "L{li} MLA must not load KDA vectors");
+                }
+            }
+
+            // FFN: the `first_dense` prefix is dense, the rest is latent MoE.
+            if (li as i32) < cfg.first_dense {
+                assert!(!l.sparse, "L{li} should be dense");
+                let di = cfg.dense_inter as usize;
+                assert_eq!((l.gate_proj.o as usize, l.gate_proj.i as usize), (di, d));
+                assert_eq!((l.down_proj.o as usize, l.down_proj.i as usize), (d, di));
+            } else {
+                assert!(l.sparse, "L{li} should be MoE");
+                let (dl, si) = (cfg.moe_latent as usize, cfg.shared_inter as usize);
+                assert_eq!(l.router.len(), cfg.n_experts as usize * d, "L{li} router");
+                assert_eq!(l.router_bias.len(), cfg.n_experts as usize, "L{li} router bias");
+                let f1 = l.fc1_latent.as_ref().expect("fc1_latent");
+                let f2 = l.fc2_latent.as_ref().expect("fc2_latent");
+                assert_eq!((f1.o as usize, f1.i as usize), (dl, d), "L{li} fc1_latent");
+                assert_eq!((f2.o as usize, f2.i as usize), (d, dl), "L{li} fc2_latent");
+                assert_eq!(l.routed_expert_norm.len(), dl, "L{li} routed_expert_norm");
+                // Shared experts ship as ONE fused pair, `n_shared * moe_inter` wide.
+                assert_eq!(si, cfg.n_shared as usize * cfg.moe_inter as usize);
+                assert_eq!((l.sh_gate.o as usize, l.sh_gate.i as usize), (si, d), "L{li} sh_gate");
+                assert_eq!((l.sh_down.o as usize, l.sh_down.i as usize), (d, si), "L{li} sh_down");
+            }
+            eprintln!("layer {li:>2} ({:?}) loaded OK", cfg.layer_kind[li]);
         }
     }
 }

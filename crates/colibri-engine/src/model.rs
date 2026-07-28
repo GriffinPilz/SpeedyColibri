@@ -87,6 +87,42 @@ pub struct Layer {
     // are reused for the gate. `up_proj`/`down_proj` reused for the shared expert.
     pub fc1_latent: Option<QTensor>, // hidden -> moe_latent
     pub fc2_latent: Option<QTensor>, // moe_latent -> hidden
+
+    // ---- Kimi-K3: the output gate, on BOTH mixers ----
+    // `g_proj` is present on all 93 layers (confirmed by sweeping the checkpoint
+    // headers), gating the mixer output before `o`. KDA and gated MLA share it.
+    pub attn_gate: Option<QTensor>, // hidden -> n_heads * head_dim
+
+    // ---- Kimi-K3 KDA mixer (present on `LayerKind::Kda` layers) ----
+    // q/k/v reuse `q_proj`/`k_proj`/`v_proj` above; `o` is the shared output proj.
+    /// per-head decay coefficient projection, `hidden -> n_heads`
+    pub kda_b_proj: Option<QTensor>,
+    /// low-rank forget gate, factored: `hidden -> r` then `r -> n_heads * head_dim`
+    pub kda_f_a: Option<QTensor>,
+    pub kda_f_b: Option<QTensor>,
+    /// short causal depthwise conv over q/k/v, each `[n_heads*head_dim, d_conv]`
+    /// (stored `[C, 1, k]` on disk; read flat it is exactly `[C, k]`).
+    pub kda_conv_q: Vec<f32>,
+    pub kda_conv_k: Vec<f32>,
+    pub kda_conv_v: Vec<f32>,
+    /// `[head_dim]`; the decay is derived from this as Mamba's is from `A_log`
+    pub kda_a_log: Vec<f32>,
+    /// `[n_heads * head_dim]` step bias
+    pub kda_dt_bias: Vec<f32>,
+    /// `[head_dim]` output RMSNorm weight, applied per head
+    pub kda_o_norm: Vec<f32>,
+
+    // ---- Kimi-K3 attention residuals (every layer) ----
+    // A second residual path alongside the ordinary one: each of the two sublayers
+    // gets a norm plus a `[1, hidden]` projection that collapses the hidden state to
+    // one scalar per token. No other arch in the tree has this.
+    pub attn_res_norm: Vec<f32>,
+    pub attn_res_proj: Vec<f32>,
+    pub mlp_res_norm: Vec<f32>,
+    pub mlp_res_proj: Vec<f32>,
+
+    /// Kimi-K3 latent-MoE: RMSNorm applied in the `moe_latent` space, `[moe_latent]`.
+    pub routed_expert_norm: Vec<f32>,
 }
 
 /// The MTP (multi-token prediction) speculative head — port of the `mtpL` /

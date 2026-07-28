@@ -682,6 +682,34 @@ static bool nvfp4_wsmm_launch(float *y,const float *x,const uint8_t *w,const uin
     return true;
 }
 
+/* Launch the S==1 NVFP4 GEMV under COLI_NVFP4_GEMV:
+ *   0 = narrow (original: one nibble-pair byte shared by lanes 2j/2j+1, x staged in shared)
+ *   1 = one byte per lane + shared x
+ *   2 = one byte per lane, x read from device (frees the shared-mem occupancy cap)
+ *   3 = uint32 per lane — a full 128 B/warp cache line (default; needs Kh % 4 == 0)
+ *
+ * ONE dispatcher for every NVFP4 decode GEMV. The read-pattern work (#46) originally lived
+ * inline in `coli_cuda_matmul_nvfp4`, so it reached the *resident* weights only and both
+ * expert MLPs kept launching the narrow kernel — the closed-set dispatch trap, and the
+ * reason that win read as "+9.4%, rest is Amdahl" when routed experts are the larger half
+ * of a decode step. Route every call site here so a read-pattern change lands everywhere.
+ *
+ * Mode is resolved once: within a call site K is fixed, so draft and verify pick the same
+ * kernel and the MTP `exact` path stays reduction-order-identical to sequential decode. */
+static void nvfp4_gemv_dispatch(float *y,const float *x,const uint8_t *w,const uint8_t *bs,
+        float g,int K,int N,cudaStream_t s){
+    static int s_mode=-1;
+    if(s_mode<0){const char*e=getenv("COLI_NVFP4_GEMV");s_mode=e?atoi(e):3;}
+    const int tpb=256,wpb=tpb>>5;
+    unsigned blocks=(unsigned)((N+wpb-1)/wpb);
+    size_t shm=(size_t)K*sizeof(float);
+    if(s_mode==0)      nvfp4_gemv     <<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
+    else if(s_mode==1) nvfp4_gemv_wide<<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
+    else if(s_mode==2) nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+    else if((((K+1)>>1)&3)==0) nvfp4_gemv_u32<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+    else               nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+}
+
 /* Single-row decode GEMV (S==1) for int8 W8A16 — mirror of `fp8a16_gemv` with the
  * weight decode swapped e4m3 -> signed int8 (1 byte/weight, direct K stride). One warp
  * per output column; all 32 lanes sweep the row coalesced, so the grid is O/warps-per-
@@ -1623,30 +1651,8 @@ extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "nvfp4 matmul input")) return 0;
     const uint8_t *w = (const uint8_t *)t->weights;
     const uint8_t *bs = (const uint8_t *)t->bscale;
-    size_t gemv_shmem = (size_t)I * sizeof(float);
     if (S == 1) {
-        /* COLI_NVFP4_WIDE=0 selects the original narrow-read GEMV for A/B. */
-        /* COLI_NVFP4_GEMV: 0=narrow (original), 1=wide read + shared x, 2=wide
-         * read, no shared x, 3=uint32 full-cache-line read (default). */
-        static int s_mode = -1;
-        if (s_mode < 0) { const char *e = getenv("COLI_NVFP4_GEMV"); s_mode = e ? atoi(e) : 3; }
-        const int tpb = 256, wpb = tpb >> 5;
-        unsigned blocks = (unsigned)((O + wpb - 1) / wpb);
-        if (s_mode == 0)
-            nvfp4_gemv<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
-        else if (s_mode == 1)
-            nvfp4_gemv_wide<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
-        else if (s_mode == 2)
-            nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
-        else if ((((I + 1) >> 1) & 3) == 0)   /* uint32 loads need Kh % 4 == 0 */
-            nvfp4_gemv_u32<<<blocks, tpb, 0, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
-        else
-            nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        nvfp4_gemv_dispatch(ctx->y, ctx->x, w, bs, t->gscale, I, O, ctx->stream);
     } else {
         dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
         nvfp4_matmul<<<grid, 128, 0, ctx->stream>>>(ctx->y, ctx->x, w, bs, t->gscale, S, I, O);
@@ -1815,17 +1821,34 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     if(S==1&&!s_tiled){
-        int tpb=256,wpb=tpb>>5;
-        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
-        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+        nvfp4_gemv_dispatch(ctx->gate,ctx->x,gw,gbs,gg,D,I,ctx->stream);
+        nvfp4_gemv_dispatch(ctx->up,  ctx->x,uw,ubs,ug,D,I,ctx->stream);
         act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
-        nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
+        nvfp4_gemv_dispatch(ctx->y,ctx->gate,dw,dbs,dg,I,D,ctx->stream);
     }else{
-        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
-        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
-        nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
-        act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
-        nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+        // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32), the same
+        // #90 fix the relu2 expert already had: at prefill this expert sees only
+        // S = tokens*top_k/n_experts rows (~16 on M2.7, ~26 on Nemotron), so the WMMA tile
+        // re-dequants the whole weight per 16-row m-tile and runs at ~0.26% of tensor peak.
+        // Reading each weight once and accumulating over all S rows in registers is the win.
+        // Wiring it only into relu2 left the three SwiGLU models (M2.7/M3/GLM) on WMMA —
+        // 57% of an M2.7 prefill sat in this branch.
+        static int s_ws=-1;
+        if(s_ws<0){const char*e=getenv("COLI_NVFP4_WSMM");s_ws=(!e||atoi(e));}
+        bool did_ws=false;
+        if(s_ws&&nvfp4_wsmm_launch(ctx->gate,ctx->x,gw,gbs,gg,S,D,I,ctx->stream)){
+            // Same S ⇒ the up/down launches take the same MT bucket and cannot decline.
+            nvfp4_wsmm_launch(ctx->up,ctx->x,uw,ubs,ug,S,D,I,ctx->stream);
+            act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
+            did_ws=nvfp4_wsmm_launch(ctx->y,ctx->gate,dw,dbs,dg,S,I,D,ctx->stream);
+        }
+        if(!did_ws){
+            dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+            dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+            nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
+            act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
+            nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+        }
     }
     if(!cuda_ok(cudaGetLastError(),"expert nvfp4 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -1907,15 +1930,14 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
     // paths below reduce over K in a different order, so they cannot be used for verify.
     // S is tiny at verify, so the lost row-parallelism costs nothing there.
     if((S==1&&!s_tiled)||exact){
-        int tpb=256,wpb=tpb>>5;
         for(int r=0;r<S;r++){
             const float *xr=ctx->x+(size_t)r*D; float *tr=ctx->up+(size_t)r*I; float *yr=ctx->y+(size_t)r*D;
             // t = up·x  → tr [I]
-            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
+            nvfp4_gemv_dispatch(tr,xr,uw,ubs,ug,D,I,ctx->stream);
             // t = relu(t)²
             relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tr,(size_t)I);
             // y = down·t → yr [D]
-            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
+            nvfp4_gemv_dispatch(yr,tr,dw,dbs,dg,I,D,ctx->stream);
         }
     }else{
         // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32): reads each
@@ -2216,7 +2238,7 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
                                "expert group nvfp4 relu2 input upload"))return 0;
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
-    int tpb=256,wpb=tpb>>5,off=0;
+    int off=0;
     for(int c=0;c<count;c++){
         int r=rows[c];
         const uint8_t *uw=(const uint8_t*)ups[c]->weights,*dw=(const uint8_t*)downs[c]->weights;
@@ -2225,9 +2247,9 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
         // This expert's slice of the pooled buffers: rows [off, off+r).
         float *xc=ctx->x+(size_t)off*D,*tc=ctx->up+(size_t)off*I,*yc=ctx->y+(size_t)off*D;
         if(r==1&&!s_tiled){
-            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ug,D,I);
+            nvfp4_gemv_dispatch(tc,xc,uw,ubs,ug,D,I,ctx->stream);
             relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tc,(size_t)I);
-            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,dg,I,D);
+            nvfp4_gemv_dispatch(yc,tc,dw,dbs,dg,I,D,ctx->stream);
         }else{
             dim3 hidden((unsigned)((I+63)/64),(unsigned)((r+15)/16));
             dim3 output((unsigned)((D+63)/64),(unsigned)((r+15)/16));

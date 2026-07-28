@@ -385,8 +385,9 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     let minimax = src_cfg.as_ref().map(|c| c.arch.is_gqa()).unwrap_or(false);
     let nemotron =
         src_cfg.as_ref().map(|c| c.arch == colibri_core::Arch::NemotronH).unwrap_or(false);
+    let kimi = src_cfg.as_ref().map(|c| c.arch == colibri_core::Arch::KimiK3).unwrap_or(false);
     let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
-    let n_layers = if minimax || nemotron {
+    let n_layers = if minimax || nemotron || kimi {
         src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)
     } else {
         env_u32("COLI_NLAYERS", 78) as usize
@@ -413,6 +414,9 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         gemma_norm,
         // Nemotron-H hybrid: backbone.*→model.* remap + `.mixer.` classification.
         nemotron,
+        // Kimi-K3 hybrid: M3-style remap + the latent-MoE projection rename. Its routed
+        // experts are already MXFP4 and pass through without requantizing.
+        kimi,
         // How many layer indices above the stack the MTP head occupies: 1 for GLM/M3's
         // single sparse block, 2 for Nemotron-H's `"*E"` attention+latent-MoE pair. Read
         // from the SOURCE config's `mtp_hybrid_override_pattern`; falls back to 1.

@@ -103,6 +103,12 @@ pub struct ConvertOpts {
     /// marker) classifies the Mamba2 vectors,
     /// latent projections, and latent-space routed experts. See [`nemotron_container_name`].
     pub nemotron: bool,
+    /// source is Kimi-K3 (`kimi_k3`): hybrid KDA / gated-MLA with a latent MoE. Maps its
+    /// `language_model.*` / `block_sparse_moe.*` names like M3 and additionally renames the
+    /// two latent projections (`routed_expert_{down,up}_proj` → `fc{1,2}_latent_proj`).
+    /// Its routed experts are already MXFP4 and pass through unquantized — see
+    /// [`kimi_container_name`].
+    pub kimi: bool,
     /// How many container layer indices the MTP speculative head occupies, starting at
     /// `n_layers` — `Config::mtp_head_layers()`. **1** for GLM/M3 (one sparse block) and
     /// **2** for Nemotron-H (`mtp_hybrid_override_pattern == "*E"`: an attention sublayer
@@ -123,6 +129,7 @@ impl Default for ConvertOpts {
             minimax: false,
             gemma_norm: false,
             nemotron: false,
+            kimi: false,
             mtp_layers: 1,
         }
     }
@@ -220,6 +227,52 @@ fn m3_container_name(name: &str) -> Option<String> {
     let mut n = name.strip_prefix("language_model.").unwrap_or(name).to_string();
     n = n.replace(".block_sparse_moe.", ".mlp.");
     // Expert sub-weights: w1 = gate, w3 = up, w2 = down.
+    n = n
+        .replace(".w1.", ".gate_proj.")
+        .replace(".w3.", ".up_proj.")
+        .replace(".w2.", ".down_proj.");
+    Some(n)
+}
+
+/// Map a Kimi-K3 source tensor name to its colibrì-container name, or `None` to drop it.
+///
+/// K3 ships MiniMax-M3-shaped names (`language_model.` prefix, `block_sparse_moe`, expert
+/// `w1/w2/w3`), so the bulk of this mirrors [`m3_container_name`]. Three things are K3's own:
+///
+/// * **Latent MoE.** `routed_expert_down_proj` / `routed_expert_up_proj` become
+///   `fc1_latent_proj` / `fc2_latent_proj`, reusing the names Nemotron-H's latent-MoE path
+///   already uses for the same two projections.
+///
+///   `down`/`up` here are *dimension* direction, NOT the SwiGLU gate/up/down convention —
+///   getting them backwards silently transposes the MoE block. The shapes disambiguate:
+///   `routed_expert_down_proj` is `[3584, 7168]` (hidden 7168 -> latent 3584), which is
+///   Nemotron's `fc1_latent` ("hidden -> moe_latent"); `routed_expert_up_proj` is
+///   `[7168, 3584]`, its `fc2_latent`. The expert `w1/w2/w3` inside the latent space keep
+///   the ordinary meaning (w1 = gate, w3 = up, w2 = down), same as M3.
+///
+/// * **Per-layer mixer.** Both mixers live under `self_attn.*` and pass through unchanged:
+///   KDA carries `q/k/v/o/g/b/f_a/f_b_proj` plus `{q,k,v}_conv1d`, `A_log`, `dt_bias` and
+///   `o_norm`; gated MLA carries `q_a/q_b/kv_a_proj_with_mqa/kv_b_proj`, its two layernorms,
+///   and the output gate `g_proj`. The loader tells them apart by `Config::layer_kind`, not
+///   by name, so nothing here needs to know which is which.
+///
+/// * **Attention residuals.** `self_attention_res_{norm,proj}`, `mlp_res_{norm,proj}` and the
+///   model-level `output_attn_res_{norm,proj}` pass through; they have no analogue in any
+///   other arch but are plain small tensors.
+fn kimi_container_name(name: &str) -> Option<String> {
+    for drop in ["vision_tower", "mm_projector", "multi_modal_projector", "visual", "image_"] {
+        if name.contains(drop) {
+            return None;
+        }
+    }
+    let mut n = name.strip_prefix("language_model.").unwrap_or(name).to_string();
+    // Latent projections FIRST: they contain the substrings `down_proj`/`up_proj`, so
+    // renaming them before the expert w1/w2/w3 rewrite keeps the two rules independent.
+    n = n
+        .replace(".routed_expert_down_proj.", ".fc1_latent_proj.")
+        .replace(".routed_expert_up_proj.", ".fc2_latent_proj.");
+    n = n.replace(".block_sparse_moe.", ".mlp.");
+    // Expert sub-weights, in the latent space: w1 = gate, w3 = up, w2 = down.
     n = n
         .replace(".w1.", ".gate_proj.")
         .replace(".w3.", ".up_proj.")
@@ -345,6 +398,24 @@ fn classify_head(
     }
     if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
         return Kind::Io;
+    }
+    // ---- Kimi-K3 ----------------------------------------------------------------
+    // These three would otherwise be silently mis-materialized by the generic rules below.
+    //
+    // * K3's routed experts arrive compressed-tensors style as `weight_packed` plus a
+    //   `weight_scale` sidecar, so the `.weight` suffix the expert rule keys on is absent
+    //   — the tensor would fall all the way through to `F32` and be dequantized into a
+    //   full-precision expert, which is both wrong and ~8x the bytes.
+    // * The KDA short convolutions are `[channels, 1, k]` kernels, not matmul weights.
+    //   There is no output dim to carry a per-row scale. (Nemotron's equivalent never
+    //   reaches here — it is caught by the `.mixer.` branch above.)
+    // * The residual projections are a single row, `[1, hidden]`. A per-row int8 scale on
+    //   a 1-row tensor is pure overhead.
+    if name.contains(".mlp.experts.") && name.ends_with(".weight_packed") {
+        return Kind::X;
+    }
+    if name.contains("_conv1d.weight") || name.ends_with("_res_proj.weight") {
+        return Kind::F32;
     }
     if name.contains(".mlp.experts.") && name.ends_with(".weight") {
         return Kind::X; // routed expert (streamed)
@@ -1277,6 +1348,14 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
             _ => return Ok(TensorOut::Skip),
         }
+    } else if opts.kimi {
+        // Kimi-K3: M3-shaped names plus the latent-MoE projections. `num_nextn_predict_layers`
+        // is 0 in this checkpoint, so there is no head to keep and the plain `n_layers`
+        // ceiling applies (same as the M3 branch).
+        match kimi_container_name(name) {
+            Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
+            _ => return Ok(TensorOut::Skip),
+        }
     } else if opts.nemotron {
         // Unlike the M3 branch above (whose head is dropped by name), Nemotron's MTP head
         // is KEPT and remapped into `model.layers.{n_layers..n_layers+mtp_layers}`, so the
@@ -2018,6 +2097,124 @@ mod tests {
         );
         // Anything above the single nextn head is not part of the architecture.
         assert_eq!(classify("model.layers.79.eh_proj.weight", 78, false, false), Kind::Skip);
+    }
+
+    /// Every K3 tensor must land in the right `Kind`. The three that do not follow from
+    /// the generic rules are pinned here; the rest are checked to confirm they fall
+    /// through correctly rather than by accident.
+    #[test]
+    fn kimi_k3_classification() {
+        let c = |s: &str| classify(s, 93, false, false);
+        let l = "model.layers.1.";
+
+        // Routed experts: `weight_packed`, not `.weight`. Without the explicit rule this
+        // reaches the final `Kind::F32` and gets dequantized to f32 experts.
+        assert_eq!(c(&format!("{l}mlp.experts.7.gate_proj.weight_packed")), Kind::X);
+        assert_eq!(c(&format!("{l}mlp.experts.7.down_proj.weight_packed")), Kind::X);
+        // Its E8M0 sidecar is consumed alongside the weight, never emitted on its own.
+        assert_eq!(c(&format!("{l}mlp.experts.7.gate_proj.weight_scale")), Kind::Skip);
+
+        // KDA vectors and kernels stay f32.
+        for t in ["self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight",
+                  "self_attn.A_log", "self_attn.dt_bias", "self_attn.o_norm.weight"] {
+            assert_eq!(c(&format!("{l}{t}")), Kind::F32, "{t}");
+        }
+        // Residual projections are single rows -> f32, not per-row-scaled int8.
+        for t in ["self_attention_res_proj.weight", "mlp_res_proj.weight",
+                  "self_attention_res_norm.weight", "mlp_res_norm.weight"] {
+            assert_eq!(c(&format!("{l}{t}")), Kind::F32, "{t}");
+        }
+
+        // Resident matrices quantize: both mixers' projections, the latent projections,
+        // and the shared expert.
+        for t in ["self_attn.q_proj.weight", "self_attn.g_proj.weight",
+                  "self_attn.f_b_proj.weight", "self_attn.kv_b_proj.weight",
+                  "mlp.fc1_latent_proj.weight", "mlp.fc2_latent_proj.weight",
+                  "mlp.shared_experts.down_proj.weight"] {
+            assert_eq!(c(&format!("{l}{t}")), Kind::Q, "{t}");
+        }
+
+        // Router and the latent norm stay f32; embeddings take io_bits.
+        assert_eq!(c(&format!("{l}mlp.gate.weight")), Kind::F32);
+        assert_eq!(c(&format!("{l}mlp.gate.e_score_correction_bias")), Kind::F32);
+        assert_eq!(c(&format!("{l}mlp.routed_expert_norm.weight")), Kind::F32);
+        assert_eq!(c("model.embed_tokens.weight"), Kind::Io);
+        assert_eq!(c("lm_head.weight"), Kind::Io);
+
+        // The new rules must not disturb the other arches: Nemotron's conv1d still goes
+        // through the `.mixer.` branch, and GLM's expert `.weight` still classifies as X.
+        assert_eq!(c("model.layers.1.mlp.experts.7.gate_proj.weight"), Kind::X);
+    }
+
+    /// K3's names are M3-shaped, so most of this is the M3 rewrite. The parts that are
+    /// K3's own are the two latent projections and the fact that both mixers pass through
+    /// untouched under `self_attn.*`.
+    #[test]
+    fn kimi_k3_name_mapping() {
+        let m = |s: &str| kimi_container_name(s);
+        assert_eq!(m("language_model.model.embed_tokens.weight").as_deref(),
+                   Some("model.embed_tokens.weight"));
+        assert_eq!(m("language_model.lm_head.weight").as_deref(), Some("lm_head.weight"));
+        assert_eq!(m("language_model.model.norm.weight").as_deref(), Some("model.norm.weight"));
+
+        // Routed experts: w1 = gate, w3 = up, w2 = down — inside the latent space.
+        // Both the packed nibbles and their E8M0 scale sidecar get the same rewrite.
+        let e = "language_model.model.layers.1.block_sparse_moe.experts.7.";
+        assert_eq!(m(&format!("{e}w1.weight_packed")).as_deref(),
+                   Some("model.layers.1.mlp.experts.7.gate_proj.weight_packed"));
+        assert_eq!(m(&format!("{e}w3.weight_packed")).as_deref(),
+                   Some("model.layers.1.mlp.experts.7.up_proj.weight_packed"));
+        assert_eq!(m(&format!("{e}w2.weight_scale")).as_deref(),
+                   Some("model.layers.1.mlp.experts.7.down_proj.weight_scale"));
+
+        // The latent projections. `down` is hidden->latent (Nemotron's fc1_latent) and
+        // `up` is latent->hidden (fc2_latent) — dimension direction, not gate/up/down.
+        // Swapping these transposes the whole MoE block, so pin them explicitly.
+        let b = "language_model.model.layers.1.block_sparse_moe.";
+        assert_eq!(m(&format!("{b}routed_expert_down_proj.weight")).as_deref(),
+                   Some("model.layers.1.mlp.fc1_latent_proj.weight"));
+        assert_eq!(m(&format!("{b}routed_expert_up_proj.weight")).as_deref(),
+                   Some("model.layers.1.mlp.fc2_latent_proj.weight"));
+        // ...and they must NOT be caught by the expert down/up rewrite.
+        assert!(!m(&format!("{b}routed_expert_down_proj.weight")).unwrap().contains("routed_expert"));
+
+        // Router, shared experts, latent norm.
+        assert_eq!(m(&format!("{b}gate.e_score_correction_bias")).as_deref(),
+                   Some("model.layers.1.mlp.gate.e_score_correction_bias"));
+        assert_eq!(m(&format!("{b}shared_experts.down_proj.weight")).as_deref(),
+                   Some("model.layers.1.mlp.shared_experts.down_proj.weight"));
+        assert_eq!(m(&format!("{b}routed_expert_norm.weight")).as_deref(),
+                   Some("model.layers.1.mlp.routed_expert_norm.weight"));
+
+        // Both mixers pass through untouched — KDA...
+        let a = "language_model.model.layers.0.self_attn.";
+        for t in ["q_proj.weight", "g_proj.weight", "b_proj.weight", "f_a_proj.weight",
+                  "f_b_proj.weight", "q_conv1d.weight", "A_log", "dt_bias", "o_norm.weight"] {
+            assert_eq!(m(&format!("{a}{t}")).as_deref(),
+                       Some(format!("model.layers.0.self_attn.{t}").as_str()));
+        }
+        // ...and gated MLA.
+        let a3 = "language_model.model.layers.3.self_attn.";
+        for t in ["q_a_proj.weight", "q_b_proj.weight", "kv_a_proj_with_mqa.weight",
+                  "kv_b_proj.weight", "kv_a_layernorm.weight", "o_proj.weight"] {
+            assert_eq!(m(&format!("{a3}{t}")).as_deref(),
+                       Some(format!("model.layers.3.self_attn.{t}").as_str()));
+        }
+
+        // Attention residuals (no analogue in any other arch) pass through.
+        for t in ["self_attention_res_norm.weight", "self_attention_res_proj.weight",
+                  "mlp_res_norm.weight", "mlp_res_proj.weight"] {
+            assert_eq!(m(&format!("language_model.model.layers.5.{t}")).as_deref(),
+                       Some(format!("model.layers.5.{t}").as_str()));
+        }
+
+        // The dense layer-0 MLP keeps its ordinary names.
+        assert_eq!(m("language_model.model.layers.0.mlp.gate_proj.weight").as_deref(),
+                   Some("model.layers.0.mlp.gate_proj.weight"));
+
+        // Vision tower and projector are dropped (text-only MVP, as with M3).
+        assert!(m("vision_tower.encoder.blocks.0.wqkv.weight").is_none());
+        assert!(m("mm_projector.proj.0.weight").is_none());
     }
 
     #[test]

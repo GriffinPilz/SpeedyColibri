@@ -333,6 +333,34 @@ impl KvCache {
         }
     }
 
+    /// This layer's KDA conv history: `3 * (d_conv - 1) * c` floats laid out
+    /// `[stream][token][channel]` for q, k, v (oldest token first). Zeros for a fresh
+    /// cache or a non-KDA layer, which is exactly the "convolve against nothing"
+    /// boundary a prefill wants.
+    pub(crate) fn kda_conv_take(&self, layer: usize, c: usize, k: usize) -> Vec<f32> {
+        let need = 3 * k.saturating_sub(1) * c;
+        match self.kda_conv.get(layer) {
+            Some(v) if v.len() >= need && need > 0 => v[..need].to_vec(),
+            _ => vec![0.0f32; need],
+        }
+    }
+
+    /// Replace this layer's KDA conv history. `carries` is what
+    /// [`KvCache::kda_conv_take`] returns, advanced by one step.
+    pub(crate) fn kda_conv_store(&mut self, layer: usize, carries: &[f32]) {
+        let Some(slot) = self.kda_conv.get_mut(layer) else { return };
+        if slot.len() < carries.len() {
+            slot.resize(carries.len(), 0.0);
+        }
+        slot[..carries.len()].copy_from_slice(carries);
+    }
+
+    /// This layer's delta-rule association matrix, `[h, dk, dk]` flattened K-major.
+    /// Allocated by [`KvCache::enable_kda`]; empty on a non-KDA layer.
+    pub(crate) fn kda_state_mut(&mut self, layer: usize) -> &mut [f32] {
+        &mut self.kda_state[layer]
+    }
+
     /// Element counts of one KDA layer's two fixed-size buffers, as f32 counts:
     /// `(conv_history, delta_rule_state)`.
     ///

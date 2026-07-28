@@ -2168,11 +2168,19 @@ fn ram_budget() -> u64 {
 }
 
 /// A model whose experts fit in the achievable cache (RAM − reserve) to at least this %
-/// is "near-fit": it gets `fadvise` on top of the fill (collapse the page-cache double-hold
-/// so the whole working set stays resident — measured 1.94× on MiniMax-M2.7). A ≫-RAM model
-/// (GLM ~23%, M3 ~46%) is *also* filled and pressure-managed, but keeps the page cache
-/// (fadvise off) as a reclaimable second tier the kernel serves at 4 KB granularity.
-const NEARFIT_COVERAGE_PCT: u64 = 80;
+/// is "near-fit": it gets `fadvise` + a fill-to-`natural_fill` residency hold (collapse the
+/// page-cache double-hold so the whole working set stays resident — measured 1.94× on a
+/// *fitting* MiniMax-M2.7 snapshot). A ≫-RAM model (GLM ~23%, M3 ~46%) keeps the page cache
+/// (fadvise off) and streams against a `MemTotal/3` cap the kernel serves at 4 KB granularity.
+///
+/// The bar is deliberately **above 100%**: residency only pays when the set *genuinely* fits
+/// with headroom. At partial coverage (80–99%) the fill pins ~`natural_fill` GB resident *and*
+/// still streams the uncovered tail with zero page-cache slack left — the worst of both, and it
+/// *thrashes*. Measured on the 117 GB NVFP4 MiniMax-M2.7 (86% coverage): the greedy fill was
+/// bimodal 0.9–4.3 tok/s, while dropping it to the `MemTotal/3` streaming cap gave a *stable*
+/// ~3.2 tok/s (and, as the byte math predicts, that beats M3 — M2.7 moves ~half the bytes/token).
+/// 118% matches the preload "fits-with-headroom" gate, so residency-fill and eager-preload agree.
+const NEARFIT_COVERAGE_PCT: u64 = 118;
 
 /// Wire the expert cache to **fill RAM safely, for every model**. It grows toward a fill
 /// target and a background monitor evicts LRU experts under memory pressure so the box can
@@ -2280,11 +2288,11 @@ where
         ADAPTIVE_HARD_FLOOR >> 30
     );
     // Preload is safe only when the whole expert set fits the fill target with COMFORTABLE
-    // headroom — not merely "near-fit". `near_fit` fires at ~92% coverage (the fadvise-tiering
-    // decision), but eagerly loading ALL experts then overfills: M2.7 at 109 GB experts on a
-    // 121 GB box preloaded to residency and THRASHED to 0.97 tok/s (vs ~4.3 lazy). Require
-    // experts ≤ 85% of natural_fill so KV + working + page cache keep real room. An explicit
-    // COLI_RAM_GB means the user is managing residency — leave preload to them.
+    // headroom. This now coincides with `near_fit` (118% coverage ⟺ experts ≤ 84.7% of
+    // natural_fill), so residency-fill and eager-preload agree by construction — a model can no
+    // longer land in the partial-coverage thrash zone that once collapsed M2.7 to ~1 tok/s
+    // (109 GB experts on a 121 GB box). The explicit `fits_with_headroom` (≤ 85%) is kept as a
+    // belt-and-suspenders guard. An explicit COLI_RAM_GB means the user manages residency — skip.
     let fits_with_headroom = total_expert_bytes <= natural_fill / 100 * 85;
     near_fit && explicit.is_none() && fits_with_headroom
 }

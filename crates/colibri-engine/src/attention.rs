@@ -477,9 +477,13 @@ pub fn attention_with_heads(
     let _tr = std::time::Instant::now();
     for s in 0..s_len {
         let pos = pos_base + s;
-        for hh in 0..h {
-            let base = s * h * qh + hh * qh + qk_nope;
-            rope_interleave(&mut q[base..base + r], pos, r, theta);
+        // Kimi-K3 is NoPE (`mla_use_nope`): the rope-half dims still exist in the
+        // projections and still take part in the q.k dot, they are just never rotated.
+        if !cfg.mla_nope {
+            for hh in 0..h {
+                let base = s * h * qh + hh * qh + qk_nope;
+                rope_interleave(&mut q[base..base + r], pos, r, theta);
+            }
         }
         // normalized latent
         let latent_src_end = s * cw + kvl;
@@ -492,7 +496,9 @@ pub fn attention_with_heads(
         {
             let rdst = kv.krot_row_mut(layer, pos);
             rdst.copy_from_slice(&comp[latent_src_end..latent_src_end + r]);
-            rope_interleave(rdst, pos, r, theta);
+            if !cfg.mla_nope {
+                rope_interleave(rdst, pos, r, theta);
+            }
         }
     }
 
@@ -603,6 +609,18 @@ pub fn attention_with_heads(
         }
     }
     atime(&crate::forward::ATTN_CORE_US, _tc);
+
+    // ---- 3b) output gate (Kimi-K3 `mla_use_output_gate`) --------------------
+    // `ctx *= sigmoid(g_proj(x))`, elementwise over [S, n_heads * v_head]. A plain
+    // multiply, NOT the gated RMSNorm the KDA mixer uses — same tensor name, different
+    // operation. Absent on every other arch, where `attn_gate` is None.
+    if let Some(g) = l.attn_gate.as_ref() {
+        let mut gate = vec![0f32; s_len * h * vh];
+        matmul_qt(&mut gate, x, g, s_len);
+        for (c, gv) in ctx.iter_mut().zip(gate.iter()) {
+            *c *= crate::math::sigmoid(*gv);
+        }
+    }
 
     // ---- 4) output projection ----------------------------------------------
     let _to = std::time::Instant::now();

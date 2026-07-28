@@ -791,6 +791,7 @@ mod kv_accounting_tests {
                   "qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
                   "vocab_size":163840,"max_position_embeddings":1048576,
                   "rms_norm_eps":1e-05,"rope_theta":10000.0,"moe_renormalize":true,
+                  "mla_use_nope":true,"mla_use_output_gate":true,
                   "moe_router_activation_func":"sigmoid","num_expert_group":1,
                   "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":163586,
                   "linear_attn_config":{"head_dim":128,"num_heads":96,

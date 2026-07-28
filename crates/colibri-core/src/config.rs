@@ -204,6 +204,10 @@ pub struct Config {
     /// state is `[kda_n_heads, kda_head_dim, kda_head_dim]` per KDA layer — the
     /// square `d_k x d_v` association matrix a delta rule carries between steps.
     pub kda_head_dim: i32,
+    /// MLA runs WITHOUT rotary embeddings (`mla_use_nope`). The `qk_rope_head_dim`
+    /// split still exists in the projections — those dims are simply carried
+    /// un-rotated — so this cannot be inferred from the shapes. Kimi-K3 asserts it.
+    pub mla_nope: bool,
     /// KDA short causal-conv kernel width (`linear_attn_config.short_conv_kernel_size`).
     /// The conv history is `[kda_d_conv, 3 * kda_n_heads * kda_head_dim]` — q, k and v
     /// each carry their own `*_conv1d`, hence the factor of 3.
@@ -433,6 +437,7 @@ impl Config {
             relu2: false,
             mamba_dt_min: 0.0,
             // Kimi-K3-only fields.
+            mla_nope: false,
             kda_n_heads: 0,
             kda_head_dim: 0,
             kda_d_conv: 0,
@@ -603,6 +608,7 @@ impl Config {
             relu2: false,
             mamba_dt_min: 0.0,
             // Kimi-K3-only fields.
+            mla_nope: false,
             kda_n_heads: 0,
             kda_head_dim: 0,
             kda_d_conv: 0,
@@ -695,7 +701,7 @@ impl Config {
             kv_lora: gt("kv_lora_rank"),
             qk_nope: gt("qk_nope_head_dim"),
             qk_rope: gt("qk_rope_head_dim"),
-            // MLA, like GLM: no GQA full-KV, so no `qk_head` geometry to fold in.
+            // Fixed up below to `qk_nope + qk_rope`, exactly as the GLM parse does.
             qk_head: 0,
             v_head: gt("v_head_dim"),
             n_shared: gt("num_shared_experts"),
@@ -747,6 +753,7 @@ impl Config {
             moe_latent: gt("routed_expert_hidden_size"),
             relu2: false,
             mamba_dt_min: 0.0,
+            mla_nope: t.get("mla_use_nope").and_then(Json::as_bool).unwrap_or(false),
             kda_n_heads: lg("num_heads", 0),
             kda_head_dim: lg("head_dim", 0),
             kda_d_conv: lg("short_conv_kernel_size", 0),
@@ -756,6 +763,17 @@ impl Config {
         if c.stop_ids.is_empty() {
             parse_stop_ids(r, &mut c.stop_ids);
         }
+
+        // The MLA per-head query width, and its scale — same fixup the GLM parse does,
+        // and the same value the reference computes (`q_head_dim ** -0.5`, 192^-0.5).
+        //
+        // This does NOT reintroduce a GQA full-KV charge: `KvCache::bytes_per_token`
+        // gates that term on `allocates_gqa_kv`, which is false for K3, so `qk_head`
+        // only ever feeds the attention geometry. Leaving it 0 (as an earlier version
+        // did, reasoning "MLA has no GQA head dim") makes the MLA path compute with a
+        // per-head width of zero.
+        c.qk_head = c.qk_nope + c.qk_rope;
+        c.attn_scale = 1.0 / (c.qk_head as f32).sqrt();
 
         c.validate_common()?;
         if c.layer_kind.len() != c.n_layers as usize {
@@ -875,6 +893,7 @@ impl Config {
             // `torch.clamp(dt, self.time_step_min)`); default 0.0 (no floor) if absent.
             mamba_dt_min: gf("time_step_min", 0.0) as f32,
             // Kimi-K3-only fields.
+            mla_nope: false,
             kda_n_heads: 0,
             kda_head_dim: 0,
             kda_d_conv: 0,
@@ -1029,6 +1048,7 @@ mod tests {
         assert_eq!(c.hidden, 6144);
         assert_eq!(c.n_layers, 78);
         assert_eq!(c.qk_head, 128 + 64);
+        assert!(!c.mla_nope, "GLM MLA is roped");
         assert_eq!(c.stop_ids, vec![151329, 151336, 151338]);
         assert!(c.norm_topk);
         assert!(!c.gemma_norm && !c.swiglu_oai && !c.sigmoid_route);
@@ -1308,6 +1328,7 @@ mod tests {
                   "qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
                   "vocab_size":163840,"max_position_embeddings":1048576,
                   "rms_norm_eps":1e-05,"rope_theta":10000.0,"moe_renormalize":true,
+                  "mla_use_nope":true,"mla_use_output_gate":true,
                   "moe_router_activation_func":"sigmoid","num_expert_group":1,
                   "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":163586,
                   "linear_attn_config":{{"head_dim":128,"num_heads":96,
@@ -1351,7 +1372,15 @@ mod tests {
         assert_eq!(c.moe_latent, 3584, "Stable LatentMoE bottleneck");
         assert_eq!(c.shared_inter, 6144, "2 x 3072, fused in the checkpoint");
         assert_eq!((c.kv_lora, c.qk_nope, c.qk_rope, c.v_head), (512, 128, 64, 128));
-        assert_eq!(c.qk_head, 0, "MLA: no GQA head geometry, so no k_full/v_full");
+        // The MLA per-head query width, fixed up after the literal like GLM's. This is
+        // the attention geometry only — the GQA full-KV charge is gated on
+        // `allocates_gqa_kv` (false for K3), so a non-zero `qk_head` costs no KV.
+        assert_eq!(c.qk_head, 128 + 64, "q_head_dim = qk_nope + qk_rope");
+        // NoPE: the reference asserts `use_nope` and sets `rotary_emb = None`. The 64
+        // rope dims still exist in the projections, so nothing about the SHAPES reveals
+        // this — only the config flag does.
+        assert!(c.mla_nope, "K3 MLA is NoPE");
+        assert!((c.attn_scale - 1.0 / 192f32.sqrt()).abs() < 1e-9, "scale = q_head_dim^-0.5");
         assert_eq!((c.kda_n_heads, c.kda_head_dim, c.kda_d_conv), (96, 128, 4));
         assert_eq!((c.first_dense, c.max_ctx, c.vocab), (1, 1048576, 163840));
         assert!(c.sigmoid_route && c.norm_topk);

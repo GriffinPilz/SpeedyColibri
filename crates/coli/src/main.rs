@@ -572,7 +572,8 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
-    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
+    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
+    preload_all_experts(&provider, &model.cfg, _maxres);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
@@ -823,7 +824,8 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
-    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
+    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
+    preload_all_experts(&provider, &model.cfg, _maxres);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
     }
@@ -2188,17 +2190,22 @@ const NEARFIT_COVERAGE_PCT: u64 = 80;
 ///   sustainable ceiling — see `memory-ceiling-is-real` / `autopin-single-node-negative`.
 ///
 /// Off-Linux (no `/proc/meminfo`) it no-ops — there is no live pressure signal to evict on.
+/// Returns whether the model is being held at MAX residency on the automatic path
+/// (near-fit, no explicit COLI_RAM_GB) — i.e. the whole expert set fits and the cache
+/// will hold it with no eviction. `preload_all_experts` uses this to decide whether an
+/// eager preload is safe (it must never fire for a ≫-RAM model).
 fn wire_adaptive_cache<P>(
     provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
     cfg: &colibri_core::Config,
     ebits: u32,
-) where
+) -> bool
+where
     P: colibri_engine::ExpertProvider + Send + Sync + 'static,
 {
     use colibri_engine::ExpertProvider as _; // bring `.expert()` into method scope
     let total = match colibri_engine::total_ram_bytes() {
         Some(t) => t,
-        None => return, // non-Linux: no live pressure signal, leave the static budget
+        None => return false, // non-Linux: no live pressure signal, leave the static budget
     };
     // Number of MoE layers and the index of one, to size the streamed-expert footprint.
     // Homogeneous arches (GLM/MiniMax): every layer at/after `first_dense` is MoE. Nemotron-H
@@ -2271,6 +2278,62 @@ fn wire_adaptive_cache<P>(
         total >> 30,
         fill_target >> 30,
         ADAPTIVE_HARD_FLOOR >> 30
+    );
+    // Preload is safe only on the automatic near-fit path (fill_target = natural_fill holds
+    // the whole set with no eviction). An explicit COLI_RAM_GB means the user is managing
+    // residency; don't eagerly fill past what they asked for.
+    near_fit && explicit.is_none()
+}
+
+/// Eagerly load EVERY routed expert into the cache at startup, so decode never pays a cold
+/// miss. A nemotron decode touches ~all experts within a couple hundred tokens (diverse
+/// routing, no hot set), so lazy loading otherwise spreads a ~59 GB cold read across the
+/// generation and dominates it (measured: expert-load 26 s vs gpu-ffn 0.4 s over 256 tok);
+/// preloading moves that to a one-time startup and lifts warm decode 1.7× (5.86→9.95 tok/s
+/// on nemotron-3-super), token-identical. `max_residency` (from `wire_adaptive_cache`) gates
+/// it to models that fit, so a ≫-RAM model never tries to preload its whole set.
+/// `COLI_PRELOAD_EXPERTS` overrides: `1` forces on, `0` forces off.
+fn preload_all_experts<P>(
+    provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
+    cfg: &colibri_core::Config,
+    max_residency: bool,
+) where
+    P: colibri_engine::ExpertProvider + Send + Sync + 'static,
+{
+    use colibri_engine::ExpertProvider as _;
+    let want = match std::env::var("COLI_PRELOAD_EXPERTS").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => max_residency,
+    };
+    if !want {
+        return;
+    }
+    let moe_layers: Vec<usize> = if cfg.layer_kind.is_empty() {
+        (cfg.first_dense as usize..cfg.n_layers as usize).collect()
+    } else {
+        cfg.layer_kind
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| matches!(k, colibri_core::LayerKind::Moe))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let all: Vec<usize> = (0..cfg.n_experts as usize).collect();
+    let t = std::time::Instant::now();
+    for &l in &moe_layers {
+        if let Err(e) = provider.prefetch(l, &all) {
+            eprintln!("[preload] layer {l} failed: {e} — falling back to lazy load");
+            return;
+        }
+    }
+    let s = provider.stats();
+    eprintln!(
+        "[preload] {} experts resident ({:.1} GB) across {} MoE layers in {:.1}s",
+        s.resident,
+        s.bytes as f64 / 1e9,
+        moe_layers.len(),
+        t.elapsed().as_secs_f64()
     );
 }
 

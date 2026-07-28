@@ -709,7 +709,7 @@ fn e2m1_code(t: f32) -> u8 {
 /// **back** from that byte (`f8e4m3_to_f32(code) * global`), so encode and the kernel/CPU
 /// decode agree exactly. This is the real quantizer behind [`quantize_nvfp4_sim`]'s
 /// reconstruction (which was scored at 9.4% rel-RMS on the real experts).
-/// `quantize_nvfp4` for the linear.rs layout-agreement test.
+/// `quantize_nvfp4` for the linear.rs / loader.rs layout-agreement tests.
 #[cfg(test)]
 pub(crate) fn quantize_nvfp4_pub(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<u8>, f32) {
     quantize_nvfp4(w, o, i)

@@ -426,6 +426,52 @@ __global__ static void nvfp4_gemv_wide_g(float *y,const float *x,const uint8_t *
     if(lane==0) y[n]=acc*g;
 }
 
+/* Full-line NVFP4 GEMV — resident, S==1. Each lane loads a uint32 (4 bytes = 8 nibbles),
+ * so a warp fetches 128 B: one whole cache line per step, versus 32 B for the byte version
+ * and 16 B for the original.
+ *
+ * The 8 nibbles also share ONE block scale. Their k range starts at k0 = 8*kb4, so
+ * k0 mod 16 is 0 or 8 and k0..k0+7 never straddles a 16-wide scale block — one ue4m3
+ * decode per 8 values instead of per 2.
+ *
+ * Rows are Kh = ceil(K/2) bytes apart, so 4-byte alignment holds whenever Kh % 4 == 0;
+ * the caller checks that and falls back to the byte version otherwise rather than issuing
+ * a misaligned uint32 load. */
+__global__ static void nvfp4_gemv_u32(float *y,const float *x,const uint8_t *w,
+                                      const uint8_t *bs,float g,int K,int N){
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4, Kw=Kh>>2;
+    const uint32_t *wr=(const uint32_t*)(w+(size_t)n*Kh);
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int kw=lane;kw<Kw;kw+=32){
+        uint32_t v=wr[kw];
+        int k0=kw<<3;                       /* 8 nibbles per uint32 */
+        float sc=e4m3f(br[k0>>4]);          /* k0..k0+7 share one block scale */
+        float p=0.f;
+        #pragma unroll
+        for(int j=0;j<8;j++){
+            int nib=(v>>(j<<2))&0xF;
+            p+=x[k0+j]*e2m1f(nib);
+        }
+        acc+=p*sc;
+    }
+    /* tail: whatever bytes the uint32 sweep could not cover */
+    for(int kb=(Kw<<2)+lane;kb<Kh;kb+=32){
+        uint8_t byte=w[(size_t)n*Kh+kb];
+        int k0=kb<<1;
+        float sc=e4m3f(br[k0>>4]);
+        float a=x[k0]*e2m1f(byte&0xF);
+        float b=(k0+1<K)?x[k0+1]*e2m1f(byte>>4):0.f;
+        acc+=(a+b)*sc;
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
 /* Tiled WMMA down-proj (S>1 prefill). Mirror of `fp8a16_matmul` with the nvfp4 decode. */
 /* SEGMENTED NVFP4 matmul: one launch covers EVERY expert in a layer.
  *
@@ -1580,10 +1626,10 @@ extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
     size_t gemv_shmem = (size_t)I * sizeof(float);
     if (S == 1) {
         /* COLI_NVFP4_WIDE=0 selects the original narrow-read GEMV for A/B. */
-        /* COLI_NVFP4_GEMV: 0=narrow (original), 1=wide read + shared x, 2=wide read and
-         * NO shared x (occupancy variant, default). */
+        /* COLI_NVFP4_GEMV: 0=narrow (original), 1=wide read + shared x, 2=wide
+         * read, no shared x, 3=uint32 full-cache-line read (default). */
         static int s_mode = -1;
-        if (s_mode < 0) { const char *e = getenv("COLI_NVFP4_GEMV"); s_mode = e ? atoi(e) : 2; }
+        if (s_mode < 0) { const char *e = getenv("COLI_NVFP4_GEMV"); s_mode = e ? atoi(e) : 3; }
         const int tpb = 256, wpb = tpb >> 5;
         unsigned blocks = (unsigned)((O + wpb - 1) / wpb);
         if (s_mode == 0)
@@ -1591,6 +1637,12 @@ extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
                 ctx->y, ctx->x, w, bs, t->gscale, I, O);
         else if (s_mode == 1)
             nvfp4_gemv_wide<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        else if (s_mode == 2)
+            nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        else if ((((I + 1) >> 1) & 3) == 0)   /* uint32 loads need Kh % 4 == 0 */
+            nvfp4_gemv_u32<<<blocks, tpb, 0, ctx->stream>>>(
                 ctx->y, ctx->x, w, bs, t->gscale, I, O);
         else
             nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(

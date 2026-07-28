@@ -572,8 +572,9 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
-    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
-    preload_all_experts(&provider, &model.cfg, _maxres);
+    let owned_ids: Vec<u32> = sharding.local_experts(cluster.this_node).collect();
+    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, &owned_ids);
+    preload_all_experts(&provider, &model.cfg, _maxres, &owned_ids);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
@@ -824,8 +825,9 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
-    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
-    preload_all_experts(&provider, &model.cfg, _maxres);
+    let owned_ids: Vec<u32> = sharding.local_experts(cluster.this_node).collect();
+    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, &owned_ids);
+    preload_all_experts(&provider, &model.cfg, _maxres, &owned_ids);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
     }
@@ -2206,6 +2208,7 @@ fn wire_adaptive_cache<P>(
     provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
     cfg: &colibri_core::Config,
     ebits: u32,
+    owned: &[u32],
 ) -> bool
 where
     P: colibri_engine::ExpertProvider + Send + Sync + 'static,
@@ -2237,13 +2240,24 @@ where
     // are exact (for Nemotron this also captures the latent input dim, not `hidden`). The
     // `ebits` estimate is only a fallback: it reflects the *requested* resident dense width
     // (default 8), not the streamed experts' real format, and would mis-decide coverage.
-    let per = match provider.expert(probe_layer, 0) {
+    //
+    // Probe an expert this node **owns**: the sharded provider refuses a peer's expert, so
+    // probing a hardcoded 0 fails on every rank but 0 and silently drops to the `ebits`
+    // fallback — which measured 15.79 MB against Nemotron's real 3.1 MB (5× over).
+    let probe_expert = owned.first().copied().unwrap_or(0) as usize;
+    let per = match provider.expert(probe_layer, probe_expert) {
         Ok(e) => (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64,
         Err(_) => {
             colibri_engine::capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, ebits)
         }
     };
-    let total_expert_bytes = per.saturating_mul(cfg.n_experts as u64).saturating_mul(n_moe);
+    // Only the experts THIS node owns are ever loaded here, so coverage must be measured
+    // against the shard — not `cfg.n_experts`. Using the whole model's count made a 2-rank
+    // worker see ~630 GB against 121 GB of RAM (16% "coverage"), pick the ≫-RAM regime, cap
+    // at 40 GB and never preload — reintroducing the lazy cold-load that #42 fixed, on every
+    // worker, in a way that would only show up as bad 2-node numbers.
+    let owned_experts = if owned.is_empty() { cfg.n_experts as u64 } else { owned.len() as u64 };
+    let total_expert_bytes = per.saturating_mul(owned_experts).saturating_mul(n_moe);
     // Achievable fill without an explicit cap: hold back the process's own peak runtime
     // (KV/activations/staging/read buffers). Coverage is model-intrinsic (does it fit RAM?).
     let natural_fill = total.saturating_sub(ADAPTIVE_FILL_RESERVE);
@@ -2279,8 +2293,15 @@ where
         (false, true) => "near-fit max-residency, fadvise on",
         (false, false) => "≫-RAM fill, page cache kept",
     };
+    // Name the shard when this node owns only part of the model — otherwise a 2-node log
+    // reads as though the box holds the whole thing and the coverage number looks like a bug.
+    let scope = if owned_experts < cfg.n_experts as u64 {
+        format!(" (shard: {owned_experts}/{} experts)", cfg.n_experts)
+    } else {
+        String::new()
+    };
     eprintln!(
-        "[cache] {regime}: ~{} GB experts / {} GB RAM ({covers_pct}% coverage) → fill to ~{} GB, \
+        "[cache] {regime}: ~{} GB experts{scope} / {} GB RAM ({covers_pct}% coverage) → fill to ~{} GB, \
          LRU-evict under pressure (hard floor {} GB) — never OOM",
         total_expert_bytes >> 30,
         total >> 30,
@@ -2309,6 +2330,7 @@ fn preload_all_experts<P>(
     provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
     cfg: &colibri_core::Config,
     max_residency: bool,
+    owned: &[u32],
 ) where
     P: colibri_engine::ExpertProvider + Send + Sync + 'static,
 {
@@ -2331,7 +2353,14 @@ fn preload_all_experts<P>(
             .map(|(i, _)| i)
             .collect()
     };
-    let all: Vec<usize> = (0..cfg.n_experts as usize).collect();
+    // Only this node's own experts: the sharded provider refuses a peer's, so preloading
+    // `0..n_experts` on a worker fails on the first unowned id and drops the WHOLE node back
+    // to lazy loading.
+    let all: Vec<usize> = if owned.is_empty() {
+        (0..cfg.n_experts as usize).collect()
+    } else {
+        owned.iter().map(|&e| e as usize).collect()
+    };
     let t = std::time::Instant::now();
     for &l in &moe_layers {
         if let Err(e) = provider.prefetch(l, &all) {

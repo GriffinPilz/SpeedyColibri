@@ -776,20 +776,76 @@ fn copy_raw(name: &str, shards: &Shards) -> io::Result<ReqOut> {
 
 /// Re-quantize one container tensor: expert e4m3 weight → NVFP4; its `.qs` dropped;
 /// everything else copied through byte-for-byte.
+/// Re-encode one **resident** int8 weight as NVFP4, or `None` to copy it through.
+///
+/// Resident weights live in the container as raw i8 codes plus a per-row f32 `.qs`
+/// scale. Dequantize to f32 and re-encode with the same NVFP4 writer the experts use, so
+/// the on-disk layout is identical: `W` = e2m1 nibbles `O*ceil(I/2)` CONCATENATED with
+/// ue4m3 block scales `O*ceil(I/16)`, plus a `W.g` F32 global. Concatenation is what lets
+/// the loader take the block scales in the same coalesced read as the weight.
+///
+/// Returns `None` (copy through) unless the tensor really is a 2-D int8 blob with a
+/// matching `.qs`. A resident tensor that is already f32, or any shape we do not
+/// recognise, is left exactly as it was rather than guessed at — silently re-encoding
+/// something unexpected is how a converter corrupts a model.
+fn requant_resident_one(name: &str, shards: &Shards) -> io::Result<Option<ReqOut>> {
+    let t = shards
+        .find(name)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}")))?;
+    let Ok((o, i)) = two_dims(&t.shape, name) else {
+        return Ok(None); // not 2-D — norms and friends copy through
+    };
+    let qs_name = format!("{name}.qs");
+    // int8 iff one byte per element AND a per-row scale exists. Anything else (already
+    // f32, or some other width) is not ours to touch.
+    if t.numel as usize != o * i || t.nbytes as usize != o * i || !shards.has(&qs_name) {
+        return Ok(None);
+    }
+    let mut codes = vec![0u8; o * i];
+    shards.read_raw(name, &mut codes)?;
+    let mut qs = vec![0f32; o];
+    shards.read_f32(&qs_name, &mut qs)?;
+    let mut w = vec![0f32; o * i];
+    for r in 0..o {
+        let sc = qs[r];
+        for c in 0..i {
+            w[r * i + c] = codes[r * i + c] as i8 as f32 * sc;
+        }
+    }
+    let (mut blob, bsc, g) = quantize_nvfp4(&w, o, i);
+    blob.extend_from_slice(&bsc);
+    Ok(Some(ReqOut::Nvfp4(
+        OutTensor { name: name.to_string(), dtype: "U8", shape: vec![blob.len() as i64], bytes: blob },
+        OutTensor { name: format!("{name}.g"), dtype: "F32", shape: vec![1], bytes: f32_bytes(&[g]) },
+    )))
+}
+
 fn requant_one(
     name: &str,
     shards: &Shards,
     n_layers: usize,
     hidden: usize,
     moe_inter: usize,
+    resident_nvfp4: bool,
 ) -> io::Result<ReqOut> {
-    // A per-row `.qs` belonging to an expert weight is consumed by that weight's NVFP4
-    // encoding (which reads it to dequant e4m3); drop it. Resident `.qs` copies through.
+    // A per-row `.qs` belonging to a weight we re-encode as NVFP4 is consumed by that
+    // encoding (it is read to dequant), so drop it. Every other `.qs` copies through.
     if let Some(base) = name.strip_suffix(".qs") {
-        if classify(base, n_layers, true, false) == Kind::X {
+        let k = classify(base, n_layers, true, false);
+        if k == Kind::X || (resident_nvfp4 && k == Kind::Q) {
             return Ok(ReqOut::Skip);
         }
         return copy_raw(name, shards);
+    }
+    // Resident weight → NVFP4. `Kind::Q` is exactly the set the quality gate measured
+    // (attention q/k/v/o, Mamba in_proj/out_proj, fc1/fc2_latent, shared experts);
+    // embeddings and `lm_head` are `Kind::Io` and are deliberately NOT touched — they
+    // were never simulated, and the io tier is quality-critical.
+    if resident_nvfp4 && name.ends_with(".weight") && classify(name, n_layers, true, false) == Kind::Q
+    {
+        if let Some(out) = requant_resident_one(name, shards)? {
+            return Ok(out);
+        }
     }
     if name.ends_with(".weight") && classify(name, n_layers, true, false) == Kind::X {
         let (o, i) = expert_oi(name, hidden, moe_inter);
@@ -842,6 +898,7 @@ pub fn requant_experts_nvfp4(
     n_layers: usize,
     hidden: usize,
     moe_inter: usize,
+    resident_nvfp4: bool,
     mut progress: impl FnMut(usize, usize, &ConvertStats),
 ) -> io::Result<ConvertStats> {
     let indir = indir.as_ref();
@@ -876,7 +933,7 @@ pub fn requant_experts_nvfp4(
                     scope.spawn(move || {
                         slice
                             .iter()
-                            .map(|&nm| requant_one(nm, sref, n_layers, hidden, moe_inter))
+                            .map(|&nm| requant_one(nm, sref, n_layers, hidden, moe_inter, resident_nvfp4))
                             .collect::<io::Result<Vec<_>>>()
                     })
                 })
@@ -1959,6 +2016,45 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn resident_nvfp4_blob_matches_the_loader_layout() {
+        // The converter and the runtime loader agree by CONVENTION, not by a shared type:
+        // the weight blob is nibbles ++ block-scales and `.g` carries the global. If either
+        // side drifts, every resident weight silently decodes to garbage. Pin the contract:
+        // encode, then decode the way `moe.rs`/`linear.rs` do, and compare to the input.
+        let (o, i) = (3usize, 32usize);
+        let w: Vec<f32> =
+            (0..o * i).map(|k| ((k as f32) * 0.317).sin() * (1.0 + (k % 5) as f32)).collect();
+        let (mut blob, bsc, g) = quantize_nvfp4(&w, o, i);
+        let nib_bytes = o * i.div_ceil(2);
+        let bs_bytes = o * i.div_ceil(16);
+        assert_eq!(blob.len(), nib_bytes, "nibble section size");
+        assert_eq!(bsc.len(), bs_bytes, "block-scale section size");
+        blob.extend_from_slice(&bsc); // exactly what requant_resident_one writes
+
+        // Decode as the runtime does: nibbles from the head, ue4m3 block scales from the
+        // tail, times the per-tensor global.
+        let nb = i.div_ceil(16);
+        let mut got = vec![0f32; o * i];
+        for r in 0..o {
+            for c in 0..i {
+                let byte = blob[r * (i / 2) + c / 2];
+                let nib = if c % 2 == 1 { byte >> 4 } else { byte & 0x0f } as usize;
+                let sf = colibri_core::dtype::f8e4m3_to_f32(blob[nib_bytes + r * nb + c / 16]);
+                got[r * i + c] = E2M1[nib] * sf * g;
+            }
+        }
+        // NVFP4 is lossy; assert it reconstructs to its own error floor, not exactly.
+        let (mut se, mut sr) = (0f64, 0f64);
+        for (a, b) in got.iter().zip(&w) {
+            se += ((a - b) as f64).powi(2);
+            sr += (*b as f64).powi(2);
+        }
+        let rel = (se / sr).sqrt();
+        assert!(rel < 0.15, "resident nvfp4 round trip rel-rms {rel} — layout mismatch?");
+        assert!(got.iter().any(|v| *v != 0.0), "decoded all zeros — layout mismatch");
+    }
+
     fn classify_rules() {
         assert_eq!(classify("model.embed_tokens.weight", 78, false, false), Kind::Io);
         assert_eq!(classify("lm_head.weight", 78, false, false), Kind::Io);

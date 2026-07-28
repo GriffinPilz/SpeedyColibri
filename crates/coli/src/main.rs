@@ -326,6 +326,22 @@ fn cmd_requant_nvfp4(args: &[String]) -> ExitCode {
     eprintln!(
         "[requant-nvfp4] {indir} -> {outdir}  (hidden={hidden} moe_inter={moe_inter} n_layers={n_layers})"
     );
+    // `COLI_RESIDENT_NVFP4=1` also re-encodes the RESIDENT weights (Kind::Q: attention
+    // q/k/v/o, Mamba in_proj/out_proj, fc1/fc2_latent, shared experts) from int8 to NVFP4.
+    // Embeddings/lm_head (Kind::Io) are never touched. Measured 0 ± 1.5% perplexity across
+    // three corpora, and it is the single-box decode lever: 8.87 -> 6.18 GB/token.
+    //
+    // NOTE: there is no GPU NVFP4 dense kernel yet, so a container built this way runs the
+    // resident matmuls on the single-threaded CPU path. It is CORRECT but slow — convert it
+    // to validate tokens/perplexity, do NOT benchmark speed against it.
+    let resident_nvfp4 = std::env::var("COLI_RESIDENT_NVFP4").ok().as_deref() == Some("1");
+    if resident_nvfp4 {
+        eprintln!(
+            "[requant-nvfp4] RESIDENT weights -> NVFP4 too (embeddings/lm_head untouched). \
+             No GPU dense NVFP4 kernel exists yet: this container is for correctness and \
+             perplexity only, NOT for speed measurement."
+        );
+    }
     let t0 = std::time::Instant::now();
     let res = colibri_engine::requant_experts_nvfp4(
         indir,
@@ -333,6 +349,7 @@ fn cmd_requant_nvfp4(args: &[String]) -> ExitCode {
         n_layers,
         hidden,
         moe_inter,
+        resident_nvfp4,
         |fi, n, st| {
             eprintln!(
                 "[requant-nvfp4] shard {:>3}/{n}  experts_nvfp4={} copied={} skipped={}  out={:.1} GB  {:.0}s",

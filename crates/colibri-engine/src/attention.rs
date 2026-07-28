@@ -357,6 +357,18 @@ pub fn attention_gqa(
             scale,
             gqa_kernel_mode(),
         );
+        // COLI_GQA_DEBUG=1: report the first few decode-shaped calls. `gpu_done=false`
+        // here means the kernel DECLINED and the CPU core below silently ran anyway —
+        // indistinguishable from the gate never opening unless you print it.
+        if s_len == 1 && std::env::var("COLI_GQA_DEBUG").ok().as_deref() == Some("1") {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                eprintln!(
+                    "[gqa] S=1 gpu_done={gpu_done} st0={st0} t={t_full} h={h} kvh={kvh} hd={hd} mode={}",
+                    gqa_kernel_mode()
+                );
+            }
+        }
     }
 
     // CPU core (dense or block-sparse), used unless the GPU handled it above.

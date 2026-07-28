@@ -451,6 +451,29 @@ pub fn kimi_forward<P: ExpertProvider>(
     // `from_json_kimi` range-checks `attn_res_block_size`, so it cannot be 0 here.
     let mut st = AttnResState::new(embeddings, cfg.attn_res_block_size as usize);
 
+    // COLI_DEBUG_ACT=1: the same localisation aid `forward` has, which this path would
+    // otherwise skip entirely. It reports the ACCUMULATOR, not a hidden state — K3 has no
+    // hidden state — plus the candidate count, because a `prefix` norm is only meaningful
+    // alongside how many blocks the next mix will average over, and a reset shows up as a
+    // sudden drop that is expected at each boundary rather than a sign of divergence.
+    let dbg_act = std::env::var("COLI_DEBUG_ACT").ok().as_deref() == Some("1");
+    let pnorm = |tag: &str, p: &[f32], blocks: usize| {
+        if s == 0 {
+            return;
+        }
+        let n = |r: &[f32]| r.iter().map(|v| v * v).sum::<f32>().sqrt();
+        eprintln!(
+            "[act] {tag}: |prefix[0]|={:.4} |prefix[{}]|={:.4} blocks={blocks} p[0][..4]={:?}",
+            n(&p[..d]),
+            s - 1,
+            n(&p[(s - 1) * d..s * d]),
+            &p[..4.min(d)]
+        );
+    };
+    if dbg_act {
+        pnorm("embed", &st.prefix, st.blocks.len());
+    }
+
     let mut h = vec![0f32; s * d]; // sublayer input, after the attn-res mix
     let mut nrm = vec![0f32; s * d];
     let mut tmp = vec![0f32; s * d];
@@ -501,6 +524,12 @@ pub fn kimi_forward<P: ExpertProvider>(
             timed(&DENSE_US, || dense_mlp(l, &nrm, s, &mut tmp));
         }
         st.accumulate(&tmp);
+        // Every layer, not just the first few: on a 93-layer stack with a reset every 12
+        // the interesting failure is usually a drift or a blow-up partway down, and the
+        // block boundaries are only legible if you can see all of them.
+        if dbg_act {
+            pnorm(&format!("layer{li}"), &st.prefix, st.blocks.len());
+        }
     }
 
     // Model-level attention residual, then hand back the RAW state.

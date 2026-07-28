@@ -13,12 +13,29 @@
 //! let text = t.decode(&ids);
 //! ```
 
+mod unicode_k3;
 mod unicode_tables;
 
 use colibri_json::Json;
 use std::collections::HashMap;
 use std::path::Path;
+use unicode_k3::{is_han, is_k3_lower, is_k3_upper};
 use unicode_tables::{is_l, is_n, is_s};
+
+/// Which pre-tokenizer split a model uses.
+///
+/// The two are NOT interchangeable: measured on `scripts/compare_pretok.py`, they agree
+/// on only 5 of 8 representative cases. Feeding K3 text through the cl100k split silently
+/// produces different token ids for contractions (`it's` -> `it` + `'s`), case
+/// transitions (`getHTTPResponse` stays whole instead of splitting at `HTTP`), and
+/// Latin/Han adjacency (` 北京` vs ` ` + `北京`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreTok {
+    /// The cl100k / tiktoken pattern — GLM, MiniMax, Nemotron.
+    Cl100k,
+    /// Kimi-K3's `pat_str` from `tokenization_kimi.py`.
+    KimiK3,
+}
 
 /// An added token (special or not): matched atomically, emitted literally.
 #[derive(Debug, Clone)]
@@ -43,6 +60,8 @@ pub struct Tokenizer {
     byte2str: Vec<Vec<u8>>,
     /// codepoint (< 1024) -> original byte, or -1
     cp2byte: [i16; 1024],
+    /// which pre-tokenizer split to apply, detected from `pre_tokenizer` at load
+    pretok: PreTok,
 }
 
 impl Tokenizer {
@@ -147,7 +166,13 @@ impl Tokenizer {
             specials,
             byte2str,
             cp2byte,
+            pretok: detect_pretok(root),
         })
+    }
+
+    /// Which pre-tokenizer split this tokenizer applies (detected at load).
+    pub fn pretok(&self) -> PreTok {
+        self.pretok
     }
 
     /// Total id space (max id + 1).
@@ -291,7 +316,7 @@ impl Tokenizer {
         }
     }
 
-    /// Pre-tokenizer over `p[a..b)`: decode codepoints, apply the cl100k
+    /// Pre-tokenizer over `p[a..b)`: decode codepoints, apply this tokenizer's
     /// alternatives in order, and BPE each piece. Port of `pretok_chunk`.
     fn pretok_chunk(&self, p: &[u8], a: usize, b: usize, out: &mut Vec<i32>) {
         if b <= a {
@@ -310,6 +335,14 @@ impl Tokenizer {
             }
             off.push(b);
         }
+        match self.pretok {
+            PreTok::Cl100k => self.split_cl100k(p, &cp, &off, out),
+            PreTok::KimiK3 => self.split_k3(p, &cp, &off, out),
+        }
+    }
+
+    /// The cl100k alternatives, in order.
+    fn split_cl100k(&self, p: &[u8], cp: &[u32], off: &[usize], out: &mut Vec<i32>) {
         let n = cp.len();
         let is_nl = |c: u32| c == b'\r' as u32 || c == b'\n' as u32;
         let low = |c: u32| {
@@ -442,6 +475,307 @@ impl Tokenizer {
             self.bpe_piece(p, off[start], off[i], out);
         }
     }
+
+    /// Kimi-K3's alternatives, in order. From `tokenization_kimi.py`:
+    ///
+    /// ```text
+    ///   1  [\p{Han}]+
+    ///   2  [^\r\n\p{L}\p{N}]? [U]* [L]+ (?i:'s|'t|'re|'ve|'m|'ll|'d)?
+    ///   3  [^\r\n\p{L}\p{N}]? [U]+ [L]* (?i:'s|'t|'re|'ve|'m|'ll|'d)?
+    ///   4  \p{N}{1,3}
+    ///   5   ?[^\s\p{L}\p{N}]+[\r\n]*
+    ///   6  \s*[\r\n]+
+    ///   7  \s+(?!\S)
+    ///   8  \s+
+    /// ```
+    ///
+    /// `U` is [`is_k3_upper`] and `L` is [`is_k3_lower`] — they OVERLAP (`Lm`, `Lo`, `M`
+    /// are in both), differing only in `Lu`/`Lt` vs `Ll`. Alternatives 4-8 are cl100k's
+    /// 3-7 verbatim; 1-3 are what differ, and the contraction is a SUFFIX here rather
+    /// than a leading alternative of its own.
+    ///
+    /// Alternation is leftmost-first, and the quantifiers are greedy with backtracking:
+    /// alternative 2's `[U]*` has to give ground until a lower-ish character follows,
+    /// which is what splits `getHTTPResponse` into `get` + `HTTPResponse` rather than
+    /// letting the uppercase run swallow the tail.
+    fn split_k3(&self, p: &[u8], cp: &[u32], off: &[usize], out: &mut Vec<i32>) {
+        let mut start = 0usize;
+        for end in k3_piece_ends(cp) {
+            self.bpe_piece(p, off[start], off[end], out);
+            start = end;
+        }
+    }
+}
+
+/// Codepoint indices at which each Kimi-K3 pre-token ends (so piece `i` spans
+/// `ends[i-1]..ends[i]`, with `ends` strictly increasing and ending at `cp.len()`).
+///
+/// Split out from [`Tokenizer::split_k3`] so the pattern can be tested against the
+/// reference `regex` implementation without building a whole `Tokenizer` — the splitting
+/// is the part that has to be exactly right, and BPE on top of it is already covered.
+fn k3_piece_ends(cp: &[u32]) -> Vec<usize> {
+    let n = cp.len();
+    let mut ends = Vec::new();
+    {
+        let is_nl = |c: u32| c == b'\r' as u32 || c == b'\n' as u32;
+        // The optional `[^\r\n\p{L}\p{N}]` prefix on alternatives 2 and 3.
+        let can_prefix = |c: u32| !is_nl(c) && !is_l(c) && !is_n(c);
+
+        let mut i = 0usize;
+        while i < n {
+            let c = cp[i];
+
+            // 1) [\p{Han}]+
+            if is_han(c) {
+                let mut j = i;
+                while j < n && is_han(cp[j]) {
+                    j += 1;
+                }
+                i = j;
+                ends.push(i);
+                continue;
+            }
+
+            // 2) and 3): each is `[^\r\n\p{L}\p{N}]?` followed by a letter-run shape.
+            //
+            // ORDER MATTERS, and the obvious nesting is the wrong one. Alternation is
+            // leftmost-first over WHOLE alternatives, and the optional prefix backtracks
+            // *inside* one, so the real order is:
+            //     alt2+prefix, alt2 bare, alt3+prefix, alt3 bare.
+            // Trying both shapes per prefix choice instead lets alt3+prefix win where the
+            // reference falls back to a bare alt2 — e.g. a combining mark followed by an
+            // uppercase letter, where `Mn` is both a legal prefix and a legal lower-ish
+            // run of its own (`"\u{327}Б"` -> `["\u{327}", "Б"]`, not `["\u{327}Б"]`).
+            // Found by `scripts/fuzz_k3_pretok.py`; the curated fixture missed it.
+            let mut matched = false;
+            'alts: for alt in [k3_alt2, k3_alt3] {
+                for use_prefix in [true, false] {
+                    let body = if use_prefix {
+                        if !can_prefix(c) {
+                            continue; // this char cannot serve as the prefix
+                        }
+                        i + 1
+                    } else {
+                        i
+                    };
+                    if let Some(end) = alt(cp, body) {
+                        i = end + contraction_len(cp, end);
+                        ends.push(i);
+                        matched = true;
+                        break 'alts;
+                    }
+                }
+            }
+            if matched {
+                continue;
+            }
+
+            // 4) \p{N}{1,3}
+            if is_n(c) {
+                let mut j = i;
+                let mut k = 0;
+                while j < n && is_n(cp[j]) && k < 3 {
+                    j += 1;
+                    k += 1;
+                }
+                i = j;
+                ends.push(i);
+                continue;
+            }
+
+            // 5) ' ?[^\s\p{L}\p{N}]+[\r\n]*'
+            {
+                let mut j = i;
+                if c == b' ' as u32
+                    && j + 1 < n
+                    && !is_s(cp[j + 1])
+                    && !is_l(cp[j + 1])
+                    && !is_n(cp[j + 1])
+                {
+                    j += 1;
+                }
+                if j < n && !is_s(cp[j]) && !is_l(cp[j]) && !is_n(cp[j]) {
+                    while j < n && !is_s(cp[j]) && !is_l(cp[j]) && !is_n(cp[j]) {
+                        j += 1;
+                    }
+                    while j < n && is_nl(cp[j]) {
+                        j += 1;
+                    }
+                    i = j;
+                    ends.push(i);
+                    continue;
+                }
+            }
+
+            // 6) \s*[\r\n]+ , then 7) \s+(?!\S) , then 8) \s+
+            {
+                let mut r = i;
+                while r < n && is_s(cp[r]) {
+                    r += 1;
+                }
+                if r > i {
+                    // Last newline inside the whitespace run: `\s*[\r\n]+` is greedy on
+                    // the trailing `[\r\n]+`, so the piece ends after it.
+                    let last = cp[i..r].iter().rposition(|&c| is_nl(c)).map(|k| i + k);
+                    if let Some(last) = last {
+                        i = last + 1;
+                        ends.push(i);
+                        continue;
+                    }
+                    let mut end = if r < n { r - 1 } else { r };
+                    if end <= i {
+                        end = i + 1;
+                    }
+                    i = end;
+                    ends.push(i);
+                    continue;
+                }
+            }
+
+            // safety net: shouldn't happen
+            i += 1;
+            ends.push(i);
+        }
+    }
+    ends
+}
+
+/// Split `text` with Kimi-K3's pre-tokenizer pattern, returning the pieces in order.
+///
+/// The pieces concatenate back to `text` exactly — the pattern's alternatives cover every
+/// codepoint, so nothing is dropped. Public so the split can be diffed against the
+/// reference `regex` implementation (see `tests/k3_pretok.rs`) and inspected directly
+/// when a K3 tokenization looks wrong; [`Tokenizer::encode`] applies it automatically for
+/// a tokenizer whose `pre_tokenizer` carries K3's pattern.
+pub fn k3_pretokenize(text: &str) -> Vec<&str> {
+    let p = text.as_bytes();
+    let mut cp: Vec<u32> = Vec::new();
+    let mut off: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i < p.len() {
+        let (c, k) = u8_next(p, i);
+        off.push(i);
+        cp.push(c);
+        i += k;
+    }
+    off.push(p.len());
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for end in k3_piece_ends(&cp) {
+        out.push(&text[off[start]..off[end]]);
+        start = end;
+    }
+    out
+}
+
+/// K3 alternative 2's body: `[U]* [L]+`, returning the codepoint index just past the
+/// match. The caller adds any contraction suffix.
+///
+/// `[U]*` is greedy but must leave a lower-ish character behind it, so it backtracks from
+/// the longest upper-ish run downwards. That is not decoration — the two classes OVERLAP
+/// (`Lm`, `Lo`, `M` are in both), so a shorter `[U]*` genuinely succeeds where the
+/// longest one fails.
+fn k3_alt2(cp: &[u32], b: usize) -> Option<usize> {
+    let n = cp.len();
+    if b >= n {
+        return None;
+    }
+    let mut u_end = b;
+    while u_end < n && is_k3_upper(cp[u_end]) {
+        u_end += 1;
+    }
+    // Walk the split point down from the longest upper-ish prefix; the first one with a
+    // lower-ish character after it is what a backtracking engine settles on.
+    let mut k = u_end;
+    loop {
+        if k < n && is_k3_lower(cp[k]) {
+            let mut e = k;
+            while e < n && is_k3_lower(cp[e]) {
+                e += 1;
+            }
+            return Some(e);
+        }
+        if k == b {
+            return None;
+        }
+        k -= 1;
+    }
+}
+
+/// K3 alternative 3's body: `[U]+ [L]*`.
+///
+/// No backtracking needed: the longest upper-ish run always succeeds, because `[L]*` is
+/// allowed to be empty.
+fn k3_alt3(cp: &[u32], b: usize) -> Option<usize> {
+    let n = cp.len();
+    let mut u_end = b;
+    while u_end < n && is_k3_upper(cp[u_end]) {
+        u_end += 1;
+    }
+    if u_end == b {
+        return None;
+    }
+    let mut e = u_end;
+    while e < n && is_k3_lower(cp[e]) {
+        e += 1;
+    }
+    Some(e)
+}
+
+/// Pick the pre-tokenizer split from `tokenizer.json`'s recorded `pre_tokenizer`.
+///
+/// Keyed on the literal `&&[^\p{Han}]` — the character-class INTERSECTION that K3's
+/// pattern uses to exclude Han from its two letter classes. Deliberately narrower than
+/// just `\p{Han}`: plenty of tokenizers name Han in their split (a Qwen-style pattern
+/// does), and misrouting one of those into the K3 split would silently change its token
+/// ids. The `&&` intersection is ICU syntax that the cl100k family never uses.
+///
+/// Verified against the containers on the bench box: `\p{Han}` appears in none of
+/// GLM-5.2, MiniMax-M3, MiniMax-M2.7 or Nemotron-3-Super, so all four keep
+/// [`PreTok::Cl100k`] and tokenize byte-identically to before. Anything unrecognised
+/// stays `Cl100k`, which is the safe default — it is what every pre-K3 model wants.
+fn detect_pretok(root: &Json) -> PreTok {
+    fn scan(j: &Json) -> bool {
+        match j {
+            Json::Str(s) => s.contains(r"&&[^\p{Han}]"),
+            Json::Arr(a) => a.iter().any(scan),
+            Json::Obj(o) => o.iter().any(|(_, v)| scan(v)),
+            _ => false,
+        }
+    }
+    match root.get("pre_tokenizer") {
+        Some(p) if scan(p) => PreTok::KimiK3,
+        _ => PreTok::Cl100k,
+    }
+}
+
+/// Length in codepoints of a `(?i:'s|'t|'re|'ve|'m|'ll|'d)` at `cp[i]`, else 0.
+///
+/// Shared by both splits, but they use it differently: cl100k matches it as a standalone
+/// leading alternative, K3 only as an optional SUFFIX on its two letter alternatives.
+/// That single difference is why `it's` is one piece on K3 and two on cl100k.
+fn contraction_len(cp: &[u32], i: usize) -> usize {
+    let n = cp.len();
+    if i >= n || cp[i] != b'\'' as u32 || i + 1 >= n {
+        return 0;
+    }
+    let low = |c: u32| if (b'A' as u32..=b'Z' as u32).contains(&c) { c + 32 } else { c };
+    let d = low(cp[i + 1]);
+    if i + 2 < n {
+        let d2 = low(cp[i + 2]);
+        // 're, 've, 'll
+        let two = matches!(
+            (d, d2),
+            (0x72, 0x65) | (0x76, 0x65) | (0x6C, 0x6C) // r-e, v-e, l-l
+        );
+        if two {
+            return 3;
+        }
+    }
+    if d == b's' as u32 || d == b't' as u32 || d == b'm' as u32 || d == b'd' as u32 {
+        return 2;
+    }
+    0
 }
 
 /// merge-map key: `left` bytes, a NUL separator, then `right` bytes.

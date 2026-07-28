@@ -189,7 +189,7 @@ pub static UNI_S: &[(u32, u32)] = &[
 ];
 
 /// Binary-search a codepoint in a sorted, non-overlapping range table.
-fn uni_in(table: &[(u32, u32)], cp: u32) -> bool {
+pub(crate) fn uni_in(table: &[(u32, u32)], cp: u32) -> bool {
     let (mut lo, mut hi) = (0isize, table.len() as isize - 1);
     while lo <= hi {
         let m = ((lo + hi) >> 1) as usize;

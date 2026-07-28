@@ -112,10 +112,23 @@ pub struct Layer {
     /// `[head_dim]` output RMSNorm weight, applied per head
     pub kda_o_norm: Vec<f32>,
 
-    // ---- Kimi-K3 attention residuals (every layer) ----
-    // A second residual path alongside the ordinary one: each of the two sublayers
-    // gets a norm plus a `[1, hidden]` projection that collapses the hidden state to
-    // one scalar per token. No other arch in the tree has this.
+    // ---- Kimi-K3 "attention residuals" (every layer) ----
+    // NOT a residual add, despite the name. K3 has NO ordinary residual stream: these
+    // drive a softmax attention over a stack of saved hidden states, which REPLACES the
+    // running state rather than adding to it (reference `_apply_attn_res`):
+    //
+    //     v      = [block_residual ; prefix_sum]        // [tokens, blocks+1, hidden]
+    //     k      = v * rsqrt(mean(v^2) + eps)           // RMSNorm each candidate
+    //     scores = sum(k * (res_norm * res_proj))       // the two [hidden] vecs multiplied
+    //     out    = softmax(scores) @ v                  // weighted avg of the RAW v
+    //
+    // So `*_res_norm` and `*_res_proj` are not a norm and a projection applied in
+    // sequence — they are multiplied elementwise into ONE `[hidden]` score vector. The
+    // `[1, hidden]` shape of `*_res_proj` is why it looks like a projection.
+    //
+    // `block_residual` grows by one entry every `attn_res_block_size` (12) layers and
+    // `prefix_sum` accumulates sublayer outputs across the whole stack, so this cannot
+    // be evaluated per-layer — it needs stack-level state (see the driver).
     pub attn_res_norm: Vec<f32>,
     pub attn_res_proj: Vec<f32>,
     pub mlp_res_norm: Vec<f32>,

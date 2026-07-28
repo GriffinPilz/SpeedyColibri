@@ -353,9 +353,14 @@ fn load_layer_nemotron_kind(
     Ok(l)
 }
 
-/// Load one Kimi-K3 layer. Two mixers share the layer shape — `in_ln` -> mixer ->
-/// residual -> `post_ln` -> FFN -> residual, the ordinary two-sublayer form — and
-/// which mixer runs is `cfg.layer_kind[i]`, never the tensor names.
+/// Load one Kimi-K3 layer. Both mixers share the same weight set; which one runs is
+/// `cfg.layer_kind[i]`, never the tensor names.
+///
+/// NOTE the layer is NOT the ordinary two-sublayer `x += attn(ln(x))` form. K3 has no
+/// residual stream at all: a `prefix_sum` accumulates sublayer outputs and the running
+/// state is recomputed by a softmax attention over saved states (see the
+/// `attn_res_*`/`mlp_res_*` note on [`Layer`]). That only affects the driver — the
+/// weights loaded here are the same either way.
 ///
 /// * **KDA** ([`LayerKind::Kda`], 69 layers): q/k/v projections (reusing the GQA
 ///   fields), a per-head decay projection `b_proj`, a factored forget gate
@@ -369,8 +374,9 @@ fn load_layer_nemotron_kind(
 /// Both carry `g_proj`, the output gate, on top of the shared `o` projection — the
 /// header sweep confirmed it on all 93 layers, not just one mixer's.
 ///
-/// Every layer also carries the attention-residual pair (`*_res_norm` + a
-/// `[1, hidden]` `*_res_proj`), which no other arch has.
+/// Every layer also carries the attention-residual score vectors (`*_res_norm` and the
+/// `[1, hidden]` `*_res_proj`), which no other arch has — they are multiplied into one
+/// `[hidden]` vector at use, not applied as a norm then a projection.
 fn load_layer_kimi(
     shards: &colibri_safetensors::Shards,
     cfg: &Config,

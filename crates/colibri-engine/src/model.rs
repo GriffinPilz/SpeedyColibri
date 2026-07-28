@@ -190,6 +190,16 @@ pub struct KvCache {
     /// conv channel count `conv_dim` (cols per `mamba_conv` entry); 0 if unused.
     mamba_conv_dim: usize,
 
+    // ---- Kimi-K3 KDA recurrent state (per KDA layer; empty otherwise) ----
+    // Fixed-size like the Mamba2 state above and for the same reason: a delta rule
+    // carries a bounded association matrix between steps, so its memory is O(1) in
+    // context. Populated by [`KvCache::enable_kda`].
+    /// per-KDA-layer causal-conv history, each `[d_conv, 3 * n_heads * head_dim]`
+    /// (q, k and v each have their own `*_conv1d`), time-major.
+    kda_conv: Vec<Vec<f32>>,
+    /// per-KDA-layer delta-rule association matrix, each `[n_heads, head_dim, head_dim]`.
+    kda_state: Vec<Vec<f32>>,
+
     /// first valid position per layer (MTP partial caches start mid-sequence)
     pub kv_start: Vec<usize>,
     /// device-side KV shadow (persistent-KV GPU decode path); lazily allocated
@@ -242,6 +252,8 @@ impl KvCache {
             mamba_ssm: (0..n_rows).map(|_| SsmState::zeros(0, 0, 0)).collect(),
             mamba_d_conv: 0,
             mamba_conv_dim: 0,
+            kda_conv: vec![Vec::new(); n_rows],
+            kda_state: vec![Vec::new(); n_rows],
             kv_start: vec![0; n_rows],
             #[cfg(feature = "cuda")]
             dev: None,
@@ -285,6 +297,45 @@ impl KvCache {
         }
     }
 
+    /// Element counts of one KDA layer's two fixed-size buffers, as f32 counts:
+    /// `(conv_history, delta_rule_state)`.
+    ///
+    /// The single source of truth for both [`KvCache::enable_kda`], which allocates
+    /// them, and [`KvCache::fixed_bytes`], which charges for them. Every past KV
+    /// accounting bug in this file was a second copy of a shape drifting from the
+    /// allocation, so there is deliberately only one copy of this one.
+    fn kda_state_lens(cfg: &Config) -> (usize, usize) {
+        let (nh, hd) = (cfg.kda_n_heads as usize, cfg.kda_head_dim as usize);
+        // q, k and v each carry their own `*_conv1d` over `nh * hd` channels.
+        let conv = cfg.kda_d_conv as usize * 3 * nh * hd;
+        // A delta rule keeps one `[head_dim, head_dim]` association matrix per head.
+        let state = nh * hd * hd;
+        (conv, state)
+    }
+
+    /// Enable the Kimi-K3 KDA recurrent state: for each [`LayerKind::Kda`] layer,
+    /// allocate the short causal-conv history and the per-head delta-rule matrix, both
+    /// zeroed. Gated-MLA rows keep empty buffers here and use the KV rows instead.
+    ///
+    /// O(1) in context length, like the Mamba2 state — so these are allocated eagerly
+    /// and charged to [`KvCache::fixed_bytes`], never to the per-token figure. K3
+    /// carries ~475 MB of this per *sequence* across its 69 KDA layers; a reservation
+    /// counting only per-token bytes under-commits by that much for every concurrent
+    /// sequence, and the shortfall is worst for SHORT requests, where the per-token
+    /// term is too small to accidentally cover it.
+    pub(crate) fn enable_kda(&mut self, cfg: &Config) {
+        let (conv, state) = Self::kda_state_lens(cfg);
+        let rows = self.kda_conv.len();
+        for li in 0..rows {
+            // Index by layer so the mixer can address `kda_*(li)` directly. The MTP row
+            // (if any) is past the end of `layer_kind` and is never KDA.
+            if cfg.layer_kind.get(li).copied() == Some(LayerKind::Kda) {
+                self.kda_conv[li] = vec![0.0f32; conv];
+                self.kda_state[li] = vec![0.0f32; state];
+            }
+        }
+    }
+
     /// Allocate a cache sized for `model`, holding up to `max_t` tokens.
     ///
     /// When the model carries an MTP head this allocates one extra row **per head
@@ -319,6 +370,11 @@ impl KvCache {
         if model.cfg.arch == Arch::NemotronH {
             kv.enable_mamba2(&model.cfg);
         }
+        // Kimi-K3 is hybrid on the mixer axis: its 24 gated-MLA layers use the latent
+        // KV rows allocated above, its 69 KDA layers a fixed-size recurrent state.
+        if model.cfg.arch == Arch::KimiK3 {
+            kv.enable_kda(&model.cfg);
+        }
         kv
     }
 
@@ -334,10 +390,15 @@ impl KvCache {
     }
 
     /// How many layers actually hold KV. For a hybrid stack only the attention layers
-    /// do (Nemotron-H: 8 of 88) — `for_model` allocates rows for every layer, but the
-    /// non-attention rows are never written and stay lazily uncommitted, so they cost
-    /// no physical memory and must not be charged for.
-    fn kv_layers(cfg: &Config) -> usize {
+    /// do (Nemotron-H: 8 of 88; Kimi-K3: 24 of 93, the gated-MLA layers) — `for_model`
+    /// allocates rows for every layer, but the non-attention rows are never written and
+    /// stay lazily uncommitted, so they cost no physical memory and must not be charged
+    /// for.
+    ///
+    /// `pub` so the capacity planner reports the same number the reservation uses; it
+    /// used to keep its own copy of this predicate, which is exactly how the earlier
+    /// accounting bugs got in.
+    pub fn kv_layers(cfg: &Config) -> usize {
         if cfg.layer_kind.is_empty() {
             cfg.n_layers as usize
         } else {
@@ -370,25 +431,37 @@ impl KvCache {
         Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4
     }
 
-    /// Per-sequence KV bytes that do **not** scale with context length: the Mamba2
-    /// recurrent state (conv history + selective-scan state) on each Mamba layer.
+    /// Per-sequence KV bytes that do **not** scale with context length: the recurrent
+    /// state carried by every non-attention mixer in a hybrid stack.
     ///
-    /// O(1) in context, but far from free — Nemotron-H carries ~174 MB per sequence
-    /// across its 40 Mamba layers, dominated by the `[n_heads, head_dim, d_state]` scan
-    /// state. A reservation that counts only per-token bytes under-commits by that much
-    /// for every concurrent sequence, and the shortfall is worst for SHORT requests,
-    /// where the per-token term is too small to accidentally cover it.
+    /// Two contributors, one per hybrid arch:
+    /// - **Mamba2** ([`LayerKind::Mamba`], Nemotron-H): conv history + selective-scan
+    ///   state, ~174 MB/sequence across its 40 Mamba layers.
+    /// - **KDA** ([`LayerKind::Kda`], Kimi-K3): conv history + the per-head delta-rule
+    ///   association matrix, ~475 MB/sequence across its 69 KDA layers — dominated by
+    ///   the `[n_heads, head_dim, head_dim]` matrix.
+    ///
+    /// O(1) in context, but far from free. A reservation that counts only per-token
+    /// bytes under-commits by this much for every concurrent sequence, and the shortfall
+    /// is worst for SHORT requests, where the per-token term is too small to accidentally
+    /// cover it. The shapes come from [`KvCache::kda_state_lens`] and `enable_mamba2`'s
+    /// own arithmetic, so this cannot drift from what is actually allocated.
     pub fn fixed_bytes(cfg: &Config) -> usize {
         if cfg.layer_kind.is_empty() {
             return 0;
         }
-        let n_mamba = cfg.layer_kind.iter().filter(|k| **k == LayerKind::Mamba).count();
+        let count = |want: LayerKind| cfg.layer_kind.iter().filter(|k| **k == want).count();
+        // Mamba2 (Nemotron-H). Zero elsewhere: no `Mamba` layers and zeroed dims.
+        let n_mamba = count(LayerKind::Mamba);
         let conv_dim =
             cfg.mamba_inter as usize + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
         let conv = cfg.mamba_d_conv as usize * conv_dim;
         let ssm = cfg.mamba_n_heads as usize * cfg.mamba_head_dim as usize
             * cfg.mamba_d_state as usize;
-        n_mamba * (conv + ssm) * 4
+        // KDA (Kimi-K3). Same: zero unless the stack actually has `Kda` layers.
+        let n_kda = count(LayerKind::Kda);
+        let (kda_conv, kda_state) = Self::kda_state_lens(cfg);
+        (n_mamba * (conv + ssm) + n_kda * (kda_conv + kda_state)) * 4
     }
 
     /// Total resident bytes for a sequence of `n_tokens`: the per-token KV plus the
@@ -637,5 +710,109 @@ mod kv_accounting_tests {
             * (mla + 2 * cfg.n_kv_heads as usize * cfg.qk_head as usize + shadow)
             * 4;
         assert_eq!(KvCache::bytes_per_token(&cfg), expect);
+    }
+
+    /// The real Kimi-K3 geometry (93 layers = 69 KDA + 24 gated-MLA), so the figures the
+    /// admission path depends on are pinned to the model actually served, not a toy.
+    fn kimi_k3_cfg() -> Config {
+        cfg_from(
+            r#"{"model_type":"kimi_k3",
+                "architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{
+                  "hidden_size":7168,"num_hidden_layers":93,"num_attention_heads":96,
+                  "num_key_value_heads":96,"num_experts":896,"num_experts_per_token":16,
+                  "num_shared_experts":2,"moe_intermediate_size":3072,
+                  "intermediate_size":33792,"routed_expert_hidden_size":3584,
+                  "first_k_dense_replace":1,"q_lora_rank":1536,"kv_lora_rank":512,
+                  "qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
+                  "vocab_size":163840,"max_position_embeddings":1048576,
+                  "rms_norm_eps":1e-05,"rope_theta":10000.0,"moe_renormalize":true,
+                  "moe_router_activation_func":"sigmoid","num_expert_group":1,
+                  "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":163586,
+                  "linear_attn_config":{"head_dim":128,"num_heads":96,
+                    "short_conv_kernel_size":4,
+                    "full_attn_layers":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,
+                                        72,76,80,84,88,92,93]}},
+                "vision_config":{"vt_hidden_size":1024}}"#,
+        )
+    }
+
+    /// K3 splits its stack across two mixers, and each is accounted on a different axis:
+    /// the 24 gated-MLA layers hold a context-growing KV cache, the 69 KDA layers a
+    /// fixed-size recurrent state. Charging all 93 layers per token would be ~3.9x over;
+    /// omitting the KDA state (which is what happens if `fixed_bytes` only knows about
+    /// Mamba) leaves ~475 MB per concurrent sequence unreserved.
+    #[test]
+    fn kimi_k3_charges_mla_per_token_and_kda_per_sequence() {
+        let cfg = kimi_k3_cfg();
+        assert_eq!(cfg.n_layers, 93);
+        assert_eq!(KvCache::kv_layers(&cfg), 24, "only the gated-MLA layers hold KV");
+        assert!(!KvCache::allocates_gqa_kv(&cfg), "K3 is MLA: no k_full/v_full");
+
+        // Per token: 24 layers x (kv_lora 512 + qk_rope 64) x f32, doubled by the device
+        // shadow under cuda. 108 KiB/token there, 54 KiB on the host-only build.
+        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
+        let shadow = if cfg!(feature = "cuda") { mla } else { 0 };
+        assert_eq!(KvCache::bytes_per_token(&cfg), 24 * (mla + shadow) * 4);
+
+        // Per sequence: 69 KDA layers x (conv history + delta-rule matrix), O(1) in ctx.
+        let conv = 4 * 3 * 96 * 128; // d_conv x (q,k,v) x n_heads*head_dim
+        let state = 96 * 128 * 128; // [n_heads, head_dim, head_dim]
+        assert_eq!(KvCache::fixed_bytes(&cfg), 69 * (conv + state) * 4);
+        assert_eq!(KvCache::fixed_bytes(&cfg), 474_808_320, "~475 MB per sequence");
+
+        // The fixed term must not scale with context — that is the whole point of it
+        // being separate, and the reason short requests are where it bites.
+        let (pt, fx) = (KvCache::bytes_per_token(&cfg), KvCache::fixed_bytes(&cfg));
+        assert_eq!(KvCache::bytes_for(&cfg, 1), pt + fx);
+        assert_eq!(KvCache::bytes_for(&cfg, 200_000), pt * 200_000 + fx);
+    }
+
+    /// The drift guard. Every KV accounting bug in this file has been a formula that
+    /// disagreed with what was actually allocated, so assert the two against each other
+    /// directly rather than against a second hand-derived constant.
+    #[test]
+    fn kimi_k3_fixed_bytes_equals_what_enable_kda_allocates() {
+        let cfg = kimi_k3_cfg();
+        let mut kv =
+            KvCache::new(cfg.n_layers as usize, cfg.kv_lora as usize, cfg.qk_rope as usize, 1);
+        kv.enable_kda(&cfg);
+
+        let allocated: usize = kv.kda_conv.iter().map(Vec::len).sum::<usize>()
+            + kv.kda_state.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(allocated * 4, KvCache::fixed_bytes(&cfg));
+
+        // ...and it landed on the KDA rows specifically, not on all 93.
+        let populated = kv.kda_state.iter().filter(|v| !v.is_empty()).count();
+        assert_eq!(populated, 69, "only KDA layers carry recurrent state");
+        for (li, k) in cfg.layer_kind.iter().enumerate() {
+            let has_state = !kv.kda_state[li].is_empty();
+            assert_eq!(has_state, *k == LayerKind::Kda, "layer {li} state/kind mismatch");
+        }
+    }
+
+    /// A KDA layer must never be charged as a Mamba one or vice versa: the two live in
+    /// the same `fixed_bytes` sum and are distinguished only by `LayerKind`.
+    #[test]
+    fn kda_and_mamba_fixed_state_do_not_bleed_into_each_other() {
+        let k3 = kimi_k3_cfg();
+        assert_eq!(k3.mamba_n_heads, 0, "K3 sets no Mamba dims");
+        assert!(!k3.layer_kind.contains(&LayerKind::Mamba));
+
+        let nemo = cfg_from(
+            r#"{"model_type":"nemotron_h","hidden_size":8,"num_hidden_layers":4,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,"vocab_size":8,
+                "hybrid_override_pattern":"ME*M","n_routed_experts":4,"num_experts_per_tok":2,
+                "moe_intermediate_size":6,"moe_latent_size":4,
+                "moe_shared_expert_intermediate_size":6,"norm_topk_prob":false,
+                "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
+                "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
+                "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
+        );
+        assert_eq!(nemo.kda_n_heads, 0, "Nemotron sets no KDA dims");
+        assert!(!nemo.layer_kind.contains(&LayerKind::Kda));
+        // Nemotron's figure is unchanged by the KDA term existing.
+        let conv_dim = nemo.mamba_inter as usize + 2 * 2;
+        assert_eq!(KvCache::fixed_bytes(&nemo), 2 * (2 * conv_dim + 2 * 2 * 2) * 4);
     }
 }

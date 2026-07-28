@@ -38,19 +38,44 @@ pub enum Arch {
     /// attention layers are GQA, so it is NOT blanket [`Arch::is_gqa`] — the
     /// per-layer `layer_kind` dispatch routes each layer to its mixer.
     NemotronH,
+    /// Kimi-K3: hybrid Kimi Delta Attention (KDA, a linear/delta-rule mixer) + gated
+    /// MLA, with a latent-MoE FFN on every layer after the first.
+    ///
+    /// Hybrid on the **mixer axis only** — unlike Nemotron-H, where a layer is *either*
+    /// Mamba, attention, or MoE, every K3 layer carries both a mixer and an FFN. So
+    /// [`Config::layer_kind`] holds [`LayerKind::Kda`]/[`LayerKind::Attn`] and never
+    /// [`LayerKind::Moe`]; the MoE layers are the `first_dense` prefix rule instead.
+    /// Ask [`Config::moe_layers`] for that count, never `layer_kind` directly.
+    KimiK3,
 }
 
-/// Per-layer mixer type for a hybrid architecture (Nemotron-H). Homogeneous
-/// arches leave [`Config::layer_kind`] empty and never consult this. Parsed from
-/// `hybrid_override_pattern` (`M`→`Mamba`, `E`→`Moe`, `*`→`Attn`).
+/// Per-layer mixer type for a hybrid architecture. Homogeneous arches leave
+/// [`Config::layer_kind`] empty and never consult this.
+///
+/// Two producers, and they populate different subsets:
+/// - Nemotron-H, from `hybrid_override_pattern` (`M`→`Mamba`, `E`→`Moe`, `*`→`Attn`).
+///   A layer is exactly one of the three — its MoE layers hold no mixer at all.
+/// - Kimi-K3, from `linear_attn_config` (`Kda`/`Attn` only). Every K3 layer *also*
+///   has an FFN, which this axis does not describe — see [`Config::moe_layers`].
+///
+/// So `layer_kind` answers "what mixer does layer `i` run", and only Nemotron-H's
+/// encoding additionally answers "does layer `i` hold experts". Anything needing the
+/// latter must go through [`Config::moe_layers`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
     /// Mamba2 selective-scan (state-space) mixer.
     Mamba,
-    /// Grouped-query attention mixer.
+    /// Grouped-query attention mixer. Also the gated-MLA layers on Kimi-K3 — the
+    /// distinction that matters to the KV cache is "holds a growing KV cache", and
+    /// both do.
     Attn,
     /// Mixture-of-experts (routed + shared, latent-space) mixer.
     Moe,
+    /// Kimi Delta Attention: a linear-attention mixer carrying a fixed-size recurrent
+    /// state (per-head delta-rule matrix + short causal-conv history) instead of a
+    /// context-growing KV cache. O(1) in context, like [`LayerKind::Mamba`] — and, like
+    /// it, invisible to per-token accounting, so it belongs in `KvCache::fixed_bytes`.
+    Kda,
 }
 
 impl Arch {
@@ -170,6 +195,19 @@ pub struct Config {
     /// Mamba2 lower clamp on the discretized step `dt` (`time_step_min`); the scan
     /// applies `dt = max(softplus(dt+dt_bias), dt_min)`. 0.0 for non-Mamba arches.
     pub mamba_dt_min: f32,
+
+    // ---- Kimi-K3 (hybrid KDA / gated-MLA) fields ----
+    // (0 on every other arch; only read when `arch == Arch::KimiK3`.)
+    /// KDA head count (`linear_attn_config.num_heads`).
+    pub kda_n_heads: i32,
+    /// KDA per-head dim (`linear_attn_config.head_dim`). The recurrent delta-rule
+    /// state is `[kda_n_heads, kda_head_dim, kda_head_dim]` per KDA layer — the
+    /// square `d_k x d_v` association matrix a delta rule carries between steps.
+    pub kda_head_dim: i32,
+    /// KDA short causal-conv kernel width (`linear_attn_config.short_conv_kernel_size`).
+    /// The conv history is `[kda_d_conv, 3 * kda_n_heads * kda_head_dim]` — q, k and v
+    /// each carry their own `*_conv1d`, hence the factor of 3.
+    pub kda_d_conv: i32,
 }
 
 /// Error from loading/validating a config.
@@ -309,6 +347,19 @@ impl Config {
         if model_type == Some("minimax_m2") || arch_is("MiniMaxM2ForCausalLM") {
             return Config::from_json_minimax(r, r, Arch::MinimaxM2);
         }
+        // Kimi-K3: hybrid KDA / gated-MLA, hyperparameters nested under `text_config`.
+        //
+        // MUST precede the M3 check below. That one treats *any* config carrying a
+        // `text_config` as MiniMax-M3, and K3 carries one (it is a VL model too), so
+        // reversing these two silently parses K3 as M3 — wrong attention family, wrong
+        // expert geometry, and no KDA state, with nothing to signal it.
+        if model_type == Some("kimi_k3")
+            || arch_is("KimiK3ForConditionalGeneration")
+            || arch_is("KimiLinearForCausalLM")
+        {
+            let t = r.get("text_config").unwrap_or(r);
+            return Config::from_json_kimi(r, t);
+        }
         // MiniMax-M3 VL: hyperparameters nested under `text_config`.
         let is_m3 = model_type == Some("minimax_m3_vl") || r.get("text_config").is_some();
         if is_m3 {
@@ -381,6 +432,10 @@ impl Config {
             moe_latent: 0,
             relu2: false,
             mamba_dt_min: 0.0,
+            // Kimi-K3-only fields.
+            kda_n_heads: 0,
+            kda_head_dim: 0,
+            kda_d_conv: 0,
         };
 
         // rope theta lives under rope_parameters.rope_theta
@@ -547,6 +602,10 @@ impl Config {
             moe_latent: 0,
             relu2: false,
             mamba_dt_min: 0.0,
+            // Kimi-K3-only fields.
+            kda_n_heads: 0,
+            kda_head_dim: 0,
+            kda_d_conv: 0,
         };
 
         // eos/stop ids may sit in text_config or at the root.
@@ -561,6 +620,165 @@ impl Config {
         ckr!("rotary_dim", rotary_dim, 1, head_dim);
         ckr!("num_key_value_heads", c.n_kv_heads, 1, c.n_heads);
         ckr!("shared_intermediate_size", c.shared_inter, 0, 1 << 24);
+        Ok(c)
+    }
+
+    /// The MoE layers as `(count, index_of_one)`. The index is somewhere to probe a
+    /// real expert on disk, to size one from its true on-disk format.
+    ///
+    /// Two encodings, because [`LayerKind`] has two producers:
+    /// - Nemotron-H marks MoE layers explicitly ([`LayerKind::Moe`]) — there a layer is
+    ///   *either* a mixer or an FFN, so the MoE layers are named on that axis.
+    /// - GLM, MiniMax and Kimi-K3 put an FFN on *every* layer, so the MoE layers are the
+    ///   suffix after the `first_dense` dense prefix.
+    ///
+    /// K3 reaches the second branch with a **non-empty** `layer_kind` (it carries Kda/Attn
+    /// mixer kinds), which is why the test below is "does `layer_kind` name any MoE layer"
+    /// rather than "is `layer_kind` empty". The latter reads 0 MoE layers for K3 and
+    /// mis-sizes the expert cache by the entire model.
+    pub fn moe_layers(&self) -> (usize, usize) {
+        if let Some(idx) = self.layer_kind.iter().position(|k| *k == LayerKind::Moe) {
+            (self.layer_kind.iter().filter(|k| **k == LayerKind::Moe).count(), idx)
+        } else {
+            ((self.n_layers - self.first_dense).max(0) as usize, self.first_dense.max(0) as usize)
+        }
+    }
+
+    /// Kimi-K3 (`kimi_k3`) parse. The hyperparameters are nested under `text_config`
+    /// (the root describes the vision-language wrapper); `r` is that root, for the
+    /// stop-id fallback.
+    ///
+    /// Two things differ from every other arch:
+    ///
+    /// - **The mixer is per-layer.** `linear_attn_config` names which layers run gated
+    ///   MLA (`full_attn_layers`) and which run KDA (`kda_layers`). Those lists are
+    ///   **1-indexed**: `full_attn_layers` ends at 93 on a 93-layer stack, and checkpoint
+    ///   layer 0 is KDA (config index 1). Converted to 0-indexed [`Config::layer_kind`]
+    ///   here, so everything downstream indexes normally.
+    /// - **MoE is not on that axis.** Every layer after `first_k_dense_replace` carries
+    ///   experts regardless of its mixer, so `layer_kind` holds no `Moe` entries and
+    ///   [`Config::moe_layers`] falls through to the prefix rule.
+    fn from_json_kimi(r: &Json, t: &Json) -> Result<Config, ConfigError> {
+        let gt = |k: &str| gi_in(t, k);
+        let lac = t.get("linear_attn_config");
+        let lg = |k: &str, d: i32| {
+            lac.and_then(|s| s.get(k)).and_then(Json::as_i64).map(|v| v as i32).unwrap_or(d)
+        };
+        let nlc = (gt("num_hidden_layers").max(0) as usize).min(MAX_LAYERS_IDX);
+
+        // Per-layer mixer from the 1-indexed `full_attn_layers` list; anything not named
+        // there runs KDA. Reading `full_attn_layers` rather than `kda_layers` makes the
+        // *default* the safe one: an unlisted layer becomes KDA, which carries a
+        // fixed-size recurrent state that `fixed_bytes` charges for — rather than
+        // silently becoming a KV-holding layer nothing reserved for.
+        let full: Vec<i64> = lac
+            .and_then(|s| s.get("full_attn_layers"))
+            .and_then(Json::as_array)
+            .map(|a| a.iter().filter_map(Json::as_i64).collect())
+            .unwrap_or_default();
+        let layer_kind: Vec<LayerKind> = (0..nlc)
+            .map(|i| {
+                if full.contains(&(i as i64 + 1)) { LayerKind::Attn } else { LayerKind::Kda }
+            })
+            .collect();
+
+        let mut c = Config {
+            hidden: gt("hidden_size"),
+            n_layers: gt("num_hidden_layers"),
+            n_heads: gt("num_attention_heads"),
+            n_experts: gt("num_experts"),
+            topk: gt("num_experts_per_token"),
+            moe_inter: gt("moe_intermediate_size"),
+            dense_inter: gt("intermediate_size"),
+            first_dense: gt("first_k_dense_replace"),
+            q_lora: gt("q_lora_rank"),
+            kv_lora: gt("kv_lora_rank"),
+            qk_nope: gt("qk_nope_head_dim"),
+            qk_rope: gt("qk_rope_head_dim"),
+            // MLA, like GLM: no GQA full-KV, so no `qk_head` geometry to fold in.
+            qk_head: 0,
+            v_head: gt("v_head_dim"),
+            n_shared: gt("num_shared_experts"),
+            vocab: gt("vocab_size"),
+            max_ctx: gt("max_position_embeddings"),
+            n_group: gt("num_expert_group").max(1),
+            topk_group: gt("topk_group").max(1),
+            norm_topk: t.get("moe_renormalize").and_then(Json::as_bool).unwrap_or(false),
+            stop_ids: Vec::new(),
+            // No DSA lightning indexer on K3 — sparsity is the KDA mixer, not a
+            // block-sparse index over a dense cache.
+            index_topk: 0,
+            index_nh: 0,
+            index_hd: 0,
+            index_block_size: 0,
+            index_topk_blocks: 0,
+            index_local_blocks: 0,
+            idx_type: Vec::new(),
+            eps: t.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-5) as f32,
+            theta: t.get("rope_theta").and_then(Json::as_f64).unwrap_or(10000.0) as f32,
+            attn_scale: 0.0,
+            routed_scale: t
+                .get("routed_scaling_factor")
+                .and_then(Json::as_f64)
+                .unwrap_or(1.0) as f32,
+            arch: Arch::KimiK3,
+            n_kv_heads: gt("num_key_value_heads"),
+            // The two shared experts ship fused as one `moe_intermediate_size`-wide pair
+            // per layer (the checkpoint carries `[2 * moe_inter, hidden]`).
+            shared_inter: gt("num_shared_experts") * gt("moe_intermediate_size"),
+            qk_norm: false,
+            gemma_norm: false,
+            swiglu_oai: false,
+            swiglu_alpha: 0.0,
+            swiglu_limit: 0.0,
+            sigmoid_route: t.get("moe_router_activation_func").and_then(Json::as_str)
+                == Some("sigmoid"),
+            layer_kind,
+            mtp_layer_kind: Vec::new(),
+            mamba_d_state: 0,
+            mamba_d_conv: 0,
+            mamba_n_heads: 0,
+            mamba_head_dim: 0,
+            mamba_n_groups: 0,
+            mamba_inter: 0,
+            mamba_chunk: 0,
+            // Stable LatentMoE: the routed experts run in a `routed_expert_hidden_size`
+            // bottleneck, not in `hidden` — same shape as Nemotron-H's `moe_latent`.
+            moe_latent: gt("routed_expert_hidden_size"),
+            relu2: false,
+            mamba_dt_min: 0.0,
+            kda_n_heads: lg("num_heads", 0),
+            kda_head_dim: lg("head_dim", 0),
+            kda_d_conv: lg("short_conv_kernel_size", 0),
+        };
+
+        parse_stop_ids(t, &mut c.stop_ids);
+        if c.stop_ids.is_empty() {
+            parse_stop_ids(r, &mut c.stop_ids);
+        }
+
+        c.validate_common()?;
+        if c.layer_kind.len() != c.n_layers as usize {
+            return Err(ConfigError::Unsupported(format!(
+                "kimi_k3: layer_kind length {} != num_hidden_layers {}",
+                c.layer_kind.len(),
+                c.n_layers,
+            )));
+        }
+        // Guard the case that would make every KV reservation silently zero.
+        if !c.layer_kind.contains(&LayerKind::Attn) {
+            return Err(ConfigError::Unsupported(
+                "kimi_k3: linear_attn_config.full_attn_layers named no layer of this stack \
+                 (the list is 1-indexed); every layer would be KDA and the KV cache would \
+                 size to zero"
+                    .to_string(),
+            ));
+        }
+        ckr!("linear_attn_config.num_heads", c.kda_n_heads, 1, 1 << 16);
+        ckr!("linear_attn_config.head_dim", c.kda_head_dim, 1, 1 << 16);
+        ckr!("linear_attn_config.short_conv_kernel_size", c.kda_d_conv, 1, 1 << 8);
+        ckr!("routed_expert_hidden_size", c.moe_latent, 0, 1 << 24);
+        ckr!("kv_lora_rank", c.kv_lora, 1, 1 << 16);
         Ok(c)
     }
 
@@ -656,6 +874,10 @@ impl Config {
             // Scan clamps the discretized step to `time_step_min` (reference:
             // `torch.clamp(dt, self.time_step_min)`); default 0.0 (no floor) if absent.
             mamba_dt_min: gf("time_step_min", 0.0) as f32,
+            // Kimi-K3-only fields.
+            kda_n_heads: 0,
+            kda_head_dim: 0,
+            kda_d_conv: 0,
         };
 
         parse_stop_ids(r, &mut c.stop_ids);
@@ -1067,5 +1289,121 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(Config::from_json(&text), Err(ConfigError::Unsupported(_))));
+    }
+
+    // ---- Kimi-K3 ----------------------------------------------------------------
+
+    /// The real K3 geometry: 93 layers, gated MLA on the 1-indexed `full_attn_layers`,
+    /// KDA everywhere else. `attn` lets a test perturb just that list.
+    fn kimi_k3_text(attn: &str) -> String {
+        format!(
+            r#"{{"model_type":"kimi_k3",
+                "architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{{
+                  "hidden_size":7168,"num_hidden_layers":93,"num_attention_heads":96,
+                  "num_key_value_heads":96,"num_experts":896,"num_experts_per_token":16,
+                  "num_shared_experts":2,"moe_intermediate_size":3072,
+                  "intermediate_size":33792,"routed_expert_hidden_size":3584,
+                  "first_k_dense_replace":1,"q_lora_rank":1536,"kv_lora_rank":512,
+                  "qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
+                  "vocab_size":163840,"max_position_embeddings":1048576,
+                  "rms_norm_eps":1e-05,"rope_theta":10000.0,"moe_renormalize":true,
+                  "moe_router_activation_func":"sigmoid","num_expert_group":1,
+                  "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":163586,
+                  "linear_attn_config":{{"head_dim":128,"num_heads":96,
+                    "short_conv_kernel_size":4,"full_attn_layers":[{attn}]}}}},
+                "vision_config":{{"vt_hidden_size":1024}}}}"#
+        )
+    }
+
+    const K3_ATTN: &str = "4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,93";
+
+    fn kimi_k3_cfg(attn: &str) -> Result<Config, ConfigError> {
+        Config::from_json(&Json::parse(&kimi_k3_text(attn)).unwrap())
+    }
+
+    /// `full_attn_layers` / `kda_layers` are **1-indexed** in the K3 config: the list ends
+    /// at 93 on a 93-layer stack, and checkpoint layer 0 is KDA. Off-by-one here shifts
+    /// every mixer by one layer, which no later stage can detect.
+    #[test]
+    fn kimi_k3_converts_the_one_indexed_mixer_lists() {
+        let c = kimi_k3_cfg(K3_ATTN).expect("kimi_k3 parse");
+        assert_eq!(c.arch, Arch::KimiK3);
+        assert!(!c.arch.is_gqa(), "K3 is MLA + KDA, not the GQA family");
+        assert_eq!(c.layer_kind.len(), 93);
+        assert_eq!(c.layer_kind[0], LayerKind::Kda, "config layer 1 -> index 0, KDA");
+        assert_eq!(c.layer_kind[3], LayerKind::Attn, "config layer 4 -> index 3, MLA");
+        assert_eq!(c.layer_kind[91], LayerKind::Attn, "config 92");
+        assert_eq!(c.layer_kind[92], LayerKind::Attn, "config 93, the trailing MLA layer");
+        let n_attn = c.layer_kind.iter().filter(|k| **k == LayerKind::Attn).count();
+        let n_kda = c.layer_kind.iter().filter(|k| **k == LayerKind::Kda).count();
+        assert_eq!((n_attn, n_kda), (24, 69));
+    }
+
+    /// The rest of the geometry, including the two places K3 differs from every other
+    /// arch: experts run in a `routed_expert_hidden_size` latent, and the two shared
+    /// experts ship fused as one `2 * moe_intermediate_size`-wide pair.
+    #[test]
+    fn kimi_k3_parses_latent_moe_and_fused_shared_experts() {
+        let c = kimi_k3_cfg(K3_ATTN).expect("kimi_k3 parse");
+        assert_eq!((c.hidden, c.n_layers, c.n_heads), (7168, 93, 96));
+        assert_eq!((c.n_experts, c.topk, c.n_shared), (896, 16, 2));
+        assert_eq!(c.moe_latent, 3584, "Stable LatentMoE bottleneck");
+        assert_eq!(c.shared_inter, 6144, "2 x 3072, fused in the checkpoint");
+        assert_eq!((c.kv_lora, c.qk_nope, c.qk_rope, c.v_head), (512, 128, 64, 128));
+        assert_eq!(c.qk_head, 0, "MLA: no GQA head geometry, so no k_full/v_full");
+        assert_eq!((c.kda_n_heads, c.kda_head_dim, c.kda_d_conv), (96, 128, 4));
+        assert_eq!((c.first_dense, c.max_ctx, c.vocab), (1, 1048576, 163840));
+        assert!(c.sigmoid_route && c.norm_topk);
+        assert_eq!(c.index_topk, 0, "no DSA indexer on K3");
+    }
+
+    /// K3 carries a `text_config` because it is a VL model, and the MiniMax-M3 branch
+    /// claims *any* config that has one. If the K3 check is ever reordered below it, K3
+    /// silently parses as M3 — wrong attention family, wrong expert geometry, no KDA
+    /// state, and nothing downstream to notice.
+    #[test]
+    fn kimi_k3_is_not_swallowed_by_the_minimax_m3_text_config_check() {
+        let c = kimi_k3_cfg(K3_ATTN).expect("kimi_k3 parse");
+        assert_eq!(c.arch, Arch::KimiK3, "must not fall through to MinimaxM3");
+        assert!(!c.layer_kind.is_empty(), "M3 would have left layer_kind empty");
+    }
+
+    /// MoE-ness is NOT on the `layer_kind` axis for K3: every layer past `first_dense`
+    /// carries experts regardless of its mixer. Asking `layer_kind` for MoE layers counts
+    /// zero and mis-sizes the expert cache by the whole model.
+    #[test]
+    fn kimi_k3_moe_layers_come_from_the_prefix_rule() {
+        let c = kimi_k3_cfg(K3_ATTN).expect("kimi_k3 parse");
+        assert!(!c.layer_kind.contains(&LayerKind::Moe), "no Moe on the mixer axis");
+        assert_eq!(c.moe_layers(), (92, 1), "layers 1..=92, probe at the first");
+    }
+
+    /// ...while Nemotron-H keeps using the explicit axis, where the prefix rule would be
+    /// wrong (its `first_dense` layer is a Mamba layer holding no experts at all).
+    #[test]
+    fn nemotron_moe_layers_still_come_from_layer_kind() {
+        let text = Json::parse(
+            r#"{"model_type":"nemotron_h","hidden_size":4096,"num_hidden_layers":8,
+            "num_attention_heads":32,"num_key_value_heads":2,"head_dim":128,
+            "vocab_size":131072,"hybrid_override_pattern":"MEMEMEM*",
+            "n_routed_experts":512,"num_experts_per_tok":22,"moe_intermediate_size":2688,
+            "moe_latent_size":1024,"moe_shared_expert_intermediate_size":5376,
+            "ssm_state_size":128,"conv_kernel":4,"mamba_num_heads":128,"mamba_head_dim":64,
+            "n_groups":8,"chunk_size":128}"#,
+        )
+        .unwrap();
+        let c = Config::from_json(&text).expect("nemotron parse");
+        assert_eq!(c.moe_layers(), (3, 1), "the three 'E' layers, first at index 1");
+    }
+
+    /// A `full_attn_layers` list that names no layer of this stack (e.g. someone fed it
+    /// 0-indexed values against a 1-indexed contract, or an empty list) would make every
+    /// layer KDA and size the KV cache to zero. Reject at parse rather than serve a model
+    /// whose every reservation is 0.
+    #[test]
+    fn kimi_k3_rejects_a_full_attn_list_naming_no_layer() {
+        assert!(matches!(kimi_k3_cfg(""), Err(ConfigError::Unsupported(_))));
+        assert!(matches!(kimi_k3_cfg("500,900"), Err(ConfigError::Unsupported(_))));
     }
 }

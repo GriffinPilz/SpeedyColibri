@@ -334,6 +334,13 @@ fn load_layer_nemotron_kind(
                 qt_load(shards, &p("mixer.shared_experts.down_proj.weight"), d, si, dbits)?;
             // Routed experts (latent-space, gateless ReLU²) stream via the ExpertProvider.
         }
+        // Kimi-K3's KDA layers carry a different tensor set entirely (q/k/v + separate
+        // `*_conv1d`, `f_a`/`f_b` low-rank gate, `A_log`, `dt_bias`, `b_proj`) and live
+        // under a different prefix. Loading them through the Nemotron-H mixer names would
+        // silently produce a half-populated layer, so refuse instead.
+        LayerKind::Kda => {
+            return Err(EngineError::NotImplemented("Kimi-K3 KDA layer loading"));
+        }
     }
     Ok(l)
 }
@@ -468,6 +475,10 @@ fn load_mtp_nemotron(
                 m("dt_bias"),
                 m("norm.weight"),
             ]),
+            // Only Nemotron-H populates `mtp_layer_kind`, and it never emits KDA. If one
+            // ever appears, this is not a Nemotron head — report "no head" via the
+            // function's existing completeness contract rather than probing wrong names.
+            LayerKind::Kda => return Ok(None),
         }
     }
     if !required.iter().all(|s| shards.has(s)) {

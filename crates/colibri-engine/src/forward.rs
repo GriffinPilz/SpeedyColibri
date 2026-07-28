@@ -245,6 +245,16 @@ fn nemotron_layer_forward<P: ExpertProvider>(
         LayerKind::Moe => {
             timed(&MOE_US, || crate::moe::nemotron_moe(cfg, l, li, nrm, s, tmp, provider))?
         }
+        // Reaching here means a Kimi-K3 model was routed into the Nemotron-H forward
+        // path. KDA is a different mixer (linear/delta-rule, not a selective scan), so
+        // there is nothing to approximate with — fail loudly rather than run the wrong one.
+        LayerKind::Kda => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "KDA layer dispatched into the Nemotron-H forward path; Kimi-K3 has no \
+                 forward path yet",
+            ))
+        }
     }
     for j in 0..s * d {
         x[j] += tmp[j];

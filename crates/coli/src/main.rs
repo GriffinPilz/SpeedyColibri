@@ -2201,22 +2201,15 @@ fn wire_adaptive_cache<P>(
         None => return, // non-Linux: no live pressure signal, leave the static budget
     };
     // Number of MoE layers and the index of one, to size the streamed-expert footprint.
-    // Homogeneous arches (GLM/MiniMax): every layer at/after `first_dense` is MoE. Nemotron-H
-    // is hybrid (Mamba/attn/MoE by index) — layer `first_dense` (0) is a *Mamba* layer with
-    // NO experts, so probing it falls to the dense-width fallback and both the count and the
-    // per-expert size come out wildly wrong (~17× → misclassifies a RAM-fitting model as
-    // ≫-RAM, leaving experts non-resident). Probe an actual MoE layer and count only MoE ones.
-    let (n_moe, probe_layer) = if cfg.layer_kind.is_empty() {
-        ((cfg.n_layers - cfg.first_dense).max(0) as u64, cfg.first_dense as usize)
-    } else {
-        let n = cfg.layer_kind.iter().filter(|k| matches!(k, colibri_core::LayerKind::Moe)).count();
-        let idx = cfg
-            .layer_kind
-            .iter()
-            .position(|k| matches!(k, colibri_core::LayerKind::Moe))
-            .unwrap_or(cfg.first_dense as usize);
-        (n as u64, idx)
-    };
+    // Delegated to `Config::moe_layers` so the two encodings of "which layers hold experts"
+    // live in one place: Nemotron-H names them on the `layer_kind` axis, while GLM/MiniMax/
+    // Kimi-K3 put an FFN on every layer past the `first_dense` prefix. Getting this wrong is
+    // expensive in both directions — probing a Nemotron *Mamba* layer (which has no experts)
+    // fell to the dense-width fallback and came out ~17× off, misclassifying a RAM-fitting
+    // model as ≫-RAM and leaving experts non-resident; and testing `layer_kind.is_empty()`
+    // counts 0 MoE layers for K3, whose `layer_kind` is non-empty but carries mixer kinds only.
+    let (n_moe, probe_layer) = cfg.moe_layers();
+    let n_moe = n_moe as u64;
     // Size an expert from a real one on disk — its QTensors carry the true format
     // (NVFP4 fmt=5, e4m3 fmt=4, …), so block-scale overhead and the actual bit-width
     // are exact (for Nemotron this also captures the latent input dim, not `hidden`). The
@@ -2493,16 +2486,18 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
     println!("per expert (nvfp4 ~4-bit): {:.2} MB   total routed: {total_experts} → {:.0} GB",
         mb(bpe), gb(total_experts * bpe));
     // Report the layers that actually hold KV, not the total: a hybrid stack caches on
-    // only its attention layers (Nemotron-H: 8 of 88).
-    let kv_layers = if cfg.layer_kind.is_empty() {
-        cfg.n_layers as usize
-    } else {
-        cfg.layer_kind.iter().filter(|k| matches!(k, colibri_core::LayerKind::Attn)).count()
-    };
+    // only its attention layers (Nemotron-H: 8 of 88; Kimi-K3: 24 of 93). Shared with the
+    // reservation rather than reimplemented — this used to be a second copy of the
+    // predicate, which is how the earlier KV accounting bugs got in.
+    let kv_layers = colibri_engine::KvCache::kv_layers(&cfg);
     println!("KV cache: {:.1} KB/token ({} of {} layers cache KV)",
         kv_per_tok as f64 / 1024.0, kv_layers, cfg.n_layers);
     if kv_fixed > 0 {
-        println!("  + {:.0} MB/sequence fixed Mamba2 state (O(1) in context)", mb(kv_fixed));
+        println!(
+            "  + {:.0} MB/sequence fixed recurrent state (O(1) in context, per concurrent \
+             sequence)",
+            mb(kv_fixed)
+        );
     }
     println!("  8 GB KV holds ~{} tokens ({}K)",
         context_in_kv_budget(8 * gib, kv_per_tok),

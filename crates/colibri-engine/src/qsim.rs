@@ -32,12 +32,26 @@
 //! per token are unchanged — a `COLI_QSIM` run tells you nothing about tok/s. Pair it
 //! with the byte arithmetic (`bits_target / bits_stored × class bytes`) for that half.
 //!
-//! **Caveat, stated plainly**: the container we serve is *already* quantized (int8 for
-//! resident weights), so this simulates P applied on top of int8, not P applied to the
-//! original bf16. The compounded error is `sqrt(int8² + P²)`, which for the cases that
-//! matter is dominated by P — int8's 1.35% against NVFP4's 9.35% inflates the result by
-//! under 1% relative. It is a faithful proxy, not a substitute for a real requant of
-//! the final candidate.
+//! # The caveat that bites — read before trusting a result
+//!
+//! The container we serve is *already* quantized (int8 for resident weights), so this
+//! simulates P **on top of int8**, not P on the original bf16. An earlier version of this
+//! note claimed the compounded error is `sqrt(int8² + P²)` and therefore dominated by P.
+//! **That is wrong**: it assumes the two quantization grids are independent, and they are
+//! not. NVFP4's per-16 fine scales can substantially *re-represent* values that int8 has
+//! already snapped onto a coarse grid, so `nvfp4-on-int8` can land near identity — while
+//! `int6-on-int8`, a genuine 4× row-wise coarsening, degrades for real.
+//!
+//! Measured on Nemotron-3-Super: every NVFP4 arm drifted *around* baseline perplexity
+//! (some better, which is not physically possible for added noise), while the int6 arm
+//! degraded cleanly. The NVFP4 arms were measuring almost nothing.
+//!
+//! So: **every rule reports the relative RMS perturbation it actually applied.** Compare
+//! it against the `coli qerr` figure for the same scheme against the true source. If the
+//! qsim rms is far lower, that arm is near-identity and its perplexity means nothing —
+//! the tool warns when it drops below 1%. This is a screening tool for schemes that
+//! genuinely coarsen the stored values; the final candidate still needs a real requant
+//! from source before anyone ships it.
 
 use crate::model::{Layer, Model};
 use colibri_core::QTensor;
@@ -122,12 +136,21 @@ fn parse_rules(spec: &str) -> Result<Vec<Rule>, String> {
 
 /// Round-trip one tensor's values through `scheme`, re-storing in its original format.
 ///
-/// Returns the number of weights touched so the caller can report real coverage — a
-/// rule that matched nothing must not be reported as applied.
-fn simulate(t: &mut QTensor, scheme: SimScheme) -> usize {
+/// Returns `(weights touched, Σ squared delta, Σ squared original)` so the caller can
+/// report the **relative RMS perturbation actually applied**.
+///
+/// That number is not decoration — it is the tool's own validity check. This simulates
+/// P on top of the container's existing quantization, and the two grids are NOT
+/// independent: NVFP4's per-16 fine scales can largely re-represent values that int8
+/// already snapped to a coarse grid, so `nvfp4-on-int8` can approach identity while
+/// `int6-on-int8` is a genuine coarsening. An arm that perturbed nothing will produce a
+/// perplexity indistinguishable from baseline and read as "this precision is free."
+/// Always compare an arm's reported rms against the `qerr` figure for the same scheme
+/// measured against the ORIGINAL source; if it is far lower, the arm is measuring noise.
+fn simulate(t: &mut QTensor, scheme: SimScheme) -> (usize, f64, f64) {
     let (o, i) = (t.o as usize, t.i as usize);
     if o == 0 || i == 0 {
-        return 0;
+        return (0, 0.0, 0.0);
     }
     let w = crate::convert::dequantize_qtensor_pub(t);
     let approx = match scheme {
@@ -144,20 +167,33 @@ fn simulate(t: &mut QTensor, scheme: SimScheme) -> usize {
         0 => 32,
         1 => 8,
         3 => 2,
-        _ => return 0, // unknown/streamed format — leave it alone rather than corrupt it
+        _ => return (0, 0.0, 0.0), // unknown/streamed format — leave alone, don't corrupt
     };
     let mut re = crate::quantize::qtensor_from_f32(&approx, o, i, bits);
     re.gpu_eligible = t.gpu_eligible;
+    // Perturbation actually delivered, measured against the values we started from
+    // (post-restore, so it includes the re-quantization step the model will really see).
+    let after = crate::convert::dequantize_qtensor_pub(&re);
+    let (mut se, mut sr) = (0f64, 0f64);
+    for (a, b) in after.iter().zip(&w) {
+        se += ((a - b) as f64) * ((a - b) as f64);
+        sr += (*b as f64) * (*b as f64);
+    }
     *t = re;
-    o * i
+    (o * i, se, sr)
 }
 
 /// Apply `scheme` to every tensor of `class` in one layer; returns weights touched.
-fn apply_layer(l: &mut Layer, class: Class, scheme: SimScheme) -> usize {
-    let mut n = 0;
+fn apply_layer(l: &mut Layer, class: Class, scheme: SimScheme) -> (usize, f64, f64) {
+    let (mut n, mut se, mut sr) = (0usize, 0f64, 0f64);
+    let mut acc = |r: (usize, f64, f64)| {
+        n += r.0;
+        se += r.1;
+        sr += r.2;
+    };
     let mut opt = |t: &mut Option<QTensor>| {
         if let Some(t) = t.as_mut() {
-            n += simulate(t, scheme);
+            acc(simulate(t, scheme));
         }
     };
     match class {
@@ -169,7 +205,7 @@ fn apply_layer(l: &mut Layer, class: Class, scheme: SimScheme) -> usize {
         }
         Class::Shared => {
             for t in [&mut l.sh_gate, &mut l.sh_up, &mut l.sh_down, &mut l.gate_proj, &mut l.up_proj, &mut l.down_proj] {
-                n += simulate(t, scheme);
+                acc(simulate(t, scheme));
             }
         }
         Class::Attn => {
@@ -178,16 +214,16 @@ fn apply_layer(l: &mut Layer, class: Class, scheme: SimScheme) -> usize {
             opt(&mut l.v_proj);
             opt(&mut l.qkv_proj);
             for t in [&mut l.q_a, &mut l.q_b, &mut l.kv_a, &mut l.kv_b, &mut l.o] {
-                n += simulate(t, scheme);
+                acc(simulate(t, scheme));
             }
         }
         Class::All => {
             for c in [Class::MambaIn, Class::MambaOut, Class::Latent, Class::Shared, Class::Attn] {
-                n += apply_layer(l, c, scheme);
+                acc(apply_layer(l, c, scheme));
             }
         }
     }
-    n
+    (n, se, sr)
 }
 
 /// Apply `COLI_QSIM` to a freshly loaded model. No-op when the env is unset.
@@ -209,10 +245,14 @@ pub fn apply_qsim(model: &mut Model) {
     };
     let t0 = std::time::Instant::now();
     for rule in &rules {
-        let mut n = 0usize;
+        let (mut n, mut se, mut sr) = (0usize, 0f64, 0f64);
         for l in &mut model.layers {
-            n += apply_layer(l, rule.class, rule.scheme);
+            let r = apply_layer(l, rule.class, rule.scheme);
+            n += r.0;
+            se += r.1;
+            sr += r.2;
         }
+        let rms = if sr > 0.0 { (se / sr).sqrt() } else { 0.0 };
         let scheme = match rule.scheme {
             SimScheme::Nvfp4 => "nvfp4".to_string(),
             SimScheme::Int(b) => format!("int{b}"),
@@ -224,7 +264,21 @@ pub fn apply_qsim(model: &mut Model) {
                 rule.class
             );
         } else {
-            eprintln!("[qsim] {:?} → {scheme}: {:.1}M weights simulated", rule.class, n as f64 / 1e6);
+            eprintln!(
+                "[qsim] {:?} → {scheme}: {:.1}M weights, rms perturbation {:.5}",
+                rule.class,
+                n as f64 / 1e6,
+                rms
+            );
+            // A perturbation far below the scheme's own reconstruction error means the
+            // container's existing grid absorbed most of it — the arm is near-identity
+            // and its perplexity will read as "free" no matter what the scheme costs.
+            if rms < 0.01 {
+                eprintln!(
+                    "[qsim] WARNING: rms {rms:.5} is near zero — this arm barely changed the \
+                     model. Do NOT read its perplexity as the cost of {scheme}."
+                );
+            }
         }
     }
     eprintln!(

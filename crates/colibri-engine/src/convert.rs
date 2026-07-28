@@ -1016,6 +1016,75 @@ fn quantize_nvfp4_out(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, 
     )
 }
 
+/// Is `name` a compressed-tensors **MXFP4** weight we can pass through untouched?
+///
+/// True when the tensor is `<stem>.weight_packed` (U8, `[O, I/2]` e2m1 nibbles) and its
+/// `<stem>.weight_scale` sidecar is U8 with exactly `ceil(I/32)` columns — i.e. one E8M0
+/// byte per 32 inputs, the MX block size. The column count is what separates MXFP4 from a
+/// compressed-tensors NVFP4 checkpoint, whose sidecar would carry `ceil(I/16)`.
+///
+/// Structural rather than keyed on `opts.kimi`: any MXFP4 checkpoint should pass through,
+/// and a K3 checkpoint that ever ships a differently-blocked tensor should NOT.
+fn mxfp4_source(shards: &Shards, name: &str) -> Option<(usize, usize)> {
+    let stem = name.strip_suffix(".weight_packed")?;
+    let sname = format!("{stem}.weight_scale");
+    let (w, s) = (shards.find(name)?, shards.find(&sname)?);
+    if w.dtype != DType::U8 || s.dtype != DType::U8 {
+        return None;
+    }
+    let (o, ih) = (*w.shape.first()? as usize, *w.shape.get(1)? as usize);
+    let (so, sc) = (*s.shape.first()? as usize, *s.shape.get(1)? as usize);
+    let i = ih * 2;
+    (so == o && sc == i.div_ceil(32)).then_some((o, i))
+}
+
+/// Emit an MXFP4 expert weight **byte-for-byte**, no dequant/requant round trip.
+///
+/// The source is already the trained weight: Kimi-K3 applies quantization-aware training
+/// in MXFP4 from the SFT stage on, and ships no higher-precision release. Running it
+/// through `dequant` -> `quantize_nvfp4_out` would re-snap every value onto a grid chosen
+/// from `blockmax/6`, which measured **6.40% rel-RMS** on real K3 experts — pure loss on
+/// top of the QAT operating point — and cost 5.9% more bytes (NVFP4 carries a scale per
+/// 16 inputs, MXFP4 one per 32). So we copy.
+///
+/// Layout matches the NVFP4 blob so the loader's coalesced gate/up/down read still grabs
+/// weights and scales together zero-copy: nibbles ++ block-scales concatenated into ONE
+/// U8 tensor. The sidecar is named `.mx` rather than NVFP4's `.g`, and that name is the
+/// format tag — the loader keys `fmt=6` off it, exactly as it keys `fmt=5` off `.g`. It
+/// carries 1.0: MXFP4 has no per-tensor global scale of its own, since an E8M0 byte
+/// already spans 2^+-127, but keeping the field lets both formats share one decode path.
+fn mxfp4_passthrough_out(
+    out_name: &str,
+    shards: &Shards,
+    src: &str,
+) -> io::Result<(OutTensor, OutTensor)> {
+    let read = |n: &str| -> io::Result<Vec<u8>> {
+        let t = shards
+            .find(n)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing: {n}")))?;
+        let mut b = vec![0u8; t.nbytes as usize];
+        shards.read_raw(n, &mut b)?;
+        Ok(b)
+    };
+    let stem = src.strip_suffix(".weight_packed").unwrap_or(src);
+    let mut blob = read(src)?;
+    blob.extend_from_slice(&read(&format!("{stem}.weight_scale"))?);
+    Ok((
+        OutTensor {
+            name: out_name.to_string(),
+            dtype: "U8",
+            shape: vec![blob.len() as i64],
+            bytes: blob,
+        },
+        OutTensor {
+            name: format!("{out_name}.mx"),
+            dtype: "F32",
+            shape: vec![1],
+            bytes: f32_bytes(&[1.0]),
+        },
+    ))
+}
+
 /// Write a safetensors shard from tensors already materialized in memory.
 fn write_shard(path: &Path, tensors: &[OutTensor]) -> io::Result<()> {
     let mut header = String::from("{");
@@ -1393,6 +1462,14 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             Ok(TensorOut::F32(f32_out(&out_name, shape, &w)))
         }
         kind @ (Kind::Io | Kind::X | Kind::Q) => {
+            // An already-MXFP4 routed expert is COPIED, not requantized. This has to come
+            // before `dequant` below: the source is the QAT-trained weight, and a
+            // dequant -> requantize round trip through NVFP4 is a measured 6.40% rel-RMS
+            // of pure loss plus 5.9% more bytes. See `mxfp4_passthrough_out`.
+            if matches!(kind, Kind::X) && !opts.xfp8 && mxfp4_source(shards, name).is_some() {
+                let (blob, tag) = mxfp4_passthrough_out(&out_name, shards, name)?;
+                return Ok(TensorOut::Quant(blob, tag));
+            }
             // Dequant first: the *logical* shape is authoritative (NVFP4 is stored
             // packed as [O, I/2], so the on-disk shape would lie).
             let (w, shape) = dequant(shards, name)?;
@@ -1858,6 +1935,65 @@ mod tests {
         assert_eq!(got, vec![3.0, 6.0, -3.0, 1.5]);
         // and it is detected as fp8 (no _scale_inv, no _scale_2)
         assert_eq!(detect_format(&indir).unwrap(), SourceFormat::Fp8);
+        std::fs::remove_dir_all(&indir).ok();
+    }
+
+    /// A natively-MXFP4 expert must reach the container BIT-EXACT. It is the QAT-trained
+    /// weight, so any round trip is loss, and the measured cost of the NVFP4 requant path
+    /// on real K3 experts is 6.40% rel-RMS.
+    #[test]
+    fn mxfp4_expert_passes_through_bit_exact() {
+        let indir = tmp();
+        // [O=2, I=64] -> packed [2, 32] nibbles, E8M0 scale [2, ceil(64/32)=2].
+        let packed: Vec<u8> = (0..64u32).map(|k| (k * 7 + 3) as u8).collect();
+        let scale: Vec<u8> = vec![127 - 6, 127 - 5, 127 - 11, 127 - 7]; // 2^-6, 2^-5, ...
+        let w = "model.layers.1.mlp.experts.0.gate_proj.weight_packed";
+        write_input(
+            &indir.join("model-00000.safetensors"),
+            &[
+                (w, "U8", &[2, 32], packed.clone()),
+                (&w.replace("weight_packed", "weight_scale"), "U8", &[2, 2], scale.clone()),
+            ],
+        );
+        let shards = Shards::open(&indir).unwrap();
+
+        // Detected structurally, and the logical shape is recovered from the packing.
+        assert_eq!(mxfp4_source(&shards, w), Some((2, 64)));
+
+        let (blob, tag) = mxfp4_passthrough_out("out.gate_proj.weight", &shards, w).unwrap();
+        // nibbles ++ block-scales, concatenated, byte-for-byte — nothing recomputed.
+        let mut expect = packed.clone();
+        expect.extend_from_slice(&scale);
+        assert_eq!(blob.bytes, expect, "MXFP4 must survive convert unmodified");
+        assert_eq!(blob.dtype, "U8");
+        assert_eq!(blob.shape, vec![(64 + 4) as i64]);
+        // `.mx` is the format tag the loader keys fmt=6 off, carrying the identity global.
+        assert_eq!(tag.name, "out.gate_proj.weight.mx");
+        assert_eq!(tag.bytes, 1.0f32.to_le_bytes().to_vec());
+
+        // Byte count must agree with what QTensor::bytes() charges for fmt=6.
+        let qt = colibri_core::QTensor { fmt_code: 6, o: 2, i: 64, ..Default::default() };
+        assert_eq!(qt.bytes(), blob.bytes.len() as i64 + 4);
+        std::fs::remove_dir_all(&indir).ok();
+    }
+
+    /// The detector keys on the block size, not on the arch flag: a compressed-tensors
+    /// NVFP4 expert (one scale per 16 inputs) must NOT be mistaken for MXFP4 and copied
+    /// through with a mis-sized scale plane.
+    #[test]
+    fn nvfp4_blocked_sidecar_is_not_treated_as_mxfp4() {
+        let indir = tmp();
+        let w = "model.layers.1.mlp.experts.0.gate_proj.weight_packed";
+        write_input(
+            &indir.join("model-00000.safetensors"),
+            &[
+                (w, "U8", &[2, 32], vec![0u8; 64]),
+                // ceil(64/16) = 4 columns -> NVFP4 blocking, not MX.
+                (&w.replace("weight_packed", "weight_scale"), "U8", &[2, 4], vec![0u8; 8]),
+            ],
+        );
+        let shards = Shards::open(&indir).unwrap();
+        assert_eq!(mxfp4_source(&shards, w), None);
         std::fs::remove_dir_all(&indir).ok();
     }
 

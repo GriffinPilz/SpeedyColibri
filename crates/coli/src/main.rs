@@ -425,7 +425,14 @@ fn cmd_convert(args: &[String]) -> ExitCode {
 
     eprintln!(
         "[convert] {indir} -> {outdir}  (experts={} ebits={} io_bits={} n_layers={})",
-        if opts.xfp8 { "e4m3" } else { "nvfp4" },
+        // A K3 source is already MXFP4 and its experts are COPIED, not requantized —
+        // saying "nvfp4" here would misreport what the container actually holds, which
+        // is the one thing this line exists to tell you.
+        match (opts.xfp8, opts.kimi) {
+            (true, _) => "e4m3",
+            (false, true) => "mxfp4 (passthrough)",
+            (false, false) => "nvfp4",
+        },
         opts.ebits, opts.io_bits, opts.n_layers
     );
     let t0 = std::time::Instant::now();

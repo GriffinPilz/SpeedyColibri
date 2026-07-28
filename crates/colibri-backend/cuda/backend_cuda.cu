@@ -1464,6 +1464,51 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* Resident NVFP4 matmul: y[S,O] = x[S,I] @ W[O,I]^T with W in NVFP4.
+ *
+ * The DEVICE kernels for this already existed (`nvfp4_gemv` / `nvfp4_matmul`) — they are
+ * fully general `y[M,N] = x[M,K] @ W[N,K]^T` and were only ever reached through the
+ * expert-FFN wrappers, which fuse gate/up/down. This is the single-weight entry point the
+ * resident path needs, mirroring `coli_cuda_matmul`.
+ *
+ * Why it can't go through `coli_cuda_matmul`: that uploads a dense `O*I` buffer, but NVFP4
+ * stores ~half a byte per weight plus block scales, so the dense upload would read far past
+ * the end. The weight is wrapped ZERO-COPY instead (host pointers, unified memory) — the
+ * same choice the expert path makes, and the one GB10 wants.
+ *
+ * S==1 takes the one-warp-per-column GEMV; S>1 takes the WMMA tile. Same split, and for the
+ * same reason, as the int8/e4m3 path: at S==1 a 16-row MMA tile wastes 15/16 of its work. */
+extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
+                                       float *y, const float *x,
+                                       const void *weights, const void *bscale,
+                                       float gscale, int S, int I, int O, int device) {
+    if (S < 1 || !y || !x ||
+        !coli_cuda_tensor_wrap_nvfp4(tensor, weights, bscale, gscale, I, O, device)) return 0;
+    ColiCudaTensor *t = *tensor;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "nvfp4 matmul input")) return 0;
+    const uint8_t *w = (const uint8_t *)t->weights;
+    const uint8_t *bs = (const uint8_t *)t->bscale;
+    size_t gemv_shmem = (size_t)I * sizeof(float);
+    if (S == 1 && gemv_shmem <= 48u * 1024u) {
+        const int tpb = 256, wpb = tpb >> 5;
+        nvfp4_gemv<<<(unsigned)((O + wpb - 1) / wpb), tpb, gemv_shmem, ctx->stream>>>(
+            ctx->y, ctx->x, w, bs, t->gscale, I, O);
+    } else {
+        dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
+        nvfp4_matmul<<<grid, 128, 0, ctx->stream>>>(ctx->y, ctx->x, w, bs, t->gscale, S, I, O);
+    }
+    if (!cuda_ok(cudaGetLastError(), "nvfp4 matmul launch") ||
+        !cuda_ok(cudaMemcpyAsync(y, ctx->y, yb, cudaMemcpyDeviceToHost, ctx->stream),
+                 "nvfp4 matmul output") ||
+        !cuda_ok(cudaStreamSynchronize(ctx->stream), "nvfp4 matmul sync")) return 0;
+    return 1;
+}
+
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                                       ColiCudaTensor *down, float *y,
                                       const float *x, int S) {

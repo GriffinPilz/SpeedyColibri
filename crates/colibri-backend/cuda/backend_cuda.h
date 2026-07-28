@@ -84,6 +84,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate, ColiCud
  * expert (no gate); reuses the NVFP4 decode of coli_cuda_expert_mlp_nvfp4 with a relu²
  * activation between the up and down projections. Requires up/down at fmt==5, with
  * down the transpose of up. */
+/* Resident NVFP4 matmul y[S,O] = x[S,I] @ W[O,I]^T. Wraps the weight zero-copy and
+ * dispatches the existing general nvfp4_gemv (S==1) / nvfp4_matmul (S>1) kernels. */
+COLI_CUDA_DLLEXPORT int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
+        float *y, const float *x, const void *weights, const void *bscale,
+        float gscale, int S, int I, int O, int device);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S, int exact);
 

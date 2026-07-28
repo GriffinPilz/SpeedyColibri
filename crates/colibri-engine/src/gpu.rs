@@ -1276,10 +1276,40 @@ pub fn try_matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) -> bool {
     if !w.gpu_eligible || !available() {
         return false;
     }
-    // This dense-upload GPU matmul handles only the resident formats: f32 (0) and
-    // int8 (1). Packed formats (e4m3/NVFP4) store fewer bytes than a dense `o*i`
-    // buffer, so uploading them here reads out of bounds — they have their own fused
-    // kernel (`try_expert_ffn`) or fall to the CPU reference in `matmul_qt`.
+    // This dense-upload GPU matmul handles the resident formats f32 (0) and int8 (1).
+    // Packed formats store fewer bytes than a dense `o*i` buffer, so uploading them here
+    // reads out of bounds: NVFP4 is handled just above via its own wrap+dispatch, and
+    // e4m3 has the fused expert kernel (`try_expert_ffn`) or the CPU reference.
+    // NVFP4 (fmt 5) has its own entry point: the weight is packed (nibbles + block scales),
+    // so the dense `o*i` upload below would read out of bounds. The device kernels are the
+    // same general ones the expert path uses — only the wrapping differs.
+    if w.fmt_code == 5 {
+        let key = w.q4.as_ptr() as usize;
+        return RESIDENT.with(|r| {
+            let mut map = r.borrow_mut();
+            let slot = map.entry(key).or_insert(std::ptr::null_mut());
+            // SAFETY: y/x sized by matmul_qt's asserts; q4/bs are this QTensor's live
+            // buffers (o*ceil(i/2) and o*ceil(i/16)); the slot persists in the registry.
+            let ok = unsafe {
+                cuda::matmul_nvfp4_raw(
+                    slot,
+                    y.as_mut_ptr(),
+                    x.as_ptr(),
+                    w.q4.as_ptr() as *const c_void,
+                    w.bs.as_ptr() as *const c_void,
+                    w.g,
+                    s as i32,
+                    w.i,
+                    w.o,
+                    0,
+                )
+            };
+            if ok {
+                GPU_MATMULS.with(|c| c.set(c.get() + 1));
+            }
+            ok
+        });
+    }
     let (wptr, key): (*const c_void, usize) = match w.fmt_code {
         0 => (w.qf.as_ptr() as *const c_void, w.qf.as_ptr() as usize),
         1 => (w.q8.as_ptr() as *const c_void, w.q8.as_ptr() as usize),

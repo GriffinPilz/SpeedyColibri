@@ -2235,6 +2235,146 @@ mod tests {
         assert_eq!(classify("model.layers.79.eh_proj.weight", 78, false, false), Kind::Skip);
     }
 
+    /// The COMPLETE tensor inventory of `unsloth/Kimi-K3`, swept from the safetensors
+    /// headers of all 96 shards: 497,220 tensors reduce to exactly these 59 name patterns.
+    ///
+    /// Every one must map and classify correctly. This is the guard that a convert of the
+    /// real checkpoint will not hit a name nobody anticipated — the failure mode that
+    /// otherwise only shows up after downloading 1.5 TB. Layer 0 is KDA + the dense MLP,
+    /// layer 1 is KDA + MoE, layer 3 is gated MLA + MoE.
+    #[test]
+    fn kimi_k3_covers_the_real_checkpoint_inventory() {
+        // (source name, expected container name or "" to drop, expected Kind)
+        let cases: &[(&str, &str, Kind)] = &[
+            // --- routed experts: MXFP4 nibbles kept, E8M0 sidecar consumed -----------
+            ("language_model.model.layers.1.block_sparse_moe.experts.5.w1.weight_packed",
+             "model.layers.1.mlp.experts.5.gate_proj.weight_packed", Kind::X),
+            ("language_model.model.layers.1.block_sparse_moe.experts.5.w2.weight_packed",
+             "model.layers.1.mlp.experts.5.down_proj.weight_packed", Kind::X),
+            ("language_model.model.layers.1.block_sparse_moe.experts.5.w3.weight_packed",
+             "model.layers.1.mlp.experts.5.up_proj.weight_packed", Kind::X),
+            ("language_model.model.layers.1.block_sparse_moe.experts.5.w1.weight_scale",
+             "model.layers.1.mlp.experts.5.gate_proj.weight_scale", Kind::Skip),
+            ("language_model.model.layers.1.block_sparse_moe.experts.5.w2.weight_scale",
+             "model.layers.1.mlp.experts.5.down_proj.weight_scale", Kind::Skip),
+            ("language_model.model.layers.1.block_sparse_moe.experts.5.w3.weight_scale",
+             "model.layers.1.mlp.experts.5.up_proj.weight_scale", Kind::Skip),
+            // --- MoE block: latent projections, router, shared expert ---------------
+            ("language_model.model.layers.1.block_sparse_moe.routed_expert_down_proj.weight",
+             "model.layers.1.mlp.fc1_latent_proj.weight", Kind::Q),
+            ("language_model.model.layers.1.block_sparse_moe.routed_expert_up_proj.weight",
+             "model.layers.1.mlp.fc2_latent_proj.weight", Kind::Q),
+            ("language_model.model.layers.1.block_sparse_moe.routed_expert_norm.weight",
+             "model.layers.1.mlp.routed_expert_norm.weight", Kind::F32),
+            ("language_model.model.layers.1.block_sparse_moe.gate.weight",
+             "model.layers.1.mlp.gate.weight", Kind::F32),
+            ("language_model.model.layers.1.block_sparse_moe.gate.e_score_correction_bias",
+             "model.layers.1.mlp.gate.e_score_correction_bias", Kind::F32),
+            ("language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj.weight",
+             "model.layers.1.mlp.shared_experts.gate_proj.weight", Kind::Q),
+            ("language_model.model.layers.1.block_sparse_moe.shared_experts.up_proj.weight",
+             "model.layers.1.mlp.shared_experts.up_proj.weight", Kind::Q),
+            ("language_model.model.layers.1.block_sparse_moe.shared_experts.down_proj.weight",
+             "model.layers.1.mlp.shared_experts.down_proj.weight", Kind::Q),
+            // --- KDA mixer (69 layers) ----------------------------------------------
+            ("language_model.model.layers.0.self_attn.q_proj.weight",
+             "model.layers.0.self_attn.q_proj.weight", Kind::Q),
+            ("language_model.model.layers.0.self_attn.k_proj.weight",
+             "model.layers.0.self_attn.k_proj.weight", Kind::Q),
+            ("language_model.model.layers.0.self_attn.v_proj.weight",
+             "model.layers.0.self_attn.v_proj.weight", Kind::Q),
+            ("language_model.model.layers.0.self_attn.b_proj.weight",
+             "model.layers.0.self_attn.b_proj.weight", Kind::Q),
+            ("language_model.model.layers.0.self_attn.f_a_proj.weight",
+             "model.layers.0.self_attn.f_a_proj.weight", Kind::Q),
+            ("language_model.model.layers.0.self_attn.f_b_proj.weight",
+             "model.layers.0.self_attn.f_b_proj.weight", Kind::Q),
+            ("language_model.model.layers.0.self_attn.q_conv1d.weight",
+             "model.layers.0.self_attn.q_conv1d.weight", Kind::F32),
+            ("language_model.model.layers.0.self_attn.k_conv1d.weight",
+             "model.layers.0.self_attn.k_conv1d.weight", Kind::F32),
+            ("language_model.model.layers.0.self_attn.v_conv1d.weight",
+             "model.layers.0.self_attn.v_conv1d.weight", Kind::F32),
+            ("language_model.model.layers.0.self_attn.A_log",
+             "model.layers.0.self_attn.A_log", Kind::F32),
+            ("language_model.model.layers.0.self_attn.dt_bias",
+             "model.layers.0.self_attn.dt_bias", Kind::F32),
+            ("language_model.model.layers.0.self_attn.o_norm.weight",
+             "model.layers.0.self_attn.o_norm.weight", Kind::F32),
+            // --- gated MLA mixer (24 layers) ----------------------------------------
+            ("language_model.model.layers.3.self_attn.q_a_proj.weight",
+             "model.layers.3.self_attn.q_a_proj.weight", Kind::Q),
+            ("language_model.model.layers.3.self_attn.q_b_proj.weight",
+             "model.layers.3.self_attn.q_b_proj.weight", Kind::Q),
+            ("language_model.model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
+             "model.layers.3.self_attn.kv_a_proj_with_mqa.weight", Kind::Q),
+            ("language_model.model.layers.3.self_attn.kv_b_proj.weight",
+             "model.layers.3.self_attn.kv_b_proj.weight", Kind::Q),
+            ("language_model.model.layers.3.self_attn.q_a_layernorm.weight",
+             "model.layers.3.self_attn.q_a_layernorm.weight", Kind::F32),
+            ("language_model.model.layers.3.self_attn.kv_a_layernorm.weight",
+             "model.layers.3.self_attn.kv_a_layernorm.weight", Kind::F32),
+            // shared by BOTH mixers — g_proj and o_proj appear on all 93 layers.
+            ("language_model.model.layers.3.self_attn.g_proj.weight",
+             "model.layers.3.self_attn.g_proj.weight", Kind::Q),
+            ("language_model.model.layers.3.self_attn.o_proj.weight",
+             "model.layers.3.self_attn.o_proj.weight", Kind::Q),
+            // --- dense MLP (layer 0 only) -------------------------------------------
+            ("language_model.model.layers.0.mlp.gate_proj.weight",
+             "model.layers.0.mlp.gate_proj.weight", Kind::Q),
+            ("language_model.model.layers.0.mlp.up_proj.weight",
+             "model.layers.0.mlp.up_proj.weight", Kind::Q),
+            ("language_model.model.layers.0.mlp.down_proj.weight",
+             "model.layers.0.mlp.down_proj.weight", Kind::Q),
+            // --- per-layer norms + attention residuals ------------------------------
+            ("language_model.model.layers.0.input_layernorm.weight",
+             "model.layers.0.input_layernorm.weight", Kind::F32),
+            ("language_model.model.layers.0.post_attention_layernorm.weight",
+             "model.layers.0.post_attention_layernorm.weight", Kind::F32),
+            ("language_model.model.layers.0.self_attention_res_norm.weight",
+             "model.layers.0.self_attention_res_norm.weight", Kind::F32),
+            ("language_model.model.layers.0.self_attention_res_proj.weight",
+             "model.layers.0.self_attention_res_proj.weight", Kind::F32),
+            ("language_model.model.layers.0.mlp_res_norm.weight",
+             "model.layers.0.mlp_res_norm.weight", Kind::F32),
+            ("language_model.model.layers.0.mlp_res_proj.weight",
+             "model.layers.0.mlp_res_proj.weight", Kind::F32),
+            // --- model level ---------------------------------------------------------
+            ("language_model.model.embed_tokens.weight", "model.embed_tokens.weight", Kind::Io),
+            ("language_model.lm_head.weight", "lm_head.weight", Kind::Io),
+            ("language_model.model.norm.weight", "model.norm.weight", Kind::F32),
+            ("language_model.model.output_attn_res_norm.weight",
+             "model.output_attn_res_norm.weight", Kind::F32),
+            ("language_model.model.output_attn_res_proj.weight",
+             "model.output_attn_res_proj.weight", Kind::F32),
+            // --- vision tower + projector: dropped (text-only MVP) -------------------
+            ("vision_tower.encoder.blocks.0.wqkv.weight", "", Kind::Skip),
+            ("vision_tower.encoder.blocks.0.mlp.fc0.weight", "", Kind::Skip),
+            ("vision_tower.encoder.blocks.0.norm0.weight", "", Kind::Skip),
+            ("vision_tower.encoder.final_layernorm.weight", "", Kind::Skip),
+            ("vision_tower.patch_embed.pos_emb.weight", "", Kind::Skip),
+            ("vision_tower.patch_embed.proj.weight", "", Kind::Skip),
+            ("mm_projector.post_norm.weight", "", Kind::Skip),
+            ("mm_projector.proj.0.weight", "", Kind::Skip),
+        ];
+
+        for (src, want_out, want_kind) in cases {
+            match kimi_container_name(src) {
+                None => assert!(want_out.is_empty(), "{src} was dropped but should map"),
+                Some(got) => {
+                    assert!(!want_out.is_empty(), "{src} mapped to {got} but should be dropped");
+                    assert_eq!(&got, want_out, "container name for {src}");
+                    assert_eq!(classify(&got, 93, false, false), *want_kind, "kind for {src}");
+                }
+            }
+        }
+
+        // No text-model tensor may be silently dropped: only the vision patterns map to
+        // None. A K3 tensor reaching the container as `None` would vanish without error.
+        let dropped = cases.iter().filter(|(_, o, _)| o.is_empty()).count();
+        assert_eq!(dropped, 8, "exactly the vision tower + projector patterns are dropped");
+    }
+
     /// Every K3 tensor must land in the right `Kind`. The three that do not follow from
     /// the generic rules are pinned here; the rest are checked to confirm they fall
     /// through correctly rather than by accident.

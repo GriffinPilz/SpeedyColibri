@@ -348,6 +348,48 @@ __global__ static void nvfp4_gemv(float *y,const float *x,const uint8_t *w,
     if(lane==0) y[n]=acc*g;
 }
 
+/* Wide-read NVFP4 GEMV — RESIDENT weights only (S==1 decode).
+ *
+ * `nvfp4_gemv` above assigns one k per lane and indexes `wr[k>>1]`, so lanes 2j and 2j+1
+ * fetch the SAME byte: a warp covers just 16 contiguous bytes per step, a fraction of a
+ * 128 B line. The int8 GEMV gives each lane its own byte and covers 32. That read width —
+ * not the decode arithmetic — is the suspected reason resident NVFP4 achieved ~65 GB/s
+ * against int8's ~89 on the same weights.
+ *
+ * Here each lane owns one BYTE and unpacks both of its nibbles, doubling bytes per warp
+ * transaction and halving the trip count. A byte's two nibbles are k0=2*kb and k0+1 with
+ * k0 even, so `k0>>4 == (k0+1)>>4` always: they share a block scale, which also saves one
+ * ue4m3 decode per byte.
+ *
+ * Kept SEPARATE from `nvfp4_gemv` on purpose. Per-lane k assignment changes the f32
+ * accumulation order, so this is a few ULP from the original — fine for resident weights
+ * (gated on quality), but the expert path stays on the proven bit-exact kernel so its
+ * token-identity gates keep meaning what they say. */
+__global__ static void nvfp4_gemv_wide(float *y,const float *x,const uint8_t *w,
+                                       const uint8_t *bs,float g,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int kb=lane;kb<Kh;kb+=32){
+        uint8_t byte=wr[kb];
+        int k0=kb<<1;
+        float sc=e4m3f(br[k0>>4]);          /* both nibbles share this block scale */
+        float a=xs[k0]*e2m1f(byte&0xF);
+        float b=(k0+1<K)?xs[k0+1]*e2m1f(byte>>4):0.f;
+        acc+=(a+b)*sc;
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
 /* Tiled WMMA down-proj (S>1 prefill). Mirror of `fp8a16_matmul` with the nvfp4 decode. */
 /* SEGMENTED NVFP4 matmul: one launch covers EVERY expert in a layer.
  *
@@ -1501,9 +1543,17 @@ extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
     const uint8_t *bs = (const uint8_t *)t->bscale;
     size_t gemv_shmem = (size_t)I * sizeof(float);
     if (S == 1 && gemv_shmem <= 48u * 1024u) {
+        /* COLI_NVFP4_WIDE=0 selects the original narrow-read GEMV for A/B. */
+        static int s_wide = -1;
+        if (s_wide < 0) { const char *e = getenv("COLI_NVFP4_WIDE"); s_wide = !e || strcmp(e, "0") != 0; }
         const int tpb = 256, wpb = tpb >> 5;
-        nvfp4_gemv<<<(unsigned)((O + wpb - 1) / wpb), tpb, gemv_shmem, ctx->stream>>>(
-            ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        unsigned blocks = (unsigned)((O + wpb - 1) / wpb);
+        if (s_wide)
+            nvfp4_gemv_wide<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        else
+            nvfp4_gemv<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
     } else {
         dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
         nvfp4_matmul<<<grid, 128, 0, ctx->stream>>>(ctx->y, ctx->x, w, bs, t->gscale, S, I, O);

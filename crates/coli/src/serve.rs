@@ -230,7 +230,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     let provider = std::sync::Arc::new(ExpertCache::new(base, budget));
     crate::wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, model.resident_bytes());
     if let Some(topn) = crate::prefetch_topn() {
-        provider.enable_prefetch(topn);
+        provider.enable_prefetch(topn, model.cfg.n_experts as u64);
         println!("[serve] speculative next-layer prefetch on (top-{topn}/layer)");
     }
 

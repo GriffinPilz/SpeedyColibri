@@ -585,7 +585,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
     wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, model.resident_bytes());
     if let Some(topn) = prefetch_topn() {
-        provider.enable_prefetch(topn);
+        provider.enable_prefetch(topn, model.cfg.n_experts as u64);
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
     }
 
@@ -836,7 +836,7 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
     wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, model.resident_bytes());
     if let Some(topn) = prefetch_topn() {
-        provider.enable_prefetch(topn);
+        provider.enable_prefetch(topn, model.cfg.n_experts as u64);
     }
 
     // AUTOPIN our shard's hot experts, before the provider moves into the server

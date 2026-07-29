@@ -162,6 +162,10 @@ pub struct ExpertCache<P: ExpertProvider> {
     /// when [`enable_prefetch`](ExpertCache::enable_prefetch) was called.
     predictor: Mutex<Option<Predictor>>,
     prefetch_tx: OnceLock<mpsc::SyncSender<(usize, Vec<usize>)>>,
+    /// The model's routed-expert count, so the prefill prefetch-ahead can judge what
+    /// *fraction* of the experts a layer touched. `0` = not supplied (legacy behaviour:
+    /// the absolute [`PREFETCH_AHEAD_MIN`] gate alone). See [`ahead_predicts_next_layer`].
+    n_experts: AtomicU64,
 }
 
 impl<P: ExpertProvider> ExpertCache<P> {
@@ -174,6 +178,7 @@ impl<P: ExpertProvider> ExpertCache<P> {
             fill_target: AtomicU64::new(0),
             hard_floor: AtomicU64::new(0),
             reserved: AtomicU64::new(0),
+            n_experts: AtomicU64::new(0),
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 pinned: HashSet::new(),
@@ -394,7 +399,9 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
         //     bandwidth (measured net-negative) — is untouched.
         //   - Otherwise the learned predictor (decode / miss-heavy regime), if enabled.
         if let Some(tx) = self.prefetch_tx.get() {
-            if prefetch_ahead_enabled() && eids.len() >= PREFETCH_AHEAD_MIN {
+            if prefetch_ahead_enabled()
+                && ahead_predicts_next_layer(eids.len(), self.n_experts.load(Ordering::Relaxed))
+            {
                 let _ = tx.try_send((layer + 1, eids.to_vec()));
             } else {
                 let predicted = self
@@ -417,6 +424,46 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
 /// Minimum routed-expert count for the prefill prefetch-ahead to fire — separates
 /// prefill (routes to ~all `n_experts`) from decode (top-k per token, ~8).
 const PREFETCH_AHEAD_MIN: usize = 64;
+
+/// Minimum *percentage* of the model's experts a layer must touch before
+/// prefetch-ahead will fire. See [`ahead_predicts_next_layer`].
+const PREFETCH_AHEAD_MIN_PCT: u64 = 50;
+
+/// Should prefetch-ahead queue this layer's expert set as the prediction for the next
+/// layer?
+///
+/// Prefetch-ahead predicts layer L+1's working set by reusing layer L's expert **ids**.
+/// That is only sound when a layer routes to ~*all* experts — then "the same ids" and
+/// "everything" are the same set and the prediction cannot miss. An absolute count
+/// (`>= 64`) is a poor proxy for that, because what matters is the count relative to
+/// `n_experts`:
+///
+/// | model | experts | union/layer | fraction | prefetch-ahead |
+/// |---|---|---|---|---|
+/// | GLM @4096 | 160 | ~all | ~100% | **1.58× win** |
+/// | Kimi-K3 @5 tok | 896 | ~78 | 8.7% | **1.26× loss** |
+///
+/// K3 cleared the old absolute gate (78 ≥ 64) while predicting almost nothing: measured
+/// ABBA on 42b2, prefetch-ahead cost **2293 extra expert loads (~50 GiB)** and bought
+/// **2 additional cache hits** (7147→7149), for expert-load 12926→16277 ms. The
+/// fraction gate rejects that case and still admits GLM's. It is also context-adaptive
+/// in the right direction: the same K3 at long context routes to ~all 896 experts, and
+/// there the prediction becomes correct and the gate re-opens on its own.
+///
+/// The 50% threshold is bounded by those two measured anchors (8.7% harmful, ~100%
+/// helpful); the crossover between them is **not** measured.
+fn ahead_predicts_next_layer(n_routed: usize, n_experts: u64) -> bool {
+    // Decode (per-token top-k ≪ 64) never prefetches ahead: speculative loads evict the
+    // working set and steal demand bandwidth (measured net-negative).
+    if n_routed < PREFETCH_AHEAD_MIN {
+        return false;
+    }
+    // Expert count not supplied — keep the historical absolute-gate behaviour.
+    if n_experts == 0 {
+        return true;
+    }
+    n_routed as u64 * 100 >= n_experts * PREFETCH_AHEAD_MIN_PCT
+}
 
 /// Prefill prefetch-ahead: during prefill, unconditionally background-load the next
 /// layer's experts (they overlap the current layer's GPU compute). **On by default**
@@ -505,7 +552,11 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
     /// a peer's RAM over RDMA (multispark) rather than local disk — no drive
     /// contention there — or with a separate staging budget that can't evict the
     /// working set. Kept opt-in for that. See `scripts/expert_prefetch_analysis.py`.
-    pub fn enable_prefetch(self: &Arc<Self>, topn: usize) {
+    /// `n_experts` is the model's routed-expert count, used by the prefill
+    /// prefetch-ahead to judge what fraction of the experts a layer touched
+    /// ([`ahead_predicts_next_layer`]). Pass `0` if unknown.
+    pub fn enable_prefetch(self: &Arc<Self>, topn: usize, n_experts: u64) {
+        self.n_experts.store(n_experts, Ordering::Relaxed);
         *self.predictor.lock().unwrap() = Some(Predictor::new(topn));
         let (tx, rx) = mpsc::sync_channel::<(usize, Vec<usize>)>(4);
         if self.prefetch_tx.set(tx).is_err() {
@@ -754,6 +805,33 @@ mod tests {
     use super::*;
     use crate::quantize::qtensor_from_f32;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn prefetch_ahead_gate_tracks_fraction_not_absolute_count() {
+        // The two measured anchors. GLM @4096: 160 experts, a layer routes to ~all →
+        // prefetch-ahead is a 1.58× win and must stay on.
+        assert!(ahead_predicts_next_layer(160, 160), "GLM full-union prefill must prefetch");
+        assert!(ahead_predicts_next_layer(120, 160), "75% of experts still predicts well");
+
+        // Kimi-K3 @5 tokens: 896 experts, union ~78. This CLEARS the old absolute gate
+        // (78 ≥ 64) but predicts almost nothing — measured 2293 wasted loads (~50 GiB)
+        // for 2 extra hits, expert-load 12926→16277 ms. It must now be rejected.
+        assert!(
+            !ahead_predicts_next_layer(78, 896),
+            "K3's 8.7% union must NOT prefetch ahead — this is the regression under test"
+        );
+
+        // Same model at long context routes to ~all experts; the gate reopens on its own.
+        assert!(ahead_predicts_next_layer(896, 896), "K3 at full union should prefetch again");
+
+        // Decode is excluded on the absolute floor regardless of fraction: a tiny model
+        // where top-k IS most of the experts must still not speculate per token.
+        assert!(!ahead_predicts_next_layer(8, 8), "decode-sized unions never prefetch ahead");
+
+        // Unsupplied expert count keeps the historical absolute-gate behaviour.
+        assert!(ahead_predicts_next_layer(78, 0), "n_experts=0 falls back to the old gate");
+        assert!(!ahead_predicts_next_layer(63, 0), "the absolute floor still applies");
+    }
 
     #[test]
     fn predictor_learns_layer_transition() {

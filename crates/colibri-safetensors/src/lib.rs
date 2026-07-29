@@ -951,10 +951,17 @@ impl Shards {
     /// | GLM-5.2 | 13428 / 13490 ms | **12802 / 13280** | +3.1% |
     /// | Kimi-K3 | **25626 / 25630 ms** | 29003 ms | −13% |
     ///
-    /// Opposite signs, a small win against a large loss, and no mechanism that explains
-    /// the split — K3 simply moves ~3x the bytes over ~2.7x the misses. Gating on a
-    /// two-point disagreement would be tuning, not engineering, so this is opt-in until
-    /// someone can say WHY it inverts.
+    /// **And the GLM "+3.1%" does not survive scrutiny.** Across three sessions the
+    /// `pread` CONTROL alone read 13469/13570, 13428/13490, 13086/13247 — a ~2.6% drift,
+    /// the same size as the claimed win. Establish the control's variance before quoting
+    /// an effect this small; I did not, and reported drift as a result.
+    ///
+    /// A ring POOL was tried on the theory that per-batch `io_uring_setup` + mmaps (40
+    /// workers x every batch, and K3 runs ~2.7x more batches) explained the sign split.
+    /// It measured WORSE on GLM (13584/13414 vs 13086/13247): pooling swaps per-batch
+    /// setup for per-batch contention on one global mutex. Reverted.
+    ///
+    /// Verdict: a wash on GLM, a clear loss on K3. Opt-in, kept so the idea has numbers.
     #[cfg(target_os = "linux")]
     fn drain_jobs_uring(&self, jobs: &[Job], nthreads: usize) -> bool {
         use io_uring::{opcode, types, IoUring};

@@ -96,6 +96,20 @@ const POOL_MIN_BYTES: usize = 1 << 20;
 /// **identical** at 32 and 64: the pool does not retain the extra memory, it only needs
 /// headroom not to reject returns. Default set to 2x the measured knee for models with
 /// more spans per batch than GLM's ~12.5.
+///
+/// Verified across the fleet at 32 vs 128, interleaved, **token-identical and
+/// RSS-identical for all five**:
+///
+/// | model | expert-load | where |
+/// |---|---|---|
+/// | GLM-5.2 | 14110/14274 -> 12079/12088 ms (1.17x) | `evict free` 1804 -> 1 ms |
+/// | Kimi-K3 | 28331/28084 -> 26433/26425 ms (1.07x) | `span-setup alloc` 1470 -> 108 ms |
+/// | MiniMax-M2.7 | 473 -> 461/473 ms | neutral: all mmap views, 1 pool op |
+/// | MiniMax-M3 | 8111/8054 -> 7991/7922 ms | neutral: never overflowed at 32 |
+/// | Nemotron-3 | 2 ms | neutral: preloads once, never frees |
+///
+/// The three neutral models are neutral *by construction* — they reject no returns even
+/// at 32 — not by luck.
 fn pool_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -121,13 +135,24 @@ fn pool_max_bytes() -> u64 {
 /// Pool effectiveness: recycled / freshly allocated / returned / **rejected because the
 /// pool was full**.
 ///
-/// These exist because the cap demonstrably binds and no model of the workload explains
-/// why. GLM coalesces one expert into one ~21 MB span and loads ~12.5 per batch, so the
-/// pool should oscillate between 0 and ~13 entries and never reach 32 — yet raising the
-/// cap from 32 to 4096 collapses eviction's `free` phase from 2057 ms to 1 ms, and
-/// disabling the pool entirely pushes it to 5506 ms. Something returns far more large
-/// buffers per batch than the span count predicts. `DROPS` names it directly: every
-/// rejected push is a real `munmap` of a >=1 MB buffer.
+/// These were added because the old 32-entry cap demonstrably bound and no model of the
+/// workload explained why. They answered it: at cap 32 GLM rejected **774 returns
+/// totalling 16.4 GB** (21.2 MB each — exactly one coalesced expert) and K3 rejected
+/// **5431 totalling 95.3 GB**, against 0 and 76 at cap 128.
+///
+/// They also corrected the mechanism. Missing the pool is not symmetric with being
+/// rejected by it, and the two land in *different* profile phases:
+///
+/// - a **miss** on acquire falls through to `vec![0u8; len]` — an mmap **plus
+///   zero-filling** the whole buffer — and shows up in `span-setup / alloc`;
+/// - a **rejection** on release drops a >= `POOL_MIN_BYTES` buffer that malloc served via
+///   mmap, so it is a real `munmap` with page-table teardown, and shows up in
+///   `evict / free`.
+///
+/// Which side dominates is model-dependent, not size-dependent: GLM's cost was `free`
+/// (1804 -> 1 ms) while K3's was `alloc` (1470 -> 108 ms), for near-identical buffer
+/// sizes. An early explanation that K3's spans were below `POOL_MIN_BYTES` was simply
+/// wrong, and these counters are what disproved it.
 pub static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static POOL_PUSHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

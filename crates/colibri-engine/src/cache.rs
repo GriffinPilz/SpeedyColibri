@@ -311,25 +311,45 @@ impl State {
     /// (heat = 1, so "cold" to LFRU) survive to the compute loop instead of being
     /// evicted by their own batch and reloaded.
     fn evict_to_protecting(&mut self, budget: u64, protect: &HashSet<(usize, usize)>) {
-        while self.bytes > budget {
-            let clock = self.clock;
-            let pinned = &self.pinned;
-            let victim = self
-                .entries
-                .iter()
-                .filter(|(k, _)| !pinned.contains(*k) && !protect.contains(*k))
-                .min_by_key(|(_, e)| evict_score(e.heat, e.last, clock))
-                .map(|(k, _)| *k);
-            match victim {
-                Some(k) => {
-                    if let Some(e) = self.entries.remove(&k) {
-                        self.bytes -= e.bytes;
-                        self.evictions += 1;
-                    }
-                }
-                None => break, // everything left is pinned or protected
+        if self.bytes <= budget {
+            return;
+        }
+        // Rank once, then evict down the list — rather than re-scanning every entry to
+        // find each successive victim.
+        //
+        // This is not an approximation. `evict_score(heat, last, clock)` reads only fields
+        // of the entry itself, and eviction mutates none of them: removing one entry
+        // leaves every other entry's score unchanged, and `pinned`/`protect`/`clock` are
+        // fixed for the call. So "repeatedly take the minimum" and "take them in ascending
+        // score order" select the same victims, in the same order. Only ties can resolve
+        // differently, and those were already decided by `HashMap` iteration order, i.e.
+        // arbitrary. Verified against the old implementation in
+        // `batch_eviction_picks_the_same_victims_as_repeated_min`.
+        //
+        // The old shape was O(entries) per victim. Measured on GLM (COLI_PROFILE=1): 3488
+        // evictions against ~2051 resident entries cost **1839 ms**, 87% of everything
+        // expert-load spent outside the reader and 13% of expert-load itself — with the
+        // drive idle throughout, because this runs under `state.lock()` between batches.
+        let clock = self.clock;
+        let pinned = &self.pinned;
+        let mut victims: Vec<((usize, usize), u64, u64)> = self
+            .entries
+            .iter()
+            .filter(|(k, _)| !pinned.contains(*k) && !protect.contains(*k))
+            .map(|(k, e)| (*k, evict_score(e.heat, e.last, clock), e.bytes))
+            .collect();
+        victims.sort_unstable_by_key(|&(_, score, _)| score);
+        for (k, _, bytes) in victims {
+            if self.bytes <= budget {
+                break;
+            }
+            if self.entries.remove(&k).is_some() {
+                self.bytes -= bytes;
+                self.evictions += 1;
             }
         }
+        // Falling off the end means everything left is pinned or protected — the same
+        // outcome the old `None => break` arm produced.
     }
 }
 
@@ -844,6 +864,110 @@ mod tests {
     use super::*;
     use crate::quantize::qtensor_from_f32;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The pre-rewrite eviction loop, kept verbatim as the oracle.
+    fn evict_by_repeated_min(
+        entries: &mut HashMap<(usize, usize), Entry>,
+        bytes: &mut u64,
+        pinned: &HashSet<(usize, usize)>,
+        clock: u32,
+        budget: u64,
+        protect: &HashSet<(usize, usize)>,
+    ) -> Vec<(usize, usize)> {
+        let mut order = Vec::new();
+        while *bytes > budget {
+            let victim = entries
+                .iter()
+                .filter(|(k, _)| !pinned.contains(*k) && !protect.contains(*k))
+                .min_by_key(|(_, e)| evict_score(e.heat, e.last, clock))
+                .map(|(k, _)| *k);
+            match victim {
+                Some(k) => {
+                    if let Some(e) = entries.remove(&k) {
+                        *bytes -= e.bytes;
+                        order.push(k);
+                    }
+                }
+                None => break,
+            }
+        }
+        order
+    }
+
+    #[test]
+    fn batch_eviction_picks_the_same_victims_as_repeated_min() {
+        // `evict_to_protecting` was O(entries) per victim and cost 1839 ms on a profiled
+        // GLM run. Replacing it with a single ranked pass is only legitimate if it evicts
+        // *exactly* what the old loop did — scores do not change as entries are removed,
+        // so it should. Assert that rather than trust the argument.
+        //
+        // Distinct scores throughout: ties were always broken by HashMap iteration order,
+        // which is arbitrary, so equality there is neither expected nor meaningful.
+        // `bytes` is tracked on the Entry, so an empty Expert is enough here.
+        let mk = |bytes: u64| Entry { expert: Arc::new(Expert::default()), bytes, heat: 1, last: 0 };
+        let build = || {
+            let mut m: HashMap<(usize, usize), Entry> = HashMap::new();
+            let mut total = 0u64;
+            for i in 0..64usize {
+                let mut e = mk(1000 + i as u64);
+                // `evict_score` is recency-primary; distinct `last` gives a total order.
+                e.last = i as u32;
+                e.heat = 1 + (i % 3) as u32;
+                total += e.bytes;
+                m.insert((i % 4, i), e);
+            }
+            (m, total)
+        };
+
+        let pinned: HashSet<(usize, usize)> = [(0usize, 0usize), (1, 5)].into_iter().collect();
+        let protect: HashSet<(usize, usize)> = [(2usize, 6usize), (3, 11)].into_iter().collect();
+        let clock = 100u32;
+
+        for budget_frac in [0u64, 1, 2, 3] {
+            let (mut a_entries, mut a_bytes) = build();
+            let budget = a_bytes * budget_frac / 4;
+            let expected =
+                evict_by_repeated_min(&mut a_entries, &mut a_bytes, &pinned, clock, budget, &protect);
+
+            let (b_entries, b_bytes) = build();
+            let mut s = State {
+                entries: b_entries,
+                pinned: pinned.clone(),
+                bytes: b_bytes,
+                clock,
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+                session_usage: HashMap::new(),
+            };
+            s.evict_to_protecting(budget, &protect);
+
+            // Guard against a vacuous pass: if nothing is ever evicted, every assertion
+            // below holds trivially and the test proves nothing about the rewrite.
+            assert!(
+                !expected.is_empty(),
+                "budget={budget}: oracle evicted nothing — test is not exercising eviction"
+            );
+            assert_eq!(
+                s.evictions as usize,
+                expected.len(),
+                "budget={budget}: eviction count differs"
+            );
+            assert_eq!(s.bytes, a_bytes, "budget={budget}: resident bytes differ");
+            let mut survivors: Vec<_> = s.entries.keys().copied().collect();
+            let mut oracle: Vec<_> = a_entries.keys().copied().collect();
+            survivors.sort_unstable();
+            oracle.sort_unstable();
+            assert_eq!(survivors, oracle, "budget={budget}: different victims chosen");
+            // Whatever else happened, the invariants the caller relies on must hold.
+            for k in &pinned {
+                assert!(s.entries.contains_key(k), "evicted a pinned entry {k:?}");
+            }
+            for k in &protect {
+                assert!(s.entries.contains_key(k), "evicted a protected entry {k:?}");
+            }
+        }
+    }
 
     #[test]
     fn topn_zero_predictor_really_predicts_nothing() {

@@ -200,6 +200,19 @@ pub static BATCH_SPAWN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// count, so this is not simply calls x the configured thread count).
 pub static BATCH_THREADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Sub-phases of `SETUP`, plus the span count. On MiniMax-M2.7 every expert span is served
+/// from the mapping, so `drain` is 0 ms and **span-setup is 93% of the whole expert-load** —
+/// for that model this is no longer bookkeeping around the real work, it *is* the work.
+///
+/// `LOOKUP` is per-name tensor metadata (a `HashMap<String, _>` hit, so string hashing);
+/// `MINCORE` is [`Mapping::resident`], which issues a `mincore` syscall **and allocates and
+/// scans a one-byte-per-page vector** for every span on every read — ~1900 pages for a 7.6 MB
+/// M2.7 expert; `ALLOC` is `SharedBuf::with_len` for spans that still need a buffer.
+pub static SPAN_LOOKUP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPAN_MINCORE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPAN_ALLOC_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPAN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn profile_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_PROFILE").ok().as_deref() == Some("1"))

@@ -727,6 +727,20 @@ fn wrap_fresh(w: &QTensor) -> Option<cuda::ResidentTensor> {
             )
         };
     }
+    // MXFP4 (Kimi-K3): same three-buffer shape as NVFP4 — nibbles + block scales +
+    // global — but the format code selects the per-32 stride and the E8M0 decode.
+    if w.fmt_code == 6 {
+        return unsafe {
+            cuda::ResidentTensor::wrap_raw_mxfp4(
+                w.q4.as_ptr() as *const c_void,
+                w.bs.as_ptr() as *const c_void,
+                w.g,
+                w.i,
+                w.o,
+                0,
+            )
+        };
+    }
     unsafe { cuda::ResidentTensor::wrap_raw(weight_ptr(w), w.s.as_ptr(), w.fmt_code, w.i, w.o, 0) }
 }
 
@@ -846,6 +860,48 @@ pub fn try_expert_ffn(
 /// two-tensor expert — no gate projection). NVFP4-only: reuses the same zero-copy NVFP4
 /// decode as [`try_expert_ffn`], with a relu² activation between the up and down GEMMs.
 /// Returns `true` if it ran there; the caller falls back to the CPU reference otherwise.
+/// Kimi-K3 MXFP4 expert FFN with the situ activation: `y = down(situ(gate.x, up.x))`.
+///
+/// Exists because K3 could otherwise not use the GPU for experts at all — `ffn`
+/// deliberately declines the fused SwiGLU path when situ is set (those kernels apply
+/// oai-or-SiLU and would return success having computed a DIFFERENT activation), so K3's
+/// routed experts ran the scalar CPU loop at 85-99% of a measured forward pass.
+///
+/// Zero-copy only, like the NVFP4 paths: the nibble/block-scale plumbing has no
+/// device-copy variant.
+pub fn try_expert_ffn_mxfp4_situ(
+    gate: &QTensor,
+    up: &QTensor,
+    down: &QTensor,
+    x: &[f32],
+    nr: usize,
+    out: &mut [f32],
+    beta: f32,
+    linear_beta: f32,
+) -> bool {
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if gate.fmt_code != 6 || up.fmt_code != 6 || down.fmt_code != 6 {
+        return false;
+    }
+    let (Some(g), Some(u), Some(d)) = (wrap_fresh(gate), wrap_fresh(up), wrap_fresh(down)) else {
+        return false;
+    };
+    // SAFETY: g/u/d live to end of scope, covering the synchronous kernel + download;
+    // x/out are sized [nr, gate.i] / [nr, down.o] by `ffn`.
+    let ok = unsafe {
+        cuda::expert_mlp_mxfp4_situ_raw(
+            g.as_raw(), u.as_raw(), d.as_raw(),
+            out.as_mut_ptr(), x.as_ptr(), nr as i32, beta, linear_beta,
+        )
+    };
+    if ok {
+        GPU_FFN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 pub fn try_expert_ffn_relu2(
     up: &QTensor,
     down: &QTensor,

@@ -68,6 +68,25 @@ extern "C" {
     ) -> c_int;
     fn coli_cuda_pageable_access(device: c_int) -> c_int;
     fn coli_cuda_set_weight_zerocopy(on: c_int);
+    fn coli_cuda_tensor_wrap_mxfp4(
+        tensor: *mut *mut ColiCudaTensor,
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        i: c_int,
+        o: c_int,
+        device: c_int,
+    ) -> c_int;
+    fn coli_cuda_expert_mlp_mxfp4_situ(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+        beta: f32,
+        linear_beta: f32,
+    ) -> c_int;
     fn coli_cuda_matmul(
         tensor: *mut *mut ColiCudaTensor,
         y: *mut f32,
@@ -426,6 +445,29 @@ impl ResidentTensor {
         }
     }
 
+    /// Zero-copy wrap of an MXFP4 expert weight `[O, I]` (fmt=6): packed e2m1 nibbles
+    /// plus E8M0 per-32 block scales, both read from host RAM in place.
+    ///
+    /// # Safety
+    /// `weights`/`bscale` must outlive every kernel that uses this tensor.
+    pub unsafe fn wrap_raw_mxfp4(
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        i: i32,
+        o: i32,
+        device: i32,
+    ) -> Option<ResidentTensor> {
+        let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
+        if coli_cuda_tensor_wrap_mxfp4(&mut ptr, weights, bscale, gscale, i, o, device) != 0
+            && !ptr.is_null()
+        {
+            Some(ResidentTensor { ptr })
+        } else {
+            None
+        }
+    }
+
     /// Raw device handle (for the fused expert pipeline). Borrowed; do not free.
     pub fn as_raw(&self) -> *mut ColiCudaTensor {
         self.ptr
@@ -590,6 +632,24 @@ pub unsafe fn expert_mlp_nvfp4_raw(
 ///
 /// # Safety
 /// The two handles must be resident on the same device; `y`/`x` hold `s*up.I` floats.
+/// Kimi-K3 MXFP4 expert FFN with the situ activation. All three must be fmt==6.
+///
+/// # Safety
+/// The three handles must be resident on the same device; `y`/`x` hold `s*O`/`s*I` floats.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn expert_mlp_mxfp4_situ_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+    beta: f32,
+    linear_beta: f32,
+) -> bool {
+    coli_cuda_expert_mlp_mxfp4_situ(gate, up, down, y, x, s, beta, linear_beta) != 0
+}
+
 pub unsafe fn expert_mlp_nvfp4_relu2_raw(
     up: *mut ColiCudaTensor,
     down: *mut ColiCudaTensor,

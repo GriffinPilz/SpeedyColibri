@@ -117,6 +117,9 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 3) return (size_t)(I + 3) / 4;
     if (fmt == 4) return (size_t)I;          // e4m3 fp8: 1 byte/weight
     if (fmt == 5) return (size_t)(I + 1) / 2; // nvfp4: packed e2m1 nibbles, 2/byte
+    // mxfp4: the SAME packed e2m1 nibbles as nvfp4 — the formats differ only in the
+    // separate block-scale array (E8M0 per 32 vs ue4m3 per 16), which is not counted here.
+    if (fmt == 6) return (size_t)(I + 1) / 2;
     return 0;
 }
 
@@ -346,6 +349,132 @@ __global__ static void nvfp4_gemv(float *y,const float *x,const uint8_t *w,
     #pragma unroll
     for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
     if(lane==0) y[n]=acc*g;
+}
+
+/* ---------------------------------------------------------------------------------
+ * MXFP4 (Kimi-K3) expert kernels.
+ *
+ * Same e2m1 nibbles as NVFP4 with exactly two differences, both localized:
+ *   - one OCP E8M0 (power-of-two) block scale per 32 inputs, not a ue4m3 per 16;
+ *   - no per-tensor global (a natively-MXFP4 tensor carries g == 1.0), kept as a
+ *     parameter so both formats share one call shape.
+ *
+ * Written as separate kernels rather than by templating the NVFP4 ones: those are the
+ * hot path for four shipped models, and changing their codegen to serve a fifth is not
+ * a trade worth making for ~110 lines. K3's experts are natively MXFP4 and pass through
+ * convert bit-exact, so this is the only kernel that can read them.
+ * --------------------------------------------------------------------------------- */
+
+/* Decode one OCP E8M0 byte: a bare power of two, 2^(b-127). 0xFF is NaN. */
+__device__ __forceinline__ static float e8m0f(uint8_t b) {
+    return (b == 0xFF) ? __int_as_float(0x7fffffff) : exp2f((float)b - 127.0f);
+}
+
+/* Single-row decode GEMV (S==1 decode): one warp per output column. */
+__global__ static void mxfp4_gemv(float *y,const float *x,const uint8_t *w,
+                                  const uint8_t *bs,float g,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+31)>>5;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int k=lane;k<K;k+=32){
+        uint8_t byte=wr[k>>1];
+        int nib=(k&1)?(byte>>4):(byte&0xF);
+        acc += xs[k]*e2m1f(nib)*e8m0f(br[k>>5]);
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* Tiled WMMA matmul (S>1 prefill). Mirror of `nvfp4_matmul` with the MXFP4 decode. */
+__global__ static void mxfp4_matmul(float *y,const float *x,const uint8_t *w,
+                                    const uint8_t *bs,float g,int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    int Kh=(K+1)>>1, nb=(K+31)>>5;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){
+            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);
+        }
+        for(int z=lane;z<256;z+=32){
+            int nn=z/16,gk=k0+(z%16),gn=n0+nn;float v=0.f;
+            if(gn<N&&gk<K){
+                uint8_t byte=w[(size_t)gn*Kh+(gk>>1)];
+                int nib=(gk&1)?(byte>>4):(byte&0xF);
+                v=e2m1f(nib)*e8m0f(bs[(size_t)gn*nb+(gk>>5)])*g;
+            }
+            bh[warp][z]=__float2half(v);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,nn=z%16;
+        if(m0+m<M&&n0+nn<N)y[(size_t)(m0+m)*N+n0+nn]=out[warp][z];}
+#endif
+}
+
+/* Tiled WMMA fused gate+up (S>1 prefill). Mirror of `nvfp4_gate_up` with the MXFP4 decode. */
+__global__ static void mxfp4_gate_up(float *gate,float *up,const float *x,
+        const uint8_t *gw,const uint8_t *uw,const uint8_t *gbs,const uint8_t *ubs,
+        float gg,float ug,int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+tile*16;
+    const uint8_t *w=which?uw:gw;const uint8_t *bs=which?ubs:gbs;
+    float g=which?ug:gg;float *y=which?up:gate;
+    int Kh=(K+1)>>1, nb=(K+31)>>5;
+    __shared__ __half ah[256],bh[8][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);}
+        for(int z=lane;z<256;z+=32){int nn=z/16,gk=k0+(z%16),gn=n0+nn;float v=0.f;
+            if(gn<N&&gk<K){
+                uint8_t byte=w[(size_t)gn*Kh+(gk>>1)];
+                int nib=(gk&1)?(byte>>4):(byte&0xF);
+                v=e2m1f(nib)*e8m0f(bs[(size_t)gn*nb+(gk>>5)])*g;
+            }
+            bh[warp][z]=__float2half(v);}
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[8][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,nn=z%16;
+        if(m0+m<M&&n0+nn<N)y[(size_t)(m0+m)*N+n0+nn]=out[warp][z];}
+#endif
+}
+
+/* Kimi-K3 `situ`, fused into the gate/up combine:
+ *     gate = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
+ * ASYMMETRIC — the gate half gets tanh*sigmoid, the up half only tanh — so the two
+ * arguments are not interchangeable. `linear_beta <= 0` means "unset" (the reference's
+ * `None`), leaving `up` a plain passthrough. Mirrors `math::situ` exactly. */
+__global__ static void situ_mul(float *gate,const float *up,size_t n,
+                                float beta,float linear_beta){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n) return;
+    float gv=gate[i], uv=up[i];
+    float a = beta*tanhf(gv/beta)*(1.0f/(1.0f+__expf(-gv)));
+    float u = (linear_beta>0.0f) ? linear_beta*tanhf(uv/linear_beta) : uv;
+    gate[i]=a*u;
 }
 
 /* Tiled WMMA down-proj (S>1 prefill). Mirror of `fp8a16_matmul` with the nvfp4 decode. */
@@ -1582,6 +1711,56 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
  * WMMA at S>1 (prefill). Requires fmt==5 on all three projections and compute>=7. Zero-copy
  * only (no device-copy staging path); the block-scale + global travel on the ColiCudaTensor.
  * `COLI_NVFP4_TILED=1` forces the tiled path even at S==1 (A/B against the GEMV). */
+/* Kimi-K3 MXFP4 expert FFN: y = down( situ(gate.x, up.x) ).
+ *
+ * Same shape as coli_cuda_expert_mlp_nvfp4 with the MXFP4 decode (E8M0 per 32) and the
+ * situ activation instead of SwiGLU. It exists because K3 could not use the GPU at all:
+ * `ffn` deliberately declines the fused SwiGLU path when situ is set (those kernels apply
+ * oai-or-SiLU and would return success having computed a DIFFERENT activation), so K3's
+ * experts ran the scalar CPU loop — 85% of a measured 5-minute forward pass.
+ *
+ * `beta`/`linear_beta` come from the model config; `linear_beta <= 0` means unset. */
+extern "C" int coli_cuda_expert_mlp_mxfp4_situ(ColiCudaTensor *gate,ColiCudaTensor *up,
+        ColiCudaTensor *down,float *y,const float *x,int S,
+        float beta,float linear_beta){
+    if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=6||up->fmt!=6||down->fmt!=6||
+       gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
+       gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
+    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert mxfp4 input upload"))return 0;
+    const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
+    const uint8_t *gbs=(const uint8_t*)gate->bscale,*ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
+    float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
+    unsigned sblocks=(unsigned)(((size_t)S*I+255)/256);
+    if(S==1){
+        int tpb=256,wpb=tpb>>5;
+        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
+        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+        situ_mul<<<sblocks,256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I,beta,linear_beta);
+        mxfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
+    }else{
+        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+        mxfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
+        situ_mul<<<sblocks,256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I,beta,linear_beta);
+        mxfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert mxfp4 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert mxfp4 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert mxfp4 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    return 1;
+}
+
 extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *up,
         ColiCudaTensor *down,float *y,const float *x,int S){
     if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=5||up->fmt!=5||down->fmt!=5||
@@ -2424,6 +2603,29 @@ extern "C" int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
     t->weight_bytes = rb * (size_t)O;
     t->weights = const_cast<void *>(weights);
     t->scales = const_cast<float *>(scales);
+    t->wrapped = 1;
+    *tensor = t;
+    return 1;
+}
+
+/* Zero-copy wrap of an MXFP4 expert weight (fmt=6): nibbles + E8M0 per-32 block scales.
+ * Same shape as the NVFP4 wrap; the format code is what selects the per-32 stride and the
+ * power-of-two scale decode in the kernels. `gscale` is 1.0 for a native MXFP4 tensor. */
+extern "C" int coli_cuda_tensor_wrap_mxfp4(ColiCudaTensor **tensor,
+        const void *weights, const void *bscale, float gscale,
+        int I, int O, int device) {
+    if (!tensor || !weights || !bscale || I < 1 || O < 1) return 0;
+    if (*tensor) {
+        ColiCudaTensor *t = *tensor;
+        return t->fmt == 6 && t->I == I && t->O == O && t->device == device;
+    }
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = 6; t->I = I; t->O = O; t->device = device;
+    t->weight_bytes = row_bytes(6, I) * (size_t)O;
+    t->weights = const_cast<void *>(weights);
+    t->bscale = bscale;
+    t->gscale = gscale;
     t->wrapped = 1;
     *tensor = t;
     return 1;

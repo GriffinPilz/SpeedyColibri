@@ -901,11 +901,18 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
             if crate::gpu::try_expert_ffn_relu2(up, down, x, nr, out) {
                 return;
             }
-        } else if !a.situ && crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
-            // `situ` is deliberately excluded: the fused SwiGLU kernels apply `oai`-or-SiLU
-            // (gpu::set_activation carries no situ params), so letting a K3 model take this
-            // path would compute a DIFFERENT activation and still return success. Until a
-            // situ kernel exists, K3 experts run the CPU reference below.
+        } else if a.situ {
+            // Kimi-K3: its own kernel, because the fused SwiGLU ones apply `oai`-or-SiLU
+            // (gpu::set_activation carries no situ params) and would return success having
+            // computed a DIFFERENT activation. `try_expert_ffn_mxfp4_situ` declines
+            // anything that is not MXFP4-on-a-zero-copy-device, so a situ model with other
+            // expert formats still lands on the CPU reference below.
+            if crate::gpu::try_expert_ffn_mxfp4_situ(
+                gate, up, down, x, nr, out, a.situ_beta, a.situ_linear_beta,
+            ) {
+                return;
+            }
+        } else if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
             return;
         }
     }
@@ -2136,6 +2143,62 @@ mod tests {
                 out_sharded[dd]
             );
         }
+    }
+
+    // TEMPORARY PROOF — delete.
+    #[test]
+    fn zz_proof_activation_race() {
+        use colibri_cluster::{serve_experts, ExpertResponse, TcpTransport};
+        let c = cfg();
+        let d = c.hidden as usize;
+        let inter = c.moe_inter as usize;
+        let consts = [-1.0f32, 0.5, 1.0, 0.0];
+        let mut router = vec![0f32; c.n_experts as usize * d];
+        for (e, &cst) in consts.iter().enumerate() {
+            for i in 0..d {
+                router[e * d + i] = cst;
+            }
+        }
+        let mut l = Layer::default();
+        l.router = router;
+        l.router_bias = vec![0.0; c.n_experts as usize];
+        let sh = expert(50, (c.moe_inter * c.n_shared) as usize, d);
+        l.sh_gate = sh.gate.clone();
+        l.sh_up = sh.up.clone();
+        l.sh_down = sh.down.clone();
+        let experts: HashMap<(usize, usize), Arc<Expert>> =
+            (0..4).map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d)))).collect();
+        let provider = Arc::new(MapProvider { experts });
+        let x = vec![0.3f32, 0.5, -0.2, 0.7];
+
+        let mut out_single = vec![0f32; d];
+        moe(&c, &l, 0, &x, 1, &mut out_single, true, &*provider).unwrap();
+
+        // <-- the interleaving: another test's set_activation lands right here.
+        let _ = ACTIVATION.set(ActCfg {
+            oai: false, alpha: 0.0, limit: 0.0, relu2: false,
+            situ: true, situ_beta: 4.0, situ_linear_beta: 25.0,
+        });
+
+        let weights = [100u64, 100, 1, 1];
+        let sharding = ExpertSharding::balanced(2, c.n_experts as u32, &weights);
+        let hp = provider.clone();
+        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
+            let outputs = compute_experts_partial(
+                &*hp, req.layer as usize, &req.experts, &req.weights,
+                &req.activations, req.n_tokens, req.hidden,
+            )
+            .unwrap();
+            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
+        })
+        .unwrap();
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), addr);
+        let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
+        let mut out_sharded = vec![0f32; d];
+        moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
+            .unwrap();
+        panic!("PROOF single {} vs sharded {}", out_single[0], out_sharded[0]);
     }
 
     /// End-to-end: write a real int2 `.weight` + f32 `.qs` shard for one expert,

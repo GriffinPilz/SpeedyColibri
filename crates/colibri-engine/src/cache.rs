@@ -330,6 +330,16 @@ impl State {
         // evictions against ~2051 resident entries cost **1839 ms**, 87% of everything
         // expert-load spent outside the reader and 13% of expert-load itself — with the
         // drive idle throughout, because this runs under `state.lock()` between batches.
+        //
+        // This is O(N log N) against the old O(M*N), so for **one** victim against a huge
+        // cache the asymptotics favour the old shape — worth noting, because Nemotron
+        // preloads 20480 experts. The constants should still favour this: the old loop
+        // measured ~237 ns per entry visited (1698 ms / 3488 / 2051 — HashMap iteration,
+        // pointer-chasing into Arc'd entries, two tuple hashes for pinned/protect),
+        // whereas this collects and sorts a flat Vec of Copy tuples. That comparison is
+        // *reasoned, not measured*: the small-M/large-N regime has not been profiled, and
+        // Nemotron in practice preloads to fit and evicts ~nothing, so it is not currently
+        // exercised. Measure before assuming it holds if that changes.
         let clock = self.clock;
         let pinned = &self.pinned;
         let mut victims: Vec<((usize, usize), u64, u64)> = self

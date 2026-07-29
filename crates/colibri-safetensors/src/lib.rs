@@ -371,6 +371,39 @@ pub struct Shards {
     index: HashMap<String, usize>,
 }
 
+/// Persistent io_uring instances, checked out per worker thread and returned on drop.
+///
+/// Rings are created ONCE for the process, not per read batch. `IoUring::new` is an
+/// `io_uring_setup` syscall plus mmaps of the SQ/CQ rings, and the reader creates one per
+/// worker per batch — 40 concurrent `mmap`s serialising on the process-wide `mmap_lock`,
+/// repeated for every expert batch. That cost scales with the NUMBER of batches, which is
+/// why it showed up as a model-dependent split: Kimi-K3 runs ~2.7x more batches than
+/// GLM-5.2 and was 13% slower where GLM was 3.1% faster. Reuse removes the setup entirely.
+#[cfg(target_os = "linux")]
+static URING_POOL: Mutex<Vec<io_uring::IoUring>> = Mutex::new(Vec::new());
+
+/// Take a ring of at least `depth` entries from the pool, or build one.
+#[cfg(target_os = "linux")]
+fn uring_take(depth: u32) -> Option<io_uring::IoUring> {
+    if let Ok(mut p) = URING_POOL.lock() {
+        // Rings are uniform in practice (one depth per process), so any entry will do.
+        if let Some(r) = p.pop() {
+            return Some(r);
+        }
+    }
+    io_uring::IoUring::new(depth).ok()
+}
+
+/// Return a ring for reuse. Bounded so a pathological thread count cannot grow it forever.
+#[cfg(target_os = "linux")]
+fn uring_put(r: io_uring::IoUring) {
+    if let Ok(mut p) = URING_POOL.lock() {
+        if p.len() < 64 {
+            p.push(r);
+        }
+    }
+}
+
 /// One tiled sub-read: a 512-aligned window of a span buffer, filled from `file` at
 /// `off`. Hoisted to module scope so both drains (thread pool and io_uring) share it.
 struct Job {
@@ -983,9 +1016,12 @@ impl Shards {
                     // completion being ready, and this loop then spins on an empty CQ without
                     // ever decrementing `inflight` — observed as a live-lock (state R, 10+
                     // minutes, zero progress) on GLM. A plain ring blocks properly.
-                    let mut ring = match IoUring::new(per_ring) {
-                        Ok(r) => r,
-                        Err(_) => {
+                    //
+                    // From the POOL: building a ring here would put an io_uring_setup plus
+                    // two mmaps on every worker on every batch (see `URING_POOL`).
+                    let mut ring = match uring_take(per_ring) {
+                        Some(r) => r,
+                        None => {
                             okr.store(false, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
@@ -1010,23 +1046,27 @@ impl Shards {
                     }
                     if ring.submit().is_err() {
                         okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                        uring_put(ring);
                         return;
                     }
                     while inflight > 0 {
                         if ring.submit_and_wait(1).is_err() {
                             okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            uring_put(ring);
                             return;
                         }
                         let res: Vec<i32> = ring.completion().map(|c| c.result()).collect();
                         if res.is_empty() {
                             // Belt and braces: never loop without progress.
                             okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            uring_put(ring);
                             return;
                         }
                         for r in res {
                             inflight -= 1;
                             if r < 0 {
                                 okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                                uring_put(ring);
                                 return;
                             }
                             if next < mine.len() {
@@ -1039,9 +1079,11 @@ impl Shards {
                         }
                         if ring.submit().is_err() {
                             okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            uring_put(ring);
                             return;
                         }
                     }
+                    uring_put(ring);
                 });
             }
         });

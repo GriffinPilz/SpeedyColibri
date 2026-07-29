@@ -189,13 +189,12 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         // No /proc/meminfo (non-Linux dev box): the budget is unbounded, and printing
         // it as a number renders "17179869184 GB". Say what actually happened.
         println!(
-            "[serve] expert cache: unbounded (no MemAvailable to budget from) \
-             — set COLI_RAM_GB to cap it"
+            "[serve] expert cache: unbounded (no MemAvailable to budget from)"
         );
     } else {
         println!(
-            "[serve] expert cache: {:.0} GB initial budget; KV reserved per request \
-             (≤ {:.1} GB at the full {} ctx{}) — set COLI_RAM_GB to override",
+            "[serve] expert cache: {:.0} GB initial budget (adaptive); KV reserved per \
+             request (≤ {:.1} GB at the full {} ctx{})",
             budget as f64 / gib,
             kv_worst_case as f64 / gib,
             ctx_len,

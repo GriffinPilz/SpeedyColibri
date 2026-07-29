@@ -270,7 +270,11 @@ impl ExpertLayout {
     }
 
     /// Container weight name for one expert projection (`suf` ∈ [`ExpertLayout::projs`]).
-    fn weight_name(&self, layer: usize, eid: usize, suf: &str) -> String {
+    ///
+    /// `pub(crate)` so the convert tests can assert that what convert WRITES is exactly
+    /// what the loader LOOKS UP — the two drifted once (`weight_packed` vs `weight`) and
+    /// produced an unloadable container with every test on both sides passing.
+    pub(crate) fn weight_name(&self, layer: usize, eid: usize, suf: &str) -> String {
         format!("model.layers.{layer}.{}.experts.{eid}.{suf}.weight", self.prefix)
     }
 }

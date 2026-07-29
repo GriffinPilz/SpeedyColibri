@@ -573,7 +573,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
 
     // Resident expert cache, restricted to this node's shard (the provider refuses a
     // non-owned expert, so a routing bug fails loudly instead of streaming a peer's
-    // expert off disk). Budget from COLI_RAM_GB, else the auto cap.
+    // expert off disk). Budget from the adaptive cap.
     let base = colibri_engine::ShardsExpertProvider::with_sharding(
         &model.shards,
         &model.cfg,
@@ -2083,7 +2083,7 @@ const ADAPTIVE_HARD_FLOOR: u64 = 3 << 30;
 /// masquerade as a config effect — every earlier ascending-order sweep here was
 /// uninterpretable for exactly that reason):
 ///
-/// | `COLI_RAM_GB` | RSS   | swap  | tok/s |
+/// | budget (GB)   | RSS   | swap  | tok/s |
 /// |---------------|-------|-------|-------|
 /// | 20            | 39 GB | 0     | 0.46  |
 /// | 40            | 57 GB | 0     | 0.45  |
@@ -2107,40 +2107,22 @@ const ADAPTIVE_HARD_FLOOR: u64 = 3 << 30;
 const CACHE_CAP_DIVISOR: u64 = 3;
 
 /// Floor so a small/busy box still gets a usable cache rather than 0 (a 0 budget
-/// evicts every expert immediately and thrashes). Set `COLI_RAM_GB` explicitly if
-/// even this doesn't fit.
+/// evicts every expert immediately and thrashes).
 const MIN_BUDGET: u64 = 4 << 30;
 
 /// Expert-cache byte budget, reserving `reserve` bytes the caller knows it will
 /// still allocate (e.g. `serve`'s KV cache) on top of [`WORKING_RESERVE`].
 ///
-/// `COLI_RAM_GB` remains an **exact override** — the point of the default is to pick
-/// a safe maximum automatically, and the knob is there to go lower (or higher, if you
-/// know better).
+/// There is deliberately NO manual override. The budget is chosen adaptively from
+/// `MemAvailable` and the [`CACHE_CAP_DIVISOR`] ceiling, and a background monitor evicts
+/// under pressure — a fixed number cannot react to any of that. Every measured sweep of
+/// the old `COLI_RAM_GB` knob came out flat or worse, and the one thing it reliably did
+/// was let a caller pin a budget past the thrash cliff.
 ///
 /// Dense weights are deliberately *not* subtracted: `load_model_with` materializes
 /// them eagerly and every caller budgets *after* the load, so `MemAvailable` has
 /// already excluded them. Subtracting again would double-count ~11 GiB.
 fn ram_budget_reserving(reserve: u64) -> u64 {
-    if let Ok(gb) = std::env::var("COLI_RAM_GB") {
-        if let Ok(g) = gb.parse::<u64>() {
-            let asked = g << 30;
-            // Exact override, but say so when it's past the measured cliff: 70 GiB on a
-            // 121 GiB box swaps 15 GiB and costs ~20%, 85 costs ~4x. Silently obeying a
-            // number that guarantees thrash is how the old default hurt people.
-            if let Some(cap) = colibri_engine::total_ram_bytes().map(|t| t / CACHE_CAP_DIVISOR) {
-                if asked > cap {
-                    eprintln!(
-                        "[warn] COLI_RAM_GB={g} exceeds the safe cache ceiling of {} GB \
-                         (MemTotal/{CACHE_CAP_DIVISOR}); measured: budgets past ~55 GB on a \
-                         121 GB box swap and lose throughput. Using {g} GB as asked.",
-                        cap >> 30
-                    );
-                }
-            }
-            return asked;
-        }
-    }
     match colibri_engine::available_ram_bytes() {
         Some(avail) => budget_from(avail, reserve, colibri_engine::total_ram_bytes()),
         None => u64::MAX, // non-Linux: no /proc/meminfo, stay unbounded
@@ -2187,10 +2169,6 @@ const NEARFIT_COVERAGE_PCT: u64 = 80;
 /// target and a background monitor evicts LRU experts under memory pressure so the box can
 /// never OOM — which is what lets us point a fill-RAM policy at a model of *any* size:
 ///
-/// - **`COLI_RAM_GB=n`** → fill target is the fixed `n` GB (respecting the user's cap), but
-///   the pressure monitor still runs. This is the fix for the old behavior where a fixed
-///   budget had no feedback and grew into the wall (forcing 100 GB on the 216 GB M3 OOM-
-///   killed the server); now that same budget simply caps itself where the box stays safe.
 /// - **near-fit** (experts ≈ RAM) → fill to `total − reserve` **plus fadvise** — the whole
 ///   working set resident, no page-cache double-hold.
 /// - **≫ RAM** (experts ≫ RAM) → hold only `MemTotal / CACHE_CAP_DIVISOR` with **fadvise
@@ -2242,31 +2220,21 @@ fn wire_adaptive_cache<P>(
         0
     };
     let near_fit = covers_pct >= NEARFIT_COVERAGE_PCT;
-    // An explicit COLI_RAM_GB caps the fill target; the monitor still protects the floor.
-    let explicit = std::env::var("COLI_RAM_GB")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|g| g << 30);
     // Fill target by regime. Near-fit: fill to `natural_fill` — the whole set nearly
     // fits and the fadvise below keeps MemAvailable honest. ≫-RAM: hold only the
     // settled `MemTotal / CACHE_CAP_DIVISOR` ceiling and let the OS page cache serve the
     // streaming tail as a second tier. Holding more *thrashes*: filling ~101 GB collapsed
     // M3 decode to ~0.7 tok/s (memory-ceiling-is-real / autopin-single-node-negative).
-    let fill_target = explicit.unwrap_or(if near_fit {
-        natural_fill
-    } else {
-        total / CACHE_CAP_DIVISOR
-    });
-    // fadvise only auto-engages for a near-fit model on the automatic path; an explicit
-    // budget leaves fadvise to the COLI_FADVISE env, and ≫-RAM keeps the page cache.
-    if near_fit && explicit.is_none() {
+    let fill_target = if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR };
+    // fadvise auto-engages only for a near-fit model; ≫-RAM keeps the page cache.
+    if near_fit {
         colibri_safetensors::set_fadvise(true);
     }
     provider.spawn_adaptive_budget(fill_target, ADAPTIVE_DANGER_FLOOR, ADAPTIVE_HARD_FLOOR);
-    let regime = match (explicit.is_some(), near_fit) {
-        (true, _) => "fixed budget (COLI_RAM_GB)",
-        (false, true) => "near-fit max-residency, fadvise on",
-        (false, false) => "≫-RAM fill, page cache kept",
+    let regime = if near_fit {
+        "near-fit max-residency, fadvise on"
+    } else {
+        "≫-RAM fill, page cache kept"
     };
     eprintln!(
         "[cache] {regime}: ~{} GB experts / {} GB RAM ({covers_pct}% coverage) → fill to ~{} GB, \

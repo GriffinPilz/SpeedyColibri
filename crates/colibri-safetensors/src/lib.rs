@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// Both follow-ups have since been measured, and both confirmed it:
 /// [`o_direct_enabled`] bypasses the same tier and is 18% slower at equal cache size
-/// despite winning the raw-bandwidth microbenchmark; and raising `COLI_RAM_GB` hurts
+/// despite winning the raw-bandwidth microbenchmark; and raising the expert-cache budget hurts
 /// for the same reason, since it moves RAM from a tier that caches at 4 KB page
 /// granularity into one that caches whole 38.3 MB experts.
 /// Runtime fadvise toggle. The adaptive max-residency path ([`ExpertCache::spawn_adaptive_budget`])

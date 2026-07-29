@@ -860,10 +860,28 @@ pub fn load_model_with(
         mtp,
     };
     // Dense weights are resident for the model's lifetime → GPU-cacheable.
-    model.embed.gpu_eligible = true;
-    model.lm_head.gpu_eligible = true;
-    for l in &mut model.layers {
-        mark_gpu_eligible(l);
+    //
+    // EXCEPT on Kimi-K3. `try_matmul_qt` caches each eligible weight in a DEVICE buffer
+    // keyed by its host pointer — and on GB10 "VRAM" is the same physical RAM as the
+    // host, so that cache is a second copy of every resident weight, not a move. K3's
+    // resident set is ~53 GB (vs GLM's ~19), so host + device is ~118 GB of 121 and
+    // earlyoom SIGTERMs the process partway through the first forward pass. Measured:
+    // RSS plateaued at 65 GB while MemAvailable kept falling to 4 GB — the giveaway that
+    // the growth was allocations outside RSS.
+    //
+    // Every byte spent duplicating a resident weight is a byte the expert cache cannot
+    // use, and on K3 the routed experts are 1347 GB against a cache that only ever holds
+    // tens of GB — so cache coverage is the scarce resource, not matmul latency.
+    // `COLI_DEVICE_WEIGHTS=0` disables it for every arch — the A/B handle for "does this
+    // buy speed, or just cost the expert cache RAM it could have used?"
+    let device_cache_weights = model.cfg.arch != Arch::KimiK3
+        && std::env::var("COLI_DEVICE_WEIGHTS").ok().as_deref() != Some("0");
+    if device_cache_weights {
+        model.embed.gpu_eligible = true;
+        model.lm_head.gpu_eligible = true;
+        for l in &mut model.layers {
+            mark_gpu_eligible(l);
+        }
     }
     Ok(model)
 }
@@ -880,6 +898,54 @@ mod tests {
             Err(EngineError::Config(_)) => {}
             Err(other) => panic!("expected config error, got: {other}"),
             Ok(_) => panic!("expected an error for a missing snapshot"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod gpu_eligible_tests {
+    use super::*;
+
+    /// `mark_gpu_eligible` must cover EVERY `Option<QTensor>` on a layer.
+    ///
+    /// The list is hand-maintained and enumerated per field, so a new arch's new fields
+    /// are eligible only if someone remembers them. That omission has cost 84% of an M3
+    /// prefill (q/k/v), 94% of Nemotron's mamba (in/out_proj), 62% of its MoE phase
+    /// (fc1/fc2_latent) and would have cost K3 8.41B params (`attn_gate` and the KDA gate
+    /// projections). Nothing type-checks it and nothing fails at runtime — the weight
+    /// just silently takes the single-threaded CPU matmul.
+    ///
+    /// K3 does not currently call this (its resident set is too large to duplicate in
+    /// GB10's unified memory), but the list must stay complete for the arches that do and
+    /// for whenever a device-cache budget makes K3 eligible again.
+    #[test]
+    fn mark_gpu_eligible_covers_every_optional_projection() {
+        let q = || Some(colibri_core::QTensor { o: 2, i: 2, ..Default::default() });
+        let mut l = Layer {
+            q_proj: q(), k_proj: q(), v_proj: q(), qkv_proj: q(),
+            idx_q_proj: q(), idx_k_proj: q(),
+            mamba_in_proj: q(), mamba_out_proj: q(),
+            fc1_latent: q(), fc2_latent: q(),
+            attn_gate: q(), kda_b_proj: q(), kda_f_a: q(), kda_f_b: q(),
+            ix_wk: q(), ix_wq: q(), ix_wp: q(),
+            ..Default::default()
+        };
+        mark_gpu_eligible(&mut l);
+        let opts: [(&str, &Option<colibri_core::QTensor>); 17] = [
+            ("q_proj", &l.q_proj), ("k_proj", &l.k_proj), ("v_proj", &l.v_proj),
+            ("qkv_proj", &l.qkv_proj), ("idx_q_proj", &l.idx_q_proj),
+            ("idx_k_proj", &l.idx_k_proj), ("mamba_in_proj", &l.mamba_in_proj),
+            ("mamba_out_proj", &l.mamba_out_proj), ("fc1_latent", &l.fc1_latent),
+            ("fc2_latent", &l.fc2_latent), ("attn_gate", &l.attn_gate),
+            ("kda_b_proj", &l.kda_b_proj), ("kda_f_a", &l.kda_f_a),
+            ("kda_f_b", &l.kda_f_b), ("ix_wk", &l.ix_wk), ("ix_wq", &l.ix_wq),
+            ("ix_wp", &l.ix_wp),
+        ];
+        for (name, t) in opts {
+            assert!(
+                t.as_ref().expect("fixture sets every field").gpu_eligible,
+                "{name} is missing from mark_gpu_eligible"
+            );
         }
     }
 }

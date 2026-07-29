@@ -340,50 +340,39 @@ fn kimi_routed_experts_load_in_latent_space() {
     assert_eq!(e.down.i as usize, MOE_INTER);
 }
 
-/// Every dense weight K3 actually computes with must be GPU-eligible.
+/// K3's resident weights must NOT be device-cached.
 ///
-/// This is the `gpu_eligible` trap, which has now bitten three arches: a resident weight
-/// missing from the list in `mark_gpu_eligible` silently takes the single-threaded CPU
-/// matmul. It cost 84% of an M3 prefill (q/k/v projections), 94% of Nemotron's mamba
-/// time (in/out_proj) and 62% of its MoE phase (fc1/fc2_latent) — each found only by
-/// profiling, because nothing fails and the output is identical.
+/// `try_matmul_qt` caches each eligible weight in a DEVICE buffer keyed by its host
+/// pointer. On GB10 "VRAM" is the same physical RAM as the host, so that is a second
+/// copy of every resident weight rather than a move. K3's resident set is ~53 GB against
+/// 121 GB total, so host + device left ~3 GB and earlyoom SIGTERMed the first real
+/// forward pass (RSS plateaued at 65 GB while MemAvailable fell to 4 — the tell that the
+/// growth was outside RSS).
 ///
-/// K3 inherits most of the list, but `attn_gate`, `kda_b_proj`, `kda_f_a` and `kda_f_b`
-/// have no analogue in any other arch. `attn_gate` alone is 8.19B params across the
-/// stack — the same order as `q_b`/`kv_b`. Asserting over the whole layer rather than
-/// naming the four means a future K3 tensor is covered the day it is added.
+/// The completeness guard that used to live here — every K3 projection present in
+/// `mark_gpu_eligible` — moved into that function's own unit test, since K3 no longer
+/// calls it. Both matter: this pins the policy, that one pins the list for whenever a
+/// device-cache budget makes K3 eligible again.
 #[test]
-fn kimi_dense_weights_are_all_gpu_eligible() {
+fn kimi_resident_weights_are_not_device_cached() {
     let dir = temp_dir();
     let model = tiny_model(&dir);
-
     let mut checked = 0usize;
     for (li, l) in model.layers.iter().enumerate() {
-        // Non-Option slots: populated ones have real dimensions, defaults are 0x0.
-        let fixed: [(&str, &colibri_engine::QTensor); 9] = [
-            ("q_a", &l.q_a), ("q_b", &l.q_b), ("kv_a", &l.kv_a), ("kv_b", &l.kv_b),
-            ("o", &l.o), ("gate_proj", &l.gate_proj), ("up_proj", &l.up_proj),
-            ("down_proj", &l.down_proj), ("sh_gate", &l.sh_gate),
-        ];
-        for (name, t) in fixed {
+        for (name, t) in [("o", &l.o), ("gate_proj", &l.gate_proj), ("sh_gate", &l.sh_gate)] {
             if t.o > 0 && t.i > 0 {
-                assert!(t.gpu_eligible, "L{li} {name} ({}x{}) is not gpu_eligible", t.o, t.i);
+                assert!(!t.gpu_eligible, "L{li} {name} must not be device-cached on K3");
                 checked += 1;
             }
         }
-        let opts: [(&str, &Option<colibri_engine::QTensor>); 8] = [
-            ("q_proj", &l.q_proj), ("k_proj", &l.k_proj), ("v_proj", &l.v_proj),
-            ("attn_gate", &l.attn_gate), ("kda_b_proj", &l.kda_b_proj),
-            ("kda_f_a", &l.kda_f_a), ("kda_f_b", &l.kda_f_b),
-            ("fc1_latent", &l.fc1_latent),
-        ];
-        for (name, t) in opts {
+        for (name, t) in [("q_proj", &l.q_proj), ("attn_gate", &l.attn_gate)] {
             if let Some(t) = t {
-                assert!(t.gpu_eligible, "L{li} {name} ({}x{}) is not gpu_eligible", t.o, t.i);
+                assert!(!t.gpu_eligible, "L{li} {name} must not be device-cached on K3");
                 checked += 1;
             }
         }
     }
-    // Guard against the assertions vacuously passing on an empty model.
-    assert!(checked >= 40, "expected many weights to check, saw {checked}");
+    assert!(!model.embed.gpu_eligible, "embed must not be device-cached on K3");
+    assert!(!model.lm_head.gpu_eligible, "lm_head must not be device-cached on K3");
+    assert!(checked >= 10, "expected many weights to check, saw {checked}");
 }

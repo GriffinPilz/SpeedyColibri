@@ -12,6 +12,17 @@
 # value; the script prints the phase table so that is visible, and asserts the env reached
 # the process.
 set -u
+
+# HISTORICAL: this script swept COLI_RAM_GB, which no longer exists — the expert-cache
+# budget is adaptive only. Every arm would now get the SAME budget and the sweep would
+# report a difference of zero as though it were a finding. Die instead of misleading.
+die_removed() {
+  echo "ERROR: this experiment swept COLI_RAM_GB, which was removed (adaptive budget only)." >&2
+  echo "       Re-express the arms in terms of something that still exists before running." >&2
+  exit 2
+}
+die_removed
+
 REPO=/home/dgx1/SpeedyColibri-nemotron
 CONTAINER=/home/dgx1/models/Nemotron-3-Super-120B-container
 PORT=8098

@@ -277,6 +277,15 @@ fn kimi_container_name(name: &str) -> Option<String> {
         .replace(".w1.", ".gate_proj.")
         .replace(".w3.", ".up_proj.")
         .replace(".w2.", ".down_proj.");
+    // compressed-tensors calls the nibble blob `weight_packed`; every container in this
+    // tree — and therefore `ExpertLayout::weight_name`, which the loader builds its
+    // lookups from — calls it `weight`. Leaving the source spelling through produced
+    // `...gate_proj.weight_packed`, and the model failed to load with
+    // "missing tensor: model.layers.1.mlp.experts.498.gate_proj.weight".
+    // Only routed experts carry this suffix (247,296 of them, and nothing else in the
+    // checkpoint), so a plain replace is unambiguous. It also fixes up the `.mx`
+    // sidecar, which is named off this same string.
+    n = n.replace(".weight_packed", ".weight");
     Some(n)
 }
 
@@ -2248,11 +2257,11 @@ mod tests {
         let cases: &[(&str, &str, Kind)] = &[
             // --- routed experts: MXFP4 nibbles kept, E8M0 sidecar consumed -----------
             ("language_model.model.layers.1.block_sparse_moe.experts.5.w1.weight_packed",
-             "model.layers.1.mlp.experts.5.gate_proj.weight_packed", Kind::X),
+             "model.layers.1.mlp.experts.5.gate_proj.weight", Kind::X),
             ("language_model.model.layers.1.block_sparse_moe.experts.5.w2.weight_packed",
-             "model.layers.1.mlp.experts.5.down_proj.weight_packed", Kind::X),
+             "model.layers.1.mlp.experts.5.down_proj.weight", Kind::X),
             ("language_model.model.layers.1.block_sparse_moe.experts.5.w3.weight_packed",
-             "model.layers.1.mlp.experts.5.up_proj.weight_packed", Kind::X),
+             "model.layers.1.mlp.experts.5.up_proj.weight", Kind::X),
             ("language_model.model.layers.1.block_sparse_moe.experts.5.w1.weight_scale",
              "model.layers.1.mlp.experts.5.gate_proj.weight_scale", Kind::Skip),
             ("language_model.model.layers.1.block_sparse_moe.experts.5.w2.weight_scale",
@@ -2437,11 +2446,32 @@ mod tests {
         // Both the packed nibbles and their E8M0 scale sidecar get the same rewrite.
         let e = "language_model.model.layers.1.block_sparse_moe.experts.7.";
         assert_eq!(m(&format!("{e}w1.weight_packed")).as_deref(),
-                   Some("model.layers.1.mlp.experts.7.gate_proj.weight_packed"));
+                   Some("model.layers.1.mlp.experts.7.gate_proj.weight"));
         assert_eq!(m(&format!("{e}w3.weight_packed")).as_deref(),
-                   Some("model.layers.1.mlp.experts.7.up_proj.weight_packed"));
+                   Some("model.layers.1.mlp.experts.7.up_proj.weight"));
         assert_eq!(m(&format!("{e}w2.weight_scale")).as_deref(),
                    Some("model.layers.1.mlp.experts.7.down_proj.weight_scale"));
+
+        // CONTRACT: what convert WRITES must be exactly what the loader LOOKS UP. These
+        // two sides were written independently and drifted — convert kept the source's
+        // `weight_packed` spelling while `ExpertLayout::weight_name` builds `.weight`, so
+        // the container was unloadable ("missing tensor: ...experts.498.gate_proj.weight")
+        // even though every convert test passed. Asserting one side alone proves nothing;
+        // this compares them directly.
+        {
+            use crate::moe::ExpertLayout;
+            let layout = ExpertLayout::for_arch(colibri_core::Arch::KimiK3);
+            for (w, suf) in [("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")] {
+                let src = format!(
+                    "language_model.model.layers.1.block_sparse_moe.experts.7.{w}.weight_packed"
+                );
+                assert_eq!(
+                    m(&src).as_deref(),
+                    Some(layout.weight_name(1, 7, suf).as_str()),
+                    "convert output for {w} must match the loader's lookup for {suf}"
+                );
+            }
+        }
 
         // The latent projections. `down` is hidden->latent (Nemotron's fc1_latent) and
         // `up` is latent->hidden (fc2_latent) — dimension direction, not gate/up/down.

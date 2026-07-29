@@ -530,7 +530,7 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
     /// - **`hard_floor`** — the OOM guard. Checked every tick with **no hysteresis**: if
     ///   `MemAvailable` is below it (our own growth *or* another tenant, incl. the GPU on
     ///   GB10's unified pool), evict immediately, down to a few GB of slack above it. This
-    ///   is what a fixed `COLI_RAM_GB` lacked — a static budget with no feedback grows into
+    ///   is what a fixed manual budget lacked — a static number with no feedback grows into
     ///   the wall (measured: forcing 100 GB on the 216 GB M3 drove avail→0 and OOM-killed
     ///   the server). With this, that same budget just caps itself where the box stays safe.
     /// - **`danger_floor`** (< `hard_floor` is wrong; it sits *above* `hard_floor`) — the

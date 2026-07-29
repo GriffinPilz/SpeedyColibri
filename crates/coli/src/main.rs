@@ -2225,7 +2225,22 @@ fn wire_adaptive_cache<P>(
     // settled `MemTotal / CACHE_CAP_DIVISOR` ceiling and let the OS page cache serve the
     // streaming tail as a second tier. Holding more *thrashes*: filling ~101 GB collapsed
     // M3 decode to ~0.7 tok/s (memory-ceiling-is-real / autopin-single-node-negative).
-    let fill_target = if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR };
+    // Both regime targets above are fractions of MemTotal, which is blind to how much RAM
+    // the MODEL already took. That held while every arch's resident set was small next to
+    // the box (GLM ~19 GB of 121, so a 40 GB cache totals ~59). Kimi-K3's resident set is
+    // ~65 GB, so the same 40 GB cap totals ~105 GB and earlyoom SIGTERMs the process
+    // mid-forward — measured at 103 GB max RSS.
+    //
+    // `available_ram_bytes` is read HERE, after `load_model_with` has materialized the
+    // dense weights, so it already excludes them — exactly the number MemTotal isn't.
+    // Capping by it makes the budget resident-aware without double-counting: it is a
+    // no-op for a small-resident model (GLM has ~100 GB available at this point, so the
+    // MemTotal/3 cap still binds) and it is what keeps K3 inside the box.
+    let avail_headroom = colibri_engine::available_ram_bytes()
+        .map(|a| a.saturating_sub(ADAPTIVE_FILL_RESERVE))
+        .unwrap_or(u64::MAX);
+    let fill_target =
+        if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR }.min(avail_headroom);
     // fadvise auto-engages only for a near-fit model; ≫-RAM keeps the page cache.
     if near_fit {
         colibri_safetensors::set_fadvise(true);

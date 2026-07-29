@@ -1007,6 +1007,36 @@ fn expert_seg_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_SEG").ok().as_deref() == Some("1"))
 }
 
+/// Also take the segmented path when every expert has a SINGLE row — i.e. decode
+/// (`COLI_EXPERT_SEG_DECODE=1`).
+///
+/// The seg gate below requires some expert to have >1 row, so decode never reaches it: at
+/// one row per expert it issues a launch trio per expert instead of one for the layer.
+/// An nsys profile of Nemotron decode shows what that costs — **26,400 `nvfp4_gemv`
+/// launches averaging 15.4 us, i.e. ~407 ms, which is the whole of gpu-ffn**. Each warp
+/// handles one output row and reads ~512 B, so the kernels are latency-bound, not
+/// bandwidth-bound: widening their reads to 512 B/warp left the per-call time unchanged
+/// (15349 -> 15688 ns).
+///
+/// **MEASURED: a 2.4x REGRESSION. Leave off.** Nemotron decode, ABBA, 12 tokens, tokens
+/// identical in every arm: moe 1220 ms off vs 2963 ms on. `nvfp4_matmul_seg` tiles 16
+/// rows, so a 1-row expert wastes 15/16 of the MMA, and that redundant compute swamps the
+/// ~44x reduction in launches. It matches an earlier "seg-gemv" attempt recorded as
+/// measured-dead, so treat launch-batching for 1-row experts as settled unless someone
+/// writes a true segmented GEMV (one row per expert, many experts per grid) rather than
+/// reusing the 16-row matmul.
+///
+/// Kept as a knob because "why not just batch the launches?" is a question this profile
+/// will keep provoking, and this is the answer with a number.
+///
+/// Caveat for whoever measures next: `gpu-ffn` reports ~438 ms in BOTH arms here while
+/// `moe` differs by 1740 ms, so that timer does not capture this path's GPU work. Use
+/// `moe`, or nsys.
+fn expert_seg_decode_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_SEG_DECODE").ok().as_deref() == Some("1"))
+}
+
 fn group_prefill_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP_PREFILL").ok().as_deref() == Some("1"))
@@ -1271,7 +1301,9 @@ pub fn try_expert_group_relu2(
     // SEGMENTED fast path: one grid for the whole layer. Only worth it when experts carry
     // real row counts (prefill); at decode every expert has a single row and the grouped
     // chunk path already amortizes the round-trip.
-    if expert_seg_enabled() && active.iter().any(|(_, rows, _)| rows.len() > 1) {
+    if (expert_seg_enabled() && active.iter().any(|(_, rows, _)| rows.len() > 1))
+        || (expert_seg_decode_enabled() && active.len() > 1)
+    {
         let mut us: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
         let mut ds: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
         let mut rws: Vec<i32> = Vec::with_capacity(active.len());

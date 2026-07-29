@@ -1345,11 +1345,13 @@ where
             // Decompose the `cache+other` residual. `build` is what `experts_batch`
             // costs on top of the reader — per-expert construction from the bytes.
             eprintln!(
-                "[profile] cache breakdown: miss-filter {:.0} ms | build {:.0} ms | insert {:.0} ms | evict {:.0} ms",
+                "[profile] cache breakdown: miss-filter {:.0} ms | build {:.0} ms | insert {:.0} ms | evict {:.0} ms (select {:.0} + free {:.0})",
                 ms(&crate::cache::CACHE_FILTER_US),
                 ms(&crate::cache::CACHE_FETCH_US) - (setup + drain + post) as f64 / 1e3,
                 ms(&crate::cache::CACHE_INSERT_US),
                 ms(&crate::cache::CACHE_EVICT_US),
+                ms(&crate::cache::EVICT_SELECT_US),
+                ms(&crate::cache::EVICT_DROP_US),
             );
             let (lu, mc, al, spans) = colibri_safetensors::span_profile();
             eprintln!(

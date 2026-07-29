@@ -340,6 +340,7 @@ impl State {
         // *reasoned, not measured*: the small-M/large-N regime has not been profiled, and
         // Nemotron in practice preloads to fit and evicts ~nothing, so it is not currently
         // exercised. Measure before assuming it holds if that changes.
+        let t_select = crate::forward::profile_on().then(std::time::Instant::now);
         let clock = self.clock;
         let pinned = &self.pinned;
         let mut victims: Vec<((usize, usize), u64, u64)> = self
@@ -349,14 +350,30 @@ impl State {
             .map(|(k, e)| (*k, evict_score(e.heat, e.last, clock), e.bytes))
             .collect();
         victims.sort_unstable_by_key(|&(_, score, _)| score);
+        if let Some(t) = t_select {
+            EVICT_SELECT_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        // Move victims out of the map WITHOUT dropping them here, so the ranking cost and
+        // the deallocation cost are separable. Rewriting the O(entries)-per-victim scan as
+        // a single ranked pass did not move GLM's `evict` at all (1698-1839 ms before,
+        // 2003 ms after) — so the scan was never what this function spends its time on,
+        // and the next candidate is freeing ~21 MB of expert buffers per victim. Measure
+        // which, rather than guess a third time.
+        let t_drop = crate::forward::profile_on().then(std::time::Instant::now);
+        let mut freed: Vec<Entry> = Vec::new();
         for (k, _, bytes) in victims {
             if self.bytes <= budget {
                 break;
             }
-            if self.entries.remove(&k).is_some() {
+            if let Some(e) = self.entries.remove(&k) {
                 self.bytes -= bytes;
                 self.evictions += 1;
+                freed.push(e);
             }
+        }
+        drop(freed);
+        if let Some(t) = t_drop {
+            EVICT_DROP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         // Falling off the end means everything left is pinned or protected — the same
         // outcome the old `None => break` arm produced.
@@ -465,6 +482,15 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
 /// `FETCH` brackets `experts_batch` — it *contains* the reader's time, so the
 /// interesting quantity is `FETCH - (setup+drain+post)`: per-expert construction on top
 /// of the bytes. `EVICT` is the one to watch structurally: it is O(entries) per victim.
+/// `EVICT` split in two: ranking the victims versus actually freeing them.
+///
+/// Needed because rewriting the ranking from O(entries)-per-victim to a single sorted
+/// pass changed GLM's `evict` by nothing at all (1698-1839 ms before, 2003 ms after).
+/// A rewrite that provably picks the same victims and provably does asymptotically less
+/// work, with zero effect, means the work was never in the part that was rewritten.
+pub(crate) static EVICT_SELECT_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EVICT_DROP_US: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) static CACHE_FILTER_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CACHE_FETCH_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CACHE_INSERT_US: AtomicU64 = AtomicU64::new(0);

@@ -2253,10 +2253,11 @@ fn wire_adaptive_cache<P>(
         "≫-RAM fill, page cache kept"
     };
     eprintln!(
-        "[cache] {regime}: ~{} GB experts / {} GB RAM ({covers_pct}% coverage) → fill to ~{} GB, \
-         LRU-evict under pressure (hard floor {} GB) — never OOM",
+        "[cache] {regime}: ~{} GB experts / {} GB RAM ({covers_pct}% coverage), {} GB resident \
+         weights → fill to ~{} GB, LRU-evict under pressure (hard floor {} GB) — never OOM",
         total_expert_bytes >> 30,
         total >> 30,
+        resident >> 30,
         fill_target >> 30,
         ADAPTIVE_HARD_FLOOR >> 30
     );

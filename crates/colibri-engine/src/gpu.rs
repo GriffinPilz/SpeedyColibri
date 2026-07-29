@@ -52,6 +52,15 @@ impl GpuFfnCache {
     /// never evicting a `protect`ed key (the tensors the current op still needs).
     /// If everything left is protected, it stops (holding the minimum working set
     /// even if that exceeds the nominal budget).
+    ///
+    /// This is the same O(entries)-per-victim shape that cost the *expert* cache 1839 ms
+    /// on a profiled GLM run — worse here, in fact, since `protect.contains` linearly
+    /// scans a slice inside the inner loop. It is left alone deliberately: this cache
+    /// holds tens of entries (GLM 78 resident / 0 evictions, K3 1 / 143), not the expert
+    /// cache's ~2051, so the product is negligible and changing it would be an unmeasured
+    /// edit. Revisit **if this cache ever grows** — dropping the redundant device copy on
+    /// GB10, or Nemotron-style preloading, would make it the same problem.
+    /// See `State::evict_to_protecting` for the rank-once fix and its equivalence test.
     fn evict_to(&mut self, budget: u64, protect: &[usize]) {
         while self.bytes > budget {
             let clock = self.clock;

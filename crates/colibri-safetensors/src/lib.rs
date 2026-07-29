@@ -226,6 +226,33 @@ fn mmap_enabled() -> bool {
     })
 }
 
+/// Whether every page backing `[base, base+len)` is resident in the page cache.
+///
+/// One `mincore` syscall plus a byte scan — ~1944 bytes for a 7.96 MB M2.7 expert, which
+/// is nothing against the ~7.96 MB copy it decides whether to skip. Any error is reported
+/// as "not resident" so the caller falls back to `pread`.
+fn pages_resident(base: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    if page == 0 {
+        return false;
+    }
+    // `mincore` needs a page-aligned start; tensor offsets are not aligned, so round the
+    // window down and extend the length by the same skew.
+    let start = base as usize & !(page - 1);
+    let span = (base as usize - start) + len;
+    let npages = span.div_ceil(page);
+    // `mincore`'s vector arg is `*mut c_uchar` on glibc but `*mut i8` on this target's
+    // libc bindings; cast rather than assume either.
+    let mut vec = vec![0u8; npages];
+    let rc = unsafe {
+        libc::mincore(start as *mut libc::c_void, span, vec.as_mut_ptr() as *mut _)
+    };
+    rc == 0 && vec.iter().all(|b| b & 1 == 1)
+}
+
 impl Shards {
     /// Index every `*.safetensors` file in `snap_dir`, in sorted filename order
     /// (so `model-00001-of-...` precedes `model-00002-...`). Port of `st_init`.
@@ -799,9 +826,16 @@ impl Shards {
 
     /// A `SharedBuf` window over `[off, off+len)` of `file_idx`, or `None` to use `pread`.
     ///
-    /// `MADV_WILLNEED` starts readahead for the span so a cold miss still gets a large
-    /// request instead of a storm of 4 KiB faults — the main risk of serving experts from
-    /// a mapping.
+    /// **Only serves spans whose pages are already in the page cache.** Faulting a cold
+    /// span through the mapping is catastrophic: 4 KiB major faults instead of one large
+    /// request. Measured on M2.7 with an unconditional mapping — **407,570 major faults
+    /// and ~30 MB/s of progress**, against ~10 GB/s for the `pread` path, and
+    /// `MADV_WILLNEED` did not keep up because the faults outrun advisory readahead.
+    ///
+    /// The residency gate makes this strictly win-or-neutral, and it matches how the two
+    /// regimes actually differ: a cold span takes one fast bulk `pread` (which populates
+    /// the page cache as a side effect), and every later touch of those same pages is
+    /// served from the mapping with no copy at all — the 14.4 → 34 GB/s case.
     fn map_view(&self, file_idx: usize, off: u64, len: usize) -> Option<colibri_core::SharedBuf> {
         let m = self.mapping(file_idx)?;
         let end = (off as usize).checked_add(len)?;
@@ -809,7 +843,9 @@ impl Shards {
             return None;
         }
         let base = unsafe { (m.ptr as *const u8).add(off as usize) };
-        unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+        if !pages_resident(base, len) {
+            return None; // cold: let `pread` fetch it in one request
+        }
         // SAFETY: `base..base+len` lies inside the mapping, which `m` keeps alive for as
         // long as the returned buffer (and any view derived from it) exists.
         Some(unsafe { colibri_core::SharedBuf::mapped(base, len, m) })

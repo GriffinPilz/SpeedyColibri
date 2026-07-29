@@ -1814,12 +1814,30 @@ fn cmd_iobench(args: &[String]) -> ExitCode {
     if map == libc::MAP_FAILED {
         println!("  (E) mmap failed — skipping");
     } else {
+        // Every 64 B cache line, so this is a like-for-like READ of the same bytes (D)
+        // copies — not a page-touch. A 4 KiB stride moves 1/4096 of the data and reports
+        // a meaningless ~600 GB/s.
         warm("(E) mmap, read in place", &|| {
             let mut acc = 0u64;
             let mut n = 0u64;
             for &off in &offsets {
-                // Touch one byte per 4 KiB page: the cost of *reaching* the bytes with
-                // no copy. `acc` keeps the reads from being optimized away.
+                let base = (map as usize + off as usize) as *const u8;
+                let mut p = 0usize;
+                while p < bs {
+                    acc = acc.wrapping_add(unsafe { *base.add(p) } as u64);
+                    p += 64;
+                }
+                n += bs as u64;
+            }
+            std::hint::black_box(acc);
+            n
+        });
+        // (F) the honest upper bound for our actual consumer: the GPU reads mapped pages
+        // itself, so the CPU pays only for *reaching* them. One byte per 4 KiB page.
+        warm("(F) mmap, page-reach only", &|| {
+            let mut acc = 0u64;
+            let mut n = 0u64;
+            for &off in &offsets {
                 let base = (map as usize + off as usize) as *const u8;
                 let mut p = 0usize;
                 while p < bs {

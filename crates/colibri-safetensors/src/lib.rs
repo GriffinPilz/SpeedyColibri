@@ -942,6 +942,19 @@ impl Shards {
     /// one submit/complete loop cannot replace 40 threads blocking independently, and
     /// `submit_and_wait(1)` serialises the tail. Hence per-thread rings: the concurrency
     /// that made `pread` fast is kept, and io_uring only removes the per-read syscall.
+    ///
+    /// **That fix works, but the result is model-dependent and the knob stays OFF.**
+    /// ABBA, tokens identical in every arm:
+    ///
+    /// | model | `pread` | io_uring | |
+    /// |---|---|---|---|
+    /// | GLM-5.2 | 13428 / 13490 ms | **12802 / 13280** | +3.1% |
+    /// | Kimi-K3 | **25626 / 25630 ms** | 29003 ms | −13% |
+    ///
+    /// Opposite signs, a small win against a large loss, and no mechanism that explains
+    /// the split — K3 simply moves ~3x the bytes over ~2.7x the misses. Gating on a
+    /// two-point disagreement would be tuning, not engineering, so this is opt-in until
+    /// someone can say WHY it inverts.
     #[cfg(target_os = "linux")]
     fn drain_jobs_uring(&self, jobs: &[Job], nthreads: usize) -> bool {
         use io_uring::{opcode, types, IoUring};
@@ -966,15 +979,16 @@ impl Shards {
         std::thread::scope(|scope| {
             for t in 0..nt {
                 scope.spawn(move || {
-                    let mut ring = match IoUring::builder().setup_sqpoll(2000).build(per_ring) {
+                    // NO SQPOLL. With a polled SQ, `submit_and_wait(1)` can return without a
+                    // completion being ready, and this loop then spins on an empty CQ without
+                    // ever decrementing `inflight` — observed as a live-lock (state R, 10+
+                    // minutes, zero progress) on GLM. A plain ring blocks properly.
+                    let mut ring = match IoUring::new(per_ring) {
                         Ok(r) => r,
-                        Err(_) => match IoUring::new(per_ring) {
-                            Ok(r) => r,
-                            Err(_) => {
-                                okr.store(false, std::sync::atomic::Ordering::Relaxed);
-                                return;
-                            }
-                        },
+                        Err(_) => {
+                            okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
                     };
                     // Strided slice, matching how the pread pool interleaves work.
                     let mine: Vec<&Job> = jobs.iter().skip(t).step_by(nt).collect();
@@ -1004,6 +1018,11 @@ impl Shards {
                             return;
                         }
                         let res: Vec<i32> = ring.completion().map(|c| c.result()).collect();
+                        if res.is_empty() {
+                            // Belt and braces: never loop without progress.
+                            okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
                         for r in res {
                             inflight -= 1;
                             if r < 0 {

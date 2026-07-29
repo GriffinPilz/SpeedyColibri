@@ -416,11 +416,26 @@ fn load_layer_kimi(
             l.k_proj = Some(qt_load(shards, &p("self_attn.k_proj.weight"), c, d, dbits)?);
             l.v_proj = Some(qt_load(shards, &p("self_attn.v_proj.weight"), c, d, dbits)?);
             l.kda_b_proj = Some(qt_load(shards, &p("self_attn.b_proj.weight"), nh, d, dbits)?);
-            // Factored forget gate: hidden -> r -> n_heads*head_dim. `r` is read from
-            // f_a's row count rather than assumed — it is not any other config field.
+            // Factored forget gate: hidden -> r -> n_heads*head_dim. `r` is derived from
+            // the checkpoint rather than assumed — it is not any other config field.
+            //
+            // NOT from `shape[0]`: a CONTAINER stores every weight FLAT, so `f_a`'s shape
+            // is `[917504]` (the element count), not the source checkpoint's
+            // `[128, 7168]`. Reading `shape[0]` yielded r = 917504, which made `qt_load`
+            // infer a bogus format and blew up inside `matmul_qt` on the first KDA layer.
+            // The loader only ever sees containers, so that read was never going to work.
+            //
+            // The `.qs` sidecar carries exactly one f32 scale per ROW, so its length is
+            // the row count — unambiguous regardless of how the weight itself is packed.
+            // Fall back to `elements / hidden` (right for any 1-byte-per-weight format),
+            // then to `head_dim`.
+            let f_a = p("self_attn.f_a_proj.weight");
             let r = shards
-                .find(&p("self_attn.f_a_proj.weight"))
+                .find(&format!("{f_a}.qs"))
                 .and_then(|t| t.shape.first().copied())
+                .or_else(|| {
+                    shards.find(&f_a).and_then(|t| t.shape.first().copied()).map(|n| n / d as i64)
+                })
                 .unwrap_or(hd as i64) as usize;
             l.kda_f_a = Some(qt_load(shards, &p("self_attn.f_a_proj.weight"), r, d, dbits)?);
             l.kda_f_b = Some(qt_load(shards, &p("self_attn.f_b_proj.weight"), c, r, dbits)?);
@@ -925,11 +940,28 @@ mod kimi_container_tests {
                     }
                     let b = l.kda_b_proj.as_ref().expect("b_proj");
                     assert_eq!((b.o as usize, b.i as usize), (nh, d), "L{li} b_proj");
-                    // The forget gate is factored through a rank read off f_a's rows.
+                    // The forget gate is factored through a rank derived from the
+                    // checkpoint. NOTE `fa.o == fb.i` is NOT sufficient on its own: when
+                    // the rank came from the container's flat `shape[0]` both were
+                    // 917504, so they agreed with each other and this test passed while
+                    // the model was unloadable. Check the PAYLOAD against the dims —
+                    // that is the invariant a wrong rank actually violates.
                     let (fa, fb) = (l.kda_f_a.as_ref().unwrap(), l.kda_f_b.as_ref().unwrap());
                     assert_eq!(fa.i as usize, d, "L{li} f_a input");
                     assert_eq!(fb.o as usize, c, "L{li} f_b output");
                     assert_eq!(fa.o, fb.i, "L{li} f_a/f_b rank must agree");
+                    for (nm, t) in [("f_a", fa), ("f_b", fb), ("b", b)] {
+                        if t.fmt_code == 1 {
+                            assert_eq!(
+                                t.q8.len(),
+                                (t.o as usize) * (t.i as usize),
+                                "L{li} {nm} int8 payload does not match {}x{}",
+                                t.o,
+                                t.i
+                            );
+                            assert_eq!(t.s.len(), t.o as usize, "L{li} {nm} one scale per row");
+                        }
+                    }
                     // `[C, 1, k]` read flat is `[C, k]`.
                     let k = cfg.kda_d_conv as usize;
                     for (nm, v) in [("q", &l.kda_conv_q), ("k", &l.kda_conv_k), ("v", &l.kda_conv_v)]

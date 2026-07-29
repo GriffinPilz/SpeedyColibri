@@ -66,6 +66,50 @@ fn detect_arch() -> String {
     }
 }
 
+/// Candidate CUDA install roots to search for `libcudart`, best guess first.
+///
+/// `$CUDA_HOME` wins when set, but it must not be the only source: nvcc is normally
+/// found through PATH, so the kernels compile whether or not that variable exists, and
+/// gating the link path on it alone turns a missing export into a `cannot find -lcudart`
+/// with nothing pointing at the cause. So also derive the root from the nvcc actually in
+/// use — `<root>/bin/nvcc` — resolving a bare name through PATH first, and fall back to
+/// the conventional location. Duplicates are fine; every entry is existence-checked
+/// before it is emitted.
+fn cuda_roots(nvcc: &str) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    let mut push = |r: String| {
+        if !r.is_empty() && !roots.contains(&r) {
+            roots.push(r);
+        }
+    };
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(v) = env::var(var) {
+            push(v);
+        }
+    }
+    // A bare "nvcc" tells us nothing until PATH resolves it; `which` is not guaranteed,
+    // so walk PATH ourselves rather than depending on another external command.
+    let resolved: Option<PathBuf> = if nvcc.contains('/') {
+        Some(PathBuf::from(nvcc))
+    } else {
+        env::var_os("PATH").and_then(|p| {
+            env::split_paths(&p)
+                .map(|d| d.join(nvcc))
+                .find(|c| c.is_file())
+        })
+    };
+    // <root>/bin/nvcc -> <root>. canonicalize so a /usr/local/cuda -> cuda-13.0 symlink
+    // does not hide the real lib dir behind a dangling relative path.
+    if let Some(r) = resolved {
+        let real = r.canonicalize().unwrap_or(r);
+        if let Some(root) = real.parent().and_then(|p| p.parent()) {
+            push(root.display().to_string());
+        }
+    }
+    push("/usr/local/cuda".to_string());
+    roots
+}
+
 fn main() {
     // Only touch CUDA when the feature is enabled.
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
@@ -88,6 +132,8 @@ fn main() {
     // "no CUDA" outcome and fails at link with `undefined reference to coli_cuda_*`.
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=COLI_ALLOW_NO_NVCC");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=NVCC");
 
     let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
         env::var("CUDA_HOME")
@@ -142,11 +188,17 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=colibri_cuda");
-    if let Ok(home) = env::var("CUDA_HOME") {
-        // `cudart` lives in `lib64` on x86 CUDA but under `targets/<arch>-linux/lib`
-        // on the ARM/sbsa DGX Spark — add every candidate so the linker finds
-        // `-lcudart` regardless of layout (missing it = `cannot find -lcudart` and a
-        // silent push toward the CPU-only fallback). Only existing dirs are emitted.
+    // `cudart` lives in `lib64` on x86 CUDA but under `targets/<arch>-linux/lib` on the
+    // ARM/sbsa DGX Spark — add every candidate so the linker finds `-lcudart` regardless
+    // of layout. Only existing dirs are emitted, and extra `-L` entries are harmless.
+    //
+    // Search several ROOTS too, not just $CUDA_HOME. nvcc resolves through PATH, so a
+    // shell can compile the kernels happily and still fail at link with
+    // `cannot find -lcudart` purely because CUDA_HOME happened to be unset — which is
+    // exactly what a non-interactive ssh looks like after a reboot drops the profile.
+    // Deriving the root from the nvcc we already found makes the two agree by
+    // construction instead of by the caller remembering a second variable.
+    for home in cuda_roots(&nvcc) {
         for sub in [
             "lib64",
             "lib",

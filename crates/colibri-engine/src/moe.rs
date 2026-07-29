@@ -1467,9 +1467,20 @@ pub fn nemotron_moe<P: ExpertProvider>(
     matmul_qt(&mut h_lat, x, fc1, s_len);
 
     // ---- routed experts (weighted sum, in latent space) -------------------
+    // Expert-parallel dispatch over the LATENT state, as in `kimi_moe`: without this a
+    // sharded run dies on the first expert this node does not own. Single node (or
+    // unset) falls through to the local path.
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
-    let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
-    let moe_lat = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, &h_lat, s_len, dl)?;
+    let sharded = cluster_ctx().filter(|ctx| ctx.sharding.num_nodes() > 1);
+    let moe_lat = match &sharded {
+        Some(ctx) => routed_experts_sharded(
+            provider, layer, &uniq, &w_mat, &h_lat, s_len, dl, &ctx.sharding, &*ctx.transport,
+        )?,
+        None => {
+            let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+            compute_experts_partial(provider, layer, &uniq_u32, &w_mat, &h_lat, s_len, dl)?
+        }
+    };
 
     // ---- fc2: latent -> hidden --------------------------------------------
     matmul_qt(out, &moe_lat, fc2, s_len);

@@ -103,9 +103,33 @@ pub fn set_activation(cfg: &Config) {
     crate::gpu::set_activation(cfg.swiglu_oai, cfg.swiglu_alpha, cfg.swiglu_limit);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only activation override, consulted by [`activation`] ahead of the global.
+    ///
+    /// [`ACTIVATION`] is a write-once process global ("one model per process"), an
+    /// assumption a test binary breaks: libtest runs every `#[test]` in the same
+    /// process, in parallel threads, so one test's [`set_activation`] would reach into
+    /// every other test's math — including *mid-test*, between two calls that are
+    /// asserted equal. Tests needing a non-default variant call
+    /// [`set_activation_for_test`] instead, which scopes the choice to the one thread
+    /// libtest gave that test.
+    static ACT_OVERRIDE: std::cell::Cell<Option<ActCfg>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin the SwiGLU variant for the current test only. See [`ACT_OVERRIDE`].
+#[cfg(test)]
+fn set_activation_for_test(a: ActCfg) {
+    ACT_OVERRIDE.with(|c| c.set(Some(a)));
+}
+
 /// The active SwiGLU variant (defaults to SiLU when unset — the GLM path and
 /// unit tests that never call [`set_activation`]).
 fn activation() -> ActCfg {
+    #[cfg(test)]
+    if let Some(a) = ACT_OVERRIDE.with(|c| c.get()) {
+        return a;
+    }
     *ACTIVATION.get().unwrap_or(&ActCfg {
         oai: false,
         alpha: 0.0,
@@ -1644,7 +1668,11 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::from_json(&json).unwrap();
-        let _ = ACTIVATION.set(ActCfg {
+        // Thread-scoped, not `ACTIVATION.set`: the global is write-once and shared by
+        // every test in this binary, so setting it here silently switched other tests'
+        // experts to `situ` — and landing between a test's two asserted-equal calls made
+        // `moe_sharded_hot_aware_map_equals_single_node` fail ~1 run in 3.
+        set_activation_for_test(ActCfg {
             oai: false, alpha: 0.0, limit: 0.0, relu2: false,
             situ: cfg.situ, situ_beta: cfg.situ_beta, situ_linear_beta: cfg.situ_linear_beta,
         });
@@ -2145,62 +2173,6 @@ mod tests {
         }
     }
 
-    // TEMPORARY PROOF — delete.
-    #[test]
-    fn zz_proof_activation_race() {
-        use colibri_cluster::{serve_experts, ExpertResponse, TcpTransport};
-        let c = cfg();
-        let d = c.hidden as usize;
-        let inter = c.moe_inter as usize;
-        let consts = [-1.0f32, 0.5, 1.0, 0.0];
-        let mut router = vec![0f32; c.n_experts as usize * d];
-        for (e, &cst) in consts.iter().enumerate() {
-            for i in 0..d {
-                router[e * d + i] = cst;
-            }
-        }
-        let mut l = Layer::default();
-        l.router = router;
-        l.router_bias = vec![0.0; c.n_experts as usize];
-        let sh = expert(50, (c.moe_inter * c.n_shared) as usize, d);
-        l.sh_gate = sh.gate.clone();
-        l.sh_up = sh.up.clone();
-        l.sh_down = sh.down.clone();
-        let experts: HashMap<(usize, usize), Arc<Expert>> =
-            (0..4).map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d)))).collect();
-        let provider = Arc::new(MapProvider { experts });
-        let x = vec![0.3f32, 0.5, -0.2, 0.7];
-
-        let mut out_single = vec![0f32; d];
-        moe(&c, &l, 0, &x, 1, &mut out_single, true, &*provider).unwrap();
-
-        // <-- the interleaving: another test's set_activation lands right here.
-        let _ = ACTIVATION.set(ActCfg {
-            oai: false, alpha: 0.0, limit: 0.0, relu2: false,
-            situ: true, situ_beta: 4.0, situ_linear_beta: 25.0,
-        });
-
-        let weights = [100u64, 100, 1, 1];
-        let sharding = ExpertSharding::balanced(2, c.n_experts as u32, &weights);
-        let hp = provider.clone();
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
-            let outputs = compute_experts_partial(
-                &*hp, req.layer as usize, &req.experts, &req.weights,
-                &req.activations, req.n_tokens, req.hidden,
-            )
-            .unwrap();
-            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
-        })
-        .unwrap();
-        let mut peers = HashMap::new();
-        peers.insert(NodeId(1), addr);
-        let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
-        let mut out_sharded = vec![0f32; d];
-        moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
-            .unwrap();
-        panic!("PROOF single {} vs sharded {}", out_single[0], out_sharded[0]);
-    }
-
     /// End-to-end: write a real int2 `.weight` + f32 `.qs` shard for one expert,
     /// load it through the coalesced + chunked path (`read_threads=8`), and assert
     /// the resulting `Bytes::Shared` views (a) hold exactly the on-disk bytes and
@@ -2613,4 +2585,71 @@ mod tests {
             assert_eq!(t.g, 1.0, "{name} MXFP4 global is the identity");
         }
     }
+    /// The MXFP4+situ GPU kernel must agree with the CPU reference numerically.
+    ///
+    /// A token-identity gate cannot settle this. On the real model the kernel produced
+    /// " Paris" then `.",\n` where the CPU gave " Paris" then `.` — both continuations
+    /// start with a period, i.e. a near-tie in the argmax that benign f16/fast-math noise
+    /// can flip. That is consistent with a correct-but-lower-precision kernel AND with a
+    /// real bug, so it distinguishes nothing. This compares the actual FFN output.
+    ///
+    /// Tolerances differ by path on purpose: S==1 takes `mxfp4_gemv`, which accumulates in
+    /// f32 and should track the CPU closely; S>1 takes the WMMA path, whose MMA runs in
+    /// f16 and cannot.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mxfp4_situ_kernel_matches_cpu_reference() {
+        use colibri_core::Bytes;
+        // Latent-space expert shapes, small but with >1 block per row (32 inputs/block).
+        const D: usize = 64; // moe_latent
+        const I: usize = 32; // moe_inter
+        let mk = |o: usize, i: usize, seed: usize| -> QTensor {
+            let rb = i.div_ceil(2);
+            let nb = i.div_ceil(32);
+            let q4: Vec<u8> = (0..o * rb).map(|k| ((k * 7 + seed) % 256) as u8).collect();
+            // Scales near 2^0 so the decoded weights stay in a sane range.
+            let bs: Vec<u8> = (0..o * nb).map(|k| (126 + ((k + seed) % 3)) as u8).collect();
+            QTensor {
+                fmt_code: 6,
+                q4: Bytes::Owned(q4),
+                bs: Bytes::Owned(bs),
+                g: 1.0,
+                o: o as i32,
+                i: i as i32,
+                gpu_eligible: true,
+                ..Default::default()
+            }
+        };
+        let (gate, up, down) = (mk(I, D, 1), mk(I, D, 5), mk(D, I, 9));
+        let (beta, linear_beta) = (4.0f32, 25.0f32);
+        let _ = ACTIVATION.set(ActCfg {
+            oai: false, alpha: 0.0, limit: 0.0, relu2: false,
+            situ: true, situ_beta: beta, situ_linear_beta: linear_beta,
+        });
+
+        for (nr, tol) in [(1usize, 2e-3f32), (8usize, 5e-2f32)] {
+            let x: Vec<f32> =
+                (0..nr * D).map(|k| ((k % 11) as f32 - 5.0) * 0.05).collect();
+            let mut want = vec![0f32; nr * D];
+            ffn_cpu(&gate, &up, &down, &x, nr, &mut want);
+
+            let mut got = vec![0f32; nr * D];
+            let ran = crate::gpu::try_expert_ffn_mxfp4_situ(
+                &gate, &up, &down, &x, nr, &mut got, beta, linear_beta,
+            );
+            if !ran {
+                eprintln!("kernel declined at nr={nr} (no CUDA / no zero-copy) — skipping");
+                continue;
+            }
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= tol * scale,
+                    "nr={nr} out[{k}]: gpu {g} vs cpu {w} (tol {} of scale {scale})",
+                    tol
+                );
+            }
+        }
+    }
+
 }

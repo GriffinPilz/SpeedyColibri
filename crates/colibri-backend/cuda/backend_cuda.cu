@@ -351,6 +351,130 @@ __global__ static void nvfp4_gemv(float *y,const float *x,const uint8_t *w,
     if(lane==0) y[n]=acc*g;
 }
 
+/* Wide-read NVFP4 GEMV — RESIDENT weights only (S==1 decode).
+ *
+ * `nvfp4_gemv` above assigns one k per lane and indexes `wr[k>>1]`, so lanes 2j and 2j+1
+ * fetch the SAME byte: a warp covers just 16 contiguous bytes per step, a fraction of a
+ * 128 B line. The int8 GEMV gives each lane its own byte and covers 32. That read width —
+ * not the decode arithmetic — is the suspected reason resident NVFP4 achieved ~65 GB/s
+ * against int8's ~89 on the same weights.
+ *
+ * Here each lane owns one BYTE and unpacks both of its nibbles, doubling bytes per warp
+ * transaction and halving the trip count. A byte's two nibbles are k0=2*kb and k0+1 with
+ * k0 even, so `k0>>4 == (k0+1)>>4` always: they share a block scale, which also saves one
+ * ue4m3 decode per byte.
+ *
+ * Kept SEPARATE from `nvfp4_gemv` on purpose. Per-lane k assignment changes the f32
+ * accumulation order, so this is a few ULP from the original — fine for resident weights
+ * (gated on quality), but the expert path stays on the proven bit-exact kernel so its
+ * token-identity gates keep meaning what they say. */
+__global__ static void nvfp4_gemv_wide(float *y,const float *x,const uint8_t *w,
+                                       const uint8_t *bs,float g,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int kb=lane;kb<Kh;kb+=32){
+        uint8_t byte=wr[kb];
+        int k0=kb<<1;
+        float sc=e4m3f(br[k0>>4]);          /* both nibbles share this block scale */
+        float a=xs[k0]*e2m1f(byte&0xF);
+        float b=(k0+1<K)?xs[k0+1]*e2m1f(byte>>4):0.f;
+        acc+=(a+b)*sc;
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* Wide-read NVFP4 GEMV with NO shared staging of x — the occupancy variant.
+ *
+ * `nvfp4_gemv{,_wide}` stage x in shared memory: K floats, i.e. 16 KB per block at K=4096
+ * and 32 KB at K=8192. That is a hard occupancy cap — at 32 KB an SM holds only ~3 blocks
+ * (24 warps) where it could hold 8-16 — so far fewer memory requests are in flight than
+ * the memory system can track. Resident NVFP4 decode achieves ~65 GB/s against a measured
+ * 146 GB/s zero-copy ceiling, and too few concurrent readers is the likeliest reason.
+ *
+ * The trade is favourable: the WEIGHTS are the traffic (GB per token), while x is only
+ * K floats (16-32 KB) shared by every warp in the grid — small enough to sit in L2, so
+ * re-reading it from global costs little. Dropping the shared allocation lets many more
+ * warps be resident, which is what actually raises memory-level parallelism.
+ *
+ * Same per-lane byte assignment (and shared block-scale) as `nvfp4_gemv_wide`. */
+__global__ static void nvfp4_gemv_wide_g(float *y,const float *x,const uint8_t *w,
+                                         const uint8_t *bs,float g,int K,int N){
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int kb=lane;kb<Kh;kb+=32){
+        uint8_t byte=wr[kb];
+        int k0=kb<<1;
+        float sc=e4m3f(br[k0>>4]);
+        float a=x[k0]*e2m1f(byte&0xF);
+        float b=(k0+1<K)?x[k0+1]*e2m1f(byte>>4):0.f;
+        acc+=(a+b)*sc;
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* Full-line NVFP4 GEMV — resident, S==1. Each lane loads a uint32 (4 bytes = 8 nibbles),
+ * so a warp fetches 128 B: one whole cache line per step, versus 32 B for the byte version
+ * and 16 B for the original.
+ *
+ * The 8 nibbles also share ONE block scale. Their k range starts at k0 = 8*kb4, so
+ * k0 mod 16 is 0 or 8 and k0..k0+7 never straddles a 16-wide scale block — one ue4m3
+ * decode per 8 values instead of per 2.
+ *
+ * Rows are Kh = ceil(K/2) bytes apart, so 4-byte alignment holds whenever Kh % 4 == 0;
+ * the caller checks that and falls back to the byte version otherwise rather than issuing
+ * a misaligned uint32 load. */
+__global__ static void nvfp4_gemv_u32(float *y,const float *x,const uint8_t *w,
+                                      const uint8_t *bs,float g,int K,int N){
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4, Kw=Kh>>2;
+    const uint32_t *wr=(const uint32_t*)(w+(size_t)n*Kh);
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int kw=lane;kw<Kw;kw+=32){
+        uint32_t v=wr[kw];
+        int k0=kw<<3;                       /* 8 nibbles per uint32 */
+        float sc=e4m3f(br[k0>>4]);          /* k0..k0+7 share one block scale */
+        float p=0.f;
+        #pragma unroll
+        for(int j=0;j<8;j++){
+            int nib=(v>>(j<<2))&0xF;
+            p+=x[k0+j]*e2m1f(nib);
+        }
+        acc+=p*sc;
+    }
+    /* tail: whatever bytes the uint32 sweep could not cover */
+    for(int kb=(Kw<<2)+lane;kb<Kh;kb+=32){
+        uint8_t byte=w[(size_t)n*Kh+kb];
+        int k0=kb<<1;
+        float sc=e4m3f(br[k0>>4]);
+        float a=x[k0]*e2m1f(byte&0xF);
+        float b=(k0+1<K)?x[k0+1]*e2m1f(byte>>4):0.f;
+        acc+=(a+b)*sc;
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
 /* ---------------------------------------------------------------------------------
  * MXFP4 (Kimi-K3) expert kernels.
  *
@@ -912,13 +1036,20 @@ __global__ static void mamba2_scan_kernel(float *state, float *y, const float *h
  *
  * Launch: grid (hd, nh), block ds threads, shared = 2*ds (B/C rows) + 32 (warp partials).
  * Declines if ds exceeds the max block size — the caller then runs the CPU scan. */
+/* `exact`: when nonzero, `y`'s sum over d_state is done in STRICT nn-ascending order by
+ * thread 0 (bit-identical to the S==1 kernel and the CPU scan) instead of the warp/block
+ * tree. This is what the MTP verify forward needs: its S>1 logits must match the S==1
+ * decode path to the bit, or a near-tie argmax forks the accepted token from DRAFT=0. The
+ * strict sum serializes ds adds on one thread, so it is only chosen at small seq (verify /
+ * tiny prefills) where the tree's parallelism buys nothing anyway; large-S prefill keeps
+ * the tree. In exact mode the third shared region holds prod[ds] (host sizes it max(ds,32)). */
 __global__ static void mamba2_scan_seq_kernel(float *state, float *y, const float *hidden,
         const float *b, const float *c, const float *dt_h, const float *da_h,
-        const float *d, int nh, int hd, int ds, int ng, int seq) {
+        const float *d, int nh, int hd, int ds, int ng, int seq, int exact) {
     extern __shared__ float sh[];
     float *sh_b = sh;             // [ds]
     float *sh_c = sh_b + ds;      // [ds]
-    float *sh_red = sh_c + ds;    // [<=32] one slot per warp
+    float *sh_red = sh_c + ds;    // tree: [<=32] one slot per warp; exact: prod[ds]
     int pp = blockIdx.x, h = blockIdx.y, nn = threadIdx.x;
     if (h >= nh || pp >= hd || nn >= ds) return;
     int hpg = nh / ng, grp = h / hpg;
@@ -937,16 +1068,28 @@ __global__ static void mamba2_scan_seq_kernel(float *state, float *y, const floa
         // Per-element state update — identical operand order to the CPU scan.
         ss = __fadd_rn(__fmul_rn(ss, dah), __fmul_rn(__fmul_rn(dth, sh_b[nn]), x_hp));
         float prod = __fmul_rn(ss, sh_c[nn]);
-        // Tree reduction (the one reassociation).
-        for (int off = 16; off > 0; off >>= 1)
-            prod = __fadd_rn(prod, __shfl_down_sync(0xffffffffu, prod, off));
-        if (lane == 0) sh_red[warp] = prod;
-        __syncthreads();
-        if (nn == 0) {
-            float acc = 0.f;
-            for (int i = 0; i < nwarps; i++) acc = __fadd_rn(acc, sh_red[i]);
-            y[(size_t)t * d_inner + (size_t)h * hd + pp] =
-                __fadd_rn(acc, __fmul_rn(x_hp, dh));
+        if (exact) {
+            // Strict nn-ascending sum: bit-identical to the S==1 kernel / CPU scan.
+            sh_red[nn] = prod;
+            __syncthreads();
+            if (nn == 0) {
+                float acc = 0.f;
+                for (int i = 0; i < ds; i++) acc = __fadd_rn(acc, sh_red[i]);
+                y[(size_t)t * d_inner + (size_t)h * hd + pp] =
+                    __fadd_rn(acc, __fmul_rn(x_hp, dh));
+            }
+        } else {
+            // Tree reduction (the one reassociation) — fast path for large-S prefill.
+            for (int off = 16; off > 0; off >>= 1)
+                prod = __fadd_rn(prod, __shfl_down_sync(0xffffffffu, prod, off));
+            if (lane == 0) sh_red[warp] = prod;
+            __syncthreads();
+            if (nn == 0) {
+                float acc = 0.f;
+                for (int i = 0; i < nwarps; i++) acc = __fadd_rn(acc, sh_red[i]);
+                y[(size_t)t * d_inner + (size_t)h * hd + pp] =
+                    __fadd_rn(acc, __fmul_rn(x_hp, dh));
+            }
         }
         __syncthreads();   // nobody may overwrite sh_b/sh_c/sh_red before all readers finish
     }
@@ -1596,6 +1739,76 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* Defined further down (with the other tensor-wrap entry points); forward-declared here
+ * because this translation unit is compiled as one pass and the matmul below calls it. */
+extern "C" int coli_cuda_tensor_wrap_nvfp4(ColiCudaTensor **tensor,
+        const void *weights, const void *bscale, float gscale,
+        int I, int O, int device);
+
+/* Resident NVFP4 matmul: y[S,O] = x[S,I] @ W[O,I]^T with W in NVFP4.
+ *
+ * The DEVICE kernels for this already existed (`nvfp4_gemv` / `nvfp4_matmul`) — they are
+ * fully general `y[M,N] = x[M,K] @ W[N,K]^T` and were only ever reached through the
+ * expert-FFN wrappers, which fuse gate/up/down. This is the single-weight entry point the
+ * resident path needs, mirroring `coli_cuda_matmul`.
+ *
+ * Why it can't go through `coli_cuda_matmul`: that uploads a dense `O*I` buffer, but NVFP4
+ * stores ~half a byte per weight plus block scales, so the dense upload would read far past
+ * the end. The weight is wrapped ZERO-COPY instead (host pointers, unified memory) — the
+ * same choice the expert path makes, and the one GB10 wants.
+ *
+ * S==1 takes the one-warp-per-column GEMV; S>1 takes the WMMA tile. Same split, and for the
+ * same reason, as the int8/e4m3 path: at S==1 a 16-row MMA tile wastes 15/16 of its work. */
+extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
+                                       float *y, const float *x,
+                                       const void *weights, const void *bscale,
+                                       float gscale, int S, int I, int O, int device) {
+    if (S < 1 || !y || !x ||
+        !coli_cuda_tensor_wrap_nvfp4(tensor, weights, bscale, gscale, I, O, device)) return 0;
+    ColiCudaTensor *t = *tensor;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "nvfp4 matmul input")) return 0;
+    const uint8_t *w = (const uint8_t *)t->weights;
+    const uint8_t *bs = (const uint8_t *)t->bscale;
+    size_t gemv_shmem = (size_t)I * sizeof(float);
+    if (S == 1) {
+        /* COLI_NVFP4_WIDE=0 selects the original narrow-read GEMV for A/B. */
+        /* COLI_NVFP4_GEMV: 0=narrow (original), 1=wide read + shared x, 2=wide
+         * read, no shared x, 3=uint32 full-cache-line read (default). */
+        static int s_mode = -1;
+        if (s_mode < 0) { const char *e = getenv("COLI_NVFP4_GEMV"); s_mode = e ? atoi(e) : 3; }
+        const int tpb = 256, wpb = tpb >> 5;
+        unsigned blocks = (unsigned)((O + wpb - 1) / wpb);
+        if (s_mode == 0)
+            nvfp4_gemv<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        else if (s_mode == 1)
+            nvfp4_gemv_wide<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        else if (s_mode == 2)
+            nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        else if ((((I + 1) >> 1) & 3) == 0)   /* uint32 loads need Kh % 4 == 0 */
+            nvfp4_gemv_u32<<<blocks, tpb, 0, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        else
+            nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(
+                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+    } else {
+        dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
+        nvfp4_matmul<<<grid, 128, 0, ctx->stream>>>(ctx->y, ctx->x, w, bs, t->gscale, S, I, O);
+    }
+    if (!cuda_ok(cudaGetLastError(), "nvfp4 matmul launch") ||
+        !cuda_ok(cudaMemcpyAsync(y, ctx->y, yb, cudaMemcpyDeviceToHost, ctx->stream),
+                 "nvfp4 matmul output") ||
+        !cuda_ok(cudaStreamSynchronize(ctx->stream), "nvfp4 matmul sync")) return 0;
+    return 1;
+}
+
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                                       ColiCudaTensor *down, float *y,
                                       const float *x, int S) {
@@ -1830,7 +2043,7 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
  * instead of the SwiGLU gate*up combine. Requires up/down at fmt==5, with down the
  * transpose of up (down->I==up->O, down->O==up->I). x is [S, up->I] (latent). */
 extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
-        ColiCudaTensor *down,float *y,const float *x,int S){
+        ColiCudaTensor *down,float *y,const float *x,int S,int exact){
     if(!up||!down||!x||!y||S<1||up->fmt!=5||down->fmt!=5||
        up->device!=down->device||down->I!=up->O||down->O!=up->I)return 0;
     DeviceContext *ctx=find_ctx(up->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
@@ -1888,14 +2101,23 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
     if(s_evt) cudaEventRecord(s_e1,ctx->stream);
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
-    if(S==1&&!s_tiled){
+    // `exact`: force the per-row gemv path for EVERY row, even at S>1. This makes a
+    // multi-row (collided-expert) call bit-identical to S separate S==1 decode calls —
+    // needed by the MTP verify forward, whose S>1 logits must match sequential decode to
+    // the bit or a near-tie argmax forks the accepted token from DRAFT=0. The WSMM/WMMA
+    // paths below reduce over K in a different order, so they cannot be used for verify.
+    // S is tiny at verify, so the lost row-parallelism costs nothing there.
+    if((S==1&&!s_tiled)||exact){
         int tpb=256,wpb=tpb>>5;
-        // t = up·x  → ctx->up [I]
-        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
-        // t = relu(t)²
-        relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)I);
-        // y = down·t → ctx->y [D]
-        nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->up,dw,dbs,dg,I,D);
+        for(int r=0;r<S;r++){
+            const float *xr=ctx->x+(size_t)r*D; float *tr=ctx->up+(size_t)r*I; float *yr=ctx->y+(size_t)r*D;
+            // t = up·x  → tr [I]
+            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
+            // t = relu(t)²
+            relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tr,(size_t)I);
+            // y = down·t → yr [D]
+            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
+        }
     }else{
         // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32): reads each
         // weight once and amortizes the dequant across all S rows, vs the WMMA path's
@@ -2377,13 +2599,15 @@ extern "C" int coli_cuda_mamba2_scan(int device, float *state, float *y, const f
  * shared memory rather than silently launching something slower or wrong. */
 extern "C" int coli_cuda_mamba2_scan_seq(int device, float *state, float *y, const float *hidden,
         const float *b, const float *c, const float *dt_h, const float *da_h,
-        const float *d, int nh, int hd, int ds, int ng, int seq) {
+        const float *d, int nh, int hd, int ds, int ng, int seq, int exact) {
     if (!state || !y || !hidden || !b || !c || !dt_h || !da_h || !d) return 0;
     if (nh < 1 || hd < 1 || ds < 1 || ds > 1024 || ng < 1 || nh % ng || seq < 1) return 0;
     DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
     std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     cudaStream_t st = dc->stream;
-    size_t shmem = (2 * (size_t)ds + 32) * sizeof(float);
+    // Third shared region: tree needs <=32 warp partials; exact needs prod[ds].
+    size_t red_slots = exact ? (size_t)ds : 32;
+    size_t shmem = (2 * (size_t)ds + red_slots) * sizeof(float);
     int shmax = 0;
     if (!cuda_ok(cudaDeviceGetAttribute(&shmax, cudaDevAttrMaxSharedMemoryPerBlock, device),
                  "mamba seq shmem query"))
@@ -2430,7 +2654,7 @@ extern "C" int coli_cuda_mamba2_scan_seq(int device, float *state, float *y, con
         !cuda_ok(cudaMemcpyAsync(dc->ms_d, d, db, cudaMemcpyHostToDevice, st), "mamba seq d up"))
         return 0;
     mamba2_scan_seq_kernel<<<dim3(hd, nh), ds, shmem, st>>>(dc->ms_state, dc->ms_y, dc->ms_x,
-        dc->ms_b, dc->ms_c, dc->ms_dth, dc->ms_dah, dc->ms_d, nh, hd, ds, ng, seq);
+        dc->ms_b, dc->ms_c, dc->ms_dth, dc->ms_dah, dc->ms_d, nh, hd, ds, ng, seq, exact);
     if (!cuda_ok(cudaGetLastError(), "mamba seq launch")) return 0;
     if (!cuda_ok(cudaMemcpyAsync(dc->ms_pin_state, dc->ms_state, stt, cudaMemcpyDeviceToHost, st), "mamba seq state down") ||
         !cuda_ok(cudaMemcpyAsync(dc->ms_pin_y, dc->ms_y, xb, cudaMemcpyDeviceToHost, st), "mamba seq y download") ||

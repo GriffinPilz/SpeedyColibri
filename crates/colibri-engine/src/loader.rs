@@ -17,6 +17,48 @@ use std::io;
 /// Load a `[O, I]` weight tensor as a [`QTensor`] at `bits`. Port of
 /// `qt_from_disk` + `qt_load`.
 pub fn qt_load(shards: &Shards, name: &str, o: usize, i: usize, bits: u32) -> io::Result<QTensor> {
+    // NVFP4 resident weight (built by `COLI_RESIDENT_NVFP4`): a `.g` global scale sits
+    // beside a blob of e2m1 nibbles CONCATENATED with ue4m3 per-16 block scales — the same
+    // layout `load_expert` reads for routed experts.
+    //
+    // This branch must come FIRST. Such a weight has no `.qs`, so without it the function
+    // falls through to "full tensor → runtime quantize" and calls `read_f32` on packed
+    // nibbles: it reinterprets 4-bit codes as floats and quantizes the result. That is not
+    // a crash, it is a model that loads and emits nothing but token 0 — exactly what the
+    // first resident-NVFP4 container did.
+    let gname = format!("{name}.g");
+    if shards.has(&gname) {
+        let nb = shards.nbytes(name);
+        if nb < 0 {
+            return Err(missing(name));
+        }
+        let nib_bytes = o * i.div_ceil(2);
+        let bs_bytes = o * i.div_ceil(16);
+        if nb as usize != nib_bytes + bs_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{name}: NVFP4 blob is {nb} bytes, expected {} = nibbles({nib_bytes}) + \
+                     block-scales({bs_bytes}) for [{o},{i}]",
+                    nib_bytes + bs_bytes
+                ),
+            ));
+        }
+        let mut raw = vec![0u8; nb as usize];
+        shards.read_raw(name, &mut raw)?;
+        let bs = raw.split_off(nib_bytes);
+        let mut g = [0f32; 1];
+        shards.read_f32(&gname, &mut g)?;
+        return Ok(QTensor {
+            fmt_code: 5,
+            o: o as i32,
+            i: i as i32,
+            q4: raw.into(),
+            bs: bs.into(),
+            g: g[0],
+            ..Default::default()
+        });
+    }
     let qs = format!("{name}.qs");
     if shards.has(&qs) {
         // Pre-quantized container: raw codes + separate f32 scales.
@@ -79,15 +121,27 @@ fn missing(name: &str) -> io::Error {
 /// of projections that share the same input `x` can run as ONE matmul instead of N. Used
 /// to fuse MiniMax-M3's q/k/v projections: at S=1 decode each was a separate synchronized
 /// GPU dispatch (measured ~25% of decode across q/k/v/o × 60 layers), and one fused
-/// matmul cuts the q/k/v three into one. All parts must share `i` and `fmt_code`; supports
-/// the resident formats f32 (0) and int8 (1) — the only ones projections ship as.
-pub fn concat_rows(parts: &[&QTensor]) -> QTensor {
+/// matmul cuts the q/k/v three into one.
+///
+/// Returns `None` when the parts cannot be fused (mismatched `i`/`fmt_code`, or a format
+/// whose scales are not row-local — NVFP4's global is per TENSOR). Callers keep the
+/// separate projections in that case; the unfused path exists and is correct.
+pub fn concat_rows(parts: &[&QTensor]) -> Option<QTensor> {
     assert!(!parts.is_empty(), "concat_rows: no parts");
     let (i, fmt) = (parts[0].i, parts[0].fmt_code);
-    assert!(
-        parts.iter().all(|p| p.i == i && p.fmt_code == fmt),
-        "concat_rows: all parts must share i and fmt_code"
-    );
+    if !parts.iter().all(|p| p.i == i && p.fmt_code == fmt) {
+        return None;
+    }
+    // NVFP4 (fmt 5) carries a PER-TENSOR global scale, so three separately-encoded
+    // projections have three different globals and cannot be concatenated without
+    // re-rounding every block scale onto a common one — which would silently add error
+    // to weights we are in the middle of validating. Decline instead: `attention_gqa`
+    // already has an unfused q/k/v path, so declining costs one extra matmul per layer
+    // and nothing else. (This used to `panic!`, which is how the first loadable
+    // resident-NVFP4 container died.)
+    if !matches!(fmt, 0 | 1) {
+        return None;
+    }
     let mut out = parts[0].clone();
     out.o = parts.iter().map(|p| p.o).sum();
     match fmt {
@@ -98,10 +152,10 @@ pub fn concat_rows(parts: &[&QTensor]) -> QTensor {
             out.q8 = parts.iter().flat_map(|p| p.q8.iter().copied()).collect();
             out.s = parts.iter().flat_map(|p| p.s.iter().copied()).collect();
         }
-        _ => panic!("concat_rows: unsupported fmt_code {fmt} (projections ship f32/int8)"),
+        _ => unreachable!("guarded above"),
     }
     out.gpu_eligible = parts.iter().all(|p| p.gpu_eligible);
-    out
+    Some(out)
 }
 
 #[cfg(test)]
@@ -147,6 +201,41 @@ mod tests {
         for (_, _, bytes) in tensors {
             f.write_all(bytes).unwrap();
         }
+    }
+
+
+    /// A resident NVFP4 weight must load as fmt 5, with nibbles and block scales split at
+    /// the right offset. The regression this pins: `qt_load` had no `.g` branch, so such a
+    /// weight fell through to "no .qs → full tensor → read_f32" and reinterpreted packed
+    /// 4-bit codes as floats. Nothing errored — the model loaded and generated token 0
+    /// forever, which is how the first resident-NVFP4 container behaved.
+    #[test]
+    fn resident_nvfp4_loads_as_fmt5_not_as_f32() {
+        let (o, i) = (2usize, 32usize);
+        let w: Vec<f32> = (0..o * i).map(|k| ((k as f32) * 0.19).sin()).collect();
+        let (mut blob, bsc, g) = crate::convert::quantize_nvfp4_pub(&w, o, i);
+        let nib = blob.len();
+        blob.extend_from_slice(&bsc);
+
+        let dir = temp_dir();
+        write_st(&dir, &[("w", "U8", blob.clone()), ("w.g", "F32", f32_bytes(&[g]))]);
+        let shards = Shards::open(&dir).unwrap();
+        let t = qt_load(&shards, "w", o, i, 8).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(t.fmt_code, 5, "must load as NVFP4, not fall through to f32/int8");
+        assert_eq!(t.q4.len(), nib, "nibble section length");
+        assert_eq!(t.bs.len(), bsc.len(), "block-scale section length");
+        assert_eq!(t.g, g);
+        // Right shape is not enough — it must DECODE to the original values.
+        let row = crate::linear::qt_row_dequant(&t, 0);
+        let (mut se, mut sr) = (0f64, 0f64);
+        for (a, b) in row.iter().zip(&w[..i]) {
+            se += ((a - b) as f64).powi(2);
+            sr += (*b as f64).powi(2);
+        }
+        let rel = (se / sr).sqrt();
+        assert!(rel < 0.15, "decoded rel-rms {rel} — split offset wrong?");
     }
 
     fn temp_dir() -> PathBuf {

@@ -99,6 +99,18 @@ extern "C" {
         o: c_int,
         device: c_int,
     ) -> c_int;
+    fn coli_cuda_matmul_nvfp4(
+        tensor: *mut *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        s: c_int,
+        i: c_int,
+        o: c_int,
+        device: c_int,
+    ) -> c_int;
     fn coli_cuda_expert_mlp(
         gate: *mut ColiCudaTensor,
         up: *mut ColiCudaTensor,
@@ -137,6 +149,7 @@ extern "C" {
         y: *mut f32,
         x: *const f32,
         s: c_int,
+        exact: c_int,
     ) -> c_int;
     fn coli_cuda_expert_group(
         gates: *const *mut ColiCudaTensor,
@@ -228,6 +241,7 @@ extern "C" {
         d_state: c_int,
         n_groups: c_int,
         seq: c_int,
+        exact: c_int,
     ) -> c_int;
     // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
     fn coli_cuda_dsa_indexer_scores(
@@ -535,6 +549,43 @@ pub unsafe fn matmul(
 /// `slot` persists across calls reusing this weight; `y` has `s*o` floats, `x`
 /// has `s*i` floats; `weights`/`scales` point to the CPU copy for the upload.
 #[allow(clippy::too_many_arguments)]
+/// `y[S,O] = x[S,I] @ W[O,I]^T` for a resident **NVFP4** weight, via the existing general
+/// `nvfp4_gemv`/`nvfp4_matmul` device kernels.
+///
+/// `weights` is the packed e2m1 nibble section and `bscale` the ue4m3 per-16 block scales —
+/// two pointers, because unlike int8 the scales are not a plain `[O]` f32 vector. The weight
+/// is wrapped zero-copy, so both must outlive the cached tensor (they are model weights).
+///
+/// # Safety
+/// `y` is `[s,o]` and `x` is `[s,i]`; `weights`/`bscale` point at a live NVFP4 QTensor's
+/// buffers sized `o*ceil(i/2)` and `o*ceil(i/16)`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matmul_nvfp4_raw(
+    slot: &mut *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    weights: *const c_void,
+    bscale: *const c_void,
+    gscale: f32,
+    s: i32,
+    i: i32,
+    o: i32,
+    device: i32,
+) -> bool {
+    coli_cuda_matmul_nvfp4(
+        slot as *mut *mut ColiCudaTensor,
+        y,
+        x,
+        weights,
+        bscale,
+        gscale,
+        s as c_int,
+        i as c_int,
+        o as c_int,
+        device as c_int,
+    ) != 0
+}
+
 pub unsafe fn matmul_raw(
     slot: &mut *mut ColiCudaTensor,
     y: *mut f32,
@@ -656,8 +707,9 @@ pub unsafe fn expert_mlp_nvfp4_relu2_raw(
     y: *mut f32,
     x: *const f32,
     s: i32,
+    exact: bool,
 ) -> bool {
-    coli_cuda_expert_mlp_nvfp4_relu2(up, down, y, x, s) != 0
+    coli_cuda_expert_mlp_nvfp4_relu2(up, down, y, x, s, exact as i32) != 0
 }
 
 /// Tiled int8 (W8A16) fused expert/MLP FFN — tensor-core replacement for the naive
@@ -862,9 +914,11 @@ pub unsafe fn mamba2_scan_seq_raw(
     d_state: i32,
     n_groups: i32,
     seq: i32,
+    exact: bool,
 ) -> bool {
     coli_cuda_mamba2_scan_seq(
         0, state, y, hidden, b, c, dt_h, da_h, d, n_heads, head_dim, d_state, n_groups, seq,
+        exact as i32,
     ) != 0
 }
 

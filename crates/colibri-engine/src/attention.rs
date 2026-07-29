@@ -1179,11 +1179,12 @@ mod tests {
         attention_gqa(&c, &l_sep, 0, &mut kv1, &x, 3, 0, &mut o_sep);
         // fused: concat the same q/k/v into qkv_proj, drop the separates
         let mut l_fused = make_gqa_layer(&c);
-        l_fused.qkv_proj = Some(crate::loader::concat_rows(&[
+        l_fused.qkv_proj = crate::loader::concat_rows(&[
             l_fused.q_proj.as_ref().unwrap(),
             l_fused.k_proj.as_ref().unwrap(),
             l_fused.v_proj.as_ref().unwrap(),
-        ]));
+        ]);
+        assert!(l_fused.qkv_proj.is_some(), "int8 projections must fuse");
         l_fused.q_proj = None;
         l_fused.k_proj = None;
         l_fused.v_proj = None;

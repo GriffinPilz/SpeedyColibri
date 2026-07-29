@@ -653,6 +653,48 @@ impl KvCache {
     pub fn mamba_ssm_mut(&mut self, layer: usize) -> &mut SsmState {
         &mut self.mamba_ssm[layer]
     }
+
+    /// True when this cache carries Nemotron-H Mamba2 recurrent state.
+    pub fn has_mamba(&self) -> bool {
+        self.mamba_conv_dim != 0
+    }
+
+    /// Copy all Mamba2 recurrent state (conv history + SSM state) into `snap`, reusing
+    /// its buffers so repeated calls don't reallocate. Used to roll back a speculative
+    /// (MTP) verify forward: that forward advances every Mamba layer by the whole draft
+    /// batch, but a partial accept must keep only the accepted prefix. Attention KV
+    /// self-heals by positional overwrite; Mamba's running recurrence has no position
+    /// index, so it must be saved and restored explicitly.
+    pub fn snapshot_mamba_into(&self, snap: &mut MambaSnapshot) {
+        let n = self.mamba_conv.len();
+        if snap.conv.len() != n {
+            snap.conv = vec![Vec::new(); n];
+            snap.ssm = vec![Vec::new(); n];
+        }
+        for li in 0..n {
+            snap.conv[li].clear();
+            snap.conv[li].extend_from_slice(&self.mamba_conv[li]);
+            snap.ssm[li].clear();
+            snap.ssm[li].extend_from_slice(&self.mamba_ssm[li].data);
+        }
+    }
+
+    /// Restore all Mamba2 recurrent state from a prior [`KvCache::snapshot_mamba_into`].
+    /// Per-layer lengths are invariant across a sequence, so this is a plain copy.
+    pub fn restore_mamba_from(&mut self, snap: &MambaSnapshot) {
+        for li in 0..self.mamba_conv.len() {
+            self.mamba_conv[li].copy_from_slice(&snap.conv[li]);
+            self.mamba_ssm[li].data.copy_from_slice(&snap.ssm[li]);
+        }
+    }
+}
+
+/// Saved copy of all Mamba2 recurrent state, for speculative-decode rollback. Buffers
+/// are reused across verify steps. See [`KvCache::snapshot_mamba_into`].
+#[derive(Default)]
+pub struct MambaSnapshot {
+    conv: Vec<Vec<f32>>,
+    ssm: Vec<Vec<f32>>,
 }
 
 /// A fully loaded model.

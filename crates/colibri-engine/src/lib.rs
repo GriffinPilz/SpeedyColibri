@@ -27,6 +27,7 @@ pub mod model;
 pub mod moe;
 pub mod mtp;
 pub mod preload;
+pub mod qsim;
 pub mod quantize;
 pub mod sampling;
 pub mod usage;
@@ -167,14 +168,17 @@ fn load_layer(
         // Fuse q/k/v (they share the input x) into ONE matmul per layer: at S=1 decode
         // each was a separate synchronized GPU dispatch, ~25% of decode across the
         // projections. Drop the separate three — `attention_gqa` uses the fused tensor.
-        l.qkv_proj = Some(crate::loader::concat_rows(&[
+        l.qkv_proj = crate::loader::concat_rows(&[
             l.q_proj.as_ref().unwrap(),
             l.k_proj.as_ref().unwrap(),
             l.v_proj.as_ref().unwrap(),
-        ]));
-        l.q_proj = None;
-        l.k_proj = None;
-        l.v_proj = None;
+        ]);
+        // Drop the separates ONLY if the fusion happened; otherwise they are the live path.
+        if l.qkv_proj.is_some() {
+            l.q_proj = None;
+            l.k_proj = None;
+            l.v_proj = None;
+        }
         l.q_norm = ld(shards, &p("self_attn.q_norm.weight"))?;
         l.k_norm = ld(shards, &p("self_attn.k_norm.weight"))?;
         // Block-sparse Lightning Indexer weights on sparse attention layers.
@@ -324,7 +328,14 @@ fn load_layer_nemotron_kind(
             let q = qt_load(shards, &p("mixer.q_proj.weight"), h * hd, d, dbits)?;
             let k = qt_load(shards, &p("mixer.k_proj.weight"), kvh * hd, d, dbits)?;
             let v = qt_load(shards, &p("mixer.v_proj.weight"), kvh * hd, d, dbits)?;
-            l.qkv_proj = Some(crate::loader::concat_rows(&[&q, &k, &v]));
+            l.qkv_proj = crate::loader::concat_rows(&[&q, &k, &v]);
+            if l.qkv_proj.is_none() {
+                // Unfusible (e.g. resident NVFP4, whose global scale is per tensor) — keep
+                // the three projections; `attention_gqa` runs them separately.
+                l.q_proj = Some(q);
+                l.k_proj = Some(k);
+                l.v_proj = Some(v);
+            }
             l.o = qt_load(shards, &p("mixer.o_proj.weight"), d, h * hd, dbits)?;
         }
         LayerKind::Moe => {
@@ -918,6 +929,10 @@ pub fn load_model_with(
             mark_gpu_eligible(l);
         }
     }
+    // Optional load-time simulated requantization (COLI_QSIM). No-op unless set; it
+    // rewrites resident VALUES to carry a target precision's error so `coli ppl` can
+    // price a quantization choice without a container rebuild. See `qsim`.
+    crate::qsim::apply_qsim(&mut model);
     Ok(model)
 }
 

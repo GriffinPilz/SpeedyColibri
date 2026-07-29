@@ -97,8 +97,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate, ColiCud
  * expert (no gate); reuses the NVFP4 decode of coli_cuda_expert_mlp_nvfp4 with a relu²
  * activation between the up and down projections. Requires up/down at fmt==5, with
  * down the transpose of up. */
+/* Resident NVFP4 matmul y[S,O] = x[S,I] @ W[O,I]^T. Wraps the weight zero-copy and
+ * dispatches the existing general nvfp4_gemv (S==1) / nvfp4_matmul (S>1) kernels. */
+COLI_CUDA_DLLEXPORT int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
+        float *y, const float *x, const void *weights, const void *bscale,
+        float gscale, int S, int I, int O, int device);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
-                         ColiCudaTensor *down, float *y, const float *x, int S);
+                         ColiCudaTensor *down, float *y, const float *x, int S, int exact);
 
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */
@@ -168,7 +174,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_mamba2_scan(int device,float *state,float *y,c
 COLI_CUDA_DLLEXPORT int coli_cuda_mamba2_scan_seq(int device,float *state,float *y,
                                      const float *hidden,const float *b,const float *c,
                                      const float *dt_h,const float *da_h,const float *d,
-                                     int n_heads,int head_dim,int d_state,int n_groups,int seq);
+                                     int n_heads,int head_dim,int d_state,int n_groups,int seq,
+                                     int exact);
 
 /* DSA sparse prefill attention: like the batch variant but each query attends only
  * to its indexer selection. sel_idx is [S, maxsel] int (row s holds the chosen

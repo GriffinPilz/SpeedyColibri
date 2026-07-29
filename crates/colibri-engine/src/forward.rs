@@ -98,6 +98,19 @@ pub(crate) fn draft_budget() -> usize {
         std::env::var("DRAFT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(63)
     })
 }
+/// Largest sequence length that runs the Mamba2 seq scan in BIT-exact (strict
+/// nn-order) reduction mode. The MTP verify forward (S = 1 + draft_budget, capped at
+/// 64) must match the S==1 decode path to the bit; above this, prefill keeps the faster
+/// tree-sum. Default 64 covers any draft budget; `COLI_MAMBA_EXACT_SEQ` overrides.
+pub(crate) fn mamba_exact_seq_max() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_MAMBA_EXACT_SEQ")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64)
+    })
+}
 /// Time `f` into `acc` when profiling is enabled (else just run it).
 #[inline]
 fn timed<T>(acc: &AtomicU64, f: impl FnOnce() -> T) -> T {
@@ -742,8 +755,14 @@ pub fn mamba2_mixer(
                     dims, dt, &l.mamba_a_log, &l.mamba_dt_bias, s,
                 );
                 let st = kv.mamba_ssm_mut(layer);
+                // Small S (MTP verify / tiny prefills) reduces d_state in strict nn-order so
+                // the S>1 logits are BIT-identical to the S==1 decode path — otherwise a
+                // near-tie argmax in verify forks the accepted token from DRAFT=0. Large-S
+                // prefill keeps the fast tree-sum (the strict serial sum would bottleneck it).
+                let exact = s <= mamba_exact_seq_max();
                 crate::gpu::try_mamba2_scan_seq(
                     &mut st.data, &mut yv, h, b, c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng, s,
+                    exact,
                 )
                 .then_some(yv)
             }
@@ -805,9 +824,21 @@ pub fn forward<P: ExpertProvider>(
     // Kimi-K3 threads (prefix_sum, block_residual) through the whole stack instead of
     // carrying one hidden state, so it owns the layer loop rather than plugging into
     // the one below. Counted as a forward step above, like every other arch.
+    //
+    // Returns BEFORE the exact-experts guard below on purpose: that guard exists for the
+    // MTP verify/replay path, and K3 has no MTP head, so forcing the bit-exact per-row
+    // gemv over its prefill would only cost speed for a case that cannot arise.
     if cfg.arch == Arch::KimiK3 {
         return kimi_forward(model, kv, provider, ids, pos_base, hidden_out);
     }
+
+    // Small multi-token forwards (the MTP verify / replay) run the routed NVFP4 experts on
+    // the bit-exact per-row gemv path, so a collided expert (>1 row) matches sequential
+    // decode to the bit — pairs with the Mamba `exact` scan gate. Held for this forward's
+    // scope; large-S prefill keeps the fast WSMM/WMMA path. See gpu::ExactExpertsGuard.
+    #[cfg(feature = "cuda")]
+    let _exact_guard =
+        crate::gpu::ExactExpertsGuard::new(s > 1 && s <= mamba_exact_seq_max());
 
     // token embeddings
     let mut x = vec![0f32; s * d];
@@ -1142,6 +1173,13 @@ where
     // what makes `DRAFT=0` byte-identical to `DRAFT=n`.
     let mut budget = if model.has_mtp { budget } else { 0 };
     let (mut proposed, mut accepted, mut forwards) = (0u64, 0u64, 0u64);
+    // Nemotron-H carries recurrent Mamba2 state that a rejected draft would corrupt;
+    // snapshot it around each verify forward and roll back partial accepts. The env
+    // switch (default on) exists only to A/B the fix — COLI_MTP_ROLLBACK=0 reproduces
+    // the pre-fix corruption, so a token-identity gate can prove it detects the bug.
+    let track_mamba =
+        kv.has_mamba() && std::env::var("COLI_MTP_ROLLBACK").map_or(true, |v| v != "0");
+    let mut mamba_snap = crate::model::MambaSnapshot::default();
 
     let mut decode_ms: Vec<f64> = Vec::with_capacity(n_new);
     let mut emitted = 0usize;
@@ -1188,6 +1226,13 @@ where
         batch.extend_from_slice(&drafts[..g]);
         let sb = batch.len();
         let mut h_all = vec![0f32; sb * d];
+        // Speculating over Mamba layers is destructive: the verify forward advances every
+        // Mamba2 layer's recurrent state by all `sb` tokens. Snapshot it first so a
+        // partial accept can be rolled back to the accepted prefix (attention KV needs no
+        // such save — it is position-indexed and overwritten by the next forward).
+        if track_mamba && g > 0 {
+            kv.snapshot_mamba_into(&mut mamba_snap);
+        }
         let t = std::time::Instant::now();
         forward(model, kv, provider, &batch, pos, &mut h_all)?;
         forwards += 1;
@@ -1219,6 +1264,17 @@ where
             }
         }
         accepted += k as u64;
+
+        // Roll the Mamba recurrent state back over the rejected drafts. The verify forward
+        // advanced it by all `1+g` tokens; only `1+k` were accepted. Restore the pre-verify
+        // snapshot and replay the accepted prefix `[next, drafts[..k]]` so the state lands
+        // exactly at `pos+k`. `k == g` needs no restore — the full advance already IS the
+        // accepted state; and if we're stopping (`done`) the state is never read again.
+        if track_mamba && k < g && !done {
+            kv.restore_mamba_from(&mamba_snap);
+            let mut h_replay = vec![0f32; (1 + k) * d];
+            forward(model, kv, provider, &batch[..1 + k], pos, &mut h_replay)?;
+        }
 
         // Keep the head's KV in sync with the VERIFIED tokens only.
         if k >= 1 {

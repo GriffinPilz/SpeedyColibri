@@ -1168,30 +1168,28 @@ fn router_matmul(logits: &mut [f32], x: &[f32], router: &[f32], s_len: usize, d:
     matmul_f32(logits, x, router, s_len, d, e_n);
 }
 
-/// The expert-parallel core: partition `uniq` by owning node, compute this node's
-/// shard in-process while every peer request flies concurrently, and fold the
-/// partials in ascending node order. Returns `[s_len, d]` — the caller adds it to
-/// whatever else the layer contributes.
+/// `Σ w·expert(a)` over **all** routed experts, split by ownership: this node's shard
+/// computes in-process while every peer's shard flies concurrently over `transport`.
+/// Returns the folded `[s_len, dim]` partial sum.
 ///
-/// Generic in the space the experts operate in, which is why it takes `d` rather
-/// than reading `cfg.hidden`: [`moe_sharded`] passes the hidden state, while
-/// [`kimi_moe`] passes the *latent* bottleneck (K3 routes experts through a 3584-wide
-/// latent, so expert-parallel there ships half the wire bytes of a hidden-space model).
-/// The wire protocol already carries `hidden` per request and the worker feeds it
-/// straight into `compute_experts_partial`, so a latent-space request needs no
-/// protocol change.
+/// Dimension-agnostic on purpose. `a`/`dim` are the *expert input* space — `hidden` for
+/// the standard MoE ([`moe_sharded`]) and `moe_latent` for Nemotron's latent MoE
+/// ([`nemotron_moe`]), where experts run on the post-`fc1` latent vector. The peer
+/// handler (`serve_cluster` in `coli worker`) just forwards `req.hidden` to
+/// [`compute_experts_partial`], so it needs no change to serve either space; the latent
+/// path simply ships a smaller vector per token.
 ///
-/// Folding in ascending node order keeps the f32 sum bit-identical to the
-/// single-node path regardless of which peer answers first.
+/// Partials are folded in **ascending node order**, so the f32 accumulation order is
+/// identical to the single-node path regardless of which peer replies first.
 #[allow(clippy::too_many_arguments)]
-fn routed_experts_sharded<P: ExpertProvider, T: Transport + ?Sized>(
+fn sharded_experts_partial<P: ExpertProvider, T: Transport + ?Sized>(
     provider: &P,
     layer: usize,
     uniq: &[usize],
     w_mat: &[f32],
-    x: &[f32],
+    a: &[f32],
     s_len: usize,
-    d: usize,
+    dim: usize,
     sharding: &ExpertSharding,
     transport: &T,
 ) -> io::Result<Vec<f32>> {
@@ -1204,7 +1202,7 @@ fn routed_experts_sharded<P: ExpertProvider, T: Transport + ?Sized>(
         by_node.entry(sharding.owner(e as u32).0).or_default().push(ui);
     }
 
-    // Split the routed experts into the driver's own shard and each peer's shard.
+    // Split the routed experts into this node's own shard and each peer's shard.
     let mut local: Option<(Vec<u32>, Vec<f32>)> = None;
     let mut remotes: Vec<(u32, Vec<u32>, Vec<f32>)> = Vec::new();
     for (node, cols) in by_node {
@@ -1217,13 +1215,12 @@ fn routed_experts_sharded<P: ExpertProvider, T: Transport + ?Sized>(
         }
     }
 
-    // Overlap the nodes. A serial loop (compute local, THEN block shipping activations
-    // to each peer and awaiting its reply) made the nodes take turns — each idle while
-    // the other loaded + computed — and the expert-parallel split bought almost nothing
-    // (measured: 2-node expert-load halved but total prefill flat, the savings absorbed
-    // into peer-wait). Here every peer request flies concurrently while the local shard
-    // computes, so wall time is max(nodes) not sum(nodes). (`Transport: Send + Sync`
-    // makes the concurrent exchange sound.)
+    // Overlap the nodes. A serial loop (compute local, THEN block on each peer) made the
+    // nodes take turns — each idle while the other loaded + computed — and the expert-
+    // parallel split bought almost nothing (measured: 2-node expert-load halved but total
+    // prefill flat, the savings absorbed into peer-wait). Here every peer request flies
+    // concurrently while the local shard computes, so wall time is max(nodes) not
+    // sum(nodes). (`Transport: Send + Sync` makes the concurrent exchange sound.)
     let mut partials: Vec<(u32, Vec<f32>)> = Vec::with_capacity(remotes.len() + 1);
     let mut err: Option<io::Error> = None;
     std::thread::scope(|scope| {
@@ -1235,9 +1232,9 @@ fn routed_experts_sharded<P: ExpertProvider, T: Transport + ?Sized>(
                     let req = ExpertRequest {
                         experts: experts.clone(),
                         weights: weights.clone(),
-                        activations: x.to_vec(),
+                        activations: a.to_vec(),
                         n_tokens: s_len,
-                        hidden: d,
+                        hidden: dim,
                         layer: layer as u32,
                     };
                     transport.exchange(NodeId(node), &req)
@@ -1247,19 +1244,25 @@ fn routed_experts_sharded<P: ExpertProvider, T: Transport + ?Sized>(
             .collect();
         // Local shard computes while the peer requests are in flight.
         if let Some((experts, weights)) = &local {
-            match compute_experts_partial(provider, layer, experts, weights, x, s_len, d) {
+            match compute_experts_partial(provider, layer, experts, weights, a, s_len, dim) {
                 Ok(p) => partials.push((me.0, p)),
                 Err(e) => err = Some(e),
             }
         }
         for (node, h) in handles {
             match h.join() {
-                Ok(Ok(resp)) if resp.outputs.len() == s_len * d => partials.push((node, resp.outputs)),
+                Ok(Ok(resp)) if resp.outputs.len() == s_len * dim => {
+                    partials.push((node, resp.outputs))
+                }
                 Ok(Ok(resp)) => {
                     err.get_or_insert_with(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("node {node}: expected {} outputs, got {}", s_len * d, resp.outputs.len()),
+                            format!(
+                                "node {node}: expected {} outputs, got {}",
+                                s_len * dim,
+                                resp.outputs.len()
+                            ),
                         )
                     });
                 }
@@ -1268,7 +1271,10 @@ fn routed_experts_sharded<P: ExpertProvider, T: Transport + ?Sized>(
                 }
                 Err(_) => {
                     err.get_or_insert_with(|| {
-                        io::Error::new(io::ErrorKind::Other, format!("node {node}: exchange thread panicked"))
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("node {node}: exchange thread panicked"),
+                        )
                     });
                 }
             }
@@ -1279,7 +1285,7 @@ fn routed_experts_sharded<P: ExpertProvider, T: Transport + ?Sized>(
     }
     // Fold in ascending node order → identical accumulation order to the serial path.
     partials.sort_by_key(|(n, _)| *n);
-    let mut summed = vec![0f32; s_len * d];
+    let mut summed = vec![0f32; s_len * dim];
     for (_, p) in &partials {
         for (o, v) in summed.iter_mut().zip(p.iter()) {
             *o += *v;
@@ -1315,12 +1321,17 @@ pub fn moe_sharded<P: ExpertProvider, T: Transport + ?Sized>(
         ws[s * k..s * k + k].copy_from_slice(&w);
     }
     log_routing(layer, s_len, k, &idxs);
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
 
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
-    let summed = routed_experts_sharded(
+    let summed = sharded_experts_partial(
         provider, layer, &uniq, &w_mat, x, s_len, d, sharding, transport,
     )?;
-    out[..s_len * d].copy_from_slice(&summed);
+    for (o, v) in out.iter_mut().zip(summed.iter()) {
+        *o += *v;
+    }
 
     if with_shared {
         let mut sh = vec![0f32; s_len * d];
@@ -1467,9 +1478,30 @@ pub fn nemotron_moe<P: ExpertProvider>(
     matmul_qt(&mut h_lat, x, fc1, s_len);
 
     // ---- routed experts (weighted sum, in latent space) -------------------
+    // Expert-parallel: when a multi-node cluster is installed, split the routed experts
+    // by ownership exactly as `moe_sharded` does — but over the **latent** activation
+    // `h_lat[s_len, dl]`, which is what this arch's experts consume. That also means the
+    // wire carries `moe_latent` floats per token instead of `hidden`, so the latent MoE
+    // is *cheaper* to shard than the standard one. fc2 and the shared expert stay local:
+    // they're resident dense weights every node already has.
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
-    let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
-    let moe_lat = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, &h_lat, s_len, dl)?;
+    let moe_lat = match cluster_ctx().filter(|c| c.sharding.num_nodes() > 1) {
+        Some(ctx) => sharded_experts_partial(
+            provider,
+            layer,
+            &uniq,
+            &w_mat,
+            &h_lat,
+            s_len,
+            dl,
+            &ctx.sharding,
+            &*ctx.transport,
+        )?,
+        None => {
+            let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+            compute_experts_partial(provider, layer, &uniq_u32, &w_mat, &h_lat, s_len, dl)?
+        }
+    };
 
     // ---- fc2: latent -> hidden --------------------------------------------
     matmul_qt(out, &moe_lat, fc2, s_len);
@@ -1560,7 +1592,7 @@ pub fn kimi_moe<P: ExpertProvider>(
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
     let sharded = cluster_ctx().filter(|ctx| ctx.sharding.num_nodes() > 1);
     let mut moe_lat = match &sharded {
-        Some(ctx) => routed_experts_sharded(
+        Some(ctx) => sharded_experts_partial(
             provider, layer, &uniq, &w_mat, &h_lat, s_len, dl, &ctx.sharding, &*ctx.transport,
         )?,
         None => {
@@ -2140,7 +2172,7 @@ mod tests {
         // and the worker feeds it straight into `compute_experts_partial`, so `dl` needs
         // no protocol change — this pins that end to end over a real TCP loopback.
         //
-        // Drives `routed_experts_sharded` directly rather than `kimi_moe`: the cluster
+        // Drives `sharded_experts_partial` directly rather than `kimi_moe`: the cluster
         // context is a write-once process-global, so setting it here would contaminate
         // every other test in this binary (see `set_activation_for_test`'s comment).
         // The activation global is likewise left alone — both sides of the comparison
@@ -2194,7 +2226,7 @@ mod tests {
         peers.insert(NodeId(1), addr);
         let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
 
-        let sharded = routed_experts_sharded(
+        let sharded = sharded_experts_partial(
             &*provider, 1, &uniq, &w_mat, &h_lat, s_len, dl, &sharding, &transport,
         )
         .unwrap();

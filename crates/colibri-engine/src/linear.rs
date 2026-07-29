@@ -226,6 +226,28 @@ pub fn qt_row_dequant(w: &QTensor, row: usize) -> Vec<f32> {
                 *dst = (((byte >> sh) & 3) as i32 - 2) as f32 * s;
             }
         }
+        4 => {
+            // e4m3 fp8, 1 byte/weight, per-row scale.
+            let q = &w.q4[row * i..(row + 1) * i];
+            let s = w.s[row];
+            for (dst, &c) in out.iter_mut().zip(q) {
+                *dst = e4m3_to_f32(c) * s;
+            }
+        }
+        5 => {
+            // NVFP4: e2m1 nibbles (2/byte) × per-16 ue4m3 block scale × per-tensor global.
+            // Mirrors the fmt-5 arm of `matmul_qt`; resident weights land here once a
+            // container is built with COLI_RESIDENT_NVFP4.
+            let rb = (i + 1) / 2;
+            let nb = (i + 15) / 16;
+            let wr = &w.q4[row * rb..(row + 1) * rb];
+            let br = &w.bs[row * nb..(row + 1) * nb];
+            for (k, dst) in out.iter_mut().enumerate() {
+                let byte = wr[k >> 1];
+                let nib = if k & 1 == 1 { byte >> 4 } else { byte & 0x0f } as usize;
+                *dst = E2M1[nib] * e4m3_to_f32(br[k >> 4]) * w.g;
+            }
+        }
         other => panic!("qt_row_dequant: unknown format {other}"),
     }
     out
@@ -281,6 +303,48 @@ pub fn embed_row(embed: &QTensor, tok: usize, out: &mut [f32]) {
             }
         }
         other => panic!("embed_row: unknown format {other}"),
+    }
+}
+
+#[cfg(test)]
+mod nvfp4_row_tests {
+    use super::*;
+
+    #[test]
+    fn qt_row_dequant_agrees_with_matmul_qt_on_nvfp4() {
+        // Two independent decoders of the same layout (row-wise vs the matmul's inner
+        // loop). They must agree, or a resident NVFP4 weight decodes one way through
+        // `matmul_qt` and another through `qt_addrow`/`qt_matvec_rows`.
+        let (o, i) = (3usize, 32usize);
+        let w: Vec<f32> = (0..o * i).map(|k| ((k as f32) * 0.23).sin()).collect();
+        let (mut blob, bsc, g) = crate::convert::quantize_nvfp4_pub(&w, o, i);
+        let nib = blob.len();
+        blob.extend_from_slice(&bsc);
+        let t = QTensor {
+            fmt_code: 5,
+            o: o as i32,
+            i: i as i32,
+            q4: blob[..nib].to_vec().into(),
+            bs: blob[nib..].to_vec().into(),
+            g,
+            ..Default::default()
+        };
+        // One-hot x isolates column c, so matmul_qt's output IS the weight column.
+        for c in 0..i {
+            let mut x = vec![0f32; i];
+            x[c] = 1.0;
+            let mut y = vec![0f32; o];
+            matmul_qt(&mut y, &x, &t, 1);
+            for r in 0..o {
+                let row = qt_row_dequant(&t, r);
+                assert!(
+                    (row[c] - y[r]).abs() < 1e-5,
+                    "row {r} col {c}: qt_row_dequant {} vs matmul_qt {}",
+                    row[c],
+                    y[r]
+                );
+            }
+        }
     }
 }
 

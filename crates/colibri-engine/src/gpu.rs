@@ -100,6 +100,30 @@ thread_local! {
     static GPU_MATMULS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_FFN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GPU_ATTN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // When set, routed NVFP4 relu² experts run per-row gemv even at S>1, so a multi-row
+    // (collided-expert) call is bit-identical to S sequential decode calls. The MTP verify
+    // forward sets it via `ExactExpertsGuard`; see forward.rs.
+    static EXACT_EXPERTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether routed NVFP4 relu² experts must run the bit-exact per-row gemv path (verify).
+pub fn exact_experts() -> bool {
+    EXACT_EXPERTS.with(|c| c.get())
+}
+
+/// RAII scope that forces (or restores) the bit-exact routed-expert path. Set around the
+/// MTP verify forward so its S>1 expert logits match sequential decode to the bit.
+pub struct ExactExpertsGuard(bool);
+impl ExactExpertsGuard {
+    pub fn new(on: bool) -> ExactExpertsGuard {
+        let prev = EXACT_EXPERTS.with(|c| c.replace(on));
+        ExactExpertsGuard(prev)
+    }
+}
+impl Drop for ExactExpertsGuard {
+    fn drop(&mut self) {
+        EXACT_EXPERTS.with(|c| c.set(self.0));
+    }
 }
 
 /// How resident dense weights reach the GPU.
@@ -323,6 +347,7 @@ pub fn try_mamba2_scan_seq(
     d_state: usize,
     n_groups: usize,
     seq: usize,
+    exact: bool,
 ) -> bool {
     if !available() || !mamba_scan_gpu_enabled() || seq == 0 {
         return false;
@@ -359,6 +384,7 @@ pub fn try_mamba2_scan_seq(
             d_state as i32,
             n_groups as i32,
             seq as i32,
+            exact,
         )
     }
 }
@@ -926,7 +952,9 @@ pub fn try_expert_ffn_relu2(
     // SAFETY: u/d live until end of scope, covering the synchronous kernel + download in
     // expert_mlp_nvfp4_relu2_raw; out/x sized [nr, up.I]/[nr, up.I] by ffn() (latent-space).
     let ok = unsafe {
-        cuda::expert_mlp_nvfp4_relu2_raw(u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+        cuda::expert_mlp_nvfp4_relu2_raw(
+            u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32, exact_experts(),
+        )
     };
     if ok {
         GPU_FFN.with(|c| c.set(c.get() + 1));
@@ -1353,10 +1381,40 @@ pub fn try_matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) -> bool {
     if !w.gpu_eligible || !available() {
         return false;
     }
-    // This dense-upload GPU matmul handles only the resident formats: f32 (0) and
-    // int8 (1). Packed formats (e4m3/NVFP4) store fewer bytes than a dense `o*i`
-    // buffer, so uploading them here reads out of bounds — they have their own fused
-    // kernel (`try_expert_ffn`) or fall to the CPU reference in `matmul_qt`.
+    // This dense-upload GPU matmul handles the resident formats f32 (0) and int8 (1).
+    // Packed formats store fewer bytes than a dense `o*i` buffer, so uploading them here
+    // reads out of bounds: NVFP4 is handled just above via its own wrap+dispatch, and
+    // e4m3 has the fused expert kernel (`try_expert_ffn`) or the CPU reference.
+    // NVFP4 (fmt 5) has its own entry point: the weight is packed (nibbles + block scales),
+    // so the dense `o*i` upload below would read out of bounds. The device kernels are the
+    // same general ones the expert path uses — only the wrapping differs.
+    if w.fmt_code == 5 {
+        let key = w.q4.as_ptr() as usize;
+        return RESIDENT.with(|r| {
+            let mut map = r.borrow_mut();
+            let slot = map.entry(key).or_insert(std::ptr::null_mut());
+            // SAFETY: y/x sized by matmul_qt's asserts; q4/bs are this QTensor's live
+            // buffers (o*ceil(i/2) and o*ceil(i/16)); the slot persists in the registry.
+            let ok = unsafe {
+                cuda::matmul_nvfp4_raw(
+                    slot,
+                    y.as_mut_ptr(),
+                    x.as_ptr(),
+                    w.q4.as_ptr() as *const c_void,
+                    w.bs.as_ptr() as *const c_void,
+                    w.g,
+                    s as i32,
+                    w.i,
+                    w.o,
+                    0,
+                )
+            };
+            if ok {
+                GPU_MATMULS.with(|c| c.set(c.get() + 1));
+            }
+            ok
+        });
+    }
     let (wptr, key): (*const c_void, usize) = match w.fmt_code {
         0 => (w.qf.as_ptr() as *const c_void, w.qf.as_ptr() as usize),
         1 => (w.q8.as_ptr() as *const c_void, w.q8.as_ptr() as usize),

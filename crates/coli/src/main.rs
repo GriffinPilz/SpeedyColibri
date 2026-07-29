@@ -326,6 +326,22 @@ fn cmd_requant_nvfp4(args: &[String]) -> ExitCode {
     eprintln!(
         "[requant-nvfp4] {indir} -> {outdir}  (hidden={hidden} moe_inter={moe_inter} n_layers={n_layers})"
     );
+    // `COLI_RESIDENT_NVFP4=1` also re-encodes the RESIDENT weights (Kind::Q: attention
+    // q/k/v/o, Mamba in_proj/out_proj, fc1/fc2_latent, shared experts) from int8 to NVFP4.
+    // Embeddings/lm_head (Kind::Io) are never touched. Measured 0 ± 1.5% perplexity across
+    // three corpora, and it is the single-box decode lever: 8.87 -> 6.18 GB/token.
+    //
+    // NOTE: there is no GPU NVFP4 dense kernel yet, so a container built this way runs the
+    // resident matmuls on the single-threaded CPU path. It is CORRECT but slow — convert it
+    // to validate tokens/perplexity, do NOT benchmark speed against it.
+    let resident_nvfp4 = std::env::var("COLI_RESIDENT_NVFP4").ok().as_deref() == Some("1");
+    if resident_nvfp4 {
+        eprintln!(
+            "[requant-nvfp4] RESIDENT weights -> NVFP4 too (embeddings/lm_head untouched). \
+             No GPU dense NVFP4 kernel exists yet: this container is for correctness and \
+             perplexity only, NOT for speed measurement."
+        );
+    }
     let t0 = std::time::Instant::now();
     let res = colibri_engine::requant_experts_nvfp4(
         indir,
@@ -333,6 +349,7 @@ fn cmd_requant_nvfp4(args: &[String]) -> ExitCode {
         n_layers,
         hidden,
         moe_inter,
+        resident_nvfp4,
         |fi, n, st| {
             eprintln!(
                 "[requant-nvfp4] shard {:>3}/{n}  experts_nvfp4={} copied={} skipped={}  out={:.1} GB  {:.0}s",
@@ -583,7 +600,9 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
-    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, model.resident_bytes());
+    let owned_ids: Vec<u32> = sharding.local_experts(cluster.this_node).collect();
+    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, &owned_ids, model.resident_bytes());
+    preload_all_experts(&provider, &model.cfg, _maxres, &owned_ids);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn, model.cfg.n_experts as u64);
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
@@ -834,7 +853,9 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
-    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, model.resident_bytes());
+    let owned_ids: Vec<u32> = sharding.local_experts(cluster.this_node).collect();
+    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, &owned_ids, model.resident_bytes());
+    preload_all_experts(&provider, &model.cfg, _maxres, &owned_ids);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn, model.cfg.n_experts as u64);
     }
@@ -2159,11 +2180,19 @@ fn ram_budget() -> u64 {
 }
 
 /// A model whose experts fit in the achievable cache (RAM − reserve) to at least this %
-/// is "near-fit": it gets `fadvise` on top of the fill (collapse the page-cache double-hold
-/// so the whole working set stays resident — measured 1.94× on MiniMax-M2.7). A ≫-RAM model
-/// (GLM ~23%, M3 ~46%) is *also* filled and pressure-managed, but keeps the page cache
-/// (fadvise off) as a reclaimable second tier the kernel serves at 4 KB granularity.
-const NEARFIT_COVERAGE_PCT: u64 = 80;
+/// is "near-fit": it gets `fadvise` + a fill-to-`natural_fill` residency hold (collapse the
+/// page-cache double-hold so the whole working set stays resident — measured 1.94× on a
+/// *fitting* MiniMax-M2.7 snapshot). A ≫-RAM model (GLM ~23%, M3 ~46%) keeps the page cache
+/// (fadvise off) and streams against a `MemTotal/3` cap the kernel serves at 4 KB granularity.
+///
+/// The bar is deliberately **above 100%**: residency only pays when the set *genuinely* fits
+/// with headroom. At partial coverage (80–99%) the fill pins ~`natural_fill` GB resident *and*
+/// still streams the uncovered tail with zero page-cache slack left — the worst of both, and it
+/// *thrashes*. Measured on the 117 GB NVFP4 MiniMax-M2.7 (86% coverage): the greedy fill was
+/// bimodal 0.9–4.3 tok/s, while dropping it to the `MemTotal/3` streaming cap gave a *stable*
+/// ~3.2 tok/s (and, as the byte math predicts, that beats M3 — M2.7 moves ~half the bytes/token).
+/// 118% matches the preload "fits-with-headroom" gate, so residency-fill and eager-preload agree.
+const NEARFIT_COVERAGE_PCT: u64 = 118;
 
 /// Wire the expert cache to **fill RAM safely, for every model**. It grows toward a fill
 /// target and a background monitor evicts LRU experts under memory pressure so the box can
@@ -2177,41 +2206,65 @@ const NEARFIT_COVERAGE_PCT: u64 = 80;
 ///   sustainable ceiling — see `memory-ceiling-is-real` / `autopin-single-node-negative`.
 ///
 /// Off-Linux (no `/proc/meminfo`) it no-ops — there is no live pressure signal to evict on.
+/// Returns whether the model is being held at MAX residency on the automatic path
+/// (near-fit, no explicit COLI_RAM_GB) — i.e. the whole expert set fits and the cache
+/// will hold it with no eviction. `preload_all_experts` uses this to decide whether an
+/// eager preload is safe (it must never fire for a ≫-RAM model).
 fn wire_adaptive_cache<P>(
     provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
     cfg: &colibri_core::Config,
     ebits: u32,
+    owned: &[u32],
     resident: u64,
-) where
+) -> bool
+where
     P: colibri_engine::ExpertProvider + Send + Sync + 'static,
 {
     use colibri_engine::ExpertProvider as _; // bring `.expert()` into method scope
     let total = match colibri_engine::total_ram_bytes() {
         Some(t) => t,
-        None => return, // non-Linux: no live pressure signal, leave the static budget
+        None => return false, // non-Linux: no live pressure signal, leave the static budget
     };
     // Number of MoE layers and the index of one, to size the streamed-expert footprint.
-    // Delegated to `Config::moe_layers` so the two encodings of "which layers hold experts"
-    // live in one place: Nemotron-H names them on the `layer_kind` axis, while GLM/MiniMax/
-    // Kimi-K3 put an FFN on every layer past the `first_dense` prefix. Getting this wrong is
-    // expensive in both directions — probing a Nemotron *Mamba* layer (which has no experts)
-    // fell to the dense-width fallback and came out ~17× off, misclassifying a RAM-fitting
-    // model as ≫-RAM and leaving experts non-resident; and testing `layer_kind.is_empty()`
-    // counts 0 MoE layers for K3, whose `layer_kind` is non-empty but carries mixer kinds only.
-    let (n_moe, probe_layer) = cfg.moe_layers();
-    let n_moe = n_moe as u64;
+    // Homogeneous arches (GLM/MiniMax): every layer at/after `first_dense` is MoE. Nemotron-H
+    // is hybrid (Mamba/attn/MoE by index) — layer `first_dense` (0) is a *Mamba* layer with
+    // NO experts, so probing it falls to the dense-width fallback and both the count and the
+    // per-expert size come out wildly wrong (~17× → misclassifies a RAM-fitting model as
+    // ≫-RAM, leaving experts non-resident). Probe an actual MoE layer and count only MoE ones.
+    let (n_moe, probe_layer) = if cfg.layer_kind.is_empty() {
+        ((cfg.n_layers - cfg.first_dense).max(0) as u64, cfg.first_dense as usize)
+    } else {
+        let n = cfg.layer_kind.iter().filter(|k| matches!(k, colibri_core::LayerKind::Moe)).count();
+        let idx = cfg
+            .layer_kind
+            .iter()
+            .position(|k| matches!(k, colibri_core::LayerKind::Moe))
+            .unwrap_or(cfg.first_dense as usize);
+        (n as u64, idx)
+    };
     // Size an expert from a real one on disk — its QTensors carry the true format
     // (NVFP4 fmt=5, e4m3 fmt=4, …), so block-scale overhead and the actual bit-width
     // are exact (for Nemotron this also captures the latent input dim, not `hidden`). The
     // `ebits` estimate is only a fallback: it reflects the *requested* resident dense width
     // (default 8), not the streamed experts' real format, and would mis-decide coverage.
-    let per = match provider.expert(probe_layer, 0) {
+    //
+    // Probe an expert this node **owns**: the sharded provider refuses a peer's expert, so
+    // probing a hardcoded 0 fails on every rank but 0 and silently drops to the `ebits`
+    // fallback — which measured 15.79 MB against Nemotron's real 3.1 MB (5× over).
+    let probe_expert = owned.first().copied().unwrap_or(0) as usize;
+    let per = match provider.expert(probe_layer, probe_expert) {
         Ok(e) => (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64,
         Err(_) => {
             colibri_engine::capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, ebits)
         }
     };
-    let total_expert_bytes = per.saturating_mul(cfg.n_experts as u64).saturating_mul(n_moe);
+    // Only the experts THIS node owns are ever loaded here, so coverage must be measured
+    // against the shard — not `cfg.n_experts`. Using the whole model's count made a 2-rank
+    // worker see ~630 GB against 121 GB of RAM (16% "coverage"), pick the ≫-RAM regime, cap
+    // at 40 GB and never preload — reintroducing the lazy cold-load that #42 fixed, on every
+    // worker, in a way that would only show up as bad 2-node numbers.
+    let owned_experts = if owned.is_empty() { cfg.n_experts as u64 } else { owned.len() as u64 };
+    let total_expert_bytes = per.saturating_mul(owned_experts).saturating_mul(n_moe);
     // Achievable fill without an explicit cap: hold back the process's own peak runtime
     // (KV/activations/staging/read buffers). Coverage is model-intrinsic (does it fit RAM?).
     let natural_fill = total.saturating_sub(ADAPTIVE_FILL_RESERVE);
@@ -2221,45 +2274,120 @@ fn wire_adaptive_cache<P>(
         0
     };
     let near_fit = covers_pct >= NEARFIT_COVERAGE_PCT;
+    // An explicit COLI_RAM_GB caps the fill target; the monitor still protects the floor.
+    let explicit = std::env::var("COLI_RAM_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|g| g << 30);
     // Fill target by regime. Near-fit: fill to `natural_fill` — the whole set nearly
     // fits and the fadvise below keeps MemAvailable honest. ≫-RAM: hold only the
     // settled `MemTotal / CACHE_CAP_DIVISOR` ceiling and let the OS page cache serve the
     // streaming tail as a second tier. Holding more *thrashes*: filling ~101 GB collapsed
     // M3 decode to ~0.7 tok/s (memory-ceiling-is-real / autopin-single-node-negative).
-    // Both regime targets above are fractions of MemTotal, which is blind to how much RAM
-    // the MODEL itself took. That held while every arch's resident set was small next to
-    // the box — GLM's ~19 GB plus a 40 GB cache is ~59 GB of 121. Kimi-K3's resident set
-    // is ~63 GB, so the same 40 GB cap totals ~103 GB, which is exactly the max RSS at
-    // which earlyoom SIGTERMed it mid-forward.
-    //
-    // Budget against the model's ACTUAL resident bytes, not `MemAvailable`. MemAvailable
-    // read here looks generous for two reasons that both resolve later: the expert cache
-    // has not filled yet, and the page cache left over from reading the weights counts as
-    // available. `resident` does not move.
-    //
-    // No-op for a small-resident model (GLM: 121 - 19 - 20 = 82, so the MemTotal/3 cap
-    // still binds); binding for K3 (121 - 63 - 20 = 38).
+    // Clamp by the model's ACTUAL resident bytes. MemAvailable read here looks generous
+    // for two reasons that both resolve later — the expert cache has not filled yet, and
+    // the page cache left from reading the weights counts as available — while `resident`
+    // does not move. No-op for a small-resident model (GLM: 121-19-20 = 82, so the
+    // CACHE_CAP_DIVISOR ceiling still binds); binding for Kimi-K3 (121-63-20 = 38), where
+    // without it the cache overcommits and earlyoom SIGTERMs the process mid-forward.
     let headroom = total.saturating_sub(resident).saturating_sub(ADAPTIVE_FILL_RESERVE);
-    let fill_target =
-        if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR }.min(headroom);
-    // fadvise auto-engages only for a near-fit model; ≫-RAM keeps the page cache.
-    if near_fit {
+    let fill_target = explicit.unwrap_or(
+        if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR }.min(headroom),
+    );
+    // fadvise only auto-engages for a near-fit model on the automatic path; an explicit
+    // budget leaves fadvise to the COLI_FADVISE env, and ≫-RAM keeps the page cache.
+    if near_fit && explicit.is_none() {
         colibri_safetensors::set_fadvise(true);
     }
     provider.spawn_adaptive_budget(fill_target, ADAPTIVE_DANGER_FLOOR, ADAPTIVE_HARD_FLOOR);
-    let regime = if near_fit {
-        "near-fit max-residency, fadvise on"
+    let regime = match (explicit.is_some(), near_fit) {
+        (true, _) => "fixed budget (COLI_RAM_GB)",
+        (false, true) => "near-fit max-residency, fadvise on",
+        (false, false) => "≫-RAM fill, page cache kept",
+    };
+    // Name the shard when this node owns only part of the model — otherwise a 2-node log
+    // reads as though the box holds the whole thing and the coverage number looks like a bug.
+    let scope = if owned_experts < cfg.n_experts as u64 {
+        format!(" (shard: {owned_experts}/{} experts)", cfg.n_experts)
     } else {
-        "≫-RAM fill, page cache kept"
+        String::new()
     };
     eprintln!(
-        "[cache] {regime}: ~{} GB experts / {} GB RAM ({covers_pct}% coverage), {} GB resident \
-         weights → fill to ~{} GB, LRU-evict under pressure (hard floor {} GB) — never OOM",
+        "[cache] {regime}: ~{} GB experts{scope} / {} GB RAM ({covers_pct}% coverage), {} GB \
+         resident weights → fill to ~{} GB, LRU-evict under pressure (hard floor {} GB) — never OOM",
         total_expert_bytes >> 30,
         total >> 30,
         resident >> 30,
         fill_target >> 30,
         ADAPTIVE_HARD_FLOOR >> 30
+    );
+    // Preload is safe only when the whole expert set fits the fill target with COMFORTABLE
+    // headroom. This now coincides with `near_fit` (118% coverage ⟺ experts ≤ 84.7% of
+    // natural_fill), so residency-fill and eager-preload agree by construction — a model can no
+    // longer land in the partial-coverage thrash zone that once collapsed M2.7 to ~1 tok/s
+    // (109 GB experts on a 121 GB box). The explicit `fits_with_headroom` (≤ 85%) is kept as a
+    // belt-and-suspenders guard. An explicit COLI_RAM_GB means the user manages residency — skip.
+    let fits_with_headroom = total_expert_bytes <= natural_fill / 100 * 85;
+    near_fit && explicit.is_none() && fits_with_headroom
+}
+
+/// Eagerly load EVERY routed expert into the cache at startup, so decode never pays a cold
+/// miss. A nemotron decode touches ~all experts within a couple hundred tokens (diverse
+/// routing, no hot set), so lazy loading otherwise spreads a ~59 GB cold read across the
+/// generation and dominates it (measured: expert-load 26 s vs gpu-ffn 0.4 s over 256 tok);
+/// preloading moves that to a one-time startup and lifts warm decode 1.7× (5.86→9.95 tok/s
+/// on nemotron-3-super), token-identical. `max_residency` (from `wire_adaptive_cache`) gates
+/// it to models that fit, so a ≫-RAM model never tries to preload its whole set.
+/// `COLI_PRELOAD_EXPERTS` overrides: `1` forces on, `0` forces off.
+fn preload_all_experts<P>(
+    provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
+    cfg: &colibri_core::Config,
+    max_residency: bool,
+    owned: &[u32],
+) where
+    P: colibri_engine::ExpertProvider + Send + Sync + 'static,
+{
+    use colibri_engine::ExpertProvider as _;
+    let want = match std::env::var("COLI_PRELOAD_EXPERTS").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => max_residency,
+    };
+    if !want {
+        return;
+    }
+    let moe_layers: Vec<usize> = if cfg.layer_kind.is_empty() {
+        (cfg.first_dense as usize..cfg.n_layers as usize).collect()
+    } else {
+        cfg.layer_kind
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| matches!(k, colibri_core::LayerKind::Moe))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    // Only this node's own experts: the sharded provider refuses a peer's, so preloading
+    // `0..n_experts` on a worker fails on the first unowned id and drops the WHOLE node back
+    // to lazy loading.
+    let all: Vec<usize> = if owned.is_empty() {
+        (0..cfg.n_experts as usize).collect()
+    } else {
+        owned.iter().map(|&e| e as usize).collect()
+    };
+    let t = std::time::Instant::now();
+    for &l in &moe_layers {
+        if let Err(e) = provider.prefetch(l, &all) {
+            eprintln!("[preload] layer {l} failed: {e} — falling back to lazy load");
+            return;
+        }
+    }
+    let s = provider.stats();
+    eprintln!(
+        "[preload] {} experts resident ({:.1} GB) across {} MoE layers in {:.1}s",
+        s.resident,
+        s.bytes as f64 / 1e9,
+        moe_layers.len(),
+        t.elapsed().as_secs_f64()
     );
 }
 

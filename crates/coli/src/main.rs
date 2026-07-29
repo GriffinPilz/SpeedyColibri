@@ -3012,11 +3012,22 @@ mod tests {
             (48..=86).contains(&MMAP_MIN_COVERAGE_PCT),
             "mmap threshold {MMAP_MIN_COVERAGE_PCT} escaped the measured interval (47%, 86%)"
         );
-        // The two thresholds are independent: there is a band where NEITHER applies.
+        // The two paths are MUTUALLY EXCLUSIVE, and not merely by taste: O_DIRECT never
+        // populates the page cache, so with both on the residency gate can never succeed
+        // and every span pays a `mincore` before falling back to `pread` anyway. Measured
+        // on Kimi-K3 (7% coverage, so O_DIRECT is on) with mapping forced: 28604 -> 29304 ms
+        // steady state (2.4%, matching GLM's 2.6% at 26%), plus a ONE-OFF 65191 ms first
+        // run while 94 shards / 1.4 TB of mappings are established and first-touched.
+        // Ordering the thresholds prevents the engine from ever selecting the combination.
         assert!(
             MMAP_MIN_COVERAGE_PCT > O_DIRECT_MAX_COVERAGE_PCT,
-            "a model can be too big to map and too small to bypass — that band is real"
+            "thresholds must not overlap: O_DIRECT + mmap is all cost and no benefit"
         );
+        for cov in [0u64, 7, 26, 34, 35, 47, 79, 80, 86, 172, 1000] {
+            let direct = cov < O_DIRECT_MAX_COVERAGE_PCT;
+            let mapped = cov >= MMAP_MIN_COVERAGE_PCT;
+            assert!(!(direct && mapped), "at {cov}% both paths would be active");
+        }
     }
 
     /// The O_DIRECT threshold must keep classifying the four models it was measured on.

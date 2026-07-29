@@ -167,6 +167,22 @@ fn uring_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_IO_URING").ok().as_deref() == Some("1"))
 }
 
+/// Pages to probe in [`Mapping::resident`] instead of walking the whole span.
+/// `COLI_MINCORE_SAMPLE`; **0 (default) = exact**, examine every page.
+///
+/// The exact check costs ~51 ns per page and a mapped model pays it on every span of
+/// every read — 428 ms of MiniMax-M2.7's 435 ms expert-load. Sampling makes that O(k)
+/// instead of O(pages), but it is a genuine weakening: a span with a hole in the middle
+/// can pass and then fault. Off by default until measured against a major-fault count,
+/// because the failure mode this guards is the 300× regression documented on
+/// [`Mapping::resident`].
+fn mincore_sample() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_MINCORE_SAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+    })
+}
+
 /// Wall time (µs) inside `read_raw_shared_batched`, split three ways. Only
 /// accumulated under `COLI_PROFILE=1`.
 ///
@@ -404,6 +420,18 @@ impl Mapping {
     /// `pread` path fetches the same span in one request. An earlier attempt without the
     /// gate took 407,570 major faults and ran ~300× slower cold; `MADV_WILLNEED` did not
     /// rescue it, because advisory readahead loses to a fault storm already underway.
+    ///
+    /// **The gate is not free, and on a model that hits the mapped path it is the single
+    /// largest cost in expert-load.** Measured on MiniMax-M2.7 (COLI_PROFILE=1): 4430
+    /// spans, `mincore` **428 ms** of a 435 ms span-setup, itself 94% of a 435 ms
+    /// expert-load that does **zero** disk I/O. That is 96.6 µs per call, because
+    /// `mincore` walks page tables and a 7.6 MB expert is ~1900 pages: 8.4M pages at
+    /// ~51 ns each. Batching calls cannot help — the cost is per page, not per call — so
+    /// the only lever is examining fewer pages.
+    ///
+    /// [`mincore_sample`] does that, and is **off by default**: a sampled check can call
+    /// a partially-evicted span resident and reintroduce faults, which is the exact
+    /// failure this gate exists to prevent. Enable it only alongside a major-fault count.
     #[cfg(target_os = "linux")]
     fn resident(&self, off: usize, len: usize) -> bool {
         if len == 0 || off.saturating_add(len) > self.len {
@@ -413,6 +441,30 @@ impl Mapping {
         let start = off & !(page - 1);
         let end = off + len;
         let pages = (end - start).div_ceil(page);
+
+        // Sampled mode: probe `k` single pages spread across the span instead of walking
+        // all of them. Endpoints are always included — a span is populated by one
+        // sequential read and reclaimed from one end, so the edges are where a partial
+        // eviction shows first.
+        let k = mincore_sample();
+        if k > 0 && pages > k {
+            let mut one = [0u8; 1];
+            for i in 0..k {
+                let p = i * (pages - 1) / (k - 1).max(1); // i=0 -> first, i=k-1 -> last
+                let rc = unsafe {
+                    libc::mincore(
+                        (self.ptr as *mut u8).add(start + p * page) as *mut libc::c_void,
+                        page,
+                        one.as_mut_ptr() as *mut _,
+                    )
+                };
+                if rc != 0 || one[0] & 1 != 1 {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         let mut vec = vec![0u8; pages];
         // SAFETY: `start` is page-aligned and inside the mapping; `vec` has one byte per page.
         let rc = unsafe {

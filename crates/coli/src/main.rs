@@ -2208,6 +2208,20 @@ const NEARFIT_COVERAGE_PCT: u64 = 118;
 /// Off-Linux (no `/proc/meminfo`) it no-ops — there is no live pressure signal to evict on.
 /// Returns whether the model is being held at MAX residency on the automatic path
 /// (near-fit, no explicit COLI_RAM_GB) — i.e. the whole expert set fits and the cache
+/// Bytes of routed experts this node holds: `per-expert × experts-owned × MoE-layers`.
+///
+/// Split out as a pure function purely so the MoE-layer count is testable without a
+/// provider, RAM probe or container. That count is the part that has broken twice, and
+/// it breaks SILENTLY — deriving it from `layer_kind.is_empty()` returns 0 for Kimi-K3,
+/// whose `layer_kind` is populated with mixer kinds (Kda/Attn) while every layer past
+/// `first_dense` still carries experts. A 0 here reports "~0 GB experts / 0% coverage"
+/// and hands every coverage-derived decision a model that appears to have no experts.
+/// Always via [`colibri_core::Config::moe_layers`], never `layer_kind` directly.
+fn expert_footprint(cfg: &colibri_core::Config, per_expert: u64, owned_experts: u64) -> u64 {
+    let (n_moe, _probe) = cfg.moe_layers();
+    per_expert.saturating_mul(owned_experts).saturating_mul(n_moe as u64)
+}
+
 /// will hold it with no eviction. `preload_all_experts` uses this to decide whether an
 /// eager preload is safe (it must never fire for a ≫-RAM model).
 fn wire_adaptive_cache<P>(
@@ -2231,17 +2245,16 @@ where
     // NO experts, so probing it falls to the dense-width fallback and both the count and the
     // per-expert size come out wildly wrong (~17× → misclassifies a RAM-fitting model as
     // ≫-RAM, leaving experts non-resident). Probe an actual MoE layer and count only MoE ones.
-    let (n_moe, probe_layer) = if cfg.layer_kind.is_empty() {
-        ((cfg.n_layers - cfg.first_dense).max(0) as u64, cfg.first_dense as usize)
-    } else {
-        let n = cfg.layer_kind.iter().filter(|k| matches!(k, colibri_core::LayerKind::Moe)).count();
-        let idx = cfg
-            .layer_kind
-            .iter()
-            .position(|k| matches!(k, colibri_core::LayerKind::Moe))
-            .unwrap_or(cfg.first_dense as usize);
-        (n as u64, idx)
-    };
+    // Ask `Config::moe_layers`, never `layer_kind` directly. Branching on
+    // `layer_kind.is_empty()` is right for Nemotron-H (populated, one kind per layer)
+    // and for homogeneous arches (empty), but WRONG for Kimi-K3: its `layer_kind` is
+    // non-empty yet carries only mixer kinds (Kda/Attn) because every K3 layer has BOTH
+    // a mixer and an FFN. Counting `Moe` entries there yields 0, so K3 reported
+    // "~0 GB experts / 0% coverage" and any coverage-derived decision saw a model with
+    // no experts at all. `moe_layers` branches on whether a `Moe` entry exists and
+    // falls back to the `first_dense` prefix rule, which is correct for all three.
+    let (n_moe, probe_layer) = cfg.moe_layers();
+    let n_moe = n_moe as u64;
     // Size an expert from a real one on disk — its QTensors carry the true format
     // (NVFP4 fmt=5, e4m3 fmt=4, …), so block-scale overhead and the actual bit-width
     // are exact (for Nemotron this also captures the latent input dim, not `hidden`). The
@@ -2264,7 +2277,8 @@ where
     // at 40 GB and never preload — reintroducing the lazy cold-load that #42 fixed, on every
     // worker, in a way that would only show up as bad 2-node numbers.
     let owned_experts = if owned.is_empty() { cfg.n_experts as u64 } else { owned.len() as u64 };
-    let total_expert_bytes = per.saturating_mul(owned_experts).saturating_mul(n_moe);
+    let total_expert_bytes = expert_footprint(cfg, per, owned_experts);
+    debug_assert_eq!(total_expert_bytes, per.saturating_mul(owned_experts).saturating_mul(n_moe));
     // Achievable fill without an explicit cap: hold back the process's own peak runtime
     // (KV/activations/staging/read buffers). Coverage is model-intrinsic (does it fit RAM?).
     let natural_fill = total.saturating_sub(ADAPTIVE_FILL_RESERVE);
@@ -2356,15 +2370,22 @@ fn preload_all_experts<P>(
     if !want {
         return;
     }
-    let moe_layers: Vec<usize> = if cfg.layer_kind.is_empty() {
-        (cfg.first_dense as usize..cfg.n_layers as usize).collect()
-    } else {
+    // Branch on whether a `Moe` entry EXISTS, not on whether `layer_kind` is populated —
+    // same distinction as `Config::moe_layers`. Kimi-K3 populates `layer_kind` with mixer
+    // kinds only (Kda/Attn) while every layer past `first_dense` still carries experts, so
+    // the `is_empty()` form built an EMPTY preload list for it and would have preloaded
+    // nothing had K3 ever reached the near-fit regime (a K3 slice can).
+    let has_moe_kind =
+        cfg.layer_kind.iter().any(|k| matches!(k, colibri_core::LayerKind::Moe));
+    let moe_layers: Vec<usize> = if has_moe_kind {
         cfg.layer_kind
             .iter()
             .enumerate()
             .filter(|(_, k)| matches!(k, colibri_core::LayerKind::Moe))
             .map(|(i, _)| i)
             .collect()
+    } else {
+        (cfg.first_dense as usize..cfg.n_layers as usize).collect()
     };
     // Only this node's own experts: the sharded provider refuses a peer's, so preloading
     // `0..n_experts` on a worker fails on the first unowned id and drops the WHOLE node back
@@ -2896,6 +2917,57 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// The cache-sizing footprint must not collapse to zero on an arch whose
+    /// `layer_kind` carries mixer kinds only.
+    ///
+    /// Kimi-K3 populates `layer_kind` with Kda/Attn and never `Moe`, because every K3
+    /// layer has BOTH a mixer and an FFN. Counting `Moe` entries there gives 0 MoE
+    /// layers, so the footprint came out as 0 bytes and the `[cache]` line reported
+    /// "~0 GB experts / 0% coverage" for a model with 1.4 TB of experts — which is
+    /// exactly what an upstream merge reintroduced here after it had been fixed once.
+    /// It is silent: nothing panics, the run completes, and only the coverage-derived
+    /// decisions are wrong.
+    #[test]
+    fn expert_footprint_survives_a_mixer_only_layer_kind() {
+        // 93 layers, first_k_dense_replace = 1 => 92 MoE layers, 896 experts.
+        let json = colibri_json::Json::parse(
+            r#"{"model_type":"kimi_k3","architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{"hidden_size":7168,"num_hidden_layers":93,
+                "num_attention_heads":96,"num_key_value_heads":96,"num_experts":896,
+                "num_experts_per_token":16,"num_shared_experts":2,
+                "moe_intermediate_size":3072,"intermediate_size":6144,
+                "routed_expert_hidden_size":3584,"first_k_dense_replace":1,
+                "q_lora_rank":1536,"kv_lora_rank":512,"qk_nope_head_dim":128,
+                "qk_rope_head_dim":64,"v_head_dim":128,"vocab_size":163840,
+                "max_position_embeddings":16384,"rms_norm_eps":1e-5,"rope_theta":50000.0,
+                "moe_renormalize":true,"moe_router_activation_func":"sigmoid",
+                "num_expert_group":1,"topk_group":1,"routed_scaling_factor":1.0,
+                "eos_token_id":5,"mla_use_nope":true,"hidden_act":"situ",
+                "activation_situ_beta":4.0,"activation_situ_linear_beta":25.0,
+                "attn_res_block_size":12,
+                "linear_attn_config":{"head_dim":128,"num_heads":64,
+                  "short_conv_kernel_size":4,"full_attn_layers":[4,8,93]}}}"#,
+        )
+        .unwrap();
+        let cfg = colibri_core::Config::from_json(&json).expect("kimi_k3 parse");
+
+        // Precondition: populated, but carrying no `Moe` — the shape that breaks the
+        // naive predicate.
+        assert!(!cfg.layer_kind.is_empty());
+        assert_eq!(
+            cfg.layer_kind.iter().filter(|k| **k == colibri_core::LayerKind::Moe).count(),
+            0
+        );
+
+        const PER: u64 = 17_547_264; // one real K3 expert, MXFP4
+        let got = expert_footprint(&cfg, PER, cfg.n_experts as u64);
+        assert_eq!(got, PER * 896 * 92, "must charge all 92 MoE layers");
+        assert!(got > 1_400_000_000_000, "K3's expert set is ~1.4 TB, got {got}");
+
+        // A sharded node charges only what it owns, so coverage reflects the shard.
+        assert_eq!(expert_footprint(&cfg, PER, 448), PER * 448 * 92);
     }
 
     const GB: u64 = 1 << 30;

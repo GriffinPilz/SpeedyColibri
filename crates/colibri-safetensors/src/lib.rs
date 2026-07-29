@@ -120,9 +120,9 @@ const DIO_ALIGN: u64 = 512;
 /// kernel currently needs as a landing zone for 22.6 GB/token of streaming becomes
 /// available to the expert cache instead.
 ///
-/// **MEASURED: it does not pay, and it does not lift the `MemTotal/3` cache ceiling.
-/// Leave off.** Kept because "why don't we just use O_DIRECT?" is a question this
-/// codebase will keep attracting, and this is the answer with numbers.
+/// **It is model-dependent: a loss on GLM-5.2, a clean win on Kimi-K3.** Both
+/// measurements are below. Kept as an explicit opt-in because the mechanism that
+/// separates them is *not* established — see "what does NOT explain it".
 ///
 /// 1 node, prompt 512, ngen 12, tokens byte-identical in every arm:
 ///
@@ -140,6 +140,39 @@ const DIO_ALIGN: u64 = 512;
 /// 70 GB, 90 GB unable to complete), which proves the memory ceiling is **real
 /// rather than an artifact of buffered I/O**. `MemTotal/3` is the right operating
 /// point; the page cache is not waste to be reclaimed.
+///
+/// ## Kimi-K3, 2026-07-29: a win in BOTH regimes
+///
+/// Same box, ABBA-mirrored, 2 passes per arm, tokens byte-identical in every arm.
+/// `expert-load` is the metric — wall clock swings ~20% run to run here (it carries a
+/// one-time model load), while `expert-load` repeats to ~0.1%.
+///
+/// | regime | buffered | `O_DIRECT` | ratio |
+/// |---|---|---|---|
+/// | prefill-heavy (5-tok prompt, ngen 2) | 17162 ms | 15691 ms | **1.094×** |
+/// | decode-heavy (ngen 16) | 38540 ms | 34099 ms | **1.130×** |
+///
+/// Achieved expert-read bandwidth rose 9.43 → 10.32 GB/s against a 10.63 GB/s iobench
+/// ceiling — 89% → 97% of the drive.
+///
+/// The mechanism check: on K3 both arms read the **same** number of device bytes
+/// (200.6 vs 202.1 GiB, +0.7%). If the page cache were serving any real share of expert
+/// reads the buffered arm would read measurably *fewer*. It doesn't — so on K3 that tier
+/// contributes ~nothing and bypassing it is free.
+///
+/// ## What does NOT explain the split
+///
+/// The tempting story is "K3's expert set dwarfs RAM, so the page cache can't help." It
+/// does not survive arithmetic: against ~58 GB of effective page cache, GLM's 735 GB of
+/// experts is ~7.9% coverage and K3's 1446 GB is ~4.0%. Both are tiny, yet the results
+/// have opposite sign. Nor is it prefill-vs-decode — K3 wins in both. Real remaining
+/// differences (per-expert read size 37.7 MB fp8 vs 17.55 MB MXFP4; top-8/160 vs
+/// top-16/896) are untested as causes.
+///
+/// So this stays an explicit flag rather than becoming an inferred default. A gate keyed
+/// on a correlation nobody has explained is precisely the failure that made
+/// `prefetch-ahead` cost 1.26× on K3 (it used `union >= 64` as a proxy for "routes to
+/// ~all experts"). **K3 wants `COLI_O_DIRECT=1`; set it explicitly.**
 fn o_direct_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_O_DIRECT").ok().as_deref() == Some("1"))

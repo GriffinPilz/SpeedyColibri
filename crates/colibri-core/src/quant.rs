@@ -42,9 +42,26 @@ impl QFormat {
 /// measured warm on the GB10). Recycling keeps the pages faulted-in, so a
 /// steady-state load is just the `pread`. Only buffers ≥ 1 MiB are pooled (expert
 /// payloads), and the pool is bounded, so small/one-off reads are unaffected.
-pub struct SharedBuf {
-    data: Vec<u8>,
+/// A `SharedBuf` is either an owned (pooled) heap allocation that a `pread` filled, or a
+/// **borrowed window into a file mapping** — the same bytes without the copy.
+///
+/// Measured on M2.7 (`coli iobench`, warm page cache, 3 reps): reading a span through a
+/// mapping is **~34 GB/s vs ~14.4 GB/s for `pread` + copy** (2.4×), because `pread` moves
+/// every byte twice — page cache into the user buffer — plus a syscall. In warm decode
+/// that copy is 66% x 3.95 GB = 2.6 GB/token, which at 14.4 GB/s is ~181 ms and matches the
+/// ~175 ms/token the profiler attributes to expert-load.
+///
+/// The mapped case owns nothing: `map` keeps the mapping alive for exactly as long as any
+/// view into it, and `Drop` must not return that memory to the buffer pool.
+pub enum SharedBuf {
+    Owned(Vec<u8>),
+    Mapped { ptr: *const u8, len: usize, map: std::sync::Arc<dyn std::any::Any + Send + Sync> },
 }
+
+// SAFETY: the mapped variant is a read-only window into a `MAP_SHARED` file mapping kept
+// alive by `map`. Sharing it across threads is exactly as safe as sharing `&[u8]`.
+unsafe impl Send for SharedBuf {}
+unsafe impl Sync for SharedBuf {}
 
 /// Recycled allocations, largest-capacity-agnostic FIFO. Bounded by
 /// [`pool_max`]; entries are ~uniform in practice (one expert span).
@@ -75,25 +92,55 @@ impl SharedBuf {
                 // Stale bytes are fine: previously written, about to be overwritten.
                 v.truncate(len);
                 v.resize(len, 0);
-                return SharedBuf { data: v };
+                return SharedBuf::Owned(v);
             }
         }
-        SharedBuf { data: vec![0u8; len] }
+        SharedBuf::Owned(vec![0u8; len])
     }
 
+    /// A read-only view of `len` bytes at `ptr`, valid for as long as `map` is held.
+    ///
+    /// # Safety
+    /// `ptr..ptr+len` must stay mapped and readable for the lifetime of `map`, and must
+    /// not be written while any `SharedBuf` view exists.
+    pub unsafe fn mapped(
+        ptr: *const u8,
+        len: usize,
+        map: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> SharedBuf {
+        SharedBuf::Mapped { ptr, len, map }
+    }
+
+    /// Whether this buffer borrows a mapping (so callers can skip a read that already
+    /// happened by virtue of the bytes being mapped).
+    #[inline]
+    pub fn is_mapped(&self) -> bool {
+        matches!(self, SharedBuf::Mapped { .. })
+    }
+
+    /// Writable bytes. Panics on the mapped variant: those bytes are the file's, and a
+    /// caller reaching for a mutable slice means it was about to `pread` into a window it
+    /// should have been reading in place.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
+        match self {
+            SharedBuf::Owned(v) => v,
+            SharedBuf::Mapped { .. } => panic!("SharedBuf::as_mut_slice on a mapped buffer"),
+        }
     }
 }
 
 impl Drop for SharedBuf {
     fn drop(&mut self) {
-        let v = std::mem::take(&mut self.data);
-        if v.capacity() >= POOL_MIN_BYTES {
-            let mut pool = BUF_POOL.lock().unwrap();
-            if pool.len() < pool_max() {
-                pool.push(v);
+        // Only the owned variant goes back to the pool; a mapped window owns nothing and
+        // the mapping itself is released when the last `Arc` clone drops.
+        if let SharedBuf::Owned(v) = self {
+            let v = std::mem::take(v);
+            if v.capacity() >= POOL_MIN_BYTES {
+                let mut pool = BUF_POOL.lock().unwrap();
+                if pool.len() < pool_max() {
+                    pool.push(v);
+                }
             }
         }
     }
@@ -103,13 +150,21 @@ impl std::ops::Deref for SharedBuf {
     type Target = [u8];
     #[inline]
     fn deref(&self) -> &[u8] {
-        &self.data
+        match self {
+            SharedBuf::Owned(v) => v,
+            // SAFETY: constructed by `mapped`, whose contract keeps the range mapped and
+            // read-only for as long as `map` (held here) is alive.
+            SharedBuf::Mapped { ptr, len, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr, *len)
+            },
+        }
     }
 }
 
 impl std::fmt::Debug for SharedBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SharedBuf({} bytes)", self.data.len())
+        let kind = if self.is_mapped() { "mapped" } else { "owned" };
+        write!(f, "SharedBuf({} bytes, {kind})", self.len())
     }
 }
 

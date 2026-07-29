@@ -3,7 +3,12 @@
 //! Port of `c/st.h`. Equivalent to `Shards` in the reference `engine.py`, but:
 //!   - reads with positioned reads (`pread`) instead of mmap, so pages do not
 //!     stay resident in the process (the RSS fix — peak RAM stays dense+cache
-//!     rather than the whole model);
+//!     rather than the whole model). `COLI_MMAP_EXPERTS=1` opts back into a
+//!     mapping for expert spans (see [`mmap_enabled`]): warm decode `pread`s
+//!     2.6 GB/token out of page cache into fresh buffers, and reading the same
+//!     bytes in place measured 2.4× faster. The RSS objection is also weaker than
+//!     it looks — a heap copy is *anonymous* and unevictable, where a mapped file
+//!     page is clean and reclaimable under pressure;
 //!   - always converts to `f32` on the float path (BF16/F16/F32), and reads the
 //!     quantized container tensors (`U8`) raw.
 //!
@@ -174,6 +179,51 @@ pub struct Shards {
     /// [`o_direct_enabled`]. `None` entries fall back to the buffered fd.
     dio: Vec<Option<File>>,
     index: HashMap<String, usize>,
+    /// Parallel to `files`: whole-file read-only mappings, created lazily and only when
+    /// [`mmap_enabled`]. See [`Shards::mapping`].
+    maps: Vec<std::sync::OnceLock<std::sync::Arc<FileMap>>>,
+}
+
+/// A whole-file `PROT_READ`/`MAP_SHARED` mapping, unmapped on drop. Views handed out as
+/// [`SharedBuf::mapped`] hold an `Arc` of this, so the mapping outlives every view.
+pub struct FileMap {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+// SAFETY: read-only mapping; sharing it is as safe as sharing `&[u8]`.
+unsafe impl Send for FileMap {}
+unsafe impl Sync for FileMap {}
+
+impl Drop for FileMap {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { libc::munmap(self.ptr, self.len) };
+        }
+    }
+}
+
+/// Serve expert spans as windows into a file mapping instead of `pread`-ing them into a
+/// fresh buffer (`COLI_MMAP_EXPERTS=1`; default off pending the in-engine A/B).
+///
+/// Warm decode is the target. `coli iobench` on an M2.7 shard, warm page cache, 3 reps:
+/// reading a span through a mapping is **~34 GB/s vs ~14.4 GB/s for `pread` + copy**,
+/// because `pread` moves every byte twice plus a syscall. That copy is 2.6 GB/token in
+/// warm decode (~181 ms at 14.4 GB/s, matching the profiler's ~175 ms expert-load), and
+/// our consumer is the GPU, which reads host pages directly — so with a mapping the CPU
+/// stops touching the bytes at all.
+///
+/// **Not obviously a win when cold.** A mapping faults at 4 KiB granularity where a
+/// `pread` issues one large request, so prefill could regress; [`Shards::mapping`] issues
+/// `MADV_WILLNEED` over each span to get readahead back. Measure both regimes — they are
+/// genuinely different bounds (`expert-load-two-regimes`).
+///
+/// Incompatible with `O_DIRECT` (which exists to bypass the page cache a mapping depends
+/// on); `O_DIRECT` wins if both are set.
+fn mmap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("COLI_MMAP_EXPERTS").ok().as_deref() == Some("1") && !o_direct_enabled()
+    })
 }
 
 impl Shards {
@@ -196,6 +246,7 @@ impl Shards {
             files: Vec::new(),
             dio: Vec::new(),
             index: HashMap::new(),
+            maps: Vec::new(),
         };
 
         for path in paths {
@@ -263,6 +314,7 @@ impl Shards {
             }
 
             s.dio.push(if o_direct_enabled() { open_direct(&path) } else { None });
+            s.maps.push(std::sync::OnceLock::new()); // filled lazily by `mapping`
             s.files.push((path, file));
         }
 
@@ -446,10 +498,18 @@ impl Shards {
                 }
             }
             let span = (span_end - off0) as usize;
-            // Pool-recycled buffer; on error it returns to the pool unread.
-            let mut buf = SharedBuf::with_len(span);
-            self.pread_chunked(file, off0, buf.as_mut_slice(), nthreads)?;
-            let arc = Arc::new(buf);
+            // Mapped span (COLI_MMAP_EXPERTS): the bytes are reachable in place, so there
+            // is nothing to read. Falls through to the pooled buffer + pread when mmap is
+            // off or the mapping could not be made.
+            let arc = match self.map_view(file, off0, span) {
+                Some(view) => Arc::new(view),
+                None => {
+                    // Pool-recycled buffer; on error it returns to the pool unread.
+                    let mut buf = SharedBuf::with_len(span);
+                    self.pread_chunked(file, off0, buf.as_mut_slice(), nthreads)?;
+                    Arc::new(buf)
+                }
+            };
             for gi in g..end {
                 let idx = order[gi];
                 let (_, o, nb) = meta[idx];
@@ -490,6 +550,9 @@ impl Shards {
             /// alignment skew. Views additionally add the file-side padding.
             skew: usize,
             buf: SharedBuf,
+            /// True when `buf` is a window into a file mapping: the bytes are already
+            /// reachable, so this span contributes no read jobs.
+            mapped: bool,
         }
         let dio = o_direct_enabled();
         let mut spans: Vec<Span> = Vec::new();
@@ -541,18 +604,24 @@ impl Shards {
                 } else {
                     span_len
                 };
-                let mut buf = SharedBuf::with_len(read_len + extra);
+                // mmap and O_DIRECT are mutually exclusive (`mmap_enabled`), so a mapped
+                // span always has pad/extra/skew == 0 and its views need no alignment
+                // arithmetic.
+                let (mut buf, mapped) = match self.map_view(file, read_off, read_len) {
+                    Some(view) => (view, true),
+                    None => (SharedBuf::with_len(read_len + extra), false),
+                };
                 // Skew is derived from the *actual* allocation: `SharedBuf` recycles
                 // pooled buffers, so alignment varies between calls and cannot be
                 // assumed.
-                let skew = if dio {
+                let skew = if dio && !mapped {
                     let p = buf.as_mut_slice().as_ptr() as usize;
                     p.wrapping_neg() & (DIO_ALIGN as usize - 1)
                 } else {
                     0
                 };
                 let prefix = skew + pad;
-                spans.push(Span { file, read_off, read_len, skew, buf });
+                spans.push(Span { file, read_off, read_len, skew, buf, mapped });
                 for gi in g..end {
                     let idx = order[gi];
                     let (_, o, nb) = meta[idx];
@@ -584,6 +653,9 @@ impl Shards {
         }
         let mut jobs: Vec<Job> = Vec::new();
         for s in spans.iter_mut() {
+            if s.mapped {
+                continue; // nothing to read: the span is already reachable in place
+            }
             let (file, read_off, total, skew) = (s.file, s.read_off, s.read_len, s.skew);
             // Tiling starts at the aligned address, not the allocation base. `sub` is a
             // 512-multiple (enforced by `read_sub_bytes`) and `total` was rounded up, so
@@ -631,7 +703,8 @@ impl Shards {
         //    the join so each span is advised once as a whole range rather than per
         //    2 MiB job, and only once the bytes are safely in our own buffer.
         if fadvise_enabled() && !dio {
-            for s in spans.iter() {
+            for s in spans.iter().filter(|s| !s.mapped) {
+                // Never advise away a mapped span: those pages ARE the buffer.
                 self.fadvise_dontneed(s.file, s.read_off, s.read_len);
             }
         }
@@ -693,6 +766,55 @@ impl Shards {
     /// spans. Falls back to the buffered fd wherever no direct descriptor exists —
     /// non-Linux, or a filesystem that refused `O_DIRECT` — so enabling the flag can
     /// never break a read, only fail to accelerate it.
+    /// The mapping for `file_idx`, created on first use. `None` when mmap is off or the
+    /// `mmap` call fails — every caller then falls back to the `pread` path, so a failure
+    /// here costs performance, never correctness.
+    fn mapping(&self, file_idx: usize) -> Option<std::sync::Arc<FileMap>> {
+        if !mmap_enabled() {
+            return None;
+        }
+        let cell = self.maps.get(file_idx)?;
+        if let Some(m) = cell.get() {
+            return Some(m.clone());
+        }
+        let (_, f) = self.files.get(file_idx)?;
+        let len = f.metadata().ok()?.len() as usize;
+        if len == 0 {
+            return None;
+        }
+        use std::os::unix::io::AsRawFd;
+        let ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0)
+        };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        // Random access across a 122 GB container: tell the kernel not to read ahead
+        // wholesale. Per-span `MADV_WILLNEED` in `map_view` asks for the parts we want.
+        unsafe { libc::madvise(ptr, len, libc::MADV_RANDOM) };
+        let m = std::sync::Arc::new(FileMap { ptr, len });
+        let _ = cell.set(m.clone());
+        Some(cell.get().cloned().unwrap_or(m))
+    }
+
+    /// A `SharedBuf` window over `[off, off+len)` of `file_idx`, or `None` to use `pread`.
+    ///
+    /// `MADV_WILLNEED` starts readahead for the span so a cold miss still gets a large
+    /// request instead of a storm of 4 KiB faults — the main risk of serving experts from
+    /// a mapping.
+    fn map_view(&self, file_idx: usize, off: u64, len: usize) -> Option<colibri_core::SharedBuf> {
+        let m = self.mapping(file_idx)?;
+        let end = (off as usize).checked_add(len)?;
+        if end > m.len {
+            return None;
+        }
+        let base = unsafe { (m.ptr as *const u8).add(off as usize) };
+        unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+        // SAFETY: `base..base+len` lies inside the mapping, which `m` keeps alive for as
+        // long as the returned buffer (and any view derived from it) exists.
+        Some(unsafe { colibri_core::SharedBuf::mapped(base, len, m) })
+    }
+
     fn pread_dispatch(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(f) = self.dio.get(file_idx).and_then(|o| o.as_ref()) {

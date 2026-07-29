@@ -2347,28 +2347,53 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
 extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const float *k,
         const float *v, int S, int H, int Hkv, int D, int T, float scale, int mode) {
     if (!ctx || !q || !k || !v || S < 1 || H < 1 || Hkv < 1 || D < 1 || D > 1024 ||
-        H % Hkv || T < S || T > 8192)
+        H % Hkv || T < S)
         return 0;
     // mode 1 = WMMA flash (tc_gqa_attn); requires D a multiple of 16. Anything else,
     // or D not tile-aligned, falls back to the scalar gqa_attn_kernel (mode 0).
     int flash = (mode == 1 && D % 16 == 0);
+    // T > 8192 is the SCALAR kernel's limit — it holds all T scores in shared memory. The
+    // flash kernel tiles keys in blocks of 16 with online softmax and its shared footprint
+    // is O(GQA_QT*D), independent of T. Applying the cap to both meant every context past
+    // 8k silently fell back to the CPU core — the exact path whose cost is linear in
+    // context, so the cap bit hardest precisely where it hurt most.
+    if (!flash && T > 8192) return 0;
     DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
     std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     size_t qb = (size_t)S * H * D * sizeof(float), kb = (size_t)T * Hkv * D * sizeof(float);
-    if (!reserve(&dc->aq, &dc->aq_cap, qb) || !reserve(&dc->al, &dc->al_cap, kb) ||
-        !reserve(&dc->ar, &dc->ar_cap, kb) || !reserve(&dc->ac, &dc->ac_cap, qb))
-        return 0;
-    if (!cuda_ok(cudaMemcpyAsync(dc->aq, q, qb, cudaMemcpyHostToDevice, dc->stream), "gqa q upload") ||
-        !cuda_ok(cudaMemcpyAsync(dc->al, k, kb, cudaMemcpyHostToDevice, dc->stream), "gqa k upload") ||
-        !cuda_ok(cudaMemcpyAsync(dc->ar, v, kb, cudaMemcpyHostToDevice, dc->stream), "gqa v upload"))
+    /* Zero-copy K/V (COLI_GQA_KV_ZEROCOPY, default on): read the KV cache straight out of
+     * host memory instead of staging it. GB10 is unified — the expert weights already take
+     * host pointers with no registration, and K/V is the same kind of buffer.
+     *
+     * This is the whole cost of the decode path. K/V is [T, Hkv, D] and Q is one row, so at
+     * a 512-token context M2.7 stages 4 MB per layer per token — ~248 MB/token over 62
+     * layers — to feed a kernel that reads each byte once. Staging is strictly worse than
+     * not staging: the copy alone reads all of host K/V *and* writes all of device K/V,
+     * before the kernel reads it a third time. It also made attention cost grow with
+     * context twice over.
+     *
+     * Q and the output stay staged: both are [S, H, D] (24 KB at S==1), too small to matter,
+     * and the output wants device-side accumulation. */
+    static int s_zc = -1;
+    if (s_zc < 0) { const char *e = getenv("COLI_GQA_KV_ZEROCOPY"); s_zc = (!e || atoi(e)); }
+    const float *kd = k, *vd = v;
+    if (!reserve(&dc->aq, &dc->aq_cap, qb) || !reserve(&dc->ac, &dc->ac_cap, qb)) return 0;
+    if (!s_zc) {
+        if (!reserve(&dc->al, &dc->al_cap, kb) || !reserve(&dc->ar, &dc->ar_cap, kb)) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(dc->al, k, kb, cudaMemcpyHostToDevice, dc->stream), "gqa k upload") ||
+            !cuda_ok(cudaMemcpyAsync(dc->ar, v, kb, cudaMemcpyHostToDevice, dc->stream), "gqa v upload"))
+            return 0;
+        kd = dc->al; vd = dc->ar;
+    }
+    if (!cuda_ok(cudaMemcpyAsync(dc->aq, q, qb, cudaMemcpyHostToDevice, dc->stream), "gqa q upload"))
         return 0;
     if (flash) {
         size_t shW = (size_t)GQA_QT * 8 * D;   // QA+KB (fp16, 4D) + acc (f32, 4D) per 16 rows
         if (!cuda_ok(cudaFuncSetAttribute(tc_gqa_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shW), "gqa flash shared attr")) return 0;
-        tc_gqa_attn<<<dim3(H, (S + GQA_QT - 1) / GQA_QT), 256, shW, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale);
+        tc_gqa_attn<<<dim3(H, (S + GQA_QT - 1) / GQA_QT), 256, shW, dc->stream>>>(dc->ac, dc->aq, kd, vd, S, H, Hkv, D, T, scale);
     } else {
         size_t shared = (size_t)(D + T + ATTN_TPB) * sizeof(float);
-        gqa_attn_kernel<<<dim3(H, S), ATTN_TPB, shared, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale);
+        gqa_attn_kernel<<<dim3(H, S), ATTN_TPB, shared, dc->stream>>>(dc->ac, dc->aq, kd, vd, S, H, Hkv, D, T, scale);
     }
     if (!cuda_ok(cudaGetLastError(), "gqa launch")) return 0;
     if (!cuda_ok(cudaMemcpyAsync(ctx, dc->ac, qb, cudaMemcpyDeviceToHost, dc->stream), "gqa ctx download") ||

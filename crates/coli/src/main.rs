@@ -2224,6 +2224,33 @@ const NEARFIT_COVERAGE_PCT: u64 = 118;
 /// nearly double today's 379 GB, i.e. a different coverage entirely).
 const O_DIRECT_MAX_COVERAGE_PCT: u64 = 35;
 
+/// Coverage at or above which resident expert spans are served as **mapped views**
+/// instead of being copied into heap buffers. `COLI_MMAP_EXPERTS=0|1` overrides.
+///
+/// Mapping only pays when spans are *actually resident when touched* — otherwise every
+/// span pays a `mincore` and then reads anyway. Coverage is a loose proxy for that, and
+/// the crossover is much higher than [`O_DIRECT_MAX_COVERAGE_PCT`]. Measured on 42b2,
+/// ABBA, 4 runs/arm, tokens identical in every run:
+///
+/// | model | coverage | pread | mapped | |
+/// |---|---|---|---|---|
+/// | MiniMax-M2.7 | 86% | 2987 ms | **529 ms** | **5.65×** |
+/// | MiniMax-M3 | 47% | **7851 ms** | 8605 ms | 0.91× |
+/// | GLM-5.2 | 26% | **14694 ms** | 15080 ms | 0.97× |
+///
+/// The byte counters explain the split better than coverage does. M2.7 touches 33.6 GB
+/// and both arms read **zero** from the drive — it stays resident, so mapping deletes a
+/// pure memcpy. M3 touches 60.6 GB and reads **67 GiB in both arms**: at 47% coverage
+/// almost nothing survives in page cache next to the 40 GB expert cache, so the residency
+/// gate mostly fails and its `mincore` is dead weight.
+///
+/// **I initially gated this on `O_DIRECT_MAX_COVERAGE_PCT` (35%), reasoning that one
+/// number should decide both. That was wrong** — it would have enabled mapping for M3 and
+/// cost 9.6%. 80% sits between the measured loss (47%) and win (86%); the crossover inside
+/// that interval is not measured, and it is deliberately conservative because the downside
+/// is paid on every span while the upside needs residency.
+const MMAP_MIN_COVERAGE_PCT: u64 = 80;
+
 /// Wire the expert cache to **fill RAM safely, for every model**. It grows toward a fill
 /// target and a background monitor evicts LRU experts under memory pressure so the box can
 /// never OOM — which is what lets us point a fill-RAM policy at a model of *any* size:
@@ -2321,13 +2348,10 @@ where
     // Pick the read path from the same coverage number, before any expert is read.
     // O_DIRECT pays exactly when the page cache is too small to be a useful second tier
     // for this model's expert set; see `O_DIRECT_MAX_COVERAGE_PCT`.
-    // One number, two mechanisms, opposite directions. Below the threshold the page cache
-    // cannot hold enough of this model's experts to be worth keeping, so bypass it AND skip
-    // the residency checks that would mostly fail. Above it the page cache holds the working
-    // set, so keep it and hand out mapped views instead of copying.
-    let page_cache_is_useful = covers_pct >= O_DIRECT_MAX_COVERAGE_PCT;
-    colibri_safetensors::set_o_direct(!page_cache_is_useful);
-    colibri_safetensors::set_mmap_experts(page_cache_is_useful);
+    // Two decisions off the same axis, but NOT the same threshold — they were measured
+    // separately and the crossovers do not coincide (see each constant).
+    colibri_safetensors::set_o_direct(covers_pct < O_DIRECT_MAX_COVERAGE_PCT);
+    colibri_safetensors::set_mmap_experts(covers_pct >= MMAP_MIN_COVERAGE_PCT);
     // An explicit COLI_RAM_GB caps the fill target; the monitor still protects the floor.
     let explicit = std::env::var("COLI_RAM_GB")
         .ok()
@@ -2967,15 +2991,32 @@ mod tests {
     ///   MiniMax-M2.7 (86%): pread 2987 ms -> mapped 529 ms   = 5.65x WIN
     ///   GLM-5.2      (26%): pread 14694 ms -> mapped 15080 ms = 0.97x loss
     #[test]
-    fn coverage_gate_drives_o_direct_and_mmap_oppositely() {
-        for cov in [0u64, 7, 26, 27, 34, 35, 46, 86, 172, 1000] {
-            let direct = cov < O_DIRECT_MAX_COVERAGE_PCT;
-            let mapped = cov >= O_DIRECT_MAX_COVERAGE_PCT;
-            assert_ne!(direct, mapped, "at {cov}% the two paths must never both apply");
+    fn mmap_gate_matches_the_measured_models() {
+        // Every measured mmap arm. M3 is the one that matters: it sits ABOVE the O_DIRECT
+        // threshold, so gating mmap on that constant (as this first did) turns mapping on
+        // for a model where it measured 9.6% SLOWER.
+        for (name, cov, want_map) in [
+            ("minimax-m2.7", 86u64, true), // 2987 -> 529 ms, 5.65x
+            ("minimax-m3", 47, false),     // 7851 -> 8605 ms, 0.91x
+            ("glm-5.2", 26, false),        // 14694 -> 15080 ms, 0.97x
+            ("kimi-k3", 7, false),
+        ] {
+            assert_eq!(
+                cov >= MMAP_MIN_COVERAGE_PCT,
+                want_map,
+                "{name} at {cov}% coverage should have mmap={want_map}"
+            );
         }
-        // The two measured mmap anchors.
-        assert!(86 >= O_DIRECT_MAX_COVERAGE_PCT, "M2.7 (86%) must map — measured 5.65x");
-        assert!(!(26 >= O_DIRECT_MAX_COVERAGE_PCT), "GLM (26%) must NOT map — measured 0.97x");
+        // Bounded by the measured neighbours, so it cannot be tuned onto a known result.
+        assert!(
+            (48..=86).contains(&MMAP_MIN_COVERAGE_PCT),
+            "mmap threshold {MMAP_MIN_COVERAGE_PCT} escaped the measured interval (47%, 86%)"
+        );
+        // The two thresholds are independent: there is a band where NEITHER applies.
+        assert!(
+            MMAP_MIN_COVERAGE_PCT > O_DIRECT_MAX_COVERAGE_PCT,
+            "a model can be too big to map and too small to bypass — that band is real"
+        );
     }
 
     /// The O_DIRECT threshold must keep classifying the four models it was measured on.

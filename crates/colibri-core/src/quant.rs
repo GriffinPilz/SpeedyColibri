@@ -43,8 +43,27 @@ impl QFormat {
 /// steady-state load is just the `pread`. Only buffers ≥ 1 MiB are pooled (expert
 /// payloads), and the pool is bounded, so small/one-off reads are unaffected.
 pub struct SharedBuf {
-    data: Vec<u8>,
+    store: Store,
 }
+
+/// Where a [`SharedBuf`]'s bytes live.
+enum Store {
+    /// A pool-recycled heap allocation — the streaming read path writes into it.
+    Heap(Vec<u8>),
+    /// A read-only *view* into memory owned by something else, kept alive by `_owner`
+    /// (in practice a shard's `mmap`). Owns no allocation, so it is never pooled and
+    /// costs nothing to drop.
+    ///
+    /// The owner is a type-erased `Arc` so the mapping itself can live in
+    /// `colibri-safetensors` (which has `libc`) rather than dragging platform code
+    /// into this crate.
+    View { ptr: *const u8, len: usize, _owner: std::sync::Arc<dyn std::any::Any + Send + Sync> },
+}
+
+// SAFETY: a `View` is immutable for its whole life and its bytes stay mapped as long as
+// `_owner` is alive, which the `Arc` guarantees. The raw pointer is only ever read.
+unsafe impl Send for SharedBuf {}
+unsafe impl Sync for SharedBuf {}
 
 /// Recycled allocations, largest-capacity-agnostic FIFO. Bounded by
 /// [`pool_max`]; entries are ~uniform in practice (one expert span).
@@ -75,21 +94,52 @@ impl SharedBuf {
                 // Stale bytes are fine: previously written, about to be overwritten.
                 v.truncate(len);
                 v.resize(len, 0);
-                return SharedBuf { data: v };
+                return SharedBuf { store: Store::Heap(v) };
             }
         }
-        SharedBuf { data: vec![0u8; len] }
+        SharedBuf { store: Store::Heap(vec![0u8; len]) }
     }
 
+    /// Wrap `len` bytes at `ptr` that are owned by `owner`, without copying.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for reads of `len` bytes, and must stay valid and immutable
+    /// for as long as `owner` is alive. Holding `owner` in the returned buffer is what
+    /// enforces the lifetime.
+    pub unsafe fn from_view(
+        owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        ptr: *const u8,
+        len: usize,
+    ) -> SharedBuf {
+        SharedBuf { store: Store::View { ptr, len, _owner: owner } }
+    }
+
+    /// True when this buffer is a borrowed view rather than an owned allocation.
+    #[inline]
+    pub fn is_view(&self) -> bool {
+        matches!(self.store, Store::View { .. })
+    }
+
+    /// Writable bytes. Only meaningful for a heap buffer — a view is read-only by
+    /// construction, and the read path only mutates a buffer it just allocated with
+    /// [`SharedBuf::with_len`].
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
+        match &mut self.store {
+            Store::Heap(v) => v,
+            Store::View { .. } => {
+                panic!("SharedBuf::as_mut_slice on a mapped view — views are read-only")
+            }
+        }
     }
 }
 
 impl Drop for SharedBuf {
     fn drop(&mut self) {
-        let v = std::mem::take(&mut self.data);
+        // Only heap allocations are recycled. A view owns nothing — pooling its bytes
+        // would hand a mapped region out as a scratch buffer for the next read.
+        let Store::Heap(v) = &mut self.store else { return };
+        let v = std::mem::take(v);
         if v.capacity() >= POOL_MIN_BYTES {
             let mut pool = BUF_POOL.lock().unwrap();
             if pool.len() < pool_max() {
@@ -103,13 +153,18 @@ impl std::ops::Deref for SharedBuf {
     type Target = [u8];
     #[inline]
     fn deref(&self) -> &[u8] {
-        &self.data
+        match &self.store {
+            Store::Heap(v) => v,
+            // SAFETY: the from_view contract — valid for `len` reads while `_owner` lives.
+            Store::View { ptr, len, .. } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
+        }
     }
 }
 
 impl std::fmt::Debug for SharedBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SharedBuf({} bytes)", self.data.len())
+        let kind = if self.is_view() { "view" } else { "heap" };
+        write!(f, "SharedBuf({} bytes, {kind})", self.len())
     }
 }
 

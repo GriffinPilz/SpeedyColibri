@@ -91,6 +91,21 @@ fn parse_sub_kb(v: Option<&str>) -> usize {
         .unwrap_or(DEFAULT)
 }
 
+/// Serve page-cache-resident expert spans from a shared mapping instead of copying them
+/// into a heap buffer (`COLI_MMAP_EXPERTS=0` disables).
+///
+/// The warm path is the whole point: once a span is in the page cache, `pread` still
+/// memcpy's it into a fresh buffer at ~12 GB/s, against ~146 GB/s of memory bandwidth on
+/// this box — measured as MiniMax-M2.7 spending 2805 ms moving 33.6 GB while reading
+/// **zero** bytes from the drive. A mapped view hands the same bytes to the GPU with no
+/// copy at all, and a CUDA microbenchmark puts the GPU's read rate at 163 GB/s from a
+/// file-backed mapping vs 171 GB/s from a heap buffer — a 4.5% penalty to skip the copy
+/// entirely.
+fn mmap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_MMAP_EXPERTS").ok().as_deref() != Some("0"))
+}
+
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
 pub struct StTensor {
@@ -182,6 +197,101 @@ fn open_direct(_path: &Path) -> Option<File> {
     None
 }
 
+/// A whole shard file mapped read-only, for the lifetime of the process.
+///
+/// **Mapped once, never per read.** A per-read `mmap`/`munmap` pair serialises every
+/// reader thread on the process-wide `mmap_lock` and tears down PTEs on each unmap, so
+/// the 40-thread read pool collapses onto one core in the kernel while the GPU starves.
+/// (The same effect is why [`colibri_core::SharedBuf`] recycles its heap allocations:
+/// a fresh `mmap` + zero-fill faults cost ~14 ms per expert, 8× the read itself.)
+/// Mapping the whole file costs only address space — 1.4 TB of it is free on 64-bit,
+/// and physical pages materialise only when touched.
+struct Mapping {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+// SAFETY: the mapping is read-only (`PROT_READ`) and never mutated after creation, so
+// sharing the pointer across threads is sound. It is unmapped only in `Drop`, by which
+// point no `SharedBuf` view can still reference it (each holds an `Arc<Mapping>`).
+unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    #[cfg(target_os = "linux")]
+    fn open(file: &File, len: u64) -> Option<Mapping> {
+        use std::os::unix::io::AsRawFd;
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: a fresh read-only mapping of a valid fd; failure is reported as MAP_FAILED.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        // The kernel's default readahead is tuned for sequential streaming; our access is
+        // scattered expert spans, and we never want it faulting *ahead* of a span we only
+        // reached because `mincore` said it was already resident.
+        // SAFETY: `ptr`/`len` name the mapping just created.
+        unsafe { libc::madvise(ptr, len as usize, libc::MADV_RANDOM) };
+        Some(Mapping { ptr, len: len as usize })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open(_file: &File, _len: u64) -> Option<Mapping> {
+        None
+    }
+
+    /// `true` when every page of `[off, off+len)` is already in the page cache.
+    ///
+    /// This gate is the whole difference between the mapped path being free and being a
+    /// catastrophe: touching a non-resident page faults it in 4 KiB at a time, where the
+    /// `pread` path fetches the same span in one request. An earlier attempt without the
+    /// gate took 407,570 major faults and ran ~300× slower cold; `MADV_WILLNEED` did not
+    /// rescue it, because advisory readahead loses to a fault storm already underway.
+    #[cfg(target_os = "linux")]
+    fn resident(&self, off: usize, len: usize) -> bool {
+        if len == 0 || off.saturating_add(len) > self.len {
+            return false;
+        }
+        let page = 4096usize;
+        let start = off & !(page - 1);
+        let end = off + len;
+        let pages = (end - start).div_ceil(page);
+        let mut vec = vec![0u8; pages];
+        // SAFETY: `start` is page-aligned and inside the mapping; `vec` has one byte per page.
+        let rc = unsafe {
+            libc::mincore(
+                (self.ptr as *mut u8).add(start) as *mut libc::c_void,
+                end - start,
+                vec.as_mut_ptr() as *mut _,
+            )
+        };
+        rc == 0 && vec.iter().all(|b| b & 1 == 1)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn resident(&self, _off: usize, _len: usize) -> bool {
+        false
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: unmapping exactly what `open` mapped.
+        unsafe { libc::munmap(self.ptr, self.len) };
+    }
+}
+
 /// A set of indexed safetensors shards, supporting on-demand reads by name.
 pub struct Shards {
     tensors: Vec<StTensor>,
@@ -193,6 +303,10 @@ pub struct Shards {
     /// means the open was tried and refused (non-Linux, or a filesystem that rejects
     /// `O_DIRECT`) and reads fall back to the buffered fd.
     dio: Vec<std::sync::OnceLock<Option<File>>>,
+    /// Parallel to `files`: the whole-file read-only mapping, opened lazily on first
+    /// eligible read. `None` means mapping was tried and refused. Only consulted when
+    /// [`mmap_enabled`]; see [`Mapping`] for why this is per-file and not per-read.
+    maps: Vec<std::sync::OnceLock<Option<std::sync::Arc<Mapping>>>>,
     index: HashMap<String, usize>,
 }
 
@@ -215,6 +329,7 @@ impl Shards {
             tensors: Vec::new(),
             files: Vec::new(),
             dio: Vec::new(),
+            maps: Vec::new(),
             index: HashMap::new(),
         };
 
@@ -283,6 +398,7 @@ impl Shards {
             }
 
             s.dio.push(std::sync::OnceLock::new());
+            s.maps.push(std::sync::OnceLock::new());
             s.files.push((path, file));
         }
 
@@ -466,10 +582,21 @@ impl Shards {
                 }
             }
             let span = (span_end - off0) as usize;
-            // Pool-recycled buffer; on error it returns to the pool unread.
-            let mut buf = SharedBuf::with_len(span);
-            self.pread_chunked(file, off0, buf.as_mut_slice(), nthreads)?;
-            let arc = Arc::new(buf);
+            // Zero-copy when the span is already resident; otherwise a pool-recycled
+            // buffer, which on error returns to the pool unread.
+            let arc = match self.mapped_view(file, off0, span) {
+                // SAFETY: the range was checked to lie inside the mapping and to be
+                // fully resident; the `Arc<Mapping>` keeps it alive under the view.
+                Some(map) => Arc::new(unsafe {
+                    let ptr = (map.ptr as *const u8).add(off0 as usize);
+                    SharedBuf::from_view(map, ptr, span)
+                }),
+                None => {
+                    let mut buf = SharedBuf::with_len(span);
+                    self.pread_chunked(file, off0, buf.as_mut_slice(), nthreads)?;
+                    Arc::new(buf)
+                }
+            };
             for gi in g..end {
                 let idx = order[gi];
                 let (_, o, nb) = meta[idx];
@@ -541,6 +668,28 @@ impl Shards {
                 let span_len = (span_end - off0) as usize;
                 let span_idx = spans.len();
 
+                // Zero-copy when this span is already page-cache resident: hand out a
+                // view into the shard's mapping rather than allocating a buffer and
+                // memcpy'ing the same bytes into it. `read_len: 0` marks the span as
+                // needing no I/O, and the job builder below skips views.
+                if let Some(map) = self.mapped_view(file, off0, span_len) {
+                    // SAFETY: `mapped_view` checked the range lies inside the mapping and
+                    // that every page of it is resident, and the `Arc<Mapping>` moved into
+                    // the buffer keeps it alive for as long as any view survives.
+                    let buf = unsafe {
+                        let ptr = (map.ptr as *const u8).add(off0 as usize);
+                        SharedBuf::from_view(map, ptr, span_len)
+                    };
+                    spans.push(Span { file, read_off: off0, read_len: 0, skew: 0, buf });
+                    for gi in g..end {
+                        let idx = order[gi];
+                        let (_, o, nb) = meta[idx];
+                        names_map[idx] = (span_idx, (o - off0) as usize, nb as usize);
+                    }
+                    g = end;
+                    continue;
+                }
+
                 // Under O_DIRECT the file offset, the length, and the destination
                 // address must all be 512-aligned, and no tensor offset in our
                 // containers is. Align the *span* rather than bouncing each read
@@ -604,6 +753,11 @@ impl Shards {
         }
         let mut jobs: Vec<Job> = Vec::new();
         for s in spans.iter_mut() {
+            // Mapped spans are already satisfied — and `as_mut_slice` would panic on a
+            // read-only view.
+            if s.buf.is_view() {
+                continue;
+            }
             let (file, read_off, total, skew) = (s.file, s.read_off, s.read_len, s.skew);
             // Tiling starts at the aligned address, not the allocation base. `sub` is a
             // 512-multiple (enforced by `read_sub_bytes`) and `total` was rounded up, so
@@ -704,6 +858,26 @@ impl Shards {
     fn pread_into(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         self.files[file_idx].1.read_exact_at(buf, off)
+    }
+
+    /// A zero-copy view of `[off, off+len)` in `file_idx`, or `None` when the mapped
+    /// path is unavailable or the span is not already page-cache resident.
+    ///
+    /// Returning `None` is not a failure — it means "use the copy path", which is the
+    /// right answer whenever the bytes would have to be faulted in one page at a time.
+    fn mapped_view(&self, file_idx: usize, off: u64, len: usize) -> Option<Arc<Mapping>> {
+        if !mmap_enabled() {
+            return None;
+        }
+        let cell = self.maps.get(file_idx)?;
+        let map = cell
+            .get_or_init(|| {
+                let (_, f) = self.files.get(file_idx)?;
+                let size = f.metadata().ok()?.len();
+                Mapping::open(f, size).map(Arc::new)
+            })
+            .clone()?;
+        map.resident(off as usize, len).then_some(map)
     }
 
     /// Read into `buf`, preferring the `O_DIRECT` descriptor when one was opened.
@@ -1070,6 +1244,63 @@ mod tests {
         assert_eq!(got.len(), n);
         assert_eq!(got, data);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mapped_spans_are_taken_and_byte_identical_to_the_copy_path() {
+        // A just-written file is page-cache resident, so the residency gate opens and
+        // both readers should serve views. The point of the test is that they are
+        // ACTUALLY views (otherwise it silently only ever tests the copy path) and that
+        // the bytes are identical to what the file holds.
+        let dir = temp_dir();
+        let w = 1usize << 20;
+        let mut entries: Vec<(String, usize, usize)> = Vec::new();
+        let mut off = 0;
+        for part in ["g", "u", "d"] {
+            entries.push((format!("e0.{part}"), off, w));
+            off += w;
+        }
+        let data: Vec<u8> = (0..off).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        let eref: Vec<(&str, usize, usize)> =
+            entries.iter().map(|(n, o, l)| (n.as_str(), *o, *l)).collect();
+        write_u8_shard(&dir, &eref, &data);
+        let s = Shards::open(&dir).unwrap();
+
+        let names = ["e0.g", "e0.u", "e0.d"];
+        let got = s.read_raw_shared(&names, 4).unwrap();
+        assert_eq!(got.len(), 3);
+
+        // The mapped path must be the one under test wherever it exists. Mapping is
+        // Linux-only, so elsewhere this necessarily falls back to the copy path — record
+        // which one ran rather than letting the test silently cover only the fallback.
+        let was_view = got[0].0.is_view();
+        if mmap_enabled() && cfg!(target_os = "linux") {
+            assert!(was_view, "a resident span should be served from the mapping");
+        }
+
+        // Contents match the file, and the three tensors coalesced into ONE span, so
+        // all three views share a single buffer at increasing offsets.
+        for (i, (buf, o, l)) in got.iter().enumerate() {
+            assert_eq!(*l, w);
+            assert_eq!(&buf[*o..*o + *l], &data[i * w..(i + 1) * w], "tensor {i} mismatch");
+        }
+        assert!(
+            Arc::ptr_eq(&got[0].0, &got[1].0) && Arc::ptr_eq(&got[1].0, &got[2].0),
+            "contiguous tensors should share one span buffer"
+        );
+
+        // A view must never be recycled into the heap pool: dropping it and then
+        // allocating must not hand back the mapping's memory. Only meaningful when a view
+        // actually ran — for a HEAP buffer the pool is *supposed* to return the same
+        // allocation, which is what this asserts the absence of.
+        let ptr = got[0].0.as_ptr();
+        drop(got);
+        let fresh = SharedBuf::with_len(w);
+        if was_view {
+            assert_ne!(fresh.as_ptr(), ptr, "a mapped view leaked into the buffer pool");
+        } else {
+            assert_eq!(fresh.as_ptr(), ptr, "a heap span should be recycled by the pool");
+        }
     }
 
     #[test]

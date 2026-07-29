@@ -697,17 +697,25 @@ static bool nvfp4_wsmm_launch(float *y,const float *x,const uint8_t *w,const uin
  * Mode is resolved once: within a call site K is fixed, so draft and verify pick the same
  * kernel and the MTP `exact` path stays reduction-order-identical to sequential decode. */
 static void nvfp4_gemv_dispatch(float *y,const float *x,const uint8_t *w,const uint8_t *bs,
-        float g,int K,int N,cudaStream_t s){
-    static int s_mode=-1;
-    if(s_mode<0){const char*e=getenv("COLI_NVFP4_GEMV");s_mode=e?atoi(e):3;}
+        float g,int K,int N,cudaStream_t s,int expert){
+    // COLI_NVFP4_GEMV_X (UNSET_X = "follow COLI_NVFP4_GEMV") overrides the mode for the
+    // EXPERT call sites only. Without it an A/B of `COLI_NVFP4_GEMV=0 vs 3` moves the
+    // resident weights too — and the resident half already shipped in #46, so the delta
+    // would bundle a shipped gain with an unshipped one and overstate this change. An A/B
+    // knob must not straddle shipped and unshipped code.
+    enum { UNRESOLVED = -1, UNSET_X = -2 };
+    static int s_mode = UNRESOLVED, s_x = UNRESOLVED;
+    if(s_mode==UNRESOLVED){const char*e=getenv("COLI_NVFP4_GEMV");s_mode=e?atoi(e):3;}
+    if(s_x==UNRESOLVED){const char*e=getenv("COLI_NVFP4_GEMV_X");s_x=e?atoi(e):UNSET_X;}
+    const int mode=(expert&&s_x!=UNSET_X)?s_x:s_mode;
     const int tpb=256,wpb=tpb>>5;
     unsigned blocks=(unsigned)((N+wpb-1)/wpb);
     size_t shm=(size_t)K*sizeof(float);
-    if(s_mode==0)      nvfp4_gemv     <<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
-    else if(s_mode==1) nvfp4_gemv_wide<<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
-    else if(s_mode==2) nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+    if(mode==0)      nvfp4_gemv     <<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
+    else if(mode==1) nvfp4_gemv_wide<<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
+    else if(mode==2) nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
     else if((((K+1)>>1)&3)==0) nvfp4_gemv_u32<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
-    else               nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+    else             nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
 }
 
 /* Single-row decode GEMV (S==1) for int8 W8A16 — mirror of `fp8a16_gemv` with the
@@ -1652,7 +1660,7 @@ extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
     const uint8_t *w = (const uint8_t *)t->weights;
     const uint8_t *bs = (const uint8_t *)t->bscale;
     if (S == 1) {
-        nvfp4_gemv_dispatch(ctx->y, ctx->x, w, bs, t->gscale, I, O, ctx->stream);
+        nvfp4_gemv_dispatch(ctx->y, ctx->x, w, bs, t->gscale, I, O, ctx->stream, /*expert=*/0);
     } else {
         dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
         nvfp4_matmul<<<grid, 128, 0, ctx->stream>>>(ctx->y, ctx->x, w, bs, t->gscale, S, I, O);
@@ -1821,10 +1829,10 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     if(S==1&&!s_tiled){
-        nvfp4_gemv_dispatch(ctx->gate,ctx->x,gw,gbs,gg,D,I,ctx->stream);
-        nvfp4_gemv_dispatch(ctx->up,  ctx->x,uw,ubs,ug,D,I,ctx->stream);
+        nvfp4_gemv_dispatch(ctx->gate,ctx->x,gw,gbs,gg,D,I,ctx->stream,1);
+        nvfp4_gemv_dispatch(ctx->up,  ctx->x,uw,ubs,ug,D,I,ctx->stream,1);
         act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
-        nvfp4_gemv_dispatch(ctx->y,ctx->gate,dw,dbs,dg,I,D,ctx->stream);
+        nvfp4_gemv_dispatch(ctx->y,ctx->gate,dw,dbs,dg,I,D,ctx->stream,1);
     }else{
         // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32), the same
         // #90 fix the relu2 expert already had: at prefill this expert sees only
@@ -1933,11 +1941,11 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
         for(int r=0;r<S;r++){
             const float *xr=ctx->x+(size_t)r*D; float *tr=ctx->up+(size_t)r*I; float *yr=ctx->y+(size_t)r*D;
             // t = up·x  → tr [I]
-            nvfp4_gemv_dispatch(tr,xr,uw,ubs,ug,D,I,ctx->stream);
+            nvfp4_gemv_dispatch(tr,xr,uw,ubs,ug,D,I,ctx->stream,1);
             // t = relu(t)²
             relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tr,(size_t)I);
             // y = down·t → yr [D]
-            nvfp4_gemv_dispatch(yr,tr,dw,dbs,dg,I,D,ctx->stream);
+            nvfp4_gemv_dispatch(yr,tr,dw,dbs,dg,I,D,ctx->stream,1);
         }
     }else{
         // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32): reads each
@@ -2247,9 +2255,9 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
         // This expert's slice of the pooled buffers: rows [off, off+r).
         float *xc=ctx->x+(size_t)off*D,*tc=ctx->up+(size_t)off*I,*yc=ctx->y+(size_t)off*D;
         if(r==1&&!s_tiled){
-            nvfp4_gemv_dispatch(tc,xc,uw,ubs,ug,D,I,ctx->stream);
+            nvfp4_gemv_dispatch(tc,xc,uw,ubs,ug,D,I,ctx->stream,1);
             relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tc,(size_t)I);
-            nvfp4_gemv_dispatch(yc,tc,dw,dbs,dg,I,D,ctx->stream);
+            nvfp4_gemv_dispatch(yc,tc,dw,dbs,dg,I,D,ctx->stream,1);
         }else{
             dim3 hidden((unsigned)((I+63)/64),(unsigned)((r+15)/16));
             dim3 output((unsigned)((D+63)/64),(unsigned)((r+15)/16));

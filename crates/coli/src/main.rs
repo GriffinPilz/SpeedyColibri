@@ -583,7 +583,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
-    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
+    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, model.resident_bytes());
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
         println!("prefetch: speculative next-layer prefetch on (top-{topn}/layer)");
@@ -834,7 +834,7 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     );
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
-    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32);
+    wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, model.resident_bytes());
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn);
     }
@@ -2181,6 +2181,7 @@ fn wire_adaptive_cache<P>(
     provider: &std::sync::Arc<colibri_engine::ExpertCache<P>>,
     cfg: &colibri_core::Config,
     ebits: u32,
+    resident: u64,
 ) where
     P: colibri_engine::ExpertProvider + Send + Sync + 'static,
 {
@@ -2226,21 +2227,21 @@ fn wire_adaptive_cache<P>(
     // streaming tail as a second tier. Holding more *thrashes*: filling ~101 GB collapsed
     // M3 decode to ~0.7 tok/s (memory-ceiling-is-real / autopin-single-node-negative).
     // Both regime targets above are fractions of MemTotal, which is blind to how much RAM
-    // the MODEL already took. That held while every arch's resident set was small next to
-    // the box (GLM ~19 GB of 121, so a 40 GB cache totals ~59). Kimi-K3's resident set is
-    // ~65 GB, so the same 40 GB cap totals ~105 GB and earlyoom SIGTERMs the process
-    // mid-forward — measured at 103 GB max RSS.
+    // the MODEL itself took. That held while every arch's resident set was small next to
+    // the box — GLM's ~19 GB plus a 40 GB cache is ~59 GB of 121. Kimi-K3's resident set
+    // is ~63 GB, so the same 40 GB cap totals ~103 GB, which is exactly the max RSS at
+    // which earlyoom SIGTERMed it mid-forward.
     //
-    // `available_ram_bytes` is read HERE, after `load_model_with` has materialized the
-    // dense weights, so it already excludes them — exactly the number MemTotal isn't.
-    // Capping by it makes the budget resident-aware without double-counting: it is a
-    // no-op for a small-resident model (GLM has ~100 GB available at this point, so the
-    // MemTotal/3 cap still binds) and it is what keeps K3 inside the box.
-    let avail_headroom = colibri_engine::available_ram_bytes()
-        .map(|a| a.saturating_sub(ADAPTIVE_FILL_RESERVE))
-        .unwrap_or(u64::MAX);
+    // Budget against the model's ACTUAL resident bytes, not `MemAvailable`. MemAvailable
+    // read here looks generous for two reasons that both resolve later: the expert cache
+    // has not filled yet, and the page cache left over from reading the weights counts as
+    // available. `resident` does not move.
+    //
+    // No-op for a small-resident model (GLM: 121 - 19 - 20 = 82, so the MemTotal/3 cap
+    // still binds); binding for K3 (121 - 63 - 20 = 38).
+    let headroom = total.saturating_sub(resident).saturating_sub(ADAPTIVE_FILL_RESERVE);
     let fill_target =
-        if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR }.min(avail_headroom);
+        if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR }.min(headroom);
     // fadvise auto-engages only for a near-fit model; ≫-RAM keeps the page cache.
     if near_fit {
         colibri_safetensors::set_fadvise(true);

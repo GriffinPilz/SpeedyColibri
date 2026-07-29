@@ -690,10 +690,150 @@ pub struct Model {
     pub mtp: Option<MtpHead>,
 }
 
+impl Layer {
+    /// Resident bytes this layer holds — every weight and norm it owns. Routed experts
+    /// are not here (they stream), which is exactly the split `Model::resident_bytes`
+    /// needs to budget the expert cache against.
+    ///
+    /// Enumerated per field like `mark_gpu_eligible`, and wrong in the same silent way if
+    /// a new arch's tensors are forgotten: the budget simply comes out too generous. The
+    /// unit test asserts the count of fields covered here matches the struct.
+    pub fn resident_bytes(&self) -> u64 {
+        let q = |t: &QTensor| t.bytes().max(0) as u64;
+        let oq = |t: &Option<QTensor>| t.as_ref().map(&q).unwrap_or(0);
+        let v = |x: &Vec<f32>| (x.len() * 4) as u64;
+        0
+            + q(&self.q_a)
+            + q(&self.q_b)
+            + q(&self.kv_a)
+            + q(&self.kv_b)
+            + q(&self.o)
+            + q(&self.gate_proj)
+            + q(&self.up_proj)
+            + q(&self.down_proj)
+            + q(&self.sh_gate)
+            + q(&self.sh_up)
+            + q(&self.sh_down)
+            + oq(&self.q_proj)
+            + oq(&self.k_proj)
+            + oq(&self.v_proj)
+            + oq(&self.qkv_proj)
+            + oq(&self.idx_q_proj)
+            + oq(&self.idx_k_proj)
+            + oq(&self.ix_wk)
+            + oq(&self.ix_wq)
+            + oq(&self.ix_wp)
+            + oq(&self.mamba_in_proj)
+            + oq(&self.mamba_out_proj)
+            + oq(&self.fc1_latent)
+            + oq(&self.fc2_latent)
+            + oq(&self.attn_gate)
+            + oq(&self.kda_b_proj)
+            + oq(&self.kda_f_a)
+            + oq(&self.kda_f_b)
+            + v(&self.in_ln)
+            + v(&self.post_ln)
+            + v(&self.q_a_ln)
+            + v(&self.kv_a_ln)
+            + v(&self.q_norm)
+            + v(&self.k_norm)
+            + v(&self.idx_q_norm)
+            + v(&self.idx_k_norm)
+            + v(&self.router)
+            + v(&self.router_bias)
+            + v(&self.ix_knorm_w)
+            + v(&self.ix_knorm_b)
+            + v(&self.mamba_conv_w)
+            + v(&self.mamba_conv_b)
+            + v(&self.mamba_a_log)
+            + v(&self.mamba_d)
+            + v(&self.mamba_dt_bias)
+            + v(&self.mamba_norm)
+            + v(&self.kda_conv_q)
+            + v(&self.kda_conv_k)
+            + v(&self.kda_conv_v)
+            + v(&self.kda_a_log)
+            + v(&self.kda_dt_bias)
+            + v(&self.kda_o_norm)
+            + v(&self.attn_res_norm)
+            + v(&self.attn_res_proj)
+            + v(&self.mlp_res_norm)
+            + v(&self.mlp_res_proj)
+            + v(&self.routed_expert_norm)
+    }
+}
+
 impl Model {
     /// Convenience accessor for the config.
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Bytes of dense weight this model holds resident for its lifetime: embeddings,
+    /// lm_head, and every per-layer tensor. Routed experts are NOT counted — they stream
+    /// through the [`crate::ExpertCache`], which is precisely what this number is used to
+    /// budget.
+    ///
+    /// Exists because `MemAvailable` is the wrong input for that budget. Read right after
+    /// the load it looks generous — the expert cache has not filled yet, and reclaimable
+    /// page cache from reading the weights counts as available — so a budget derived from
+    /// it overshoots. This is the number that does not move: Kimi-K3 is ~63 GB of a
+    /// 121 GB box, where GLM is ~19, and that difference is the whole reason the same
+    /// `MemTotal/3` cache budget fits one and gets the other OOM-killed.
+    pub fn resident_bytes(&self) -> u64 {
+        let mut n = self.embed.bytes().max(0) as u64 + self.lm_head.bytes().max(0) as u64;
+        n += (self.final_norm.len() * 4) as u64;
+        for l in &self.layers {
+            n += l.resident_bytes();
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod resident_bytes_tests {
+    use super::*;
+
+    /// `Layer::resident_bytes` must cover EVERY weight field on the struct.
+    ///
+    /// It is enumerated per field, like `mark_gpu_eligible`, and fails the same silent
+    /// way: forget a new arch's tensors and the number simply comes out too small, the
+    /// expert-cache budget too generous, and the process gets OOM-killed on a model
+    /// nobody re-checked. This counts the fields in the struct definition and compares
+    /// against the number the function sums, so adding a field without adding it there
+    /// fails here rather than in production.
+    #[test]
+    fn resident_bytes_covers_every_weight_field() {
+        let src = include_str!("model.rs");
+        let start = src.find("pub struct Layer {").expect("Layer struct");
+        let body = &src[start..start + src[start..].find("\n}").expect("struct end")];
+        let n_fields = body.matches(": QTensor").count()
+            + body.matches(": Option<QTensor>").count()
+            + body.matches(": Vec<f32>").count();
+
+        let fstart = src.find("pub fn resident_bytes(&self) -> u64 {").expect("fn");
+        let fbody = &src[fstart..fstart + src[fstart..].find("\n    }").expect("fn end")];
+        let n_summed =
+            fbody.matches("q(&self.").count() + fbody.matches("v(&self.").count();
+
+        assert_eq!(
+            n_summed, n_fields,
+            "Layer::resident_bytes sums {n_summed} fields but the struct has {n_fields} \
+             weight fields — a new one was added without being counted"
+        );
+    }
+
+    /// A layer with nothing in it costs nothing; one with a weight costs its bytes.
+    #[test]
+    fn resident_bytes_counts_what_is_present() {
+        let empty = Layer::default();
+        assert_eq!(empty.resident_bytes(), 0, "an empty layer holds nothing");
+
+        let mut l = Layer::default();
+        l.in_ln = vec![0.0; 16]; // 64 bytes
+        l.attn_gate = Some(QTensor { fmt_code: 1, o: 4, i: 8, ..Default::default() });
+        // int8: o*i codes + o f32 scales = 32 + 16 = 48
+        assert_eq!(l.resident_bytes(), 64 + 48);
     }
 }
 

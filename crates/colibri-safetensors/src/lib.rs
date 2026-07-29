@@ -241,6 +241,17 @@ pub fn batch_pool_profile() -> (u64, u64, u64) {
     )
 }
 
+/// `(lookup_us, mincore_us, alloc_us, spans)` — the sub-phases of span-setup.
+pub fn span_profile() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SPAN_LOOKUP_US.load(Relaxed),
+        SPAN_MINCORE_US.load(Relaxed),
+        SPAN_ALLOC_US.load(Relaxed),
+        SPAN_COUNT.load(Relaxed),
+    )
+}
+
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
 pub struct StTensor {
@@ -790,9 +801,14 @@ impl Shards {
         for grp in groups {
             let n = grp.len();
             let mut meta = Vec::with_capacity(n);
+            let t_lookup = std::time::Instant::now();
             for &nm in grp.iter() {
                 let t = self.tensor(nm)?;
                 meta.push((t.file_idx, t.off, t.nbytes));
+            }
+            if prof {
+                SPAN_LOOKUP_US
+                    .fetch_add(t_lookup.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by_key(|&i| (meta[i].0, meta[i].1));
@@ -818,7 +834,14 @@ impl Shards {
                 // view into the shard's mapping rather than allocating a buffer and
                 // memcpy'ing the same bytes into it. `read_len: 0` marks the span as
                 // needing no I/O, and the job builder below skips views.
-                if let Some(map) = self.mapped_view(file, off0, span_len) {
+                let t_mc = std::time::Instant::now();
+                let view = self.mapped_view(file, off0, span_len);
+                if prof {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    SPAN_MINCORE_US.fetch_add(t_mc.elapsed().as_micros() as u64, Relaxed);
+                    SPAN_COUNT.fetch_add(1, Relaxed);
+                }
+                if let Some(map) = view {
                     // SAFETY: `mapped_view` checked the range lies inside the mapping and
                     // that every page of it is resident, and the `Arc<Mapping>` moved into
                     // the buffer keeps it alive for as long as any view survives.
@@ -856,7 +879,14 @@ impl Shards {
                 } else {
                     span_len
                 };
+                let t_alloc = std::time::Instant::now();
                 let mut buf = SharedBuf::with_len(read_len + extra);
+                if prof {
+                    SPAN_ALLOC_US.fetch_add(
+                        t_alloc.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 // Skew is derived from the *actual* allocation: `SharedBuf` recycles
                 // pooled buffers, so alignment varies between calls and cannot be
                 // assumed.

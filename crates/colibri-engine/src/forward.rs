@@ -1351,6 +1351,14 @@ where
                 ms(&crate::cache::CACHE_INSERT_US),
                 ms(&crate::cache::CACHE_EVICT_US),
             );
+            let (lu, mc, al, spans) = colibri_safetensors::span_profile();
+            eprintln!(
+                "[profile] span-setup breakdown: {} spans | tensor-lookup {:.0} ms | mincore {:.0} ms | alloc {:.0} ms",
+                spans,
+                lu as f64 / 1e3,
+                mc as f64 / 1e3,
+                al as f64 / 1e3,
+            );
             let (calls, threads, spawn) = colibri_safetensors::batch_pool_profile();
             eprintln!(
                 "[profile] drain pool: {} batches, {} OS threads created ({:.0}/batch) | spawn-issue {:.0} ms",

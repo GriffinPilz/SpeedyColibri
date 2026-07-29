@@ -1342,6 +1342,23 @@ where
                 post as f64 / 1e3,
                 cache,
             );
+            // Decompose the `cache+other` residual. `build` is what `experts_batch`
+            // costs on top of the reader — per-expert construction from the bytes.
+            eprintln!(
+                "[profile] cache breakdown: miss-filter {:.0} ms | build {:.0} ms | insert {:.0} ms | evict {:.0} ms",
+                ms(&crate::cache::CACHE_FILTER_US),
+                ms(&crate::cache::CACHE_FETCH_US) - (setup + drain + post) as f64 / 1e3,
+                ms(&crate::cache::CACHE_INSERT_US),
+                ms(&crate::cache::CACHE_EVICT_US),
+            );
+            let (calls, threads, spawn) = colibri_safetensors::batch_pool_profile();
+            eprintln!(
+                "[profile] drain pool: {} batches, {} OS threads created ({:.0}/batch) | spawn-issue {:.0} ms",
+                calls,
+                threads,
+                if calls > 0 { threads as f64 / calls as f64 } else { 0.0 },
+                spawn as f64 / 1e3,
+            );
         }
         eprintln!(
             "[profile] moe-compute breakdown: router {:.0} ms | gather {:.0} ms | gpu-ffn(+sync) {:.0} ms | scatter {:.0} ms | shared {:.0} ms",

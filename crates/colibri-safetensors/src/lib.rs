@@ -188,6 +188,17 @@ pub static BATCH_POST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// the divisor for "achieved GB/s" without needing a second process to watch /sys.
 pub static BATCH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BATCH_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Number of `read_raw_shared_batched` calls. The drain spawns a fresh `thread::scope`
+/// pool per call, so this times the thread count is how many OS threads a run creates
+/// — the suspected owner of the gap between the reader's own 9.6 GB/s and the 11.6 GB/s
+/// the device reports while busy.
+pub static BATCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Wall time (µs) the drain spends inside `thread::scope` issuing spawns, summed. Not
+/// all of it is lost — workers start as they are created — but it bounds the ramp.
+pub static BATCH_SPAWN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// OS threads the drain actually created, summed over calls (`nt` is clamped to the job
+/// count, so this is not simply calls x the configured thread count).
+pub static BATCH_THREADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn profile_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -203,6 +214,17 @@ pub fn batch_profile() -> (u64, u64, u64, u64, u64) {
         BATCH_POST_US.load(Relaxed),
         BATCH_BYTES.load(Relaxed),
         BATCH_JOBS.load(Relaxed),
+    )
+}
+
+/// `(calls, threads_created, spawn_us)` — how many drain pools a run created, how many
+/// OS threads that cost in total, and how long issuing the spawns took.
+pub fn batch_pool_profile() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BATCH_CALLS.load(Relaxed),
+        BATCH_THREADS.load(Relaxed),
+        BATCH_SPAWN_US.load(Relaxed),
     )
 }
 
@@ -895,6 +917,7 @@ impl Shards {
             let err: Mutex<Option<io::Error>> = Mutex::new(None);
             let (jobs_ref, cursor_ref, err_ref) = (&jobs, &cursor, &err);
             std::thread::scope(|scope| {
+                let t_spawn = std::time::Instant::now();
                 for _ in 0..nt {
                     scope.spawn(move || loop {
                         let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
@@ -911,6 +934,12 @@ impl Shards {
                             *err_ref.lock().unwrap() = Some(e);
                         }
                     });
+                }
+                if prof {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    BATCH_SPAWN_US.fetch_add(t_spawn.elapsed().as_micros() as u64, Relaxed);
+                    BATCH_CALLS.fetch_add(1, Relaxed);
+                    BATCH_THREADS.fetch_add(nt as u64, Relaxed);
                 }
             });
             if let Some(e) = err.into_inner().unwrap() {

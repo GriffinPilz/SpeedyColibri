@@ -428,6 +428,18 @@ impl<P: ExpertProvider + Sync> ExpertProvider for ExpertCache<P> {
     }
 }
 
+/// Phases of [`ExpertCache::load_batch`], µs, under `COLI_PROFILE=1`. Together with the
+/// reader's own span-setup/drain/post these fully account for `expert-load`, so the
+/// drive-idle portion of that window can be attributed to a phase instead of inferred.
+///
+/// `FETCH` brackets `experts_batch` — it *contains* the reader's time, so the
+/// interesting quantity is `FETCH - (setup+drain+post)`: per-expert construction on top
+/// of the bytes. `EVICT` is the one to watch structurally: it is O(entries) per victim.
+pub(crate) static CACHE_FILTER_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CACHE_FETCH_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CACHE_INSERT_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CACHE_EVICT_US: AtomicU64 = AtomicU64::new(0);
+
 /// Minimum routed-expert count for the prefill prefetch-ahead to fire — separates
 /// prefill (routes to ~all `n_experts`) from decode (top-k per token, ~8).
 const PREFETCH_AHEAD_MIN: usize = 64;
@@ -490,6 +502,11 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
     /// Loads aren't router selections — the compute loop's `expert` call then hits
     /// and records the selection.
     fn load_batch(&self, layer: usize, eids: &[usize]) -> io::Result<()> {
+        // Phase timers (COLI_PROFILE=1 only). `expert-load` minus the reader's own
+        // setup/drain/post leaves ~2.1 s unaccounted on a 14.4 s GLM run — time with
+        // the drive completely idle. Guessing put that on eviction; measure it instead.
+        let prof = crate::forward::profile_on();
+        let t = std::time::Instant::now();
         let missing: Vec<usize> = {
             let s = self.state.lock().unwrap();
             eids.iter()
@@ -497,6 +514,9 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
                 .filter(|&e| !s.entries.contains_key(&(layer, e)))
                 .collect()
         };
+        if prof {
+            CACHE_FILTER_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         if missing.is_empty() {
             return Ok(());
         }
@@ -505,6 +525,7 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
         // continuously-streaming reader by default (COLI_READER_POOL=0 disables);
         // on any batch error fall back to best-effort per-expert loads (a failure
         // otherwise surfaces when the compute loop calls `expert`).
+        let t = std::time::Instant::now();
         let loaded: Vec<(usize, Arc<Expert>)> = match self.inner.experts_batch(layer, &missing) {
             Ok(exps) if exps.len() == missing.len() => {
                 missing.iter().copied().zip(exps).collect()
@@ -519,8 +540,12 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
                 v
             }
         };
+        if prof {
+            CACHE_FETCH_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
 
         // Serial bookkeeping: insert the batch, then a single protected eviction.
+        let t = std::time::Instant::now();
         let batch: HashSet<(usize, usize)> = missing.iter().map(|&e| (layer, e)).collect();
         let mut s = self.state.lock().unwrap();
         let clock = s.clock;
@@ -534,8 +559,15 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
             s.bytes += bytes;
             s.misses += 1;
         }
+        if prof {
+            CACHE_INSERT_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let t = std::time::Instant::now();
         let budget = self.budget.load(Ordering::Relaxed);
         s.evict_to_protecting(budget, &batch);
+        if prof {
+            CACHE_EVICT_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         Ok(())
     }
 }

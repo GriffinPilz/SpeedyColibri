@@ -1325,6 +1325,24 @@ where
             ms(&EMBED_US),
             logits_us as f64 / 1e3,
         );
+        // Split `expert-load` into what the reader did and what the cache did. GLM
+        // moves 117.6 GB per run at 11.6 GB/s measured on the device — 10.1 s of a
+        // 14.3 s expert-load — so ~4 s of that window has no request in flight. This
+        // line says which phase owns it instead of leaving it to inference.
+        {
+            let (setup, drain, post, bytes, njobs) = colibri_safetensors::batch_profile();
+            let cache = ms(&LOAD_US) - (setup + drain + post) as f64 / 1e3;
+            eprintln!(
+                "[profile] expert-load breakdown: span-setup {:.0} ms | drain {:.0} ms ({:.2} GB in {} jobs, {:.2} GB/s) | post {:.0} ms | cache+other {:.0} ms",
+                setup as f64 / 1e3,
+                drain as f64 / 1e3,
+                bytes as f64 / 1e9,
+                njobs,
+                if drain > 0 { bytes as f64 / 1e3 / drain as f64 } else { 0.0 },
+                post as f64 / 1e3,
+                cache,
+            );
+        }
         eprintln!(
             "[profile] moe-compute breakdown: router {:.0} ms | gather {:.0} ms | gpu-ffn(+sync) {:.0} ms | scatter {:.0} ms | shared {:.0} ms",
             ms(&ROUTER_US),

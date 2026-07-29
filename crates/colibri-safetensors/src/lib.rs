@@ -167,6 +167,45 @@ fn uring_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_IO_URING").ok().as_deref() == Some("1"))
 }
 
+/// Wall time (µs) inside `read_raw_shared_batched`, split three ways. Only
+/// accumulated under `COLI_PROFILE=1`.
+///
+/// Why this exists: the engine's `expert-load` timer brackets the whole
+/// `provider.prefetch` call, so a slow *anything* in there — cache bookkeeping,
+/// eviction, span setup, the reads themselves — reports as one number. Measuring the
+/// drive directly (delta `/sys/block/nvme0n1/stat` around a run) showed GLM moving
+/// 117.6 GB at 11.7 GB/s while `expert-load` was 14.2 s: only ~10 s of that window
+/// had a request in flight. Attributing the rest needs the phases named, not guessed
+/// at — the last two times I guessed at where time went in this path I was wrong.
+///
+/// `SETUP` covers tensor lookup, span coalescing and buffer allocation (drive idle);
+/// `DRAIN` is the thread pool actually reading; `POST` is fadvise plus the Arc/view
+/// rebuild. `LOAD_US - (SETUP+DRAIN+POST)` is then everything the cache did.
+pub static BATCH_SETUP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BATCH_DRAIN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BATCH_POST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes the drain phase asked the kernel for, and how many jobs it split them into —
+/// the divisor for "achieved GB/s" without needing a second process to watch /sys.
+pub static BATCH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BATCH_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn profile_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_PROFILE").ok().as_deref() == Some("1"))
+}
+
+/// `(setup_us, drain_us, post_us, bytes, jobs)` — for the profile print.
+pub fn batch_profile() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BATCH_SETUP_US.load(Relaxed),
+        BATCH_DRAIN_US.load(Relaxed),
+        BATCH_POST_US.load(Relaxed),
+        BATCH_BYTES.load(Relaxed),
+        BATCH_JOBS.load(Relaxed),
+    )
+}
+
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
 pub struct StTensor {
@@ -709,6 +748,8 @@ impl Shards {
             buf: SharedBuf,
         }
         let dio = o_direct_enabled();
+        let prof = profile_on();
+        let t_setup = std::time::Instant::now();
         let mut spans: Vec<Span> = Vec::new();
         let mut mapping: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(groups.len());
         for grp in groups {
@@ -839,6 +880,13 @@ impl Shards {
         // GB/s against threaded pread's 8.12 on this drive. Any failure (no privileges,
         // no direct fd, a short read) returns false and the pool below redoes the batch,
         // so this can only fail to accelerate, never to complete.
+        if prof {
+            use std::sync::atomic::Ordering::Relaxed;
+            BATCH_SETUP_US.fetch_add(t_setup.elapsed().as_micros() as u64, Relaxed);
+            BATCH_BYTES.fetch_add(jobs.iter().map(|j| j.len as u64).sum::<u64>(), Relaxed);
+            BATCH_JOBS.fetch_add(jobs.len() as u64, Relaxed);
+        }
+        let t_drain = std::time::Instant::now();
         let uring_done = o_direct_enabled() && uring_enabled() && self.drain_jobs_uring(&jobs, nthreads);
         if !jobs.is_empty() && !uring_done {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -870,6 +918,14 @@ impl Shards {
             }
         }
 
+        let t_post = std::time::Instant::now();
+        if prof {
+            BATCH_DRAIN_US.fetch_add(
+                t_drain.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
         // 3. Release the page-cache copy of everything we just streamed. Done after
         //    the join so each span is advised once as a whole range rather than per
         //    2 MiB job, and only once the bytes are safely in our own buffer.
@@ -881,7 +937,7 @@ impl Shards {
 
         // 4. Arc-wrap each span, then rebuild the per-group name views.
         let arcs: Vec<Arc<SharedBuf>> = spans.into_iter().map(|s| Arc::new(s.buf)).collect();
-        Ok(mapping
+        let out = mapping
             .into_iter()
             .map(|names_map| {
                 names_map
@@ -889,7 +945,14 @@ impl Shards {
                     .map(|(si, off, len)| (arcs[si].clone(), off, len))
                     .collect()
             })
-            .collect())
+            .collect();
+        if prof {
+            BATCH_POST_US.fetch_add(
+                t_post.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(out)
     }
 
     /// Read a slice of a tensor: `n_elems` starting at element `elem_off`. Used

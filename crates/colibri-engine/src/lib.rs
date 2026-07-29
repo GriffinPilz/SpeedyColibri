@@ -874,8 +874,43 @@ pub fn load_model_with(
     // tens of GB — so cache coverage is the scarce resource, not matmul latency.
     // `COLI_DEVICE_WEIGHTS=0` disables it for every arch — the A/B handle for "does this
     // buy speed, or just cost the expert cache RAM it could have used?"
-    let device_cache_weights = model.cfg.arch != Arch::KimiK3
-        && std::env::var("COLI_DEVICE_WEIGHTS").ok().as_deref() != Some("0");
+    let device_cache_weights =
+        std::env::var("COLI_DEVICE_WEIGHTS").ok().as_deref() != Some("0");
+
+    // HOW the eligible weights reach the GPU, decided from this model's own footprint.
+    //
+    // Uploading gives the kernel device memory but spends the resident bytes TWICE — on
+    // GB10 "VRAM" is the same physical RAM, so the duplicate competes with the expert
+    // cache. That is invisible at GLM's ~19 GB and fatal at K3's ~63 GB, where it left
+    // ~3 GB free and earlyoom killed the process mid-forward.
+    //
+    // So: upload while the duplicate plus a working cache still fits, otherwise wrap the
+    // host buffers and read them in place. Wrapping is slower per access (~51 vs
+    // ~273 GB/s) but it keeps the matmuls ON the GPU, and falling off the GPU entirely
+    // measured 6.8x slower on nemotron decode — the trade is not close.
+    #[cfg(feature = "cuda")]
+    if device_cache_weights {
+        let resident = model.resident_bytes();
+        let total = cache::total_ram_bytes().unwrap_or(u64::MAX);
+        // Room for the weights, their device duplicate, and a cache worth having.
+        const MIN_CACHE: u64 = 24 << 30;
+        let fits = total.saturating_sub(resident.saturating_mul(2)) >= MIN_CACHE;
+        let mode = if fits {
+            gpu::WeightResidency::Upload
+        } else {
+            gpu::WeightResidency::ZeroCopy
+        };
+        eprintln!(
+            "[gpu] resident weights: {} ({} GB resident, {} GB RAM)",
+            match mode {
+                gpu::WeightResidency::Upload => "device copy",
+                gpu::WeightResidency::ZeroCopy => "zero-copy (host buffers read in place)",
+            },
+            resident >> 30,
+            total >> 30
+        );
+        gpu::set_weight_residency(mode);
+    }
     if device_cache_weights {
         model.embed.gpu_eligible = true;
         model.lm_head.gpu_eligible = true;

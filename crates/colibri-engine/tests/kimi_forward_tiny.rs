@@ -340,39 +340,38 @@ fn kimi_routed_experts_load_in_latent_space() {
     assert_eq!(e.down.i as usize, MOE_INTER);
 }
 
-/// K3's resident weights must NOT be device-cached.
+/// K3's resident weights ARE GPU-eligible — the memory problem is solved by HOW they
+/// reach the GPU, not by keeping them off it.
 ///
-/// `try_matmul_qt` caches each eligible weight in a DEVICE buffer keyed by its host
-/// pointer. On GB10 "VRAM" is the same physical RAM as the host, so that is a second
-/// copy of every resident weight rather than a move. K3's resident set is ~53 GB against
-/// 121 GB total, so host + device left ~3 GB and earlyoom SIGTERMed the first real
-/// forward pass (RSS plateaued at 65 GB while MemAvailable fell to 4 — the tell that the
-/// growth was outside RSS).
+/// The first cut excluded K3 from `mark_gpu_eligible` entirely, because uploading a
+/// device copy of its ~63 GB resident set left ~3 GB free on a 121 GB box and earlyoom
+/// killed the process. But dropping off the GPU is its own disaster: measured 6.8x slower
+/// on nemotron decode, because `try_matmul_qt` declining sends the weight to the
+/// single-threaded CPU matmul.
 ///
-/// The completeness guard that used to live here — every K3 projection present in
-/// `mark_gpu_eligible` — moved into that function's own unit test, since K3 no longer
-/// calls it. Both matter: this pins the policy, that one pins the list for whenever a
-/// device-cache budget makes K3 eligible again.
+/// So eligibility is universal again and `WeightResidency` decides the form: upload while
+/// the duplicate still fits, otherwise wrap the host buffers and read them in place. This
+/// pins the eligibility half; the residency choice needs a CUDA device to exercise.
 #[test]
-fn kimi_resident_weights_are_not_device_cached() {
+fn kimi_resident_weights_are_gpu_eligible() {
     let dir = temp_dir();
     let model = tiny_model(&dir);
     let mut checked = 0usize;
     for (li, l) in model.layers.iter().enumerate() {
         for (name, t) in [("o", &l.o), ("gate_proj", &l.gate_proj), ("sh_gate", &l.sh_gate)] {
             if t.o > 0 && t.i > 0 {
-                assert!(!t.gpu_eligible, "L{li} {name} must not be device-cached on K3");
+                assert!(t.gpu_eligible, "L{li} {name} should be GPU-eligible");
                 checked += 1;
             }
         }
         for (name, t) in [("q_proj", &l.q_proj), ("attn_gate", &l.attn_gate)] {
             if let Some(t) = t {
-                assert!(!t.gpu_eligible, "L{li} {name} must not be device-cached on K3");
+                assert!(t.gpu_eligible, "L{li} {name} should be GPU-eligible");
                 checked += 1;
             }
         }
     }
-    assert!(!model.embed.gpu_eligible, "embed must not be device-cached on K3");
-    assert!(!model.lm_head.gpu_eligible, "lm_head must not be device-cached on K3");
+    assert!(model.embed.gpu_eligible, "embed should be GPU-eligible");
+    assert!(model.lm_head.gpu_eligible, "lm_head should be GPU-eligible");
     assert!(checked >= 10, "expected many weights to check, saw {checked}");
 }

@@ -45,6 +45,11 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
 /* Zero-copy wrap: point at host (RAM) buffers directly instead of copying to
  * device memory. Only valid on unified-memory devices with pageable host access
  * (the GB10). Weights stay in their on-disk layout. No device allocation. */
+/* Resident-weight residency: 0 = upload a device copy (fast reads, costs a second
+ * copy of every weight), 1 = wrap the host buffer and read it in place (free, slower
+ * reads). See the definition for why Kimi-K3 forces the choice. */
+COLI_CUDA_DLLEXPORT void coli_cuda_set_weight_zerocopy(int on);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);

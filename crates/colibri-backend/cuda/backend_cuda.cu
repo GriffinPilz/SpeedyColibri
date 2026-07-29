@@ -1339,11 +1339,33 @@ extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64
     if(d2h_ms) *d2h_ms=g_group_d2h_ms;
 }
 
+/* Resident-weight residency mode (see coli_cuda_set_weight_zerocopy). 0 = upload a
+ * device copy; 1 = wrap the host buffer and read it in place. */
+static int g_weight_zerocopy = 0;
+
+/* Choose how coli_cuda_tensor_upload materializes a resident weight.
+ *
+ * Uploading gives the kernel device memory (~273 GB/s) at the cost of a SECOND copy of
+ * every resident weight — and on GB10 "VRAM" is the same physical RAM, so that copy is
+ * charged against the expert cache's budget. Wrapping reads the host buffer in place
+ * (~51 GB/s, the path the streamed experts already take) for free.
+ *
+ * Kimi-K3 forces the choice: ~63 GB resident of a 121 GB box, so uploading leaves nothing
+ * for the expert cache and the process is OOM-killed mid-forward. Wrapping is slower per
+ * access but keeps the matmuls ON the GPU, and falling off the GPU entirely measured
+ * 6.8x slower on nemotron decode. */
+extern "C" void coli_cuda_set_weight_zerocopy(int on) { g_weight_zerocopy = on ? 1 : 0; }
+
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
     DeviceContext *ctx = find_ctx(device);
     if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    /* Zero-copy: hand back a wrapped tensor pointing at the host buffers. Every kernel
+     * below reads `t->weights` the same way either path; only the pointer's provenance
+     * differs, and pageable access makes a host pointer legal. */
+    if (g_weight_zerocopy && !*tensor)
+        return coli_cuda_tensor_wrap(tensor, weights, scales, fmt, I, O, device);
     size_t rb = row_bytes(fmt, I);
     if (!rb || (fmt && !scales)) return 0;
     if (*tensor) {

@@ -67,6 +67,7 @@ extern "C" {
         device: c_int,
     ) -> c_int;
     fn coli_cuda_pageable_access(device: c_int) -> c_int;
+    fn coli_cuda_set_weight_zerocopy(on: c_int);
     fn coli_cuda_matmul(
         tensor: *mut *mut ColiCudaTensor,
         y: *mut f32,
@@ -296,6 +297,12 @@ pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
 /// Whether `device` can read pageable host memory directly (coherent unified
 /// memory like the GB10). When true, the zero-copy [`ResidentTensor::wrap_raw`]
 /// path avoids copying weights into device memory entirely.
+/// Whether `tensor_upload` wraps host buffers instead of copying to the device. Set once
+/// at load, before any matmul: an already-cached tensor keeps whichever form it got.
+pub fn set_weight_zerocopy(on: bool) {
+    unsafe { coli_cuda_set_weight_zerocopy(on as c_int) }
+}
+
 pub fn pageable_access(device: i32) -> bool {
     unsafe { coli_cuda_pageable_access(device) != 0 }
 }

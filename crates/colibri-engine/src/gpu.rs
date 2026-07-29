@@ -102,6 +102,55 @@ thread_local! {
     static GPU_ATTN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// How resident dense weights reach the GPU.
+///
+/// `try_matmul_qt` used to always UPLOAD: `cudaMalloc` + `cudaMemcpy` into a device
+/// buffer cached by host pointer. On GB10 "VRAM" is the same physical RAM as the host, so
+/// that is a second copy of every resident weight rather than a move — and it is charged
+/// against the same 121 GB the expert cache lives in.
+///
+/// The trade is real in both directions, so this is a choice rather than a default:
+///   * **Upload** — the kernel reads device memory (~273 GB/s measured) but the model's
+///     resident bytes are spent twice. Right when they fit.
+///   * **ZeroCopy** — `coli_cuda_tensor_wrap` points the kernel at the host buffer
+///     (~51 GB/s, the same path the streamed experts already take). Slower per access,
+///     but costs nothing. Right when Upload would not fit — and vastly better than the
+///     alternative of falling off the GPU entirely, which measured **6.8x** slower on
+///     nemotron decode.
+///
+/// Kimi-K3 is the case that forces it: ~63 GB resident of a 121 GB box, so uploading
+/// leaves no room for the expert cache and earlyoom kills the process mid-forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightResidency {
+    /// Device copy, cached by host pointer.
+    Upload,
+    /// Host buffer read in place — no device allocation.
+    ZeroCopy,
+}
+
+thread_local! {
+    static RESIDENCY: std::cell::Cell<WeightResidency> =
+        const { std::cell::Cell::new(WeightResidency::Upload) };
+}
+
+/// Choose how resident weights reach the GPU. Set once at load, before any forward pass.
+pub fn set_weight_residency(m: WeightResidency) {
+    RESIDENCY.with(|c| c.set(m));
+    if available() {
+        cuda::set_weight_zerocopy(m == WeightResidency::ZeroCopy && zerocopy());
+    }
+}
+
+/// The current mode; `ZeroCopy` degrades to `Upload` if the device cannot read pageable
+/// host memory (nothing else in the tree could work either, but be explicit).
+pub fn weight_residency() -> WeightResidency {
+    let m = RESIDENCY.with(|c| c.get());
+    if m == WeightResidency::ZeroCopy && !zerocopy() {
+        return WeightResidency::Upload;
+    }
+    m
+}
+
 /// Whether the zero-copy wrap path is usable: a CUDA device is available and it
 /// can read pageable host memory directly (probed once). `COLI_NO_ZEROCOPY=1`
 /// forces the copy path for A/B comparison.

@@ -81,11 +81,41 @@ fn pool_max() -> usize {
     })
 }
 
+/// Pool effectiveness: recycled / freshly allocated / returned / **rejected because the
+/// pool was full**.
+///
+/// These exist because the cap demonstrably binds and no model of the workload explains
+/// why. GLM coalesces one expert into one ~21 MB span and loads ~12.5 per batch, so the
+/// pool should oscillate between 0 and ~13 entries and never reach 32 — yet raising the
+/// cap from 32 to 4096 collapses eviction's `free` phase from 2057 ms to 1 ms, and
+/// disabling the pool entirely pushes it to 5506 ms. Something returns far more large
+/// buffers per batch than the span count predicts. `DROPS` names it directly: every
+/// rejected push is a real `munmap` of a >=1 MB buffer.
+pub static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static POOL_PUSHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static POOL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes rejected, so the drops can be read as memory traffic rather than a bare count.
+pub static POOL_DROP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(hits, misses, pushes, drops, drop_bytes)`.
+pub fn pool_profile() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        POOL_HITS.load(Relaxed),
+        POOL_MISSES.load(Relaxed),
+        POOL_PUSHES.load(Relaxed),
+        POOL_DROPS.load(Relaxed),
+        POOL_DROP_BYTES.load(Relaxed),
+    )
+}
+
 impl SharedBuf {
     /// A buffer of exactly `len` bytes: recycled from the pool when one with
     /// enough capacity is available (contents are stale, caller overwrites),
     /// freshly zero-allocated otherwise.
     pub fn with_len(len: usize) -> SharedBuf {
+        use std::sync::atomic::Ordering::Relaxed;
         if len >= POOL_MIN_BYTES {
             let mut pool = BUF_POOL.lock().unwrap();
             if let Some(i) = pool.iter().position(|v| v.capacity() >= len) {
@@ -94,8 +124,10 @@ impl SharedBuf {
                 // Stale bytes are fine: previously written, about to be overwritten.
                 v.truncate(len);
                 v.resize(len, 0);
+                POOL_HITS.fetch_add(1, Relaxed);
                 return SharedBuf { store: Store::Heap(v) };
             }
+            POOL_MISSES.fetch_add(1, Relaxed);
         }
         SharedBuf { store: Store::Heap(vec![0u8; len]) }
     }
@@ -141,9 +173,17 @@ impl Drop for SharedBuf {
         let Store::Heap(v) = &mut self.store else { return };
         let v = std::mem::take(v);
         if v.capacity() >= POOL_MIN_BYTES {
+            use std::sync::atomic::Ordering::Relaxed;
+            let cap = v.capacity() as u64;
             let mut pool = BUF_POOL.lock().unwrap();
             if pool.len() < pool_max() {
                 pool.push(v);
+                POOL_PUSHES.fetch_add(1, Relaxed);
+            } else {
+                // Rejected: `v` is dropped here, and at >=1 MB malloc served it via mmap,
+                // so this is a real munmap with page-table teardown — the 2057 ms.
+                POOL_DROPS.fetch_add(1, Relaxed);
+                POOL_DROP_BYTES.fetch_add(cap, Relaxed);
             }
         }
     }

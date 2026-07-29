@@ -1361,6 +1361,11 @@ where
                 mc as f64 / 1e3,
                 al as f64 / 1e3,
             );
+            let (ph, pm, pp, pd, pdb) = colibri_core::pool_profile();
+            eprintln!(
+                "[profile] buf pool: {ph} hits / {pm} misses | {pp} recycled / {pd} rejected ({:.1} GB re-freed)",
+                pdb as f64 / 1e9,
+            );
             let (calls, threads, spawn) = colibri_safetensors::batch_pool_profile();
             eprintln!(
                 "[profile] drain pool: {} batches, {} OS threads created ({:.0}/batch) | spawn-issue {:.0} ms",

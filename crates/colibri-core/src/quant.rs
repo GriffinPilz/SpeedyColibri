@@ -65,19 +65,56 @@ enum Store {
 unsafe impl Send for SharedBuf {}
 unsafe impl Sync for SharedBuf {}
 
-/// Recycled allocations, largest-capacity-agnostic FIFO. Bounded by
-/// [`pool_max`]; entries are ~uniform in practice (one expert span).
-static BUF_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+/// Recycled allocations plus the bytes they hold, so the pool can be bounded by size
+/// rather than by count. Tracked inside the mutex — no separate atomic to drift.
+#[derive(Default)]
+struct Pool {
+    bufs: Vec<Vec<u8>>,
+    bytes: u64,
+}
+
+static BUF_POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool { bufs: Vec::new(), bytes: 0 });
 
 /// Don't pool buffers smaller than this — tiny reads don't pay the fault cost.
 const POOL_MIN_BYTES: usize = 1 << 20;
 
-/// Max pooled entries (`COLI_BUF_POOL`, default 32 ≈ 600 MB of 18 MB experts;
-/// `0` disables recycling).
+/// Max pooled entries (`COLI_BUF_POOL`; `0` disables recycling).
+///
+/// **The default was 32 and that cost GLM 1.20x on expert-load.** A rejected return is
+/// not a no-op: at >= `POOL_MIN_BYTES` malloc served the buffer via `mmap`, so dropping
+/// it is a real `munmap` with page-table teardown, and it happens under the cache lock
+/// with the drive idle. Measured on 42b2, interleaved, token-identical:
+///
+/// | cap | expert-load | evict `free` | peak RSS |
+/// |---|---|---|---|
+/// | 0 | 18451 / 18259 ms | 5506 / 5270 ms | |
+/// | 32 | 14449 / 14411 ms | 2057 / 2045 ms | 59.8 GiB |
+/// | **64** | **12078 ms** | **18 ms** | **59.8 GiB** |
+/// | 4096 | 12064 / 12083 ms | 1 / 1 ms | |
+///
+/// 64 captures the whole win and 4096 adds nothing, so the knee is just above 32. RSS is
+/// **identical** at 32 and 64: the pool does not retain the extra memory, it only needs
+/// headroom not to reject returns. Default set to 2x the measured knee for models with
+/// more spans per batch than GLM's ~12.5.
 fn pool_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("COLI_BUF_POOL").ok().and_then(|s| s.parse().ok()).unwrap_or(32)
+        std::env::var("COLI_BUF_POOL").ok().and_then(|s| s.parse().ok()).unwrap_or(128)
+    })
+}
+
+/// Max **bytes** retained (`COLI_BUF_POOL_MB`, default 2048).
+///
+/// A count is the wrong unit here: entries range from 1 MB (K3's MXFP4 spans) to ~21 MB
+/// (GLM's coalesced experts), so the same cap means 128 MB for one model and 2.7 GB for
+/// another. This is the bound that actually protects the memory ceiling
+/// (see `memory-ceiling-is-real`); `pool_max` is a coarse secondary limit kept so the
+/// A/B above stays reproducible.
+fn pool_max_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_BUF_POOL_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(2048u64)
+            << 20
     })
 }
 
@@ -118,10 +155,12 @@ impl SharedBuf {
         use std::sync::atomic::Ordering::Relaxed;
         if len >= POOL_MIN_BYTES {
             let mut pool = BUF_POOL.lock().unwrap();
-            if let Some(i) = pool.iter().position(|v| v.capacity() >= len) {
-                let mut v = pool.swap_remove(i);
+            if let Some(i) = pool.bufs.iter().position(|v| v.capacity() >= len) {
+                let v = pool.bufs.swap_remove(i);
+                pool.bytes = pool.bytes.saturating_sub(v.capacity() as u64);
                 drop(pool);
                 // Stale bytes are fine: previously written, about to be overwritten.
+                let mut v = v;
                 v.truncate(len);
                 v.resize(len, 0);
                 POOL_HITS.fetch_add(1, Relaxed);
@@ -176,8 +215,9 @@ impl Drop for SharedBuf {
             use std::sync::atomic::Ordering::Relaxed;
             let cap = v.capacity() as u64;
             let mut pool = BUF_POOL.lock().unwrap();
-            if pool.len() < pool_max() {
-                pool.push(v);
+            if pool.bufs.len() < pool_max() && pool.bytes + cap <= pool_max_bytes() {
+                pool.bytes += cap;
+                pool.bufs.push(v);
                 POOL_PUSHES.fetch_add(1, Relaxed);
             } else {
                 // Rejected: `v` is dropped here, and at >=1 MB malloc served it via mmap,

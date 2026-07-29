@@ -351,6 +351,97 @@ __global__ static void nvfp4_gemv(float *y,const float *x,const uint8_t *w,
     if(lane==0) y[n]=acc*g;
 }
 
+/* Widest-read NVFP4 GEMV: one uint4 (16 B) per lane, 512 B per warp transaction.
+ *
+ * `nvfp4_gemv` gives one k to each lane and indexes `wr[k>>1]`, so lanes 2j/2j+1 fetch the
+ * SAME byte and a warp covers 16 B. `nvfp4_gemv_wide` gives each lane a byte: 32 B. Both
+ * are far under what the memory wants. Measured on GB10 with a pure read kernel over a
+ * real shard (mapbench2), bandwidth against access width:
+ *
+ *   4 B/lane (128 B/warp)   144.7 GB/s heap
+ *   16 B/lane (512 B/warp)  172.9 GB/s heap, 248.3 GB/s device-resident
+ *
+ * and the routed-expert gemv was measured at only ~110 GB/s, i.e. the KERNEL was the
+ * limit, not the memory. Hence 16 B/lane here.
+ *
+ * Layout: a uint4 spans 32 nibbles = 32 values of k, so it covers exactly TWO NVFP4
+ * block-16 scales — `v.x`/`v.y` take `br[2i]`, `v.z`/`v.w` take `br[2i+1]` — and the
+ * scale decode drops to 2 per 16 B instead of 1 per value.
+ *
+ * `x` IS staged in shared memory. A first version read it from global to free up
+ * occupancy, which was a mistake: each lane then pulls 32 consecutive x values (128 B) so
+ * a warp scatters over ~4 KB per step instead of broadcasting from shared, and the
+ * activation stream becomes the bottleneck the weight stream just stopped being. Measured
+ * on Nemotron decode: gpu-ffn flat but total moe 1271 -> 1503 ms, an 18% REGRESSION.
+ * Widen the weights, keep x shared.
+ *
+ * NOT bit-identical to `nvfp4_gemv`: per-lane k assignment changes the f32 reduction
+ * order, so results differ in the last ULPs. The caller must keep using the narrow kernel
+ * whenever `exact` is set (MTP verify), which is why this is a separate kernel and not a
+ * replacement. Requires `wr` 16 B aligned, i.e. `Kh % 16 == 0` and a 16 B aligned base;
+ * the caller checks both and falls back otherwise. */
+__global__ static void nvfp4_gemv_u4(float *y,const float *x,const uint8_t *w,
+                                     const uint8_t *bs,float g,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    const uint4 *wq=(const uint4*)wr;
+    int Kq=Kh>>4;                       /* whole uint4 groups; caller guarantees Kh%16==0 */
+    float acc=0.f;
+    for(int i=lane;i<Kq;i+=32){
+        uint4 v=wq[i];
+        int k0=i<<5;                    /* 32 values of k per uint4 */
+        float s0=e4m3f(br[k0>>4]);      /* k0 .. k0+15  */
+        float s1=e4m3f(br[(k0+16)>>4]); /* k0+16 .. k0+31 */
+        uint32_t word[4]={v.x,v.y,v.z,v.w};
+        #pragma unroll
+        for(int wi=0;wi<4;wi++){
+            float sc=(wi<2)?s0:s1;
+            int kb=k0+(wi<<3);
+            uint32_t wd=word[wi];
+            float part=0.f;
+            #pragma unroll
+            for(int bj=0;bj<4;bj++){
+                uint32_t byte=(wd>>(bj<<3))&0xFFu;
+                int kk=kb+(bj<<1);
+                part += xs[kk]*e2m1f(byte&0xF) + xs[kk+1]*e2m1f(byte>>4);
+            }
+            acc+=part*sc;
+        }
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* Can `nvfp4_gemv_u4` read this weight? Needs every row 16 B aligned.
+ * `COLI_NVFP4_U4=0` forces the narrow kernel, so the two can be A/B'd in one binary. */
+__host__ static inline int nvfp4_u4_ok(const uint8_t *w,int K){
+    static int s_on=-1;
+    if(s_on<0){const char*e=getenv("COLI_NVFP4_U4");s_on=e?atoi(e):1;}
+    if(!s_on) return 0;
+    int Kh=(K+1)>>1;
+    int ok = ((Kh & 15)==0) && ((((uintptr_t)w) & 15)==0);
+    /* Diagnostic (COLI_U4_REPORT=1): a silently-ineligible weight is indistinguishable
+     * from "the wide kernel is no faster", and expert weights are views at arbitrary
+     * safetensors offsets, so alignment is NOT a given. */
+    static int s_rep=-1; if(s_rep<0){const char*e=getenv("COLI_U4_REPORT");s_rep=e?atoi(e):0;}
+    if(s_rep){
+        static long long yes=0,no=0,no_kh=0,no_ptr=0;
+        if(ok) yes++; else { no++; if(Kh&15) no_kh++; if(((uintptr_t)w)&15) no_ptr++; }
+        if(((yes+no)%500)==0)
+            fprintf(stderr,"[u4] eligible=%lld ineligible=%lld (Kh%%16: %lld, ptr%%16: %lld)\n",
+                    yes,no,no_kh,no_ptr);
+    }
+    return ok;
+}
+
 /* Wide-read NVFP4 GEMV — RESIDENT weights only (S==1 decode).
  *
  * `nvfp4_gemv` above assigns one k per lane and indexes `wr[k>>1]`, so lanes 2j and 2j+1
@@ -2111,12 +2202,20 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
         int tpb=256,wpb=tpb>>5;
         for(int r=0;r<S;r++){
             const float *xr=ctx->x+(size_t)r*D; float *tr=ctx->up+(size_t)r*I; float *yr=ctx->y+(size_t)r*D;
-            // t = up·x  → tr [I]
-            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
+            // t = up·x  → tr [I].  The u4 kernel reads 512 B/warp against the narrow
+            // kernel's 16 B and is the decode hot path; `exact` (MTP verify) must keep the
+            // narrow one, whose reduction order sequential decode is gated against.
+            if(!exact && nvfp4_u4_ok(uw,D))
+                nvfp4_gemv_u4<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
+            else
+                nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
             // t = relu(t)²
             relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tr,(size_t)I);
             // y = down·t → yr [D]
-            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
+            if(!exact && nvfp4_u4_ok(dw,I))
+                nvfp4_gemv_u4<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
+            else
+                nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
         }
     }else{
         // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32): reads each
@@ -2426,9 +2525,19 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
         // This expert's slice of the pooled buffers: rows [off, off+r).
         float *xc=ctx->x+(size_t)off*D,*tc=ctx->up+(size_t)off*I,*yc=ctx->y+(size_t)off*D;
         if(r==1&&!s_tiled){
-            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ug,D,I);
+            // THE decode hot path for gateless NVFP4 experts (Nemotron): one row per
+            // expert, so a gemv per projection. Prefer the 512 B/warp reader — the narrow
+            // kernel reads 16 B/warp, and the routed-expert gemv measured ~110 GB/s
+            // against a 172 GB/s host ceiling, so it is read-width bound, not memory bound.
+            if(nvfp4_u4_ok(uw,D))
+                nvfp4_gemv_u4<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ug,D,I);
+            else
+                nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ug,D,I);
             relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tc,(size_t)I);
-            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,dg,I,D);
+            if(nvfp4_u4_ok(dw,I))
+                nvfp4_gemv_u4<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,dg,I,D);
+            else
+                nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,dg,I,D);
         }else{
             dim3 hidden((unsigned)((I+63)/64),(unsigned)((r+15)/16));
             dim3 output((unsigned)((D+63)/64),(unsigned)((r+15)/16));

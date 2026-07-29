@@ -929,104 +929,104 @@ impl Shards {
         self.files[file_idx].1.read_exact_at(buf, off)
     }
 
-    /// Drain `jobs` through a single io_uring instead of a pool of blocking `pread`
-    /// threads. Returns `false` if io_uring is unavailable, so the caller falls back.
+    /// Drain `jobs` through **one io_uring per worker thread**, preserving the thread-level
+    /// concurrency of the `pread` pool while replacing each thread's blocking syscalls with
+    /// batched submission. Returns `false` if io_uring is unavailable, so the caller falls
+    /// back (re-reading a job is idempotent — it overwrites the same destination).
     ///
-    /// This is the O_DIRECT path only, and that is the whole point. Measured on a real
-    /// container shard (`coli iobench`):
+    /// O_DIRECT only, and that is the point. `coli iobench` on a real shard:
+    /// io_uring SQPOLL + `O_DIRECT` **10.63 GB/s**, threaded `pread` 8.12, io_uring
+    /// *buffered* 5.66. io_uring was shelved once because we were buffered — the 5.66 row.
     ///
-    /// | mechanism | GB/s |
-    /// |---|---|
-    /// | io_uring SQPOLL + `O_DIRECT` | **10.63** |
-    /// | threaded `pread` (the fallback below) | 8.12 |
-    /// | io_uring **buffered** | 5.66 |
-    ///
-    /// io_uring was measured a regression here once before and shelved — because we were
-    /// buffered, which is the 5.66 row. `O_DIRECT` is now chosen automatically for exactly
-    /// the models that stream (see the coverage gate in `coli`), so the condition that made
-    /// it lose no longer holds for them. Requiring `o_direct_enabled()` keeps the buffered
-    /// case on `pread` where it belongs.
-    ///
-    /// Each job already targets a distinct, 512-aligned sub-range of a span buffer (the
-    /// caller aligned whole spans for `O_DIRECT`), so completions write straight into the
-    /// destination — no bounce buffer, no copy.
+    /// A SINGLE-ring version of this lost 1.58x on GLM (21732/20888 ms vs 13469/13570):
+    /// one submit/complete loop cannot replace 40 threads blocking independently, and
+    /// `submit_and_wait(1)` serialises the tail. Hence per-thread rings: the concurrency
+    /// that made `pread` fast is kept, and io_uring only removes the per-read syscall.
     #[cfg(target_os = "linux")]
-    fn drain_jobs_uring(&self, jobs: &[Job], qd: usize) -> bool {
+    fn drain_jobs_uring(&self, jobs: &[Job], nthreads: usize) -> bool {
         use io_uring::{opcode, types, IoUring};
+        use std::os::unix::io::AsRawFd;
         if jobs.is_empty() {
             return true;
         }
-        let depth = qd.clamp(8, 256).next_power_of_two() as u32;
-        // SQPOLL is where the win comes from (a kernel thread polls the SQ, so submission
-        // costs no syscall); it needs privileges, so fall back to a plain ring if refused.
-        let mut ring = match IoUring::builder().setup_sqpoll(2000).build(depth) {
-            Ok(r) => r,
-            Err(_) => match IoUring::new(depth) {
-                Ok(r) => r,
-                Err(_) => return false,
-            },
-        };
-        // Resolve one fd per file up front: `pread_dispatch` would otherwise re-resolve
-        // (and lazily open) the O_DIRECT twin on every job.
+        // Resolve one O_DIRECT fd per file up front: `get_or_init` off the worker threads,
+        // and a missing direct fd means this path does not apply at all.
         let mut fds: Vec<i32> = Vec::with_capacity(self.files.len());
         for i in 0..self.files.len() {
-            let dio = self
-                .maps
-                .get(i)
-                .map(|_| ())
-                .and(self.dio.get(i))
-                .and_then(|cell| cell.get_or_init(|| open_direct(&self.files[i].0)).as_ref());
-            match dio {
-                Some(f) => {
-                    use std::os::unix::io::AsRawFd;
-                    fds.push(f.as_raw_fd())
-                }
-                // No direct fd for this file: this path is O_DIRECT-only, so bail to pread.
+            match self.dio.get(i).and_then(|c| c.get_or_init(|| open_direct(&self.files[i].0)).as_ref())
+            {
+                Some(f) => fds.push(f.as_raw_fd()),
                 None => return false,
             }
         }
-        let mk = |j: &Job| {
-            opcode::Read::new(types::Fd(fds[j.file]), j.ptr as *mut u8, j.len as u32)
-                .offset(j.off)
-                .build()
-                .user_data(0)
-        };
-        let (mut next, mut inflight) = (0usize, 0usize);
-        while next < jobs.len() && inflight < depth as usize {
-            // SAFETY: `jobs[next].ptr` addresses a live, disjoint sub-range of a span
-            // buffer that outlives this call, and no two jobs overlap.
-            if unsafe { ring.submission().push(&mk(&jobs[next])) }.is_err() {
-                break;
-            }
-            next += 1;
-            inflight += 1;
-        }
-        if ring.submit().is_err() {
-            return false;
-        }
-        while inflight > 0 {
-            if ring.submit_and_wait(1).is_err() {
-                return false;
-            }
-            let completed = ring.completion().map(|c| c.result()).collect::<Vec<_>>();
-            for res in completed {
-                inflight -= 1;
-                if res < 0 {
-                    return false; // short/failed read — let `pread` redo the whole batch
-                }
-                if next < jobs.len() {
-                    // SAFETY: as above.
-                    if unsafe { ring.submission().push(&mk(&jobs[next])) }.is_ok() {
+        let nt = nthreads.max(1).min(jobs.len());
+        let per_ring = (jobs.len().div_ceil(nt)).clamp(8, 128).next_power_of_two() as u32;
+        let ok = std::sync::atomic::AtomicBool::new(true);
+        let (fds, okr) = (&fds, &ok);
+        std::thread::scope(|scope| {
+            for t in 0..nt {
+                scope.spawn(move || {
+                    let mut ring = match IoUring::builder().setup_sqpoll(2000).build(per_ring) {
+                        Ok(r) => r,
+                        Err(_) => match IoUring::new(per_ring) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        },
+                    };
+                    // Strided slice, matching how the pread pool interleaves work.
+                    let mine: Vec<&Job> = jobs.iter().skip(t).step_by(nt).collect();
+                    let (mut next, mut inflight) = (0usize, 0usize);
+                    let mk = |j: &Job| {
+                        opcode::Read::new(types::Fd(fds[j.file]), j.ptr as *mut u8, j.len as u32)
+                            .offset(j.off)
+                            .build()
+                            .user_data(0)
+                    };
+                    while next < mine.len() && inflight < per_ring as usize {
+                        // SAFETY: each job addresses a live, disjoint sub-range of a span
+                        // buffer that outlives this scope; no two jobs overlap.
+                        if unsafe { ring.submission().push(&mk(mine[next])) }.is_err() {
+                            break;
+                        }
                         next += 1;
                         inflight += 1;
                     }
-                }
+                    if ring.submit().is_err() {
+                        okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    while inflight > 0 {
+                        if ring.submit_and_wait(1).is_err() {
+                            okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        let res: Vec<i32> = ring.completion().map(|c| c.result()).collect();
+                        for r in res {
+                            inflight -= 1;
+                            if r < 0 {
+                                okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                            if next < mine.len() {
+                                // SAFETY: as above.
+                                if unsafe { ring.submission().push(&mk(mine[next])) }.is_ok() {
+                                    next += 1;
+                                    inflight += 1;
+                                }
+                            }
+                        }
+                        if ring.submit().is_err() {
+                            okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                });
             }
-            if ring.submit().is_err() {
-                return false;
-            }
-        }
-        true
+        });
+        ok.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(not(target_os = "linux"))]

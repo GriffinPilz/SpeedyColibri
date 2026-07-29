@@ -2194,6 +2194,36 @@ fn ram_budget() -> u64 {
 /// 118% matches the preload "fits-with-headroom" gate, so residency-fill and eager-preload agree.
 const NEARFIT_COVERAGE_PCT: u64 = 118;
 
+/// Coverage at or above which shard reads stay **buffered**; below it we switch to
+/// `O_DIRECT`. `COLI_O_DIRECT=0|1` overrides in either direction.
+///
+/// The page cache is a real second tier — but only if it can hold a useful share of the
+/// expert set. Coverage (`natural_fill / total_expert_bytes`) is exactly that ratio, so
+/// it is the right axis, and the crossover is sharp. Measured on 42b2, ABBA-mirrored,
+/// 2 passes per arm, 12-token prompt, ngen 6, tokens byte-identical in every arm
+/// (`expert-load` ms — wall carries a one-time model load and swings ~20%):
+///
+/// | model | coverage | buffered | `O_DIRECT` | |
+/// |---|---|---|---|---|
+/// | Kimi-K3 | 7% | 31350 | **28788** | O_DIRECT 1.089× |
+/// | GLM-5.2 | 27% | 16957 | **14812** | O_DIRECT 1.145× |
+/// | MiniMax-M3 | 47% | **6232** | 6755 | buffered |
+/// | MiniMax-M2.7 | 86% | **4166** | 4444 | buffered |
+///
+/// Monotonic, and the mechanism is visible in the byte counters rather than inferred:
+/// K3's two arms read the SAME device bytes (200.6 vs 202.1 GiB) because at 7% the page
+/// cache serves ~nothing, so bypassing it is free; M2.7's buffered rep read **zero**
+/// device bytes because at 86% the page cache holds essentially the whole working set,
+/// and bypassing it forfeits all of that.
+///
+/// 35% sits between the two measured neighbours (27% and 47%). The exact crossover
+/// inside that interval is not measured — the two nearest points are what bound it.
+///
+/// This supersedes the older "leave off" advice, which came from ONE model measured
+/// before the coverage axis was understood (and on GLM's older, 735 GB e4m3 container —
+/// nearly double today's 379 GB, i.e. a different coverage entirely).
+const O_DIRECT_MAX_COVERAGE_PCT: u64 = 35;
+
 /// Wire the expert cache to **fill RAM safely, for every model**. It grows toward a fill
 /// target and a background monitor evicts LRU experts under memory pressure so the box can
 /// never OOM — which is what lets us point a fill-RAM policy at a model of *any* size:
@@ -2288,6 +2318,10 @@ where
         0
     };
     let near_fit = covers_pct >= NEARFIT_COVERAGE_PCT;
+    // Pick the read path from the same coverage number, before any expert is read.
+    // O_DIRECT pays exactly when the page cache is too small to be a useful second tier
+    // for this model's expert set; see `O_DIRECT_MAX_COVERAGE_PCT`.
+    colibri_safetensors::set_o_direct(covers_pct < O_DIRECT_MAX_COVERAGE_PCT);
     // An explicit COLI_RAM_GB caps the fill target; the monitor still protects the floor.
     let explicit = std::env::var("COLI_RAM_GB")
         .ok()
@@ -2917,6 +2951,35 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// The O_DIRECT threshold must keep classifying the four models it was measured on.
+    /// Each row is a real ABBA-mirrored result, so a threshold change that flips any of
+    /// them is a change against evidence and should fail here first.
+    #[test]
+    fn o_direct_threshold_matches_the_measured_models() {
+        // (name, coverage %, O_DIRECT should be ON)
+        let measured = [
+            ("kimi-k3", 7u64, true),      // 31350 -> 28788 ms, 1.089x
+            ("glm-5.2", 27, true),        // 16957 -> 14812 ms, 1.145x
+            ("minimax-m3", 47, false),    // buffered 6232 vs 6755
+            ("minimax-m2.7", 86, false),  // buffered 4166 vs 4444; warm rep read 0 bytes
+        ];
+        for (name, cov, want_direct) in measured {
+            assert_eq!(
+                cov < O_DIRECT_MAX_COVERAGE_PCT,
+                want_direct,
+                "{name} at {cov}% coverage should have O_DIRECT={want_direct}"
+            );
+        }
+        // The threshold must sit strictly between the two measured neighbours, so it
+        // cannot be "tuned" past a model whose result we actually have.
+        assert!(
+            (28..=46).contains(&O_DIRECT_MAX_COVERAGE_PCT),
+            "threshold {O_DIRECT_MAX_COVERAGE_PCT} escaped the measured interval (27%, 47%)"
+        );
+        // Nemotron preloads (172% coverage) and must never take the direct path.
+        assert!(!(172 < O_DIRECT_MAX_COVERAGE_PCT));
     }
 
     /// The cache-sizing footprint must not collapse to zero on an arch whose

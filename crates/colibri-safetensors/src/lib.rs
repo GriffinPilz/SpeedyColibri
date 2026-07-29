@@ -111,71 +111,54 @@ pub struct StTensor {
 /// The NVMe's logical block size (measured 512 on the DGX Spark).
 const DIO_ALIGN: u64 = 512;
 
-/// Bypass the page cache entirely for shard reads (`COLI_O_DIRECT=1`).
+/// Bypass the page cache entirely for shard reads.
 ///
-/// Distinct from [`fadvise_enabled`], and the difference is the whole point:
-/// `fadvise` still routes every read *through* the page cache and discards it
-/// afterwards, so it pays the landing-zone cost and gets no caching in return —
-/// measured a 63% loss. `O_DIRECT` never touches the page cache, so the RAM the
-/// kernel currently needs as a landing zone for 22.6 GB/token of streaming becomes
-/// available to the expert cache instead.
+/// **Chosen automatically** from the model's expert-set coverage during cache wiring
+/// (`O_DIRECT_MAX_COVERAGE_PCT` in `coli`), not by the operator. `COLI_O_DIRECT=0|1`
+/// overrides in either direction, for pinning an arm during a measurement.
 ///
-/// **It is model-dependent: a loss on GLM-5.2, a clean win on Kimi-K3.** Both
-/// measurements are below. Kept as an explicit opt-in because the mechanism that
-/// separates them is *not* established — see "what does NOT explain it".
+/// Distinct from [`fadvise_enabled`], and the difference is the whole point: `fadvise`
+/// still routes every read *through* the page cache and discards it afterwards, so it
+/// pays the landing-zone cost and gets no caching in return — measured a 63% loss.
+/// `O_DIRECT` never touches that tier at all.
 ///
-/// 1 node, prompt 512, ngen 12, tokens byte-identical in every arm:
+/// Whether skipping it helps depends on whether the page cache can hold a useful share
+/// of THIS model's experts. Measured across four models (table in
+/// `O_DIRECT_MAX_COVERAGE_PCT`), the crossover is monotonic in coverage: at 7% and 27%
+/// O_DIRECT wins by 1.089× and 1.145×; at 47% and 86% buffered wins. The byte counters
+/// show the mechanism directly — at 7% both arms read the same device bytes (the page
+/// cache was serving ~nothing), while at 86% the buffered arm read *zero* device bytes.
 ///
-/// | arm | ms/token | pgmajfault | compact_stall | buff/cache |
-/// |-----|----------|------------|---------------|------------|
-/// | buffered, 40 GB | **2942** | +715 | +177,766 | 43 GB |
-/// | O_DIRECT, 40 GB | 3480 (+18%) | +397 | **+23** | 37 GB |
-/// | O_DIRECT, 70 GB | 5002 (+70%) | +325,409 | +26 | 23 GB |
-/// | O_DIRECT, 90 GB | did not finish | +19,254 | +23 | 2 GB |
+/// The historical measurement that said "leave off" is still real, but it was one model
+/// (GLM) on its older 735 GB e4m3 container — roughly double today's 379 GB, so a
+/// different coverage point than the name suggests. It is the 47%/86% end of the same
+/// curve, not a contradiction. That table also showed the memory ceiling is real rather
+/// than an artifact of buffered I/O: at 70 GB the O_DIRECT arm still thrashed (+325,409
+/// major faults) and at 90 GB it could not finish.
 ///
-/// It does what it claims — compaction stalls collapse from 177,766 to 23, so the
-/// landing-zone pressure really is gone — but at equal cache size it is 18% slower,
-/// because bypassing the page cache forfeits a tier that was serving a large share
-/// of reads. And the large-cache configurations still thrash (325k major faults at
-/// 70 GB, 90 GB unable to complete), which proves the memory ceiling is **real
-/// rather than an artifact of buffered I/O**. `MemTotal/3` is the right operating
-/// point; the page cache is not waste to be reclaimed.
-///
-/// ## Kimi-K3, 2026-07-29: a win in BOTH regimes
-///
-/// Same box, ABBA-mirrored, 2 passes per arm, tokens byte-identical in every arm.
-/// `expert-load` is the metric — wall clock swings ~20% run to run here (it carries a
-/// one-time model load), while `expert-load` repeats to ~0.1%.
-///
-/// | regime | buffered | `O_DIRECT` | ratio |
-/// |---|---|---|---|
-/// | prefill-heavy (5-tok prompt, ngen 2) | 17162 ms | 15691 ms | **1.094×** |
-/// | decode-heavy (ngen 16) | 38540 ms | 34099 ms | **1.130×** |
-///
-/// Achieved expert-read bandwidth rose 9.43 → 10.32 GB/s against a 10.63 GB/s iobench
-/// ceiling — 89% → 97% of the drive.
-///
-/// The mechanism check: on K3 both arms read the **same** number of device bytes
-/// (200.6 vs 202.1 GiB, +0.7%). If the page cache were serving any real share of expert
-/// reads the buffered arm would read measurably *fewer*. It doesn't — so on K3 that tier
-/// contributes ~nothing and bypassing it is free.
-///
-/// ## What does NOT explain the split
-///
-/// The tempting story is "K3's expert set dwarfs RAM, so the page cache can't help." It
-/// does not survive arithmetic: against ~58 GB of effective page cache, GLM's 735 GB of
-/// experts is ~7.9% coverage and K3's 1446 GB is ~4.0%. Both are tiny, yet the results
-/// have opposite sign. Nor is it prefill-vs-decode — K3 wins in both. Real remaining
-/// differences (per-expert read size 37.7 MB fp8 vs 17.55 MB MXFP4; top-8/160 vs
-/// top-16/896) are untested as causes.
-///
-/// So this stays an explicit flag rather than becoming an inferred default. A gate keyed
-/// on a correlation nobody has explained is precisely the failure that made
-/// `prefetch-ahead` cost 1.26× on K3 (it used `union >= 64` as a proxy for "routes to
-/// ~all experts"). **K3 wants `COLI_O_DIRECT=1`; set it explicitly.**
+/// The `O_DIRECT` twin is not a drop-in fd swap: **no tensor offset in our containers is
+/// 512-aligned** (measured: 0 of 4326 sampled), so reads are aligned at *span*
+/// granularity rather than bounced through a scratch buffer, which would otherwise
+/// reintroduce a full memcpy of every expert. Correctness is unaffected either way.
+/// Runtime O_DIRECT selection, set from the model's expert-set coverage during cache
+/// wiring (see `wire_adaptive_cache`). `COLI_O_DIRECT` still wins when set, in either
+/// direction, so a measurement can pin an arm.
+static O_DIRECT_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Choose O_DIRECT for shard reads. Called once, before any expert is read, with the
+/// decision derived from how much of the model's expert set RAM can actually hold.
+pub fn set_o_direct(on: bool) {
+    O_DIRECT_RUNTIME.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn o_direct_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_O_DIRECT").ok().as_deref() == Some("1"))
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("COLI_O_DIRECT").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    });
+    env.unwrap_or_else(|| O_DIRECT_RUNTIME.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Open a second, `O_DIRECT` descriptor for `path`. `None` if the platform or
@@ -203,9 +186,13 @@ fn open_direct(_path: &Path) -> Option<File> {
 pub struct Shards {
     tensors: Vec<StTensor>,
     files: Vec<(PathBuf, File)>,
-    /// Parallel to `files`: `O_DIRECT` twin descriptors, populated only when
-    /// [`o_direct_enabled`]. `None` entries fall back to the buffered fd.
-    dio: Vec<Option<File>>,
+    /// Parallel to `files`: `O_DIRECT` twin descriptors, opened **lazily** on first
+    /// dispatched read. Lazy because the choice is made from the model's expert-set
+    /// coverage during cache wiring, which happens *after* `Shards::open` — sizing the
+    /// expert set needs a real expert probed through these very shards. An inner `None`
+    /// means the open was tried and refused (non-Linux, or a filesystem that rejects
+    /// `O_DIRECT`) and reads fall back to the buffered fd.
+    dio: Vec<std::sync::OnceLock<Option<File>>>,
     index: HashMap<String, usize>,
 }
 
@@ -295,7 +282,7 @@ impl Shards {
                 s.index.insert(name.to_string(), idx);
             }
 
-            s.dio.push(if o_direct_enabled() { open_direct(&path) } else { None });
+            s.dio.push(std::sync::OnceLock::new());
             s.files.push((path, file));
         }
 
@@ -728,9 +715,17 @@ impl Shards {
     /// never break a read, only fail to accelerate it.
     fn pread_dispatch(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some(f) = self.dio.get(file_idx).and_then(|o| o.as_ref()) {
-            use std::os::unix::fs::FileExt;
-            return f.read_exact_at(buf, off);
+        if o_direct_enabled() {
+            // Opened on first use, then cached for the process's life. `get_or_init` is
+            // idempotent under the read pool's concurrency: several threads may race here,
+            // one open wins and the losers drop theirs.
+            let slot = self.dio.get(file_idx).and_then(|cell| {
+                cell.get_or_init(|| open_direct(&self.files[file_idx].0)).as_ref()
+            });
+            if let Some(f) = slot {
+                use std::os::unix::fs::FileExt;
+                return f.read_exact_at(buf, off);
+            }
         }
         self.pread_into(file_idx, off, buf)
     }

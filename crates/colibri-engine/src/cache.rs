@@ -80,24 +80,31 @@ impl Predictor {
         }
         let mut ranked: Vec<(u32, u32)> = score.into_iter().collect();
         ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        // Bound-check BEFORE pushing. Push-then-check emitted one expert even at
+        // `topn == 0` — and `topn == 0` is exactly what `prefetch_topn()` passes to wire
+        // the background loader with what it documents as "a no-op predictor" (the
+        // prefill prefetch-ahead needs the loader thread even when COLI_PREFETCH is off).
+        // So the no-op predictor was speculatively loading one expert per layer: measured
+        // on K3 as 80 wasted expert loads (~1.4 GB) per run against an otherwise
+        // identical arm.
         let mut out: Vec<usize> = Vec::with_capacity(self.topn);
         for (e, _) in ranked {
-            out.push(e as usize);
             if out.len() >= self.topn {
                 break;
             }
+            out.push(e as usize);
         }
         if out.len() < self.topn {
             if let Some(f) = self.freq.get(&target) {
                 let mut fr: Vec<(u32, u32)> = f.iter().map(|(&e, &c)| (e, c)).collect();
                 fr.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                 for (e, _) in fr {
+                    if out.len() >= self.topn {
+                        break;
+                    }
                     let e = e as usize;
                     if !out.contains(&e) {
                         out.push(e);
-                        if out.len() >= self.topn {
-                            break;
-                        }
                     }
                 }
             }
@@ -805,6 +812,35 @@ mod tests {
     use super::*;
     use crate::quantize::qtensor_from_f32;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn topn_zero_predictor_really_predicts_nothing() {
+        // `prefetch_topn()` returns Some(0) to wire the background loader for the prefill
+        // prefetch-ahead while leaving the learned predictor inert. A push-then-check
+        // loop broke that: it emitted one expert per layer even at topn=0, which on K3
+        // showed up as 80 speculative loads per run that nothing asked for.
+        // The predictor must actually HAVE something to predict, or this proves nothing:
+        // teach the 1->2 transition first, exactly as `predictor_learns_layer_transition`
+        // does. With a cold predictor `ranked` is empty and any bound looks correct.
+        let mut p = Predictor::new(0);
+        for _ in 0..2 {
+            p.observe_and_predict(1, &[10]);
+            p.observe_and_predict(2, &[20]);
+        }
+        let pred = p.observe_and_predict(1, &[10]);
+        assert!(pred.is_empty(), "topn=0 must predict nothing, got {pred:?}");
+
+        // Same teaching with a real bound still yields the learned expert, so the fix
+        // did not simply disable prediction.
+        let mut q = Predictor::new(4);
+        for _ in 0..2 {
+            q.observe_and_predict(1, &[10]);
+            q.observe_and_predict(2, &[20]);
+        }
+        let qp = q.observe_and_predict(1, &[10]);
+        assert_eq!(qp.first(), Some(&20), "topn=4 should still predict, got {qp:?}");
+        assert!(qp.len() <= 4, "bound must be exact, got {qp:?}");
+    }
 
     #[test]
     fn prefetch_ahead_gate_tracks_fraction_not_absolute_count() {

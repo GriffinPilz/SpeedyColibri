@@ -101,9 +101,39 @@ fn parse_sub_kb(v: Option<&str>) -> usize {
 /// copy at all, and a CUDA microbenchmark puts the GPU's read rate at 163 GB/s from a
 /// file-backed mapping vs 171 GB/s from a heap buffer — a 4.5% penalty to skip the copy
 /// entirely.
+///
+/// **Measured in the engine** (42b2, ABBA, 4 runs/arm, 12-tok prompt, tokens identical in
+/// every run). It is a large win exactly where spans are resident, and a small loss where
+/// they are not — which is why it is coverage-gated rather than always on:
+///
+/// | model | coverage | pread | mapped | |
+/// |---|---|---|---|---|
+/// | MiniMax-M2.7 | 86% | 2987 ms | **529 ms** | **5.65×** |
+/// | GLM-5.2 | 26% | **14694 ms** | 15080 ms | 0.97× |
+///
+/// M2.7 is the pure case: both arms read **zero** bytes from the drive, so the whole
+/// difference is the copy. GLM at 26% mostly misses the residency gate, so each span pays
+/// a `mincore` and then reads anyway.
+/// Runtime selection, set from expert-set coverage during cache wiring — the SAME number
+/// that chooses O_DIRECT, and for the same reason, read the other way round. Below the
+/// threshold the page cache cannot hold the working set, so spans are usually absent and
+/// every one pays a `mincore` that then falls back to `pread` anyway; above it the page
+/// cache *is* the working set and mapping replaces a full copy.
+static MMAP_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the mapped expert path (called once, before any expert is read).
+pub fn set_mmap_experts(on: bool) {
+    MMAP_RUNTIME.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn mmap_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_MMAP_EXPERTS").ok().as_deref() != Some("0"))
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("COLI_MMAP_EXPERTS").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    });
+    env.unwrap_or_else(|| MMAP_RUNTIME.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// One tensor located within a shard file.

@@ -2321,7 +2321,13 @@ where
     // Pick the read path from the same coverage number, before any expert is read.
     // O_DIRECT pays exactly when the page cache is too small to be a useful second tier
     // for this model's expert set; see `O_DIRECT_MAX_COVERAGE_PCT`.
-    colibri_safetensors::set_o_direct(covers_pct < O_DIRECT_MAX_COVERAGE_PCT);
+    // One number, two mechanisms, opposite directions. Below the threshold the page cache
+    // cannot hold enough of this model's experts to be worth keeping, so bypass it AND skip
+    // the residency checks that would mostly fail. Above it the page cache holds the working
+    // set, so keep it and hand out mapped views instead of copying.
+    let page_cache_is_useful = covers_pct >= O_DIRECT_MAX_COVERAGE_PCT;
+    colibri_safetensors::set_o_direct(!page_cache_is_useful);
+    colibri_safetensors::set_mmap_experts(page_cache_is_useful);
     // An explicit COLI_RAM_GB caps the fill target; the monitor still protects the floor.
     let explicit = std::env::var("COLI_RAM_GB")
         .ok()
@@ -2951,6 +2957,25 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// One constant now drives BOTH the read path (O_DIRECT) and the mapped-view path,
+    /// in opposite directions, so a change to it moves two behaviours at once. Both are
+    /// measured, so pin both.
+    ///
+    /// mmap, ABBA, 4 runs/arm, tokens identical throughout:
+    ///   MiniMax-M2.7 (86%): pread 2987 ms -> mapped 529 ms   = 5.65x WIN
+    ///   GLM-5.2      (26%): pread 14694 ms -> mapped 15080 ms = 0.97x loss
+    #[test]
+    fn coverage_gate_drives_o_direct_and_mmap_oppositely() {
+        for cov in [0u64, 7, 26, 27, 34, 35, 46, 86, 172, 1000] {
+            let direct = cov < O_DIRECT_MAX_COVERAGE_PCT;
+            let mapped = cov >= O_DIRECT_MAX_COVERAGE_PCT;
+            assert_ne!(direct, mapped, "at {cov}% the two paths must never both apply");
+        }
+        // The two measured mmap anchors.
+        assert!(86 >= O_DIRECT_MAX_COVERAGE_PCT, "M2.7 (86%) must map — measured 5.65x");
+        assert!(!(26 >= O_DIRECT_MAX_COVERAGE_PCT), "GLM (26%) must NOT map — measured 0.97x");
     }
 
     /// The O_DIRECT threshold must keep classifying the four models it was measured on.

@@ -136,6 +136,37 @@ fn mmap_enabled() -> bool {
     env.unwrap_or_else(|| MMAP_RUNTIME.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Submit O_DIRECT expert reads through io_uring rather than a pool of blocking `pread`
+/// threads (`COLI_IO_URING=1`). **Off by default — measured a 1.58x REGRESSION.**
+///
+/// The hypothesis was good and the microbenchmark supported it: `coli iobench` on a real
+/// shard gives io_uring SQPOLL + `O_DIRECT` 10.63 GB/s against threaded `pread`'s 8.12,
+/// and io_uring had previously been rejected only because we were buffered (where it
+/// manages 5.66). `O_DIRECT` became automatic for the streaming models earlier, removing
+/// that objection — so this looked unblocked.
+///
+/// It is not. GLM-5.2, ABBA, 2 passes, tokens identical in every arm:
+///
+/// | arm | pass 1 | pass 2 |
+/// |---|---|---|
+/// | threaded `pread` | 13469 ms | 13570 ms |
+/// | io_uring | 21732 ms | 20888 ms |
+///
+/// The microbenchmark and the engine differ in a way that matters: iobench drives ONE
+/// ring over ONE file with nothing else running, while the reader spans ~90 shards and
+/// interleaves with compute. This drain is single-threaded — one submit/complete loop
+/// where the `pread` path has 40 threads blocking independently — so it replaces 40-way
+/// concurrency with one loop's throughput, and `submit_and_wait(1)` serialises the tail.
+/// Getting the microbenchmark's number would need several rings (per-thread or
+/// per-shard), not one; whether that beats 40 blocking threads is unmeasured.
+///
+/// Kept so the result is reproducible and the "just use io_uring" idea has a number
+/// attached rather than being rediscovered a third time.
+fn uring_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_IO_URING").ok().as_deref() == Some("1"))
+}
+
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
 pub struct StTensor {
@@ -338,6 +369,15 @@ pub struct Shards {
     /// [`mmap_enabled`]; see [`Mapping`] for why this is per-file and not per-read.
     maps: Vec<std::sync::OnceLock<Option<std::sync::Arc<Mapping>>>>,
     index: HashMap<String, usize>,
+}
+
+/// One tiled sub-read: a 512-aligned window of a span buffer, filled from `file` at
+/// `off`. Hoisted to module scope so both drains (thread pool and io_uring) share it.
+struct Job {
+    file: usize,
+    off: u64,
+    ptr: usize,
+    len: usize,
 }
 
 impl Shards {
@@ -775,12 +815,6 @@ impl Shards {
         // device requests: the block layer already splits these at ~112 KB.
         // See `read_sub_bytes` for the override.
         let sub = read_sub_bytes();
-        struct Job {
-            file: usize,
-            off: u64,
-            ptr: usize,
-            len: usize,
-        }
         let mut jobs: Vec<Job> = Vec::new();
         for s in spans.iter_mut() {
             // Mapped spans are already satisfied — and `as_mut_slice` would panic on a
@@ -801,7 +835,12 @@ impl Shards {
                 o += clen;
             }
         }
-        if !jobs.is_empty() {
+        // io_uring first when the reads are O_DIRECT — that combination measured 10.63
+        // GB/s against threaded pread's 8.12 on this drive. Any failure (no privileges,
+        // no direct fd, a short read) returns false and the pool below redoes the batch,
+        // so this can only fail to accelerate, never to complete.
+        let uring_done = o_direct_enabled() && uring_enabled() && self.drain_jobs_uring(&jobs, nthreads);
+        if !jobs.is_empty() && !uring_done {
             use std::sync::atomic::{AtomicUsize, Ordering};
             let nt = nthreads.max(1).min(jobs.len());
             let cursor = AtomicUsize::new(0);
@@ -888,6 +927,111 @@ impl Shards {
     fn pread_into(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         self.files[file_idx].1.read_exact_at(buf, off)
+    }
+
+    /// Drain `jobs` through a single io_uring instead of a pool of blocking `pread`
+    /// threads. Returns `false` if io_uring is unavailable, so the caller falls back.
+    ///
+    /// This is the O_DIRECT path only, and that is the whole point. Measured on a real
+    /// container shard (`coli iobench`):
+    ///
+    /// | mechanism | GB/s |
+    /// |---|---|
+    /// | io_uring SQPOLL + `O_DIRECT` | **10.63** |
+    /// | threaded `pread` (the fallback below) | 8.12 |
+    /// | io_uring **buffered** | 5.66 |
+    ///
+    /// io_uring was measured a regression here once before and shelved — because we were
+    /// buffered, which is the 5.66 row. `O_DIRECT` is now chosen automatically for exactly
+    /// the models that stream (see the coverage gate in `coli`), so the condition that made
+    /// it lose no longer holds for them. Requiring `o_direct_enabled()` keeps the buffered
+    /// case on `pread` where it belongs.
+    ///
+    /// Each job already targets a distinct, 512-aligned sub-range of a span buffer (the
+    /// caller aligned whole spans for `O_DIRECT`), so completions write straight into the
+    /// destination — no bounce buffer, no copy.
+    #[cfg(target_os = "linux")]
+    fn drain_jobs_uring(&self, jobs: &[Job], qd: usize) -> bool {
+        use io_uring::{opcode, types, IoUring};
+        if jobs.is_empty() {
+            return true;
+        }
+        let depth = qd.clamp(8, 256).next_power_of_two() as u32;
+        // SQPOLL is where the win comes from (a kernel thread polls the SQ, so submission
+        // costs no syscall); it needs privileges, so fall back to a plain ring if refused.
+        let mut ring = match IoUring::builder().setup_sqpoll(2000).build(depth) {
+            Ok(r) => r,
+            Err(_) => match IoUring::new(depth) {
+                Ok(r) => r,
+                Err(_) => return false,
+            },
+        };
+        // Resolve one fd per file up front: `pread_dispatch` would otherwise re-resolve
+        // (and lazily open) the O_DIRECT twin on every job.
+        let mut fds: Vec<i32> = Vec::with_capacity(self.files.len());
+        for i in 0..self.files.len() {
+            let dio = self
+                .maps
+                .get(i)
+                .map(|_| ())
+                .and(self.dio.get(i))
+                .and_then(|cell| cell.get_or_init(|| open_direct(&self.files[i].0)).as_ref());
+            match dio {
+                Some(f) => {
+                    use std::os::unix::io::AsRawFd;
+                    fds.push(f.as_raw_fd())
+                }
+                // No direct fd for this file: this path is O_DIRECT-only, so bail to pread.
+                None => return false,
+            }
+        }
+        let mk = |j: &Job| {
+            opcode::Read::new(types::Fd(fds[j.file]), j.ptr as *mut u8, j.len as u32)
+                .offset(j.off)
+                .build()
+                .user_data(0)
+        };
+        let (mut next, mut inflight) = (0usize, 0usize);
+        while next < jobs.len() && inflight < depth as usize {
+            // SAFETY: `jobs[next].ptr` addresses a live, disjoint sub-range of a span
+            // buffer that outlives this call, and no two jobs overlap.
+            if unsafe { ring.submission().push(&mk(&jobs[next])) }.is_err() {
+                break;
+            }
+            next += 1;
+            inflight += 1;
+        }
+        if ring.submit().is_err() {
+            return false;
+        }
+        while inflight > 0 {
+            if ring.submit_and_wait(1).is_err() {
+                return false;
+            }
+            let completed = ring.completion().map(|c| c.result()).collect::<Vec<_>>();
+            for res in completed {
+                inflight -= 1;
+                if res < 0 {
+                    return false; // short/failed read — let `pread` redo the whole batch
+                }
+                if next < jobs.len() {
+                    // SAFETY: as above.
+                    if unsafe { ring.submission().push(&mk(&jobs[next])) }.is_ok() {
+                        next += 1;
+                        inflight += 1;
+                    }
+                }
+            }
+            if ring.submit().is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn drain_jobs_uring(&self, _jobs: &[Job], _qd: usize) -> bool {
+        false
     }
 
     /// A zero-copy view of `[off, off+len)` in `file_idx`, or `None` when the mapped

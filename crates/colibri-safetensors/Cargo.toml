@@ -13,3 +13,8 @@ colibri-core = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# io_uring submission for O_DIRECT expert reads (see `drain_jobs_uring`). Linux only:
+# the win is O_DIRECT-specific, and O_DIRECT is itself Linux-only here.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6"

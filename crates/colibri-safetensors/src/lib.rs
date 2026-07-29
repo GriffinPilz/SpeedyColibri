@@ -801,14 +801,18 @@ impl Shards {
         for grp in groups {
             let n = grp.len();
             let mut meta = Vec::with_capacity(n);
-            let t_lookup = std::time::Instant::now();
+            // `prof.then(...)` so the clock is not read at all with profiling off: these
+            // three timers are per-*span*, and span-setup is the very phase they exist to
+            // shrink (93% of M2.7's expert-load). An unconditional `Instant::now()` here
+            // would be part of what it measures.
+            let t_lookup = prof.then(std::time::Instant::now);
             for &nm in grp.iter() {
                 let t = self.tensor(nm)?;
                 meta.push((t.file_idx, t.off, t.nbytes));
             }
-            if prof {
+            if let Some(t) = t_lookup {
                 SPAN_LOOKUP_US
-                    .fetch_add(t_lookup.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by_key(|&i| (meta[i].0, meta[i].1));
@@ -834,11 +838,11 @@ impl Shards {
                 // view into the shard's mapping rather than allocating a buffer and
                 // memcpy'ing the same bytes into it. `read_len: 0` marks the span as
                 // needing no I/O, and the job builder below skips views.
-                let t_mc = std::time::Instant::now();
+                let t_mc = prof.then(std::time::Instant::now);
                 let view = self.mapped_view(file, off0, span_len);
-                if prof {
+                if let Some(t) = t_mc {
                     use std::sync::atomic::Ordering::Relaxed;
-                    SPAN_MINCORE_US.fetch_add(t_mc.elapsed().as_micros() as u64, Relaxed);
+                    SPAN_MINCORE_US.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
                     SPAN_COUNT.fetch_add(1, Relaxed);
                 }
                 if let Some(map) = view {
@@ -879,11 +883,11 @@ impl Shards {
                 } else {
                     span_len
                 };
-                let t_alloc = std::time::Instant::now();
+                let t_alloc = prof.then(std::time::Instant::now);
                 let mut buf = SharedBuf::with_len(read_len + extra);
-                if prof {
+                if let Some(t) = t_alloc {
                     SPAN_ALLOC_US.fetch_add(
-                        t_alloc.elapsed().as_micros() as u64,
+                        t.elapsed().as_micros() as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }

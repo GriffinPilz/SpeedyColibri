@@ -2216,20 +2216,36 @@ fn ram_budget() -> u64 {
     ram_budget_reserving(0)
 }
 
-/// A model whose experts fit in the achievable cache (RAM − reserve) to at least this %
-/// is "near-fit": it gets `fadvise` + a fill-to-`natural_fill` residency hold (collapse the
-/// page-cache double-hold so the whole working set stays resident — measured 1.94× on a
-/// *fitting* MiniMax-M2.7 snapshot). A ≫-RAM model (GLM ~23%, M3 ~46%) keeps the page cache
-/// (fadvise off) and streams against a `MemTotal/3` cap the kernel serves at 4 KB granularity.
+/// A model whose experts fit in the achievable cache to at least this % is "near-fit": it
+/// gets `fadvise` plus a fill-to-`natural_fill` residency hold, collapsing the page-cache
+/// double-hold so the working set stays resident. Below it, a model keeps the page cache
+/// as a second tier and streams against the `MemTotal/CACHE_CAP_DIVISOR` cap.
 ///
-/// The bar is deliberately **above 100%**: residency only pays when the set *genuinely* fits
-/// with headroom. At partial coverage (80–99%) the fill pins ~`natural_fill` GB resident *and*
-/// still streams the uncovered tail with zero page-cache slack left — the worst of both, and it
-/// *thrashes*. Measured on the 117 GB NVFP4 MiniMax-M2.7 (86% coverage): the greedy fill was
-/// bimodal 0.9–4.3 tok/s, while dropping it to the `MemTotal/3` streaming cap gave a *stable*
-/// ~3.2 tok/s (and, as the byte math predicts, that beats M3 — M2.7 moves ~half the bytes/token).
-/// 118% matches the preload "fits-with-headroom" gate, so residency-fill and eager-preload agree.
-const NEARFIT_COVERAGE_PCT: u64 = 118;
+/// **Was 118, which is above 100% — i.e. residency was reserved for models that fit
+/// entirely, and an 86%-coverage model got the 40 GB streaming cap instead. That cost 8.5×.**
+///
+/// Measured on a rebooted 121 GiB Spark, MiniMax-M2.7 (86% coverage, 117 GB of experts),
+/// `bench_serve` 12 distinct prompts x 32 tok, two binaries differing only in this
+/// constant, arms alternating, 4 passes each:
+///
+/// | | pass 1 | pass 2 | pass 3 | pass 4 | swap |
+/// |---|---|---|---|---|---|
+/// | 40 GB + page cache (118) | 0.30 | 0.51 | 0.81 | 0.62 tok/s | 0 |
+/// | **max residency (80)** | **4.51** | **5.26** | **5.23** | **5.30 tok/s** | **0** |
+///
+/// The old comment recorded this same configuration as *bimodal 0.9–4.3 tok/s* and chose
+/// the streaming cap for stability. That instability is gone — passes 2-4 span 1.3% — and
+/// three things changed in between: mmap serves resident spans as views instead of heap
+/// copies (so residency no longer double-holds), the buffer-pool cap fix removed the
+/// alloc/free churn, and the fill can no longer page the box out (unconditional headroom
+/// clamp + a swap guard that evicts on swap growth). `swap=0M` across every pass.
+///
+/// 80 sits below M2.7's 86% and above MiniMax-M3's 46%, the nearest model on the other
+/// side; the crossover between 46 and 86 is **not** measured. The old rationale — that
+/// partial coverage pins RAM *and* streams the tail with no page-cache slack — is real but
+/// was outweighed here: holding 86% of the set resident beats holding 34% of it and
+/// serving the rest at 4 KB page granularity.
+const NEARFIT_COVERAGE_PCT: u64 = 80;
 
 /// Coverage at or above which shard reads stay **buffered**; below it we switch to
 /// `O_DIRECT`. `COLI_O_DIRECT=0|1` overrides in either direction.
@@ -2498,12 +2514,18 @@ where
         fill_target >> 30,
         ADAPTIVE_HARD_FLOOR >> 30
     );
-    // Preload is safe only when the whole expert set fits the fill target with COMFORTABLE
-    // headroom. This now coincides with `near_fit` (118% coverage ⟺ experts ≤ 84.7% of
-    // natural_fill), so residency-fill and eager-preload agree by construction — a model can no
-    // longer land in the partial-coverage thrash zone that once collapsed M2.7 to ~1 tok/s
-    // (109 GB experts on a 121 GB box). The explicit `fits_with_headroom` (≤ 85%) is kept as a
-    // belt-and-suspenders guard.
+    // Preload needs a STRICTER test than residency-fill, and since `NEARFIT_COVERAGE_PCT`
+    // dropped to 80 the two deliberately diverge.
+    //
+    // Residency-fill is worthwhile whenever most of the set can stay resident — MiniMax-M2.7
+    // at 86% coverage holds ~103 of its 117 GB and measured 5.3 tok/s against 0.6 for the
+    // streaming cap. Eager preload is a different promise: it loads EVERY expert up front, so
+    // it is only safe when the whole set fits with room to spare. M2.7 fails that (117 GB of
+    // experts against ~103 GB of headroom), and forcing it would fill the cache and then
+    // evict from it during the preload itself.
+    //
+    // So: fill aggressively, preload only when the set genuinely fits. `near_fit` is retained
+    // as a necessary condition — a ≫-RAM model must never attempt this.
     let fits_with_headroom = total_expert_bytes <= natural_fill / 100 * 85;
     near_fit && fits_with_headroom
 }

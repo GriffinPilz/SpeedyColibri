@@ -655,6 +655,30 @@ impl Shards {
         self.files.len()
     }
 
+    /// Drop every shard's cached pages, returning the bytes advised away.
+    ///
+    /// Benchmark hygiene. Page-cache state carries between runs and is the single largest
+    /// source of contamination in this repo's measurements: the *same* configuration has
+    /// read 2.27 tok/s early in a sequence and 0.23 tok/s late, purely because an earlier
+    /// arm left the cache warm (or cold). Every A/B that does not control it is measuring
+    /// the order of its arms as much as its arms.
+    ///
+    /// `posix_fadvise(DONTNEED)` rather than `/proc/sys/vm/drop_caches` because it needs
+    /// **no root** and is *targeted*: it drops this model's pages and leaves the rest of
+    /// the machine alone. It is advisory — a page still referenced by a live mapping stays
+    /// — so it is a reset between runs, not a guarantee mid-run.
+    pub fn drop_page_cache(&self) -> u64 {
+        let mut dropped = 0u64;
+        for i in 0..self.files.len() {
+            let len = self.files[i].1.metadata().map(|m| m.len()).unwrap_or(0);
+            if len > 0 {
+                self.fadvise_dontneed(i, 0, len as usize);
+                dropped += len;
+            }
+        }
+        dropped
+    }
+
     /// Whether a tensor exists — port of `st_has`.
     pub fn has(&self, name: &str) -> bool {
         self.index.contains_key(name)

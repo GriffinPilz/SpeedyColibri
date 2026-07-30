@@ -153,6 +153,7 @@ fn main() -> ExitCode {
         "probe" => cmd_probe(&args),
         "qerr" => cmd_qerr(&args),
         "iobench" => cmd_iobench(&args),
+        "dropcache" => cmd_dropcache(&args),
         "bench" => {
             eprintln!("coli {cmd}: not yet ported. See PORTING.md for status.");
             ExitCode::from(2)
@@ -1666,6 +1667,69 @@ fn cmd_repack(args: &[String]) -> ExitCode {
 ///   (B) io_uring with SQPOLL at depth `qd`, buffered (page-cache-served, like us),
 ///   (C) io_uring + O_DIRECT at depth `qd` — the drive's ceiling (bypasses cache).
 /// If (A) already ≈ (C), the read engine is not the bottleneck and io_uring can't help.
+/// `coli dropcache <container>` — drop the model's cached pages, and report memory state.
+///
+/// Run this **between benchmark arms**. Page-cache carry-over is the largest source of
+/// contamination in this repo's measurements: the same configuration has read 2.27 tok/s
+/// early in a sequence and 0.23 tok/s late, purely from what an earlier arm left warm. An
+/// A/B that does not reset between arms is measuring arm order as much as arm content.
+///
+/// Uses `posix_fadvise(DONTNEED)`, so it needs **no root** and only touches this model's
+/// pages. Two things it deliberately does not do, because they require privileges this
+/// process does not have:
+///
+///   - `/proc/sys/vm/drop_caches` — would clear the whole machine's cache
+///   - `swapoff -a && swapon -a` — the only way to reclaim already-swapped pages
+///
+/// If a run has driven the box into swap, that swap **stays** until someone with root
+/// clears it, and every subsequent measurement is taken on a degraded box. This command
+/// reports swap usage precisely so that state is visible rather than silently spoiling the
+/// next twenty runs — which is exactly what happened here before it existed.
+fn cmd_dropcache(args: &[String]) -> ExitCode {
+    let Some(container) = args.first() else {
+        eprintln!("usage: coli dropcache <container-dir>");
+        return ExitCode::from(2);
+    };
+    let mem = |key: &str| -> u64 {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines().find(|l| l.starts_with(key)).and_then(|l| {
+                    l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                })
+            })
+            .unwrap_or(0)
+            / 1024 // MiB
+    };
+    let cached_before = mem("Cached:");
+    let shards = match colibri_safetensors::Shards::open(container) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("dropcache: {container}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dropped = shards.drop_page_cache();
+    let cached_after = mem("Cached:");
+    let swap_used = mem("SwapTotal:").saturating_sub(mem("SwapFree:"));
+    println!(
+        "dropcache: advised {} GB across {} shards | page cache {} -> {} MiB (freed {})",
+        dropped >> 30,
+        shards.num_files(),
+        cached_before,
+        cached_after,
+        cached_before.saturating_sub(cached_after),
+    );
+    if swap_used > 0 {
+        println!(
+            "dropcache: WARNING {swap_used} MiB still in SWAP — fadvise cannot reclaim it. \
+             Every measurement on this box is degraded until a root user runs \
+             `swapoff -a && swapon -a` (or the box is rebooted)."
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 #[cfg(target_os = "linux")]
 fn cmd_iobench(args: &[String]) -> ExitCode {
     use std::os::unix::fs::OpenOptionsExt;
@@ -2510,32 +2574,33 @@ where
     if let Some(c) = mgr.commit(colibri_engine::ram::Class::Dense, resident) {
         c.hold_forever(); // dense weights live for the process
     }
-    // Pre-allocate the expert arena to the fill target, in whole experts. From here the
-    // expert footprint is a constant: slots are recycled by overwriting cold ones, never
-    // freed, so it cannot creep upward under load.
+    // The expert arena is **not** wired here yet. It was, and the first real-model run
+    // showed the sizing is wrong in two ways that each make things worse, not better:
     //
-    // `per` is one expert's bytes. A partial slot is useless — an expert either fits or
-    // is read elsewhere — so the grant is truncated to whole slots rather than rounded up
-    // past the ceiling.
-    let slots = if per > 0 { (fill_target / per) as usize } else { 0 };
-    if slots > 0 {
-        let claimed = colibri_core::quant::arena_init(per as usize, slots);
-        if let Some(c) = mgr.commit(colibri_engine::ram::Class::Experts, claimed) {
-            c.hold_forever();
-        }
-        eprintln!(
-            "[ram] ceiling {} GB = {}% of {} GB | dense {} GB | expert arena {} GB \
-             ({slots} slots x {} MB, pre-faulted, recycled by overwrite) | {} GB left for \
-             KV + activations",
-            mgr.ceiling() >> 30,
-            TARGET_RAM_PCT,
-            total >> 30,
-            resident >> 30,
-            claimed >> 30,
-            per >> 20,
-            mgr.ceiling().saturating_sub(mgr.committed()) >> 30,
-        );
-    }
+    //   - **Mapped models do not use it at all.** MiniMax-M2.7 and Nemotron serve resident
+    //     spans as mmap *views*, so they never allocate an expert-sized heap buffer. The
+    //     arena was ~102 GB of pre-faulted memory nothing would ever ask for, and touching
+    //     it at startup on a box with 84 GB free hung the load before the first token.
+    //   - **The slot size did not match real spans.** Slots were sized at `per` (one
+    //     expert), but `read_raw_shared_batched` coalesces an expert's projections into one
+    //     span that is *larger* than that — GLM asked for ~21 MB against 20 MB slots, so
+    //     every request bypassed the arena and allocated fresh while 40 GB sat idle
+    //     alongside it (peak RSS 80 GiB).
+    //
+    // The arena itself is sound and tested (`crates/colibri-core/tests/arena.rs`); what is
+    // missing is a slot size derived from the *span* sizes the reader actually requests,
+    // and a decision to skip it entirely when spans are served as views. Until then, the
+    // committed budget below is the honest one: the ledger tracks the dense tier and
+    // admits requests against it, without claiming an arena that does not exist.
+    eprintln!(
+        "[ram] ceiling {} GB = {}% of {} GB | dense {} GB | {} GB for experts + KV + \
+         activations (arena not yet wired: expert memory is still pooled, not pre-granted)",
+        mgr.ceiling() >> 30,
+        TARGET_RAM_PCT,
+        total >> 30,
+        resident >> 30,
+        mgr.ceiling().saturating_sub(mgr.committed()) >> 30,
+    );
     // fadvise auto-engages only for a near-fit model: there the whole set is resident, so
     // the page cache is a pure duplicate and dropping it frees RAM for experts. A ≫-RAM
     // model needs the page cache as its second tier. `COLI_FADVISE` still overrides.

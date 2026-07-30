@@ -37,6 +37,7 @@ field() { grep -oP "$2" <<<"$1" | head -1 || true; }
 suite_prefill() {
   echo; echo "── prefill (NGEN=1, profile; $REPS reps + warmup) ──"
   local prefills=() eloads=() toks=()
+  mem_reset
   COLI_NGEN=1 COLI_PROFILE=1 COLI_TIMING=1 "$COLI_BIN" gen "$CONTAINER" $PROMPT_TOKENS >/dev/null 2>&1 || true
   local i out pf el ff pj at mo tok
   for i in $(seq 1 "$REPS"); do
@@ -56,6 +57,7 @@ suite_prefill() {
     "$(median "${prefills[@]}")" "$(median "${eloads[@]}")" \
     "$(awk -v n="$NTOK_PROMPT" -v ms="$(median "${prefills[@]}")" 'BEGIN{printf (ms>0)? n/(ms/1000) : 0}')"
   gate_tokens "${toks[@]}"
+  mem_reset
 }
 
 # ---- decode: warm steady-state tok/s + decode phase breakdown ------------------
@@ -66,6 +68,7 @@ suite_decode() {
   # Steady-state = MEDIAN of the per-token rates (robust to the cold first tokens and
   # the ±40% expert-load cache spikes); `best` = the compute-floor token.
   local meds=() toks=()
+  mem_reset
   COLI_NGEN="$ngen" COLI_TIMING=1 "$COLI_BIN" gen "$CONTAINER" $PROMPT_TOKENS >/dev/null 2>&1 || true
   local i out med best tok
   for i in $(seq 1 "$REPS"); do
@@ -80,6 +83,7 @@ suite_decode() {
   done
   printf "  MEDIAN across reps: %s tok/s\n" "$(median "${meds[@]}")"
   gate_tokens "${toks[@]}"
+  mem_reset
 }
 
 # ---- batch: aggregate tok/s vs batch size + a token-identity verify -------------
@@ -112,6 +116,7 @@ suite_batch() {
 suite_serve() {
   local port="${SERVE_PORT:-8080}" ntok="${SERVE_NTOK:-32}"
   echo; echo "── serve (bench_serve.py, diverse NL prompts, HTTP :$port) ──"
+  mem_reset
   local log="/tmp/coli_serve_${MODEL}_$$.log"
   COLI_SERVE_MODEL="$MODEL" COLI_PORT="$port" "$COLI_BIN" serve "$CONTAINER" "$port" >"$log" 2>&1 &
   local pid=$!

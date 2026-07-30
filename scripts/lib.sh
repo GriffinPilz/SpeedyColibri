@@ -22,6 +22,28 @@ need_coli()      { [[ -x "$COLI_BIN" ]] || die "coli not found at $COLI_BIN — 
 need_container() { [[ -d "$CONTAINER" ]] || die "container missing: $CONTAINER (model '$COLI_MODEL' not materialized on this host)"; }
 need_source()    { [[ -d "$SOURCE" ]]    || die "source missing: $SOURCE (model '$COLI_MODEL')"; }
 
+# Reset memory state between benchmark arms.
+#
+# Page-cache carry-over is the biggest source of contamination in this repo's numbers:
+# the SAME configuration measured 2.27 tok/s early in a sequence and 0.23 tok/s late,
+# purely from what the previous arm left warm. An A/B that does not reset is partly
+# measuring the order of its arms.
+#
+# `coli dropcache` uses posix_fadvise(DONTNEED) — no root, and only this model's pages.
+# It also reports swap, which fadvise CANNOT reclaim: if a run has driven the box into
+# swap, every later measurement is degraded until someone with root runs
+# `swapoff -a && swapon -a`. Better to see that in the log than to spend a day
+# re-measuring a poisoned box (which is exactly what happened before this existed).
+#
+# Call it BEFORE each arm (start from a known state) and AFTER (leave the box clean for
+# whatever runs next).
+mem_reset() {
+  [[ -x "$COLI_BIN" && -d "$CONTAINER" ]] || return 0
+  "$COLI_BIN" dropcache "$CONTAINER" 2>/dev/null | sed 's/^/    /'
+  # Let the kernel actually complete the reclaim before the next arm starts timing.
+  sleep "${MEM_RESET_SETTLE:-3}"
+}
+
 # Median of numeric args (integers or floats).
 median() {
   printf "%s\n" "$@" | sort -n | awk '

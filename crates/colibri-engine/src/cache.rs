@@ -312,6 +312,7 @@ impl State {
     /// evicted by their own batch and reloaded.
     fn evict_to_protecting(&mut self, budget: u64, protect: &HashSet<(usize, usize)>) {
         if self.bytes <= budget {
+            self.publish_ram();
             return;
         }
         // Rank once, then evict down the list — rather than re-scanning every entry to
@@ -375,8 +376,26 @@ impl State {
         if let Some(t) = t_drop {
             EVICT_DROP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        self.publish_ram();
         // Falling off the end means everything left is pinned or protected — the same
         // outcome the old `None => break` arm produced.
+    }
+
+    /// Publish resident expert bytes to the RAM ledger.
+    ///
+    /// Both insert paths call `evict_to`/`evict_to_protecting` immediately after adding to
+    /// `self.bytes`, and the adaptive monitor calls them directly, so publishing on **every**
+    /// exit of `evict_to_protecting` — including the early "already fits" return, which is
+    /// the common case after an insert — covers every mutation of `self.bytes` without
+    /// scattering calls across the file.
+    ///
+    /// Before this, `Class::Experts` was never committed. The cache bounded itself against
+    /// its own `budget` while `serve`'s KV admission computed headroom as
+    /// `ceiling - dense - experts` with `experts` stuck at 0 — so the two largest consumers
+    /// on the box each sized themselves as if the other were absent. That is the accounting
+    /// hole behind "RAM must never pass 96%", not the ceiling arithmetic, which was correct.
+    fn publish_ram(&self) {
+        crate::ram::set_usage(crate::ram::Class::Experts, self.bytes);
     }
 }
 

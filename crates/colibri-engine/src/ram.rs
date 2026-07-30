@@ -142,6 +142,50 @@ impl RamManager {
             }
         }
     }
+
+    /// Set a class's committed total to `bytes` outright, and return the ledger headroom
+    /// left afterwards.
+    ///
+    /// For a subsystem that already maintains its own authoritative byte count and bounds
+    /// itself by eviction rather than by refusal — the expert cache is the only one. A
+    /// `Commitment` per expert would mean one RAII object per cache entry and a commit/
+    /// release on every LFRU insert and evict, to track a number `State.bytes` already
+    /// holds exactly.
+    ///
+    /// This is **not** an admission check: it cannot refuse, and it can push the total past
+    /// the ceiling. That is deliberate — the caller learns how far it is over from the
+    /// returned headroom (0 means at or beyond) and evicts down. Refusing here would mean
+    /// failing an expert load mid-forward, which has no useful recovery.
+    ///
+    /// Until this existed, `Class::Experts` was **never committed at all**: the largest
+    /// consumer on the box (up to ~102 GB) was invisible to the ledger, so `serve`'s KV
+    /// admission computed its headroom as `ceiling - dense` and believed ~100 GB was free
+    /// while the cache was holding it.
+    pub fn set_usage(&self, class: Class, bytes: u64) -> u64 {
+        let prev = self.per_class[class as usize].swap(bytes, Ordering::AcqRel);
+        // Keep `total` consistent with the per-class figure. Signed delta, applied as one
+        // add or one sub, so concurrent commits in other classes are never clobbered.
+        if bytes >= prev {
+            self.total.fetch_add(bytes - prev, Ordering::AcqRel);
+        } else {
+            self.total.fetch_sub(prev - bytes, Ordering::AcqRel);
+        }
+        self.ceiling.saturating_sub(self.total.load(Ordering::Acquire))
+    }
+
+    /// Ledger headroom: what a new allocation of any class could still take.
+    pub fn headroom(&self) -> u64 {
+        self.ceiling.saturating_sub(self.total.load(Ordering::Acquire))
+    }
+}
+
+/// Set a class's usage on the process manager, returning the remaining headroom.
+/// `u64::MAX` when no manager is installed, so an unmanaged path is unconstrained.
+pub fn set_usage(class: Class, bytes: u64) -> u64 {
+    match manager() {
+        Some(m) => m.set_usage(class, bytes),
+        None => u64::MAX,
+    }
 }
 
 /// The process's manager. Installed once at startup, before any model is loaded.
@@ -266,6 +310,33 @@ mod tests {
 
     fn mgr(ceiling: u64) -> Arc<RamManager> {
         Arc::new(RamManager::new(ceiling))
+    }
+
+    #[test]
+    fn set_usage_is_absolute_and_composes_with_commitments() {
+        let m = mgr(100);
+        let _dense = m.commit(Class::Dense, 20).expect("fits");
+
+        // Absolute, not additive — the cache reports its total, not a delta.
+        assert_eq!(m.set_usage(Class::Experts, 50), 30, "20 + 50 = 70 of 100");
+        assert_eq!(m.set_usage(Class::Experts, 60), 20, "replaces 50, does not add to it");
+        assert_eq!(m.committed_in(Class::Experts), 60);
+        assert_eq!(m.committed(), 80);
+
+        // Shrinking on eviction gives the headroom back to *other* classes.
+        assert_eq!(m.set_usage(Class::Experts, 10), 70);
+        assert!(m.commit(Class::Kv, 70).is_some(), "evicted expert bytes are now grantable");
+    }
+
+    #[test]
+    fn set_usage_reports_zero_headroom_when_over_the_ceiling() {
+        // It cannot refuse — failing an expert load mid-forward has no useful recovery — so
+        // the caller learns it is over from the headroom and evicts down. If this ever
+        // returned nonzero while over, the cache would keep growing past the ceiling.
+        let m = mgr(100);
+        assert_eq!(m.set_usage(Class::Experts, 140), 0);
+        assert_eq!(m.committed(), 140, "the overshoot is visible, not silently clamped");
+        assert_eq!(m.set_usage(Class::Experts, 90), 10, "and it recovers when evicted down");
     }
 
     #[test]

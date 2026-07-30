@@ -2275,7 +2275,25 @@ const NEARFIT_COVERAGE_PCT: u64 = 80;
 /// This supersedes the older "leave off" advice, which came from ONE model measured
 /// before the coverage axis was understood (and on GLM's older, 735 GB e4m3 container —
 /// nearly double today's 379 GB, i.e. a different coverage entirely).
-const O_DIRECT_MAX_COVERAGE_PCT: u64 = 35;
+///
+/// **Now 0 — O_DIRECT is off for every model, forced by the move to max residency.**
+/// O_DIRECT and mapped views are mutually exclusive: O_DIRECT never populates the page
+/// cache, so a mapped span's residency check can never pass and every span pays a
+/// `mincore` before falling back to `pread` regardless. Measured on Kimi-K3 with both
+/// forced on: 28604 -> 29304 ms steady state plus a one-off 65191 ms while 94 shards of
+/// mappings are established.
+///
+/// Now that every model fills to its full headroom and serves resident spans as views,
+/// the page cache is not a rival tier — **it is where our resident experts live**.
+/// Bypassing it would defeat the residency this whole change exists to create. The 1.089x
+/// (K3) and 1.145x (GLM) O_DIRECT wins in the table above were measured against the 40 GB
+/// streaming cap, where the page cache genuinely could not hold a useful share; that is no
+/// longer the configuration.
+///
+/// Kept as a constant so it can be re-enabled per-model if a measurement demands it.
+/// `COLI_O_DIRECT=1` forces it back on — but see the mutual-exclusion note above before
+/// combining it with mapping.
+const O_DIRECT_MAX_COVERAGE_PCT: u64 = 0;
 
 /// Coverage below which the expert reader uses a **narrow** thread pool
 /// ([`DISK_BOUND_READ_THREADS`]) instead of `2 x cores`. `COLI_LOAD_THREADS` overrides.
@@ -2330,10 +2348,23 @@ const DISK_BOUND_READ_THREADS: usize = 12;
 ///
 /// **I initially gated this on `O_DIRECT_MAX_COVERAGE_PCT` (35%), reasoning that one
 /// number should decide both. That was wrong** — it would have enabled mapping for M3 and
-/// cost 9.6%. 80% sits between the measured loss (47%) and win (86%); the crossover inside
-/// that interval is not measured, and it is deliberately conservative because the downside
-/// is paid on every span while the upside needs residency.
-const MMAP_MIN_COVERAGE_PCT: u64 = 80;
+/// cost 9.6%. 80% sat between the measured loss (47%) and win (86%).
+///
+/// **Now 0 — mapping is on for every model.** Both premises of the table above have been
+/// removed, and the table itself says so: M3's loss is explained as "almost nothing
+/// survives in page cache **next to the 40 GB expert cache**". That 40 GB cap is gone —
+/// every model now fills to its full headroom — so the residency the gate was waiting for
+/// is exactly what the fill creates. The two decisions were coupled the whole time: mmap
+/// was withheld because residency was low, and residency was low because it was capped.
+///
+/// The second premise was cost. The gate's own `mincore` was 405 ms of MiniMax-M2.7's
+/// 441 ms expert-load; sampling it (`COLI_MINCORE_SAMPLE`, default 8) cut that to 26 ms.
+/// The "dead weight" a failed residency check costs is now ~15x smaller than when 80 was
+/// chosen, so the downside of guessing wrong is correspondingly smaller.
+///
+/// Kept as a constant rather than deleted so the gate can be restored per-model if a
+/// measurement demands it. `COLI_MMAP_EXPERTS=0` disables mapping outright.
+const MMAP_MIN_COVERAGE_PCT: u64 = 0;
 
 /// Wire the expert cache to **fill RAM safely, for every model**. It grows toward a fill
 /// target and a background monitor evicts LRU experts under memory pressure so the box can
@@ -2466,7 +2497,23 @@ where
     // tier, the KV for the live context, or the GPU's share of a unified pool — the three
     // terms that decide whether a fill is safe. Every one of those is available here, so
     // the budget is computed, not asked for.
-    let requested = if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR };
+    // MAX RESIDENCY FOR EVERY MODEL. RAM held back is RAM not caching a model, so the
+    // fill target is the headroom itself — `TARGET_RAM_PCT` of MemTotal less the dense
+    // tier and the non-KV runtime — regardless of coverage. Experts are only given back
+    // when another process needs the memory (`ADAPTIVE_DANGER_FLOOR`) or when the kernel
+    // starts paging us out (the swap guard in `spawn_adaptive_budget`).
+    //
+    // This drops the old `MemTotal / CACHE_CAP_DIVISOR` streaming cap, which held every
+    // ≫-RAM model to 40 GB of 121 — 33% of RAM — on the theory that the page cache is a
+    // better second tier than our own cache. On MiniMax-M2.7 that theory cost **8.5×**
+    // (0.6 vs 5.3 tok/s), and the two premises it rested on have both changed: resident
+    // spans are now mmap *views* of page-cache pages rather than heap duplicates, so
+    // residency no longer double-holds, and a fill can no longer walk the box into swap.
+    //
+    // For a model whose experts vastly exceed RAM this mostly restores what the clamp
+    // already allowed — Kimi-K3's 63 GB dense tier leaves 43 GB either way — so the change
+    // is largest exactly where there is the most to gain.
+    let requested = natural_fill;
     // `headroom` accounts for everything in RAM that is NOT experts: the resident dense
     // tier plus the serving process's own runtime (KV, activations, GPU staging, read
     // buffers). It bounds the fill unconditionally. No-op for a small-resident model
@@ -3195,80 +3242,81 @@ mod tests {
         );
     }
 
-    /// One constant now drives BOTH the read path (O_DIRECT) and the mapped-view path,
-    /// in opposite directions, so a change to it moves two behaviours at once. Both are
-    /// measured, so pin both.
+    /// The read path under max residency: **mapped views for every model, O_DIRECT for
+    /// none**, and above all never both at once.
     ///
-    /// mmap, ABBA, 4 runs/arm, tokens identical throughout:
-    ///   MiniMax-M2.7 (86%): pread 2987 ms -> mapped 529 ms   = 5.65x WIN
-    ///   GLM-5.2      (26%): pread 14694 ms -> mapped 15080 ms = 0.97x loss
+    /// This test previously pinned mmap to a coverage gate of 80 with the rows
+    /// `M2.7 86% -> on`, `M3 47% -> off`, `GLM 26% -> off`. Those measurements were real
+    /// (M2.7 5.65x win; M3 0.91x, GLM 0.97x losses) but they were all taken **against the
+    /// 40 GB streaming cap**, and the gate's own doc explained M3's loss as "almost nothing
+    /// survives in page cache next to the 40 GB expert cache". That cap is gone: every
+    /// model now fills to its full headroom, which is precisely the residency the gate was
+    /// waiting for. The gate and the cap were circular — mapping was withheld because
+    /// residency was low, and residency was low because it was capped.
+    ///
+    /// The mutual-exclusion invariant below is NOT superseded and must never be relaxed.
     #[test]
-    fn mmap_gate_matches_the_measured_models() {
-        // Every measured mmap arm. M3 is the one that matters: it sits ABOVE the O_DIRECT
-        // threshold, so gating mmap on that constant (as this first did) turns mapping on
-        // for a model where it measured 9.6% SLOWER.
-        for (name, cov, want_map) in [
-            ("minimax-m2.7", 86u64, true), // 2987 -> 529 ms, 5.65x
-            ("minimax-m3", 47, false),     // 7851 -> 8605 ms, 0.91x
-            ("glm-5.2", 26, false),        // 14694 -> 15080 ms, 0.97x
-            ("kimi-k3", 7, false),
+    fn read_path_is_mapped_everywhere_and_never_o_direct_too() {
+        // Real coverages across the fleet, including the extremes.
+        for (name, cov) in [
+            ("kimi-k3", 3u64),
+            ("glm-5.2", 26),
+            ("minimax-m3", 46),
+            ("minimax-m2.7", 88),
+            ("nemotron-3-super", 158),
         ] {
-            assert_eq!(
-                cov >= MMAP_MIN_COVERAGE_PCT,
-                want_map,
-                "{name} at {cov}% coverage should have mmap={want_map}"
+            assert!(cov >= MMAP_MIN_COVERAGE_PCT, "{name} at {cov}% should map");
+            assert!(
+                !(cov < O_DIRECT_MAX_COVERAGE_PCT),
+                "{name} at {cov}% should not use O_DIRECT under max residency"
             );
         }
-        // Bounded by the measured neighbours, so it cannot be tuned onto a known result.
-        assert!(
-            (48..=86).contains(&MMAP_MIN_COVERAGE_PCT),
-            "mmap threshold {MMAP_MIN_COVERAGE_PCT} escaped the measured interval (47%, 86%)"
-        );
-        // The two paths are MUTUALLY EXCLUSIVE, and not merely by taste: O_DIRECT never
-        // populates the page cache, so with both on the residency gate can never succeed
-        // and every span pays a `mincore` before falling back to `pread` anyway. Measured
-        // on Kimi-K3 (7% coverage, so O_DIRECT is on) with mapping forced: 28604 -> 29304 ms
-        // steady state (2.4%, matching GLM's 2.6% at 26%), plus a ONE-OFF 65191 ms first
-        // run while 94 shards / 1.4 TB of mappings are established and first-touched.
-        // Ordering the thresholds prevents the engine from ever selecting the combination.
-        assert!(
-            MMAP_MIN_COVERAGE_PCT > O_DIRECT_MAX_COVERAGE_PCT,
-            "thresholds must not overlap: O_DIRECT + mmap is all cost and no benefit"
-        );
-        for cov in [0u64, 7, 26, 34, 35, 47, 79, 80, 86, 172, 1000] {
+
+        // THE invariant. O_DIRECT never populates the page cache, so with both on a mapped
+        // span's residency check can never pass: every span pays a `mincore` and falls back
+        // to `pread` regardless. Measured on Kimi-K3 with both forced: 28604 -> 29304 ms
+        // steady state, plus a ONE-OFF 65191 ms while 94 shards / 1.4 TB of mappings are
+        // established and first-touched. Under max residency the page cache is not a rival
+        // tier — it is where the resident experts live — so bypassing it is strictly worse.
+        for cov in [0u64, 3, 7, 26, 34, 35, 46, 47, 79, 80, 88, 158, 1000] {
             let direct = cov < O_DIRECT_MAX_COVERAGE_PCT;
             let mapped = cov >= MMAP_MIN_COVERAGE_PCT;
             assert!(!(direct && mapped), "at {cov}% both paths would be active");
         }
     }
 
-    /// The O_DIRECT threshold must keep classifying the four models it was measured on.
-    /// Each row is a real ABBA-mirrored result, so a threshold change that flips any of
-    /// them is a change against evidence and should fail here first.
+    /// O_DIRECT is off fleet-wide under max residency — and this test records what that
+    /// costs, so it is a known trade rather than a forgotten one.
+    ///
+    /// The threshold was 35, and these ABBA-mirrored results are still valid *for the
+    /// configuration they were taken in* (the 40 GB streaming cap):
+    ///
+    ///   kimi-k3     7%  31350 -> 28788 ms   O_DIRECT 1.089x WIN  <- given up
+    ///   glm-5.2    27%  16957 -> 14812 ms   O_DIRECT 1.145x WIN  <- given up
+    ///   minimax-m3 47%   6232 vs 6755 ms    buffered wins
+    ///   m2.7       86%   4166 vs 4444 ms    buffered wins
+    ///
+    /// Both wins are forfeited deliberately. O_DIRECT bypasses the page cache, and under
+    /// max residency the page cache is where our resident experts live — a mapped span's
+    /// residency check can never pass against O_DIRECT reads, so the two cannot coexist
+    /// (see `read_path_is_mapped_everywhere_and_never_o_direct_too`). Holding 43 GB of K3
+    /// and 87 GB of GLM resident is worth more than a 1.09-1.15x on the reads that miss —
+    /// **but that is a prediction, not a measurement**, and the fleet A/B is what settles
+    /// it. If GLM or K3 regress, this is the first knob to revisit.
     #[test]
-    fn o_direct_threshold_matches_the_measured_models() {
-        // (name, coverage %, O_DIRECT should be ON)
-        let measured = [
-            ("kimi-k3", 7u64, true),      // 31350 -> 28788 ms, 1.089x
-            ("glm-5.2", 27, true),        // 16957 -> 14812 ms, 1.145x
-            ("minimax-m3", 47, false),    // buffered 6232 vs 6755
-            ("minimax-m2.7", 86, false),  // buffered 4166 vs 4444; warm rep read 0 bytes
-        ];
-        for (name, cov, want_direct) in measured {
-            assert_eq!(
-                cov < O_DIRECT_MAX_COVERAGE_PCT,
-                want_direct,
-                "{name} at {cov}% coverage should have O_DIRECT={want_direct}"
+    fn o_direct_is_off_fleet_wide_under_max_residency() {
+        for (name, cov) in [
+            ("kimi-k3", 3u64),
+            ("glm-5.2", 26),
+            ("minimax-m3", 46),
+            ("minimax-m2.7", 88),
+            ("nemotron-3-super", 158),
+        ] {
+            assert!(
+                !(cov < O_DIRECT_MAX_COVERAGE_PCT),
+                "{name} at {cov}% must not take the direct path while mapping is on"
             );
         }
-        // The threshold must sit strictly between the two measured neighbours, so it
-        // cannot be "tuned" past a model whose result we actually have.
-        assert!(
-            (28..=46).contains(&O_DIRECT_MAX_COVERAGE_PCT),
-            "threshold {O_DIRECT_MAX_COVERAGE_PCT} escaped the measured interval (27%, 47%)"
-        );
-        // Nemotron preloads (172% coverage) and must never take the direct path.
-        assert!(!(172 < O_DIRECT_MAX_COVERAGE_PCT));
     }
 
     /// The cache-sizing footprint must not collapse to zero on an arch whose

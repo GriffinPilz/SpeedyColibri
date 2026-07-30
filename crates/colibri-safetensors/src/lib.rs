@@ -168,18 +168,35 @@ fn uring_enabled() -> bool {
 }
 
 /// Pages to probe in [`Mapping::resident`] instead of walking the whole span.
-/// `COLI_MINCORE_SAMPLE`; **0 (default) = exact**, examine every page.
+/// `COLI_MINCORE_SAMPLE`; **0 = exact** (examine every page), default **8**.
 ///
 /// The exact check costs ~51 ns per page and a mapped model pays it on every span of
-/// every read — 428 ms of MiniMax-M2.7's 435 ms expert-load. Sampling makes that O(k)
-/// instead of O(pages), but it is a genuine weakening: a span with a hole in the middle
-/// can pass and then fault. Off by default until measured against a major-fault count,
-/// because the failure mode this guards is the 300× regression documented on
-/// [`Mapping::resident`].
+/// every read. Measured on MiniMax-M2.7 (which reads *zero* device bytes warm, so this
+/// syscall **is** its expert-load), interleaved, tokens identical and RSS identical:
+///
+/// | k | expert-load | `mincore` | **major faults** |
+/// |---|---|---|---|
+/// | 0 (exact) | 441 / 440 / 451 ms | 405 / 405 / 413 ms | **0** |
+/// | **8** | **61 / 61 ms** | **26 / 26 ms** | **0** |
+/// | 2 | 45 / 45 ms | 8 / 8 ms | **0** |
+///
+/// **7.2x on expert-load with zero major faults**, and minor faults matching the exact
+/// arm to within 0.007%.
+///
+/// k=8 rather than the nominally-faster k=2: the remaining 16 ms is negligible against
+/// 441, while 8 probes catch a partially-evicted span far more often than 2. One side of
+/// that trade is a little speed; the other is the 300x, 407k-major-fault regression
+/// documented on [`Mapping::resident`].
+///
+/// **What this test does NOT exercise:** every arm ran fully warm and resident, so the
+/// failure mode — a span with a hole in the middle passing the sampled check — never
+/// arose. It is bounded rather than excluded: the mapped path only runs at >=80%
+/// coverage (models that essentially fit), and `COLI_MINCORE_SAMPLE=0` restores the exact
+/// check. If major faults ever appear on a mapped model, set that first.
 fn mincore_sample() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("COLI_MINCORE_SAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+        std::env::var("COLI_MINCORE_SAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(8)
     })
 }
 

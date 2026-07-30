@@ -1361,6 +1361,18 @@ where
                 mc as f64 / 1e3,
                 al as f64 / 1e3,
             );
+            // Only populated under COLI_RESIDENCY_PROBE=1 — it costs an exact mincore walk.
+            let (psp, pby, pres, pruns, pempty) = colibri_safetensors::partial_profile();
+            if psp > 0 {
+                eprintln!(
+                    "[profile] partial residency: {psp} missed spans ({:.1} GB) | {:.1}% already resident | {} missing runs ({:.0} per span, {:.0} KB each) | {pempty} fully absent",
+                    pby as f64 / 1e9,
+                    100.0 * pres as f64 / pby.max(1) as f64,
+                    pruns,
+                    pruns as f64 / psp as f64,
+                    (pby - pres) as f64 / 1e3 / pruns.max(1) as f64,
+                );
+            }
             let (ph, pm, pp, pd, pdb) = colibri_core::pool_profile();
             eprintln!(
                 "[profile] buf pool: {ph} hits / {pm} misses | {pp} recycled / {pd} rejected ({:.1} GB re-freed)",

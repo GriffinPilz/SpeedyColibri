@@ -246,6 +246,47 @@ pub static SPAN_MINCORE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub static SPAN_ALLOC_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SPAN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Measures how much of a span that *failed* the residency gate was resident anyway.
+///
+/// The gate is all-or-nothing: one reclaimed 4 KiB page sends a whole ~21 MB coalesced
+/// expert back through `pread`. That is obviously wasteful, but "obviously wasteful" has
+/// been wrong here before, so this counts it before anything is built to exploit it.
+///
+/// The number that decides the design is **not** the resident fraction — it is
+/// [`PARTIAL_RUNS`], the count of contiguous *missing* ranges. Repairing a partial span
+/// means replacing one large sequential read with one read per missing run. Two runs of
+/// 1 MB is a large win over re-reading 21 MB; five hundred scattered 4 KiB runs is a
+/// catastrophic loss to the same drive that measured 11.6 GB/s at 127 KiB and far less
+/// at 4 KiB. Fragmentation, not volume, is what makes the idea pay or not pay.
+///
+/// Costs an exact `mincore` walk, so it is opt-in via `COLI_RESIDENCY_PROBE=1` and only
+/// ever runs on the path that was already about to read the whole span.
+pub static PARTIAL_SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PARTIAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PARTIAL_RESIDENT_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PARTIAL_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Spans where the exact walk found *nothing* resident — the honest streaming case, for
+/// which no repair scheme can help. Kept separate so it cannot flatter the average.
+pub static PARTIAL_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn residency_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_RESIDENCY_PROBE").ok().as_deref() == Some("1"))
+}
+
+/// `(spans, bytes, resident_bytes, missing_runs, fully_absent)`.
+pub fn partial_profile() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PARTIAL_SPANS.load(Relaxed),
+        PARTIAL_BYTES.load(Relaxed),
+        PARTIAL_RESIDENT_BYTES.load(Relaxed),
+        PARTIAL_RUNS.load(Relaxed),
+        PARTIAL_EMPTY.load(Relaxed),
+    )
+}
+
 fn profile_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_PROFILE").ok().as_deref() == Some("1"))
@@ -494,10 +535,63 @@ impl Mapping {
         rc == 0 && vec.iter().all(|b| b & 1 == 1)
     }
 
+    /// Record how much of a span that failed [`resident`] was resident anyway, and in how
+    /// many contiguous missing runs. Diagnostic only — see [`PARTIAL_SPANS`].
+    ///
+    /// Runs are counted at page granularity on the *missing* side, which is the quantity a
+    /// repair scheme would have to turn into reads.
+    #[cfg(target_os = "linux")]
+    fn probe_partial(&self, off: usize, len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if len == 0 || off.saturating_add(len) > self.len {
+            return;
+        }
+        let page = 4096usize;
+        let start = off & !(page - 1);
+        let end = off + len;
+        let pages = (end - start).div_ceil(page);
+        let mut vec = vec![0u8; pages];
+        // SAFETY: `start` is page-aligned and inside the mapping; `vec` has one byte per page.
+        let rc = unsafe {
+            libc::mincore(
+                (self.ptr as *mut u8).add(start) as *mut libc::c_void,
+                end - start,
+                vec.as_mut_ptr() as *mut _,
+            )
+        };
+        if rc != 0 {
+            return;
+        }
+        let mut resident_pages = 0u64;
+        let mut runs = 0u64;
+        let mut in_run = false;
+        for b in &vec {
+            if b & 1 == 1 {
+                resident_pages += 1;
+                in_run = false;
+            } else {
+                if !in_run {
+                    runs += 1;
+                }
+                in_run = true;
+            }
+        }
+        PARTIAL_SPANS.fetch_add(1, Relaxed);
+        PARTIAL_BYTES.fetch_add(len as u64, Relaxed);
+        PARTIAL_RESIDENT_BYTES.fetch_add(resident_pages * page as u64, Relaxed);
+        PARTIAL_RUNS.fetch_add(runs, Relaxed);
+        if resident_pages == 0 {
+            PARTIAL_EMPTY.fetch_add(1, Relaxed);
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn resident(&self, _off: usize, _len: usize) -> bool {
         false
     }
+
+    #[cfg(not(target_os = "linux"))]
+    fn probe_partial(&self, _off: usize, _len: usize) {}
 }
 
 impl Drop for Mapping {
@@ -1309,7 +1403,16 @@ impl Shards {
                 Mapping::open(f, size).map(Arc::new)
             })
             .clone()?;
-        map.resident(off as usize, len).then_some(map)
+        if map.resident(off as usize, len) {
+            return Some(map);
+        }
+        // The span is about to be re-read in full. Before building anything that would
+        // read only its missing part, measure whether that part is contiguous enough to
+        // be worth reading separately.
+        if residency_probe() {
+            map.probe_partial(off as usize, len);
+        }
+        None
     }
 
     /// Read into `buf`, preferring the `O_DIRECT` descriptor when one was opened.

@@ -417,11 +417,78 @@ pub struct ShardsExpertProvider<'a> {
 /// point in that flat region rather than over-fitting to the single fastest
 /// sample. The clamp keeps tiny boxes above a useful queue depth and stops
 /// many-core hosts spawning hundreds of blocked threads for one drive.
+/// **2026-07-29: the table above is the PREFILL regime and it does not generalise.**
+///
+/// Re-swept in the decode regime (12-token prompt) on the same box, interleaved,
+/// token-identical at every point. GLM:
+///
+/// | threads | 2 | 4 | 6 | 8 | 12 | 16 | 34 | 64 |
+/// |---|---|---|---|---|---|---|---|---|
+/// | drain GB/s | 5.82 | 9.11 | 10.91 | 11.40 | **11.42** | 11.32 | 9.87 | 9.82 |
+/// | expert-load ms | 20293 | 13004 | 10865 | 10402 | **10389** | 10503 | 12017 | 12090 |
+///
+/// The peak is 8-12 and it degrades in *both* directions; the prefill table peaks at 40.
+/// Both are real — a prefill layer routes to ~all experts so a batch is huge, while a
+/// decode batch is ~137 jobs and 40 threads oversubscribe it.
+///
+/// **And the right answer is per-model, not per-regime.** Fleet A/B at 34 vs 8 threads,
+/// decode, token-identical:
+///
+/// | model | coverage | 34 threads | 8 threads | |
+/// |---|---|---|---|---|
+/// | GLM-5.2 | 26% | 12017 ms | **10402 ms** | 8 wins |
+/// | Kimi-K3 | 7% | 26364 ms | **22531 ms** | 8 wins (1.17x) |
+/// | MiniMax-M3 | 46% | **3718 ms** | 8611-16092 ms | 8 **loses 2-4x** |
+/// | Nemotron-3 | 172% | **12.0 s preload** | 29.5 s preload | 8 **loses 2.5x** |
+/// | MiniMax-M2.7 | 86% | 481 ms | 485 ms | neutral (all mmap views) |
+///
+/// So a constant — of any value — is wrong: 8 is a large win on two models and a 2-4x
+/// regression on two others.
+///
+/// What separates them is whether the bytes actually come off the drive. GLM reads
+/// device bytes equal to reader bytes in **both** arms (ratio 1.00, invariant), so it is
+/// genuinely disk-sourced and saturates at low queue depth; M3's ratio swings 0.26 -> 1.13
+/// with thread count, so it is not. That tracks coverage, which
+/// [`crate::coverage_pct`]-style gating already uses for the cache regime, O_DIRECT and
+/// mmap.
+///
+/// **The mechanism behind M3's behaviour is NOT established** — thread count changes the
+/// device-byte count itself, so that measurement cannot separate cause from effect. This
+/// gate is therefore deliberately one-directional: it only *lowers* the thread count for
+/// the low-coverage, measured-disk-bound models, and leaves every other model on exactly
+/// the previous default. Worst case it is neutral; it cannot reintroduce the M3/Nemotron
+/// regression.
 fn default_read_threads() -> usize {
-    std::env::var("COLI_LOAD_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| crate::preload::default_num_files().saturating_mul(2).clamp(8, 64))
+    if let Some(n) = std::env::var("COLI_LOAD_THREADS").ok().and_then(|s| s.parse().ok()) {
+        return n;
+    }
+    let wide = crate::preload::default_num_files().saturating_mul(2).clamp(8, 64);
+    match disk_bound_read_threads() {
+        Some(n) => n.min(wide),
+        None => wide,
+    }
+}
+
+/// Reader threads for a **disk-bound** model, or `None` to keep the wide default.
+///
+/// Set by the launcher once coverage is known (see `wire_adaptive_cache`); unset means
+/// "not classified", which keeps today's behaviour.
+static DISK_BOUND_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn disk_bound_read_threads() -> Option<usize> {
+    match DISK_BOUND_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Tell the reader this model streams from disk, so it should use a narrow pool.
+///
+/// `0` clears it. Must be called before the provider is constructed —
+/// [`default_read_threads`] is read once per provider, not per read.
+pub fn set_disk_bound_read_threads(n: usize) {
+    DISK_BOUND_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl<'a> ShardsExpertProvider<'a> {

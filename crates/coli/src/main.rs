@@ -2224,6 +2224,37 @@ const NEARFIT_COVERAGE_PCT: u64 = 118;
 /// nearly double today's 379 GB, i.e. a different coverage entirely).
 const O_DIRECT_MAX_COVERAGE_PCT: u64 = 35;
 
+/// Coverage below which the expert reader uses a **narrow** thread pool
+/// ([`DISK_BOUND_READ_THREADS`]) instead of `2 x cores`. `COLI_LOAD_THREADS` overrides.
+///
+/// A constant thread count is wrong for the fleet. Measured on 42b2, decode, interleaved,
+/// token-identical, 34 threads vs 8:
+///
+/// | model | coverage | 34 | 8 | |
+/// |---|---|---|---|---|
+/// | Kimi-K3 | 7% | 26364 ms | **22531 ms** | 8 wins 1.17x |
+/// | GLM-5.2 | 26% | 12017 ms | **10402 ms** | 8 wins 1.15x |
+/// | MiniMax-M3 | 46% | **3718 ms** | 8611-16092 ms | 8 loses **2-4x** |
+/// | MiniMax-M2.7 | 86% | 481 ms | 485 ms | neutral (all mmap views) |
+/// | Nemotron-3 | 172% | **12.0 s preload** | 29.5 s preload | 8 loses **2.5x** |
+///
+/// The two winners are the two models whose bytes genuinely come off the drive: GLM reads
+/// device bytes equal to reader bytes in *both* arms (ratio 1.00, invariant under thread
+/// count), so it saturates the NVMe at low queue depth and extra threads only cost. M3's
+/// ratio swings 0.26 -> 1.13 with thread count, so it is not disk-bound in the same sense.
+///
+/// 35 sits between the measured neighbours 26 (GLM, wants narrow) and 46 (M3, wants wide);
+/// the exact crossover in that interval is **not** measured. It coincides with
+/// [`O_DIRECT_MAX_COVERAGE_PCT`] by accident, not by derivation — do not merge them, the
+/// same mistake was already made and caught with the mmap threshold.
+const DISK_BOUND_COVERAGE_PCT: u64 = 35;
+
+/// Reader threads for a disk-bound model. The GLM sweep is flat across 8-16
+/// (11.40 / 11.42 / 11.32 GB/s at 8 / 12 / 16) and falls off hard outside it
+/// (5.82 at 2, 9.87 at 34), so 12 is the middle of the plateau rather than the single
+/// fastest sample.
+const DISK_BOUND_READ_THREADS: usize = 12;
+
 /// Coverage at or above which resident expert spans are served as **mapped views**
 /// instead of being copied into heap buffers. `COLI_MMAP_EXPERTS=0|1` overrides.
 ///
@@ -2352,6 +2383,15 @@ where
     // separately and the crossovers do not coincide (see each constant).
     colibri_safetensors::set_o_direct(covers_pct < O_DIRECT_MAX_COVERAGE_PCT);
     colibri_safetensors::set_mmap_experts(covers_pct >= MMAP_MIN_COVERAGE_PCT);
+    // Third decision off the same axis, with its own threshold and its own measurement.
+    // A model whose experts genuinely stream off the drive saturates the NVMe at a low
+    // queue depth, and every reader thread past that only adds spawn cost (the drain
+    // builds a fresh pool per batch) and contention. Models that do not stream want the
+    // wide pool — for them, narrowing it is a 2-4x regression. See
+    // `colibri_engine::moe::set_disk_bound_read_threads` for the fleet table.
+    if covers_pct < DISK_BOUND_COVERAGE_PCT {
+        colibri_engine::moe::set_disk_bound_read_threads(DISK_BOUND_READ_THREADS);
+    }
     // An explicit COLI_RAM_GB caps the fill target; the monitor still protects the floor.
     let explicit = std::env::var("COLI_RAM_GB")
         .ok()
@@ -2981,6 +3021,40 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// The narrow-reader gate, pinned to the fleet A/B that produced it (34 vs 8 threads,
+    /// decode, interleaved, token-identical). This one is worth pinning hard: a constant
+    /// thread count of 8 is a 1.15-1.17x WIN on the two low-coverage models and a 2-4x
+    /// REGRESSION on the two high-coverage ones, so getting the threshold wrong is not a
+    /// small miss in either direction.
+    #[test]
+    fn narrow_reader_gate_matches_the_measured_models() {
+        for (name, cov, want_narrow) in [
+            ("kimi-k3", 7u64, true),       // 26364 -> 22531 ms at 8 threads
+            ("glm-5.2", 26, true),         // 12017 -> 10402 ms at 8 threads
+            ("minimax-m3", 46, false),     // 3718 -> 8611..16092 ms at 8 threads: 2-4x WORSE
+            ("minimax-m2.7", 86, false),   // 481 -> 485 ms: neutral, all mmap views
+            ("nemotron-3-super", 172, false), // preload 12.0 s -> 29.5 s at 8 threads
+        ] {
+            assert_eq!(
+                cov < DISK_BOUND_COVERAGE_PCT,
+                want_narrow,
+                "{name} at {cov}% coverage should have narrow-reader={want_narrow}"
+            );
+        }
+        // Bracketed by the measured neighbours (GLM 26 wants narrow, M3 46 wants wide) so
+        // the threshold cannot be tuned onto a known result.
+        assert!(
+            (27..=46).contains(&DISK_BOUND_COVERAGE_PCT),
+            "narrow-reader threshold {DISK_BOUND_COVERAGE_PCT} escaped the measured interval (26%, 46%)"
+        );
+        // Inside the flat part of the GLM thread curve: 8/12/16 gave 11.40/11.42/11.32
+        // GB/s, while 2 and 34 collapse to 5.82 and 9.87.
+        assert!(
+            (8..=16).contains(&DISK_BOUND_READ_THREADS),
+            "{DISK_BOUND_READ_THREADS} threads is outside the measured 8-16 plateau"
+        );
     }
 
     /// One constant now drives BOTH the read path (O_DIRECT) and the mapped-view path,

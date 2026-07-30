@@ -2540,10 +2540,14 @@ where
         colibri_safetensors::set_fadvise(true);
     }
     provider.spawn_adaptive_budget(fill_target, ADAPTIVE_DANGER_FLOOR, ADAPTIVE_HARD_FLOOR);
+    // Both regimes now fill to the SAME max-residency target; they differ only in what
+    // happens to the page cache. A model whose set fits drops it (`fadvise`) because it is
+    // a pure duplicate of what we already hold; a model that still streams a tail keeps it
+    // as the second tier for the part that could not be made resident.
     let regime = if near_fit {
-        "near-fit max-residency, fadvise on"
+        "max residency, fadvise (set fits)"
     } else {
-        "≫-RAM fill, page cache kept"
+        "max residency, page cache kept for the streaming tail"
     };
     // Name the shard when this node owns only part of the model — otherwise a 2-node log
     // reads as though the box holds the whole thing and the coverage number looks like a bug.

@@ -41,6 +41,17 @@ const DEFAULT_CTX: usize = 32_768;
 /// Tokens generated per warm-up prompt (enough to route a spread of experts).
 const WARMUP_TOKENS: usize = 8;
 
+/// How long a request waits for KV room before the server answers 503.
+///
+/// Two admissible requests can collide simply by overlapping, and the second only needs
+/// the first to finish. Rejecting on first try would make the node's capacity look far
+/// smaller than it is, so contention queues. A request that could never fit is separated
+/// out and answered 507 immediately — waiting cannot help it, and leaving it queued would
+/// block the requests behind it that *can* be served.
+///
+/// 30 s is well beyond a typical decode and well inside any sane client timeout.
+const KV_QUEUE_SECS: u64 = 30;
+
 
 /// Parse a token count like `32k`, `1m`, or `131072`.
 fn parse_ctx(s: &str) -> Option<usize> {
@@ -572,21 +583,54 @@ fn complete(
     // state). That is O(1) in context, so counting only per-token bytes under-reserves worst
     // for SHORT prompts — where the per-token figure is far too small to cover it.
     let kv_bytes = KvCache::bytes_for(&model.cfg, ids.len()) as u64;
-    if !provider.reserve_ram(kv_bytes) {
-        let gib = (1u64 << 30) as f64;
-        let msg = format!(
-            "Not enough memory for this prompt: {} tokens need ~{:.1} GB of KV cache, \
-             which does not fit right now. Use a shorter prompt.",
-            ids.len(),
-            kv_bytes as f64 / gib
-        );
-        send_json(
-            stream,
-            507,
-            &format!("{{\"error\":{{\"message\":{},\"type\":\"insufficient_memory\",\"code\":\"kv_cache_too_large\"}}}}", jstr(&msg)),
-        );
-        return;
-    }
+    // Admit through the RAM ledger, which knows the dense tier and the expert arena.
+    // A request that merely collides with another in flight WAITS — both may be
+    // individually admissible, and rejecting the second would make capacity look far
+    // smaller than it is. A request too large for the whole rigid budget is rejected at
+    // once, because waiting cannot help it and it would block the queue behind it.
+    let rigid = colibri_engine::ram::manager()
+        .map(|m| m.ceiling().saturating_sub(m.committed_in(colibri_engine::ram::Class::Dense))
+            .saturating_sub(m.committed_in(colibri_engine::ram::Class::Experts)))
+        .unwrap_or(u64::MAX);
+    let (verdict, kv_commit) = colibri_engine::ram::commit_or_wait(
+        colibri_engine::ram::Class::Kv,
+        kv_bytes,
+        rigid,
+        std::time::Duration::from_secs(KV_QUEUE_SECS),
+    );
+    let _kv_commit = match verdict {
+        colibri_engine::ram::Admission::Ok => kv_commit,
+        colibri_engine::ram::Admission::TooLarge => {
+            let gib = (1u64 << 30) as f64;
+            let msg = format!(
+                "Prompt too large for this node: {} tokens need ~{:.1} GB of KV cache, \
+                 but only ~{:.1} GB is available for requests after the model's own \
+                 memory. Use a shorter prompt.",
+                ids.len(),
+                kv_bytes as f64 / gib,
+                rigid as f64 / gib
+            );
+            send_json(
+                stream,
+                507,
+                &format!("{{\"error\":{{\"message\":{},\"type\":\"insufficient_memory\",\"code\":\"kv_cache_too_large\"}}}}", jstr(&msg)),
+            );
+            return;
+        }
+        colibri_engine::ram::Admission::Busy => {
+            let msg = format!(
+                "Server busy: this prompt needs ~{:.1} GB of KV cache and other requests \
+                 did not free it within {KV_QUEUE_SECS}s. Retry shortly.",
+                kv_bytes as f64 / (1u64 << 30) as f64
+            );
+            send_json(
+                stream,
+                503,
+                &format!("{{\"error\":{{\"message\":{},\"type\":\"server_busy\",\"code\":\"kv_cache_contended\"}}}}", jstr(&msg)),
+            );
+            return;
+        }
+    };
     let mut kv = mk_kv(model, ids.len() + max_tokens);
 
     if stream_mode {
@@ -594,8 +638,7 @@ fn complete(
     } else {
         block_completion(stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv);
     }
-    drop(kv); // free the KV before releasing the reservation
-    provider.release_ram(kv_bytes);
+    drop(kv); // free the KV before the commitment that covers it
 }
 
 /// Official GLM-5.2 chat template (byte-matches `chat_template.jinja`, mirrored

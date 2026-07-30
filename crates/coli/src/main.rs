@@ -2502,6 +2502,40 @@ where
             fill_target >> 30,
         );
     }
+    // Register with the RAM ledger before a single expert is read, so every later
+    // allocation — KV, activations, staging — is admitted against a total that already
+    // knows what the model itself costs. This is the arbiter that did not exist when the
+    // expert cache filled MiniMax-M3 to 94 GB and inference then allocated on top of it.
+    let mgr = colibri_engine::ram::init_manager(ram_target(total));
+    if let Some(c) = mgr.commit(colibri_engine::ram::Class::Dense, resident) {
+        c.hold_forever(); // dense weights live for the process
+    }
+    // Pre-allocate the expert arena to the fill target, in whole experts. From here the
+    // expert footprint is a constant: slots are recycled by overwriting cold ones, never
+    // freed, so it cannot creep upward under load.
+    //
+    // `per` is one expert's bytes. A partial slot is useless — an expert either fits or
+    // is read elsewhere — so the grant is truncated to whole slots rather than rounded up
+    // past the ceiling.
+    let slots = if per > 0 { (fill_target / per) as usize } else { 0 };
+    if slots > 0 {
+        let claimed = colibri_core::quant::arena_init(per as usize, slots);
+        if let Some(c) = mgr.commit(colibri_engine::ram::Class::Experts, claimed) {
+            c.hold_forever();
+        }
+        eprintln!(
+            "[ram] ceiling {} GB = {}% of {} GB | dense {} GB | expert arena {} GB \
+             ({slots} slots x {} MB, pre-faulted, recycled by overwrite) | {} GB left for \
+             KV + activations",
+            mgr.ceiling() >> 30,
+            TARGET_RAM_PCT,
+            total >> 30,
+            resident >> 30,
+            claimed >> 30,
+            per >> 20,
+            mgr.ceiling().saturating_sub(mgr.committed()) >> 30,
+        );
+    }
     // fadvise auto-engages only for a near-fit model: there the whole set is resident, so
     // the page cache is a pure duplicate and dropping it frees RAM for experts. A ≫-RAM
     // model needs the page cache as its second tier. `COLI_FADVISE` still overrides.

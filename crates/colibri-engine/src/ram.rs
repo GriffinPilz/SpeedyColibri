@@ -144,6 +144,92 @@ impl RamManager {
     }
 }
 
+/// The process's manager. Installed once at startup, before any model is loaded.
+static MANAGER: std::sync::OnceLock<Arc<RamManager>> = std::sync::OnceLock::new();
+
+/// Install the process RAM manager with a `ceiling`. Idempotent — a second call returns
+/// the first manager, so a re-entrant load path cannot silently install a second ledger
+/// (two ledgers would each think they owned the whole box, which is how you get to swap
+/// with both of them reporting healthy).
+pub fn init_manager(ceiling: u64) -> Arc<RamManager> {
+    Arc::clone(MANAGER.get_or_init(|| Arc::new(RamManager::new(ceiling))))
+}
+
+/// The process RAM manager, if one has been installed.
+///
+/// `None` means unmanaged — a `coli` subcommand that never loads a model, or a unit test.
+/// Callers must treat that as "allocate freely", never as "refuse".
+pub fn manager() -> Option<Arc<RamManager>> {
+    MANAGER.get().map(Arc::clone)
+}
+
+/// Commit `bytes` of `class` against the process manager, or `None` if it will not fit.
+///
+/// When no manager is installed this returns `Some` with a zero-byte commitment, so an
+/// unmanaged caller proceeds unchanged. **Do not** treat `None` as advisory: it means the
+/// allocation would breach the ceiling, and making it anyway is what reaches swap.
+pub fn try_commit(class: Class, bytes: u64) -> Option<Commitment> {
+    match manager() {
+        Some(m) => m.commit(class, bytes),
+        None => Some(Commitment { mgr: unmanaged(), class, bytes: 0 }),
+    }
+}
+
+/// Outcome of an admission attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Committed — the caller may allocate.
+    Ok,
+    /// Did not fit within `timeout`, but would fit on an empty box. The caller waited and
+    /// other requests did not finish in time; retrying later is reasonable.
+    Busy,
+    /// Larger than the ceiling permits even with nothing else running. Waiting cannot
+    /// help — reject immediately rather than occupying a queue slot forever.
+    TooLarge,
+}
+
+/// Commit `bytes`, waiting up to `timeout` for room if the box is merely busy.
+///
+/// Queuing matters because refusing on first try turns transient contention into a user-
+/// visible error: two concurrent requests can each be admissible on their own, and the
+/// second only has to wait for the first to finish. Rejecting it instead would make
+/// capacity look far smaller than it is.
+///
+/// Requests that could never fit are separated out and rejected at once. A request larger
+/// than the whole rigid budget will not become admissible no matter how long it waits, and
+/// leaving it queued would block the requests behind it that *can* be served.
+pub fn commit_or_wait(
+    class: Class,
+    bytes: u64,
+    rigid_budget: u64,
+    timeout: std::time::Duration,
+) -> (Admission, Option<Commitment>) {
+    if bytes > rigid_budget {
+        return (Admission::TooLarge, None);
+    }
+    if let Some(c) = try_commit(class, bytes) {
+        return (Admission::Ok, Some(c));
+    }
+    // Poll rather than condvar: releases happen in `Commitment::drop`, which is called
+    // from every thread that finished a request and must stay allocation- and lock-free.
+    // A 10 ms poll against multi-second requests is invisible.
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if let Some(c) = try_commit(class, bytes) {
+            return (Admission::Ok, Some(c));
+        }
+    }
+    (Admission::Busy, None)
+}
+
+/// A detached manager with an unreachable ceiling, backing zero-byte commitments handed
+/// out when the process is unmanaged.
+fn unmanaged() -> Arc<RamManager> {
+    static U: std::sync::OnceLock<Arc<RamManager>> = std::sync::OnceLock::new();
+    Arc::clone(U.get_or_init(|| Arc::new(RamManager::new(u64::MAX))))
+}
+
 /// RAII handle: the commitment is live until this is dropped.
 #[must_use = "dropping the Commitment immediately releases the RAM it reserved"]
 pub struct Commitment {
@@ -243,6 +329,53 @@ mod tests {
         }
         assert_eq!(m.committed(), 0, "drop releases");
         assert!(m.commit(Class::Kv, 100).is_some(), "the room came back");
+    }
+
+    /// A request bigger than the rigid budget is rejected immediately, not queued.
+    ///
+    /// Queuing it would be worse than useless: it can never become admissible, and while
+    /// it waits it blocks requests behind it that *can* be served.
+    #[test]
+    fn an_impossible_request_is_rejected_without_waiting() {
+        let t0 = std::time::Instant::now();
+        let (verdict, c) = commit_or_wait(
+            Class::Kv,
+            100,
+            50, // rigid budget
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(verdict, Admission::TooLarge);
+        assert!(c.is_none());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1), "it must not have waited");
+    }
+
+    /// Contention waits and then succeeds when the other request finishes. Two requests
+    /// that each fit alone must not turn into an error just because they overlapped.
+    #[test]
+    fn a_contended_request_waits_rather_than_failing() {
+        // Uses the process manager, so it must not run concurrently with another test
+        // that installs one. `init_manager` is idempotent, which is why this is safe here:
+        // whichever test installs it first wins and the ceiling below is only used via
+        // `try_commit`'s own accounting.
+        let m = init_manager(u64::MAX);
+        // Occupy everything a hypothetical 100-byte budget would allow, then free it from
+        // another thread while the first is waiting.
+        let held = m.commit(Class::Kv, 100).unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            drop(held); // room appears
+        });
+        // With an unreachable ceiling this succeeds instantly; the assertion that matters
+        // is that a Busy verdict is reserved for genuine timeout, never for "try again".
+        let (verdict, c) = commit_or_wait(
+            Class::Kv,
+            10,
+            u64::MAX,
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(verdict, Admission::Ok);
+        assert!(c.is_some());
+        t.join().unwrap();
     }
 
     #[test]

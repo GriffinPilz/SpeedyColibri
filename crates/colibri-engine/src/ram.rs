@@ -68,12 +68,24 @@ const N_CLASSES: usize = 5;
 pub struct RamManager {
     /// Hard ceiling on the sum of live commitments.
     ceiling: u64,
+    /// The authoritative total, moved only by CAS so it can never exceed `ceiling` —
+    /// not even transiently.
+    ///
+    /// The per-class counters cannot serve this role. Summing them and then adding to one
+    /// of them is two steps, and between them the sum is visibly over the ceiling to any
+    /// other thread. That is not merely untidy: a concurrent `commit` would read the
+    /// inflated total and refuse a request that actually fits. Caught by
+    /// `concurrent_commits_cannot_overshoot_the_ceiling`, which failed roughly one run in
+    /// five before this was a CAS.
+    total: AtomicU64,
+    /// Per-class breakdown, for reporting only. Updated after the CAS succeeds, so it may
+    /// lag `total` by a few instructions — never read it to make an admission decision.
     per_class: [AtomicU64; N_CLASSES],
 }
 
 impl RamManager {
     pub fn new(ceiling: u64) -> RamManager {
-        RamManager { ceiling, per_class: Default::default() }
+        RamManager { ceiling, total: AtomicU64::new(0), per_class: Default::default() }
     }
 
     pub fn ceiling(&self) -> u64 {
@@ -81,7 +93,7 @@ impl RamManager {
     }
 
     pub fn committed(&self) -> u64 {
-        self.per_class.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+        self.total.load(Ordering::Acquire)
     }
 
     pub fn committed_in(&self, class: Class) -> u64 {
@@ -107,18 +119,27 @@ impl RamManager {
         if bytes == 0 {
             return Some(Commitment { mgr: Arc::clone(self), class, bytes: 0 });
         }
+        let mut cur = self.total.load(Ordering::Acquire);
         loop {
-            let committed = self.committed();
-            if bytes > self.ceiling.saturating_sub(committed) {
+            if bytes > self.ceiling.saturating_sub(cur) {
                 return None;
             }
-            self.per_class[class as usize].fetch_add(bytes, Ordering::Relaxed);
-            // Another thread may have committed between the read and the add. Over-commit
-            // is the one state that must never persist, so undo and retry.
-            if self.committed() <= self.ceiling {
-                return Some(Commitment { mgr: Arc::clone(self), class, bytes });
+            // One atomic step from "fits" to "taken", so the total is never observably
+            // above the ceiling. An add-then-check would be visibly over between the two,
+            // and a concurrent commit reading that inflated value would refuse a request
+            // that actually fits.
+            match self.total.compare_exchange_weak(
+                cur,
+                cur + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.per_class[class as usize].fetch_add(bytes, Ordering::Relaxed);
+                    return Some(Commitment { mgr: Arc::clone(self), class, bytes });
+                }
+                Err(observed) => cur = observed, // someone else moved it; re-test the fit
             }
-            self.per_class[class as usize].fetch_sub(bytes, Ordering::Relaxed);
         }
     }
 }
@@ -146,6 +167,9 @@ impl Commitment {
 
 impl Drop for Commitment {
     fn drop(&mut self) {
+        // Total first: releasing early can only ever make the ledger look *more* full
+        // than it is, which is the safe direction to be briefly wrong in.
+        self.mgr.total.fetch_sub(self.bytes, Ordering::AcqRel);
         self.mgr.per_class[self.class as usize].fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }

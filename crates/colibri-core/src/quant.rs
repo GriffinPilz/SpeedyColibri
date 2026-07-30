@@ -117,6 +117,62 @@ fn pool_max() -> usize {
     })
 }
 
+/// Arena mode: the pool is pre-allocated to a fixed size and becomes the **only** source
+/// of expert-sized buffers, so expert memory neither grows nor is ever freed.
+///
+/// `0` (default) = organic pool, the behaviour described above. Non-zero = arena: that
+/// many bytes of `slot_bytes` buffers are allocated and touched once at startup, and
+/// [`SharedBuf::with_len`] serves every request of that size from them.
+///
+/// This is what makes "never enter swap" a property of the design. An organic pool is
+/// bounded in what it *retains* but not in what it *allocates* — under a burst it will
+/// happily allocate past the pool cap and free the excess later. A pre-allocated arena
+/// cannot: the memory is claimed up front, recycled by overwriting cold slots, and never
+/// returned. Combined with `RamManager`, which sizes this grant from what requests will
+/// not need, the process's expert footprint is a constant.
+static ARENA: std::sync::Mutex<Option<ArenaCfg>> = std::sync::Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct ArenaCfg {
+    slot_bytes: usize,
+    slots: usize,
+}
+
+/// Pre-allocate the expert arena: `slots` buffers of `slot_bytes` each.
+///
+/// Touches every buffer so the pages are really resident and accounted — an untouched
+/// allocation is a promise the kernel has not yet had to keep, which is exactly the kind
+/// of deferred cost that made `MemAvailable` misleading in the first place.
+///
+/// Returns the bytes actually claimed.
+pub fn arena_init(slot_bytes: usize, slots: usize) -> u64 {
+    if slot_bytes == 0 || slots == 0 {
+        return 0;
+    }
+    let mut pool = BUF_POOL.lock().unwrap();
+    pool.bufs.reserve(slots);
+    for _ in 0..slots {
+        let mut v = vec![0u8; slot_bytes];
+        // Touch one byte per 4 KiB page: `vec![0u8; n]` may be served by a lazily-faulted
+        // mmap, and a slot that faults on first *use* would take its cost inside a
+        // forward pass rather than at startup.
+        for p in (0..slot_bytes).step_by(4096) {
+            unsafe { std::ptr::write_volatile(v.as_mut_ptr().add(p), 0) };
+        }
+        pool.bytes += v.capacity() as u64;
+        pool.bufs.push(v);
+    }
+    let claimed = pool.bytes;
+    drop(pool);
+    *ARENA.lock().unwrap() = Some(ArenaCfg { slot_bytes, slots });
+    claimed
+}
+
+/// `(slot_bytes, slots)` when the arena is active.
+pub fn arena_cfg() -> Option<(usize, usize)> {
+    ARENA.lock().unwrap().map(|a| (a.slot_bytes, a.slots))
+}
+
 /// Max **bytes** retained (`COLI_BUF_POOL_MB`, default 2048).
 ///
 /// A count is the wrong unit here: entries range from 1 MB (K3's MXFP4 spans) to ~21 MB
@@ -159,6 +215,10 @@ pub static POOL_PUSHES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static POOL_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bytes rejected, so the drops can be read as memory traffic rather than a bare count.
 pub static POOL_DROP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times a caller had to wait for an arena slot (every slot lent out at once).
+pub static ARENA_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times the wait gave up and allocated anyway — always a bug, never contention.
+pub static ARENA_STARVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(hits, misses, pushes, drops, drop_bytes)`.
 pub fn pool_profile() -> (u64, u64, u64, u64, u64) {
@@ -192,6 +252,52 @@ impl SharedBuf {
                 return SharedBuf { store: Store::Heap(v) };
             }
             POOL_MISSES.fetch_add(1, Relaxed);
+            // Arena mode, right-sized request, no slot free: every slot is currently
+            // lent out. Falling through to `vec![0u8; len]` here is what would let the
+            // expert footprint grow past its grant — the exact overshoot that put
+            // MiniMax-M3 into swap. Wait for a slot instead; the cache returns one as
+            // soon as any in-flight expert is dropped.
+            //
+            // Deadlock is not possible while callers hold at most one slot at a time
+            // *more* than the arena has: the arena is sized to the cache budget, and the
+            // cache evicts before it loads. `ARENA_WAITS` makes a stall visible rather
+            // than mysterious if that ever stops being true.
+            let arena_slot = ARENA
+                .lock()
+                .unwrap()
+                .map(|a| len <= a.slot_bytes)
+                .unwrap_or(false);
+            if arena_slot {
+                drop(pool);
+                ARENA_WAITS.fetch_add(1, Relaxed);
+                let mut spins = 0u32;
+                loop {
+                    std::thread::yield_now();
+                    let mut p = BUF_POOL.lock().unwrap();
+                    if let Some(i) = p.bufs.iter().position(|v| v.capacity() >= len) {
+                        let v = p.bufs.swap_remove(i);
+                        p.bytes = p.bytes.saturating_sub(v.capacity() as u64);
+                        drop(p);
+                        let mut v = v;
+                        v.truncate(len);
+                        v.resize(len, 0);
+                        POOL_HITS.fetch_add(1, Relaxed);
+                        return SharedBuf { store: Store::Heap(v) };
+                    }
+                    drop(p);
+                    spins += 1;
+                    if spins > 10_000 {
+                        // Every slot has been lent out for a long time — a real bug, not
+                        // contention. Allocate rather than hang; the ledger will notice
+                        // the overshoot and this counter says where it came from.
+                        ARENA_STARVED.fetch_add(1, Relaxed);
+                        break;
+                    }
+                    if spins % 64 == 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                }
+            }
         }
         SharedBuf { store: Store::Heap(vec![0u8; len]) }
     }
@@ -240,7 +346,12 @@ impl Drop for SharedBuf {
             use std::sync::atomic::Ordering::Relaxed;
             let cap = v.capacity() as u64;
             let mut pool = BUF_POOL.lock().unwrap();
-            if pool.bufs.len() < pool_max() && pool.bytes + cap <= pool_max_bytes() {
+            // In arena mode a return is ALWAYS accepted. The arena is the memory — handing
+            // a slot back is how it gets recycled, and rejecting one would turn a recycle
+            // into a `munmap` and shrink the arena permanently, which is the opposite of
+            // what a fixed grant means. The caps below are for the organic pool only.
+            let arena = ARENA.lock().unwrap().is_some();
+            if arena || (pool.bufs.len() < pool_max() && pool.bytes + cap <= pool_max_bytes()) {
                 pool.bytes += cap;
                 pool.bufs.push(v);
                 POOL_PUSHES.fetch_add(1, Relaxed);

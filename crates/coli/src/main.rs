@@ -2413,6 +2413,19 @@ const DISK_BOUND_READ_THREADS: usize = 12;
 /// cost 9.6%. 80% sits between the measured loss (47%) and win (86%); the crossover inside
 /// that interval is not measured, and it is deliberately conservative because the downside
 /// is paid on every span while the upside needs residency.
+///
+/// **This threshold now collides with [`NEARFIT_COVERAGE_PCT`], which is also 80.** The two
+/// fire on exactly the same models and want the same RAM in different tiers: near-fit fills
+/// the *heap* expert cache to the 96% ceiling, this serves spans from the *page cache*. The
+/// heap wins, because it is explicit. Measured on M2.7 after max residency shipped: the heap
+/// took ~110 GB, page cache was left ~11 GB, and the mapped path served **1505 of 18571
+/// spans (8%)** while the run drained 135.9 GB from the drive.
+///
+/// So the 5.65× above is **stale for the configuration we actually run**, and so is "M2.7
+/// reads zero from the drive". Max residency is still the right trade — it measured 8.5× on
+/// M2.7 serve against the 40 GB streaming cap, and a small heap next to a large page cache
+/// is precisely the arm that lost. But do not cite this table as current, and do not tune
+/// this constant expecting it to matter until the tier competition is resolved.
 const MMAP_MIN_COVERAGE_PCT: u64 = 80;
 
 /// Wire the expert cache to **fill RAM safely, for every model**. It grows toward a fill

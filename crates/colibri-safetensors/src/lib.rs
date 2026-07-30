@@ -261,6 +261,33 @@ pub static SPAN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 ///
 /// Costs an exact `mincore` walk, so it is opt-in via `COLI_RESIDENCY_PROBE=1` and only
 /// ever runs on the path that was already about to read the whole span.
+///
+/// **Answered, and the answer is no.** MiniMax-M2.7 (the only near-fit, mmap-eligible
+/// model), 512-token prompt + 32 generated:
+///
+/// ```text
+/// 17066 missed spans (135.9 GB) | 0.3% already resident
+/// 18887 missing runs (1 per span, 7173 KB each) | 12346 fully absent (72%)
+/// ```
+///
+/// Spans are reclaimed **whole**, not fragmented. Repair would save 0.3% of the bytes and
+/// would replace one large sequential read with one read of nearly the same size. GLM-5.2
+/// is the control: below [`MMAP_MIN_COVERAGE_PCT`] no mapping is opened, so it reports
+/// nothing at all.
+///
+/// The reason is structural rather than accidental, which is why this is unlikely to
+/// change: the near-fit heap cache and this mapped path are gated on the *same* 80%
+/// coverage threshold and compete for the same RAM. The heap wins — it is explicit — and
+/// took ~110 GB on M2.7, leaving ~11 GB of page cache, so the mapped path served only
+/// 1505 of 18571 spans. There is barely any page-cache residency left to be partial about.
+/// That trade is deliberate (max residency measured 8.5× on M2.7 serve against the 40 GB
+/// streaming cap), but it means the "M2.7 warm drains zero device bytes" result predates
+/// it and no longer holds.
+///
+/// Design note for anyone re-running this: a warm-up pass does **not** warm the page cache
+/// under max residency. It fills the heap, which dies with the process — after M2.7's
+/// warm-up the box showed 4 GB used, 11 GB cache, 107 GB free. Warm the page cache
+/// directly, with the heap capped, or the "warm" run is cold.
 pub static PARTIAL_SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PARTIAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PARTIAL_RESIDENT_BYTES: std::sync::atomic::AtomicU64 =

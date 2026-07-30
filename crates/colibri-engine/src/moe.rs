@@ -382,11 +382,16 @@ pub struct ShardsExpertProvider<'a> {
     ebits: u32,
     sharding: ExpertSharding,
     this_node: NodeId,
-    /// Concurrent readers each expert's ~18 MB read is chunked across (a single
-    /// stream tops out far below the NVMe, which needs queue depth ~10 to saturate).
-    /// `COLI_LOAD_THREADS` overrides; see [`default_read_threads`] for why the
-    /// default is 2× cores rather than the core count.
-    read_threads: usize,
+    /// Explicit reader-thread count, or `None` to resolve per read via
+    /// [`default_read_threads`].
+    ///
+    /// **Resolved lazily on purpose.** Storing it at construction made the
+    /// coverage-gated narrow-reader setting a silent no-op: the launcher builds the
+    /// provider first and only then computes coverage (`wire_adaptive_cache` takes
+    /// `&provider`), so the gate always arrived after this field was already fixed at
+    /// `2 x cores`. Caught by the fleet run — the drain-pool line still reported
+    /// 34 threads/batch and the timings were unchanged — not by review.
+    read_threads: Option<usize>,
     /// Container name/shape convention for this arch's experts (3-tensor SwiGLU vs
     /// 2-tensor gateless). Derived once from `cfg.arch` at construction.
     layout: ExpertLayout,
@@ -458,11 +463,18 @@ pub struct ShardsExpertProvider<'a> {
 /// the low-coverage, measured-disk-bound models, and leaves every other model on exactly
 /// the previous default. Worst case it is neutral; it cannot reintroduce the M3/Nemotron
 /// regression.
-fn default_read_threads() -> usize {
-    if let Some(n) = std::env::var("COLI_LOAD_THREADS").ok().and_then(|s| s.parse().ok()) {
+pub(crate) fn default_read_threads() -> usize {
+    // Memoised: this is now resolved on every read (see `ShardsExpertProvider::read_threads`),
+    // so the env lookup and `available_parallelism` must not repeat. Only the atomic is live.
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static WIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(n) = *ENV.get_or_init(|| {
+        std::env::var("COLI_LOAD_THREADS").ok().and_then(|s| s.parse().ok())
+    }) {
         return n;
     }
-    let wide = crate::preload::default_num_files().saturating_mul(2).clamp(8, 64);
+    let wide =
+        *WIDE.get_or_init(|| crate::preload::default_num_files().saturating_mul(2).clamp(8, 64));
     match disk_bound_read_threads() {
         Some(n) => n.min(wide),
         None => wide,
@@ -501,7 +513,7 @@ impl<'a> ShardsExpertProvider<'a> {
             ebits,
             sharding: ExpertSharding::single(cfg.n_experts as u32),
             this_node: NodeId(0),
-            read_threads: default_read_threads(),
+            read_threads: None,
             layout: ExpertLayout::for_arch(cfg.arch),
         }
     }
@@ -521,9 +533,19 @@ impl<'a> ShardsExpertProvider<'a> {
             ebits,
             sharding,
             this_node,
-            read_threads: default_read_threads(),
+            read_threads: None,
             layout: ExpertLayout::for_arch(cfg.arch),
         }
+    }
+
+    /// Reader threads for this provider's next read.
+    ///
+    /// Resolved per call rather than cached at construction, so a coverage-gated setting
+    /// applied after the provider exists still takes effect. `default_read_threads`
+    /// memoises the environment lookup and the core count, so this costs one relaxed
+    /// atomic load.
+    fn read_threads(&self) -> usize {
+        self.read_threads.unwrap_or_else(default_read_threads)
     }
 }
 
@@ -891,7 +913,7 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
             self.ebits,
             layer,
             eid,
-            self.read_threads,
+            self.read_threads(),
         )?))
     }
 
@@ -919,7 +941,7 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
                 self.ebits,
                 layer,
                 eids,
-                self.read_threads,
+                self.read_threads(),
             )?;
             Ok(exps.into_iter().map(Arc::new).collect())
         } else {
@@ -1705,6 +1727,42 @@ mod tests {
     use super::*;
     use crate::quantize::qtensor_from_f32;
     use std::collections::HashMap;
+
+    /// The narrow-reader gate must apply even though it is set **after** the provider is
+    /// built — the launcher constructs the provider first and only then computes coverage
+    /// (`wire_adaptive_cache` takes `&provider`).
+    ///
+    /// This shipped once as a silent no-op: `read_threads` was resolved at construction,
+    /// so the gate always arrived too late and the fleet run still reported 34
+    /// threads/batch with unchanged timings. A build that compiles and a knob that does
+    /// nothing look identical without this.
+    ///
+    /// Serialised against nothing on purpose: it touches a process-global, so it restores
+    /// the previous value rather than assuming one (see `test-globals-contaminate`).
+    #[test]
+    fn narrow_reader_gate_applies_after_the_provider_exists() {
+        // If COLI_LOAD_THREADS is set in the environment it wins by design and the gate is
+        // bypassed — the assertion below would then be testing the override, not the gate.
+        if std::env::var("COLI_LOAD_THREADS").is_ok() {
+            return;
+        }
+        let prev = DISK_BOUND_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+        let wide = {
+            set_disk_bound_read_threads(0);
+            default_read_threads()
+        };
+        set_disk_bound_read_threads(12);
+        let narrow = default_read_threads();
+        set_disk_bound_read_threads(prev);
+
+        assert!(wide >= 8, "wide default {wide} should be the 2x-cores value (clamped >= 8)");
+        assert_eq!(narrow, 12.min(wide), "gate must lower the count, got {narrow}");
+        assert!(
+            narrow < wide || wide <= 12,
+            "gate had no effect: wide={wide}, narrow={narrow} — this is exactly the no-op \
+             that shipped when read_threads was resolved at construction"
+        );
+    }
 
     // In-memory provider for MoE math tests (no safetensors needed).
     struct MapProvider {

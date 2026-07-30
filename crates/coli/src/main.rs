@@ -2078,18 +2078,38 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
 /// resident, so any small constant still yields a budget far past the cliff.
 const WORKING_RESERVE: u64 = 10 << 30;
 
-/// Adaptive max-residency reserve: RAM held back from the expert fill for the serving
-/// process's own peak runtime — KV cache, prefill activations, GPU host staging, expert
-/// read buffers. `fill_target = total − this`. Sized from the validated static-100 GB
-/// config on a 121 GiB Spark (M2.7), which left ~21 GB and was rock-stable at 4.35 tok/s;
-/// a 10 GB reserve thrashed (own-request spikes tripped eviction). Must exceed peak
-/// per-request runtime so `MemAvailable` never nears [`ADAPTIVE_DANGER_FLOOR`] on our own
-/// account — only an *external* tenant should push it there.
-const ADAPTIVE_FILL_RESERVE: u64 = 20 << 30;
+/// Share of `MemTotal` the process aims to occupy in total — experts, dense weights and
+/// its own runtime combined. Experts take whatever is left after the other two.
+///
+/// The goal is **maximum expert residency**: RAM held back is RAM not caching a model.
+/// Only an *external* tenant should push us off it, which is what
+/// [`ADAPTIVE_DANGER_FLOOR`] and the swap guard in `spawn_adaptive_budget` are for.
+///
+/// The remaining 4% is left to the kernel itself — slab, page tables (a 100 GB mapping
+/// needs ~200 MB of PTEs alone), network and block buffers, and the few hundred MB of
+/// userland already running. Taking it is what turns a fill into paging.
+const TARGET_RAM_PCT: u64 = 96;
+
+/// Non-expert RAM the serving process needs at peak, **excluding KV**: prefill
+/// activations, GPU host staging, expert read buffers, the CUDA context and allocator
+/// slack.
+///
+/// This was 20 GB and conflated two different things. KV is *not* a constant — it scales
+/// with context and with live request count, and it is already handled dynamically:
+/// `ExpertCache::reserve_ram` has callers subtract a request's KV from the standing budget
+/// for its duration, so the monitor holds `fill_target − reserved` and never refills into
+/// space a live request needs. Reserving a flat 20 GB *on top* of that charged for KV
+/// twice and cost ~15 GB of expert residency on every model.
+const RUNTIME_RESERVE: u64 = 10 << 30;
+
+/// Ceiling on total process footprint: [`TARGET_RAM_PCT`] of RAM.
+fn ram_target(total: u64) -> u64 {
+    total / 100 * TARGET_RAM_PCT
+}
 
 /// Bound any requested expert-cache fill by what is left after the model's **non-expert**
-/// RAM: the resident dense tier plus [`ADAPTIVE_FILL_RESERVE`] for KV, activations, GPU
-/// staging and read buffers.
+/// RAM, within the [`TARGET_RAM_PCT`] footprint: the resident dense tier plus
+/// [`RUNTIME_RESERVE`].
 ///
 /// There is deliberately no way to bypass this. A hand-set byte budget (the removed
 /// `COLI_RAM_GB`) used to skip it: on a 121 GiB Spark a 110 GB request drove the serve
@@ -2098,7 +2118,9 @@ const ADAPTIVE_FILL_RESERVE: u64 = 20 << 30;
 /// know the resident dense tier, the KV for the live context, or the GPU's share of a
 /// unified pool; all three are known here.
 fn clamp_fill_to_headroom(requested: u64, resident: u64, total: u64) -> u64 {
-    let headroom = total.saturating_sub(resident).saturating_sub(ADAPTIVE_FILL_RESERVE);
+    let headroom = ram_target(total)
+        .saturating_sub(resident)
+        .saturating_sub(RUNTIME_RESERVE);
     requested.min(headroom)
 }
 
@@ -2382,9 +2404,17 @@ where
     let owned_experts = if owned.is_empty() { cfg.n_experts as u64 } else { owned.len() as u64 };
     let total_expert_bytes = expert_footprint(cfg, per, owned_experts);
     debug_assert_eq!(total_expert_bytes, per.saturating_mul(owned_experts).saturating_mul(n_moe));
-    // Achievable fill without an explicit cap: hold back the process's own peak runtime
-    // (KV/activations/staging/read buffers). Coverage is model-intrinsic (does it fit RAM?).
-    let natural_fill = total.saturating_sub(ADAPTIVE_FILL_RESERVE);
+    // Achievable expert residency: the `TARGET_RAM_PCT` footprint minus the dense tier and
+    // the non-KV runtime. Coverage is then model-intrinsic — "what share of this model's
+    // experts can actually stay resident on this box?" — and drives the cache regime, the
+    // read path (O_DIRECT), the mapped-view path, and the reader thread count.
+    //
+    // This is deliberately the SAME expression as `clamp_fill_to_headroom`, so the number
+    // coverage is computed from is the number that will actually be held. It previously
+    // was not: coverage used `total - 20 GB` while the clamp used
+    // `total - resident - 20 GB`, so a model with a large dense tier (Kimi-K3, 63 GB) was
+    // classified against a fill it could never reach.
+    let natural_fill = clamp_fill_to_headroom(u64::MAX, resident, total);
     let covers_pct = if total_expert_bytes > 0 {
         natural_fill.saturating_mul(100) / total_expert_bytes
     } else {
@@ -2435,7 +2465,7 @@ where
              so the box cannot page out",
             requested >> 30,
             resident >> 30,
-            ADAPTIVE_FILL_RESERVE >> 30,
+            RUNTIME_RESERVE >> 30,
             total >> 30,
             fill_target >> 30,
         );
@@ -3066,14 +3096,35 @@ mod tests {
         let total = gb(121); // the Spark
         let resident = gb(3); // M2.7's dense tier
 
-        // The exact case that swapped.
+        // The exact case that swapped. 96% of 121 = 116; 116 - 3 dense - 10 runtime = 103.
         let clamped = clamp_fill_to_headroom(gb(110), resident, total);
         assert!(
-            clamped <= total - resident - ADAPTIVE_FILL_RESERVE,
+            clamped <= ram_target(total) - resident - RUNTIME_RESERVE,
             "clamped fill {} GB still exceeds headroom",
             clamped >> 30
         );
-        assert_eq!(clamped, gb(98), "121 - 3 dense - 20 reserve = 98 GB");
+        assert_eq!(
+            clamped,
+            ram_target(total) - resident - RUNTIME_RESERVE,
+            "the clamp must BE the headroom, not merely respect it"
+        );
+        assert_eq!(clamped >> 30, 103, "96% of 121 GiB, less 3 dense and 10 runtime");
+
+        // The whole point of the target: nearly all of RAM ends up holding model, not
+        // held back "just in case". Experts + dense must reach at least 85% of MemTotal.
+        let footprint = clamped + resident;
+        assert!(
+            footprint * 100 / total >= 85,
+            "only {}% of RAM would hold model — the reserve is too conservative",
+            footprint * 100 / total
+        );
+        // ...but never all of it: the kernel needs slab, page tables (~200 MB of PTEs for
+        // a 100 GB mapping alone) and block/network buffers. Taking those is what turns a
+        // fill into paging.
+        assert!(
+            footprint <= ram_target(total),
+            "footprint exceeds the {TARGET_RAM_PCT}% target"
+        );
 
         // A request that already fits is passed through untouched — the clamp is a
         // ceiling, not a rewrite.
@@ -3082,7 +3133,7 @@ mod tests {
         // A big dense tier eats the headroom: Kimi-K3 keeps ~63 GB resident, so the same
         // request must come down much further. Without this the cache overcommits and the
         // box OOM-kills the process mid-forward.
-        assert_eq!(clamp_fill_to_headroom(gb(110), gb(63), total), gb(38));
+        assert_eq!(clamp_fill_to_headroom(gb(110), gb(63), total) >> 30, 43);
 
         // Degenerate: dense tier alone exceeds RAM. Must saturate to 0, not underflow.
         assert_eq!(clamp_fill_to_headroom(gb(110), gb(200), total), 0);

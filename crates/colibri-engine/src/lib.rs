@@ -29,6 +29,7 @@ pub mod mtp;
 pub mod preload;
 pub mod qsim;
 pub mod quantize;
+pub mod ram;
 pub mod sampling;
 pub mod usage;
 

@@ -2087,6 +2087,20 @@ const WORKING_RESERVE: u64 = 10 << 30;
 /// account — only an *external* tenant should push it there.
 const ADAPTIVE_FILL_RESERVE: u64 = 20 << 30;
 
+/// Bound any requested expert-cache fill by what is left after the model's **non-expert**
+/// RAM: the resident dense tier plus [`ADAPTIVE_FILL_RESERVE`] for KV, activations, GPU
+/// staging and read buffers.
+///
+/// This applies to **every** path, including an explicit `COLI_RAM_GB`. It previously did
+/// not — the code read `explicit.unwrap_or(regime.min(headroom))`, so setting a budget
+/// skipped the clamp entirely. On a 121 GiB Spark `COLI_RAM_GB=110` therefore drove the
+/// serve process to 108.7 GiB RSS **and into swap** (3 GB paged out), with throughput at
+/// 0.06-0.24 tok/s. Asking for a big cache is asking for residency, not for paging.
+fn clamp_fill_to_headroom(requested: u64, resident: u64, total: u64) -> u64 {
+    let headroom = total.saturating_sub(resident).saturating_sub(ADAPTIVE_FILL_RESERVE);
+    requested.min(headroom)
+}
+
 /// Adaptive max-residency danger line: only when `MemAvailable` stays under this (a real
 /// other tenant, since the reserve absorbs our own runtime) does the monitor cede gradually.
 const ADAPTIVE_DANGER_FLOOR: u64 = 4 << 30;
@@ -2409,9 +2423,34 @@ where
     // CACHE_CAP_DIVISOR ceiling still binds); binding for Kimi-K3 (121-63-20 = 38), where
     // without it the cache overcommits and earlyoom SIGTERMs the process mid-forward.
     let headroom = total.saturating_sub(resident).saturating_sub(ADAPTIVE_FILL_RESERVE);
-    let fill_target = explicit.unwrap_or(
-        if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR }.min(headroom),
-    );
+    // `headroom` is the term that accounts for everything in RAM that is NOT experts —
+    // the resident dense tier plus the serving process's own runtime. It must bound the
+    // fill on EVERY path.
+    //
+    // It previously did not: `explicit.unwrap_or(regime.min(headroom))` applies the clamp
+    // only when `COLI_RAM_GB` is unset, so an explicit budget bypassed the one guard that
+    // subtracts non-expert RAM. `COLI_RAM_GB=110` on a 121 GiB box therefore drove the
+    // serve process to 108.7 GiB RSS and **into swap** (3 GB used, MemAvailable pinned at
+    // 30 GB) while throughput collapsed to 0.06-0.24 tok/s. A user asking for a large
+    // cache is asking for residency, not for paging — clamp it and say so.
+    let requested = explicit.unwrap_or(if near_fit {
+        natural_fill
+    } else {
+        total / CACHE_CAP_DIVISOR
+    });
+    let fill_target = clamp_fill_to_headroom(requested, resident, total);
+    if fill_target < requested {
+        eprintln!(
+            "[cache] requested fill {} GB exceeds what is left after the model's own RAM \
+             ({} GB dense weights + {} GB runtime reserve on {} GB total) — clamped to {} GB \
+             so the box cannot page out",
+            requested >> 30,
+            resident >> 30,
+            ADAPTIVE_FILL_RESERVE >> 30,
+            total >> 30,
+            fill_target >> 30,
+        );
+    }
     // fadvise only auto-engages for a near-fit model on the automatic path; an explicit
     // budget leaves fadvise to the COLI_FADVISE env, and ≫-RAM keeps the page cache.
     if near_fit && explicit.is_none() {
@@ -3021,6 +3060,41 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// An explicit `COLI_RAM_GB` must not be able to page the box out.
+    ///
+    /// This is a regression test for a measured failure, not a hypothetical: the clamp was
+    /// applied only on the automatic path, so `COLI_RAM_GB=110` on the 121 GiB Spark set a
+    /// 110 GB fill target with nothing subtracted for the dense tier or the runtime. The
+    /// serve process reached 108.7 GiB RSS, 3 GB went to swap, and serve throughput fell to
+    /// 0.06-0.24 tok/s — worse than the 40 GB default it was meant to beat.
+    #[test]
+    fn explicit_ram_budget_cannot_exceed_non_expert_headroom() {
+        let gb = |n: u64| n << 30;
+        let total = gb(121); // the Spark
+        let resident = gb(3); // M2.7's dense tier
+
+        // The exact case that swapped.
+        let clamped = clamp_fill_to_headroom(gb(110), resident, total);
+        assert!(
+            clamped <= total - resident - ADAPTIVE_FILL_RESERVE,
+            "clamped fill {} GB still exceeds headroom",
+            clamped >> 30
+        );
+        assert_eq!(clamped, gb(98), "121 - 3 dense - 20 reserve = 98 GB");
+
+        // A request that already fits is passed through untouched — the clamp is a
+        // ceiling, not a rewrite.
+        assert_eq!(clamp_fill_to_headroom(gb(40), resident, total), gb(40));
+
+        // A big dense tier eats the headroom: Kimi-K3 keeps ~63 GB resident, so the same
+        // request must come down much further. Without this the cache overcommits and the
+        // box OOM-kills the process mid-forward.
+        assert_eq!(clamp_fill_to_headroom(gb(110), gb(63), total), gb(38));
+
+        // Degenerate: dense tier alone exceeds RAM. Must saturate to 0, not underflow.
+        assert_eq!(clamp_fill_to_headroom(gb(110), gb(200), total), 0);
     }
 
     /// The narrow-reader gate, pinned to the fleet A/B that produced it (34 vs 8 threads,

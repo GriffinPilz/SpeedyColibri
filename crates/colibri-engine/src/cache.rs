@@ -693,6 +693,10 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
         const SUSTAIN: u32 = 6; // ~600 ms below the danger floor before we cede memory
         const HARD_SLACK: u64 = 3 << 30; // when the OOM guard fires, evict back to this much headroom
         const FLOOR_MIN: u64 = 2 << 30; // never target < 2 GiB resident
+        // Slack above the startup swap level before the guard fires: absorbs the kernel
+        // paging out genuinely cold pages (a long-idle allocation) without treating it as
+        // expert-cache pressure. Anything beyond this is us.
+        const SWAP_TOLERANCE: u64 = 256 << 20;
         let fill_target = fill_target.max(FLOOR_MIN);
         // hard_floor is the emergency line; danger_floor the softer one above it.
         let hard_floor = hard_floor.max(FLOOR_MIN);
@@ -703,6 +707,8 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
         let cache = Arc::clone(self);
         // Grow to the standing fill target immediately (the insert path enforces it).
         cache.budget.store(fill_target, Ordering::Relaxed);
+        // Swap in use at startup is someone else's; only growth beyond it is ours.
+        let swap_baseline = swap_used_bytes().unwrap_or(0);
         std::thread::spawn(move || {
             let mut low_ticks: u32 = 0;
             loop {
@@ -712,6 +718,27 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                     None => return, // non-Linux: no live signal, keep the standing budget
                 };
                 let resident = cache.state.lock().unwrap().bytes;
+
+                // SWAP GUARD — checked before the MemAvailable floors, because it fires
+                // first. Measured on 42b2: a 110 GB fill put 3 GB into swap while
+                // MemAvailable still read 30 GB, so neither floor below ever tripped and
+                // throughput fell to 0.06-0.24 tok/s. Once the kernel is paging us out,
+                // resident experts are actively harmful — a faulted page is a 4 KiB disk
+                // read where a cache miss would have been one coalesced expert read.
+                // Give memory back hard and let the standing budget re-grow only if the
+                // pressure was transient.
+                if let Some(sw) = swap_used_bytes() {
+                    if sw > swap_baseline + SWAP_TOLERANCE {
+                        let new_budget = resident
+                            .saturating_sub(resident / 4)
+                            .min(cache.budget.load(Ordering::Relaxed))
+                            .max(FLOOR_MIN);
+                        cache.budget.store(new_budget, Ordering::Relaxed);
+                        cache.state.lock().unwrap().evict_to(new_budget);
+                        low_ticks = 0;
+                        continue;
+                    }
+                }
 
                 // OOM guard (immediate, no hysteresis): never let avail cross hard_floor,
                 // whatever ate the memory. Evict back to a few GB of slack above it.
@@ -872,6 +899,23 @@ pub mod capacity {
 /// where the caller should fall back to an explicit budget.
 pub fn available_ram_bytes() -> Option<u64> {
     meminfo_field("MemAvailable:")
+}
+
+/// Bytes currently paged out (`SwapTotal - SwapFree`).
+///
+/// `MemAvailable` is not sufficient to keep the box off swap. The kernel begins paging
+/// while `MemAvailable` still reads comfortably above any floor — measured on 42b2 with a
+/// 110 GB expert fill: the serve process reached 108.7 GiB RSS and **3 GB of swap was in
+/// use while `MemAvailable` sat at 30 GB**, five times the danger floor and ten times the
+/// hard floor, so neither guard ever fired. Throughput collapsed to 0.06-0.24 tok/s.
+///
+/// Swap-in-use is the unambiguous signal that residency has gone too far: a cache that
+/// has to be paged back in is worse than no cache at all, since a page fault costs a
+/// 4 KiB disk read where a miss would have cost one coalesced expert read.
+pub fn swap_used_bytes() -> Option<u64> {
+    let total = meminfo_field("SwapTotal:")?;
+    let free = meminfo_field("SwapFree:")?;
+    Some(total.saturating_sub(free))
 }
 
 /// Total RAM in bytes, best-effort (`/proc/meminfo` `MemTotal`).

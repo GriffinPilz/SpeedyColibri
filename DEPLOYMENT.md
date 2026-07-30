@@ -110,7 +110,7 @@ see its `convert_env` in [`scripts/models.toml`](scripts/models.toml)).
 (`--device nvidia.com/gpu=all`), the nvidia runtime (`--gpus all`), or — on a
 stock shared DGX where neither is configured and you have no root — it binds
 `/dev/nvidia*` and the driver's user-space libraries directly (the entrypoint
-re-runs `ldconfig` so `libcuda.so.1` resolves). Tuning env vars (`COLI_RAM_GB`,
+re-runs `ldconfig` so `libcuda.so.1` resolves). Tuning env vars (
 `COLI_PROFILE`, ...) pass through automatically. When the command is `serve`, the
 launcher also publishes the listen port (`-p`).
 
@@ -192,7 +192,7 @@ HF_TOKEN=hf_... docker compose -f docker/docker-compose.yml run --rm -p 8080:808
 | `COLI_CTX` | `serve` context length (prompt + completion), e.g. `64k`. Clamped to the model max (`max_position_embeddings`, 1M for GLM-5.2). KV is ~175 KB/token (~5.6 GB at 32K, ~22 GB at 128K), so raise it within your RAM budget. Requests over the limit get a `context_length_exceeded` 400. | `32768` |
 | `COLI_MODEL_REPO` | HF repo to fetch when no snapshot is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
 | `COLI_MODEL_DIR` | host path to a pre-resolved snapshot → mounted at `/model` | unset |
-| `COLI_RAM_GB` / `COLI_VRAM_GB` | expert-cache budget overrides. The RAM default auto-caps at `MemTotal/3` and is safe; overriding *higher* is measured to swap and lose throughput (85 → ~0.11 tok/s vs ~0.46 at default on a 121 GB Spark). | auto: `MemTotal/3` RAM |
+| `COLI_VRAM_GB` | GPU expert-cache budget override. The RAM budget has **no** knob — it is derived from MemTotal, the resident dense tier and the runtime reserve, and re-derived under pressure (`COLI_RAM_GB` was removed: it bypassed the headroom clamp and could drive the box into swap). | auto |
 | `COLI_NUM_NODES` | cluster size (expert-parallel) | `1` |
 | `COLI_NODE_RANK` | this node's rank `0..NUM_NODES` (advertised in the discovery beacon) | `0` |
 | `COLI_DISCOVER_SECS` | `serve` startup ConnectX fabric-scan window in seconds (`0` disables) | `3` |
@@ -297,7 +297,7 @@ COLI_PRELOAD=1 coli gen /model <ids...>
 ```
 
 `preload_parallel` sorts experts by on-disk offset, gives each core a contiguous
-slice to scan, and loads up to the `COLI_RAM_GB` budget — near-sequential reads
+slice to scan, and loads up to the derived expert-cache budget — near-sequential reads
 with a deep NVMe queue. Output is byte-identical to the serial disk path.
 
 **Optional** — repack for maximum sequentiality (contiguous per-expert blobs),

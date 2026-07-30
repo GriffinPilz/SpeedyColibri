@@ -254,7 +254,6 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | Var | Meaning | Default |
 |---|---|---|
 | `HF_TOKEN` | Hugging Face token for the first download (alt. to the `hf_...` arg) | none |
-| `COLI_RAM_GB` | **manual override** of the adaptive default ([RAM residency](#ram-residency-adaptive-by-default) below). Forces a fixed expert-cache budget and disables the adaptive monitor. Rarely needed; on a ≫-RAM model, setting it *higher* drives the box into swap (measured on GLM: 85 GB → ~0.11 tok/s vs ~0.46 at the safe budget). | adaptive (see below) |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
 | `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): nemotron 262,144 (its own max) · M3 ~400k · GLM ~290k · M2.7 ~190k | `32768` |
@@ -403,12 +402,14 @@ pressure **cannot OOM**, which is what lets a fill-RAM policy point at a model o
   with as many experts as fit, keep the OS page cache as a reclaimable second tier, and let
   the monitor evict the LRU tail under pressure. Measured **1.22×** on M3 (2.05 vs 1.68 tok/s)
   — more resident experts, higher hit rate — and, crucially, **no crash**: the same box that
-  OOM-died under a fixed `COLI_RAM_GB=100` now fills to 121 GB used and holds `avail` at the
+  OOM-died under a fixed 100 GB budget now fills to 121 GB used and holds `avail` at the
   floor for the whole run.
 
-`COLI_RAM_GB=<n>` sets a fixed fill *target* (e.g. a smaller per-node budget for
-[multi-Spark](#multi-spark-expert-parallel)); the pressure monitor still runs underneath it,
-so even an oversized value can no longer walk the box into swap.
+There is **no manual RAM budget knob**. `COLI_RAM_GB` was removed: a hand-set byte budget
+cannot know the resident dense tier, the KV for the live context, or the GPU's share of the
+unified pool, and it was the one path that skipped the headroom clamp — a 110 GB request on a
+121 GiB Spark drove the serve process to 108.7 GiB RSS and into swap, at 0.06–0.24 tok/s.
+The budget is derived from those three terms and re-derived under pressure.
 
 ### Context & output length
 
@@ -698,13 +699,13 @@ one is unreachable.
 
 ```bash
 # --- on each worker node (rank 1..N-1) ---
-COLI_NUM_NODES=2 COLI_NODE_RANK=1 COLI_RAM_GB=40 \
+COLI_NUM_NODES=2 COLI_NODE_RANK=1 \
   docker/run-dgx.sh worker                    # serves its shard on :48800
 
 # --- on the driver (rank 0) — this is the node you send requests to ---
 COLI_NUM_NODES=2 COLI_NODE_RANK=0 \
   COLI_PEERS=1=192.168.100.10:48800 \
-  COLI_RAM_GB=40 docker/run-dgx.sh serve 8080
+  docker/run-dgx.sh serve 8080
 ```
 
 `docker/run-dgx.sh cluster` scans the fabric and prints the Sparks it can see, with

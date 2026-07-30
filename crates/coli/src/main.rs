@@ -2601,6 +2601,27 @@ where
         resident >> 30,
         mgr.ceiling().saturating_sub(mgr.committed()) >> 30,
     );
+    // Swap state changes what a memory-accounting bug looks like, so say which mode this
+    // box is in rather than leaving it to be discovered from a mystery slowdown.
+    //
+    // Swap OFF is the intended configuration for a dedicated inference box. Paging expert
+    // weights is strictly worse than the fallback we already have: a miss re-reads one
+    // coalesced ~21 MB span at ~11.6 GB/s from the reader, where a swapped page faults
+    // back 4 KiB at a time from the same drive, inside a forward pass, un-batchable. Swap
+    // also turns an over-commit into a silent 100x slowdown instead of a loud failure —
+    // MiniMax-M3 once limped at 0.06 tok/s producing nothing, and left 16 GB paged out
+    // that degraded every measurement after it until the box was rebooted.
+    match colibri_engine::cache::swap_used_bytes() {
+        Some(0) | None => {}
+        Some(used) => eprintln!(
+            "[ram] WARNING: {} MB is already in swap. Paging is worse than a cache miss \
+             here (4 KiB faults inside the forward pass vs one coalesced span in the \
+             reader), and it masks accounting bugs as slowdowns rather than failures. \
+             `sudo swapoff -a` on a dedicated box; already-swapped pages need \
+             `swapoff -a && swapon -a` or a reboot to reclaim.",
+            used >> 20
+        ),
+    }
     // fadvise auto-engages only for a near-fit model: there the whole set is resident, so
     // the page cache is a pure duplicate and dropping it frees RAM for experts. A ≫-RAM
     // model needs the page cache as its second tier. `COLI_FADVISE` still overrides.

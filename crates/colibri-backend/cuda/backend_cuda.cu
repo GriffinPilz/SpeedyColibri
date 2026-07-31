@@ -2103,9 +2103,19 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
     // Per-call GPU-timeline split (COLI_NVFP4_EVT=1), mirroring COLI_RELU2_EVT. This was
     // the ONLY expert entry point without one, and it is the one the SwiGLU models take —
     // so the question "where do M2.7's ~12 ms per expert call go?" had no instrument.
-    // 62 layers x 256 experts = ~15872 calls per prefill, ~7.6 MB of weights each, which
-    // works out to ~0.6 GB/s against a GPU that does hundreds: the GEMM cannot be that
-    // slow, so the split between STAGING and KERNELS is the thing to see.
+    //
+    // It answered the first half decisively. Over 6 runs of identical work (M2.7, 128-token
+    // prefill, 79.63 GB, 10000 calls) the kernel is 2.47-2.51 s — under 2% spread — while
+    // staging is 36.9-78.7 s. **Staging is always >=15x the kernel**, so the GEMM is not
+    // where this phase goes, and it stages at 1.0-2.2 GB/s for a host->device copy on a
+    // box whose "device" memory is the same LPDDR5X. That rate is the open question.
+    //
+    // It did NOT answer the second half. Staging cost plateaus mid-run (53.53 s at 8000
+    // calls -> 53.89 s at 10000), which reads like first-touch on freshly-pread pages —
+    // but a 128-token prefill touches ~15872 DISTINCT experts, so a per-expert cost would
+    // grow linearly rather than plateau, and running with a WARM page cache made staging
+    // *slower* (78.70 s), which first-touch and I/O-contention both predict the opposite
+    // of. The mechanism is unknown; do not optimize against the first-touch story.
     // Bucketed by input width D so the shared expert and the routed experts stay separable.
     static int s_evt=-1; static cudaEvent_t s_v0=0,s_v1=0,s_v2=0;
     struct NvEvt { int d; double stage_ms,kern_ms; long calls,rows,wbytes; };

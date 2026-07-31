@@ -1181,6 +1181,11 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         // and would read a gate tensor these experts don't ship.
         let grouped = if activation().relu2 {
             crate::gpu::try_expert_group_relu2(&active, activations, d, &mut out)
+        } else if active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5) {
+            // NVFP4 SwiGLU (M2.7 / M3 / GLM-5.2). Until this arm existed these models were
+            // offered the fp8 group, which declines on fmt 5, so every one of them fell
+            // through to a per-expert call — the path that pays per-expert weight staging.
+            crate::gpu::try_expert_group_nvfp4(&active, activations, d, &mut out)
         } else {
             crate::gpu::try_expert_group(&active, activations, d, &mut out)
         };

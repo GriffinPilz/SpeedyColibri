@@ -45,6 +45,12 @@ typedef struct {
     uint8_t *ewg,*ewu,*ewd; size_t ewg_cap,ewu_cap,ewd_cap;
     float *esg,*esu,*esd; size_t esg_cap,esu_cap,esd_cap;
     uint8_t *ebsg,*ebsu,*ebsd; size_t ebsg_cap,ebsu_cap,ebsd_cap;  /* NVFP4 block-scale device scratch (devcopy) */
+    /* Per-layer bulk residency (COLI_LAYER_RESIDENT): one device arena holding a whole
+     * group's expert weights, filled by a single transfer out of `host_lres`, which is
+     * PINNED. The per-expert `ewg/ewu/...` scratch above stages one expert at a time out of
+     * pageable memory, which is what measured 1.0-2.2 GB/s and 93.6% of expert-call time. */
+    uint8_t *lres; size_t lres_cap;
+    float *host_lres; size_t host_lres_cap;   /* `float*` to match reserve_pinned; bytes underneath */
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     /* Nemotron-H Mamba2 selective-scan decode scratch (state in/out + per-step inputs). */
     float *ms_state,*ms_x,*ms_y,*ms_b,*ms_c,*ms_dth,*ms_dah,*ms_d;
@@ -1712,6 +1718,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->ewg=ctx->ewu=ctx->ewd=nullptr;ctx->esg=ctx->esu=ctx->esd=nullptr;
         ctx->ewg_cap=ctx->ewu_cap=ctx->ewd_cap=ctx->esg_cap=ctx->esu_cap=ctx->esd_cap=0;
         ctx->ebsg=ctx->ebsu=ctx->ebsd=nullptr;ctx->ebsg_cap=ctx->ebsu_cap=ctx->ebsd_cap=0;
+        ctx->lres=nullptr;ctx->lres_cap=0;ctx->host_lres=nullptr;ctx->host_lres_cap=0;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
@@ -2731,13 +2738,75 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
                                "expert group nvfp4 input upload"))return 0;
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+
+    /* Per-layer bulk residency (COLI_LAYER_RESIDENT, default ON here).
+     *
+     * The whole group's expert weights are packed into ONE pinned host buffer and sent to
+     * ONE device arena in a single transfer; the kernels below then read device memory.
+     *
+     * This is the option the recorded evidence left open, and it is NOT what
+     * `COLI_FFN_DEVCOPY` does. That stages one expert at a time out of PAGEABLE memory, so
+     * the driver bounces every transfer through its own staging buffer — measured at
+     * 1.0-2.2 GB/s and 93.6% of expert-call GPU time (36.91s of staging against 2.51s of
+     * kernel on M2.7). Pinned memory removes the bounce, and one transfer per group
+     * removes the per-expert launch/latency floor that made the small copies so poor.
+     *
+     * Why this rather than grouping or a segmented GEMM: both were measured and neither
+     * moved it. Grouping's whole ceiling is the ~3% round-trip; the segmented GEMM is
+     * described in its own doc as the disproof of the occupancy theory. Every one of those
+     * measurements pointed at the weight path — ~47 GB per prefill at ~6 GB/s against a
+     * ~51 GB/s ceiling — which is what this addresses and they did not.
+     *
+     * Declines silently (leaving host pointers, i.e. the previous behaviour) if the arena
+     * or the pinned buffer cannot be reserved, so a large layer degrades instead of failing. */
+    static int s_lres=-1;
+    if(s_lres<0){const char*e=getenv("COLI_LAYER_RESIDENT");s_lres=(!e||atoi(e));}
+    bool resident=false;
+    size_t wtot=0;
+    if(s_lres){
+        for(int c=0;c<count;c++){
+            size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
+            size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
+            wtot+=2*gnb+dnb+2*gsb+dsb;   // gate+up nibbles, down nibbles, and their scales
+        }
+        if(wtot&&reserve_bytes((void**)&ctx->lres,&ctx->lres_cap,wtot)&&
+           reserve_pinned(&ctx->host_lres,&ctx->host_lres_cap,wtot)){
+            uint8_t *hp=(uint8_t*)ctx->host_lres; size_t at=0;
+            for(int c=0;c<count;c++){
+                size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
+                size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
+                const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
+                                       (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
+                                       (const uint8_t*)ups[c]->bscale,(const uint8_t*)downs[c]->bscale};
+                size_t len[6]={gnb,gnb,dnb,gsb,gsb,dsb};
+                for(int k=0;k<6;k++){ std::memcpy(hp+at,src[k],len[k]); at+=len[k]; }
+            }
+            resident=cuda_ok(cudaMemcpyAsync(ctx->lres,ctx->host_lres,wtot,
+                                             cudaMemcpyHostToDevice,ctx->stream),
+                             "expert group nvfp4 layer-resident upload");
+        }
+    }
+
     int off=0;
+    size_t rat=0;   // running offset into the device arena, in the same order it was packed
     for(int c=0;c<count;c++){
         int r=rows[c];
         const uint8_t *gw=(const uint8_t*)gates[c]->weights,*uw=(const uint8_t*)ups[c]->weights,
                       *dw=(const uint8_t*)downs[c]->weights;
         const uint8_t *gbs=(const uint8_t*)gates[c]->bscale,*ubs=(const uint8_t*)ups[c]->bscale,
                       *dbs=(const uint8_t*)downs[c]->bscale;
+        if(resident){
+            size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
+            size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
+            const uint8_t *base=(const uint8_t*)ctx->lres+rat;
+            gw=base;            base+=gnb;
+            uw=base;            base+=gnb;
+            dw=base;            base+=dnb;
+            gbs=base;           base+=gsb;
+            ubs=base;           base+=gsb;
+            dbs=base;
+            rat+=2*gnb+dnb+2*gsb+dsb;
+        }
         float gg=gates[c]->gscale,ug=ups[c]->gscale,dg=downs[c]->gscale;
         // This expert's slice of the pooled buffers: rows [off, off+r).
         float *xc=ctx->x+(size_t)off*D,*gc=ctx->gate+(size_t)off*I,

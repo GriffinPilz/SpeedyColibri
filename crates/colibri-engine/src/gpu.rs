@@ -1223,6 +1223,108 @@ fn fit_usize(v: &mut Vec<usize>, n: usize) -> &mut [usize] {
 ///
 /// Returns false — leaving `out` untouched — if unavailable/ineligible, so the caller falls
 /// back to the per-expert loop.
+/// Grouped NVFP4 **SwiGLU** experts (MiniMax-M2.7 / M3 / GLM-5.2).
+///
+/// These models had no grouped path at all: `activation().relu2` is false for them, so the
+/// dispatcher offered the *fp8* group, which declines on `fmt_code == 5` and dropped every
+/// one of them to a per-expert call — ~15872 per prefill on M2.7, each with its own H2D,
+/// weight staging, D2H, sync and scratch-mutex acquire.
+///
+/// **Grouping alone is not the point.** Its ceiling was already measured at ~3% (see the
+/// relu2 twin below), and a segmented GEMM was measured and disproved as well. What this
+/// unlocks is per-layer bulk residency inside the kernel: one pinned transfer of the whole
+/// group's weights into a device arena, versus `COLI_FFN_DEVCOPY` staging one expert at a
+/// time out of pageable memory at 1.0-2.2 GB/s. Staging is 93.6% of expert-call GPU time
+/// on M2.7, so that transfer is the target — not the launches.
+pub fn try_expert_group_nvfp4(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if active.is_empty() {
+        return true;
+    }
+    // Every expert must be a gpu-eligible NVFP4 three-tensor SwiGLU of the expected shape, or
+    // decline and let the caller run per-expert.
+    if !active.iter().all(|(ex, _, _)| {
+        ex.gate.gpu_eligible
+            && ex.gate.fmt_code == 5
+            && ex.gate.i as usize == d
+            && ex.up.gpu_eligible
+            && ex.down.gpu_eligible
+            && ex.up.fmt_code == 5
+            && ex.down.fmt_code == 5
+            && ex.up.i as usize == d
+            && ex.down.o as usize == d
+    }) {
+        return false;
+    }
+    let total: usize = active.iter().map(|(_, r, _)| r.len()).sum();
+    let mut gsc = GROUP_SCRATCH.with(|c| c.take());
+    let x_all = fit_f32(&mut gsc.x_all, total * d);
+    let token_of = fit_usize(&mut gsc.token_of, total);
+    let weight_of = fit_f32(&mut gsc.weight_of, total);
+    let mut g = 0usize;
+    for (_, rows, rw) in active {
+        for (r, &t) in rows.iter().enumerate() {
+            x_all[g * d..(g + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
+            token_of[g] = t;
+            weight_of[g] = rw[r];
+            g += 1;
+        }
+    }
+    let y_all = fit_f32(&mut gsc.y_all, total * d);
+
+    let mut gs: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
+    let mut us: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
+    let mut ds: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
+    let mut rws: Vec<i32> = Vec::with_capacity(active.len());
+    let mut keep = Vec::with_capacity(active.len() * 3);
+    let mut all_wrapped = true;
+    for (ex, rows, _) in active {
+        let (Some(gt), Some(ut), Some(dt)) =
+            (wrap_fresh(&ex.gate), wrap_fresh(&ex.up), wrap_fresh(&ex.down))
+        else {
+            all_wrapped = false;
+            break;
+        };
+        gs.push(gt.as_raw());
+        us.push(ut.as_raw());
+        ds.push(dt.as_raw());
+        rws.push(rows.len() as i32);
+        keep.push(gt);
+        keep.push(ut);
+        keep.push(dt);
+    }
+    if !all_wrapped {
+        drop(keep);
+        GROUP_SCRATCH.with(|c| c.set(gsc));
+        return false;
+    }
+    // SAFETY: the wrapped tensors stay alive in `keep` until after the call, which is
+    // synchronous through its own D2H; x_all/y_all each hold `total * d` floats.
+    let ok = unsafe {
+        cuda::expert_group_nvfp4_raw(&gs, &us, &ds, &rws, y_all.as_mut_ptr(), x_all.as_ptr())
+    };
+    drop(keep);
+    if ok {
+        for gg in 0..total {
+            let (t, wgt) = (token_of[gg], weight_of[gg]);
+            let ys = &y_all[gg * d..(gg + 1) * d];
+            let os = &mut out[t * d..(t + 1) * d];
+            for dd in 0..d {
+                os[dd] += wgt * ys[dd];
+            }
+        }
+    }
+    GROUP_SCRATCH.with(|c| c.set(gsc));
+    ok
+}
+
 pub fn try_expert_group_relu2(
     active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
     activations: &[f32],

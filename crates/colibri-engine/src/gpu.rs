@@ -1315,7 +1315,39 @@ pub fn try_expert_group_nvfp4(
     // give the copy engine a longer run; smaller chunks need a smaller pinned buffer and a
     // smaller device arena, and start the first GEMM sooner. The arena is sized to the
     // chunk, so this also bounds the device memory the path holds.
-    let chunk = group_chunk_experts().unwrap_or(active.len()).max(1);
+    // Size the chunk to the RAM ledger, and charge it.
+    //
+    // On GB10 the staging is real system memory TWICE OVER — one pinned host buffer plus
+    // one device arena, both out of the same 121 GB pool — and neither was visible to the
+    // ledger. GLM-5.2 has the largest dense tier (34 GB with its device duplicate) and the
+    // least slack, so it was the one that tipped: earlyoom SIGTERMed it at 106.3 GiB with
+    // no tokens produced. This is the same accounting hole as the dense device duplicate,
+    // reintroduced by a new allocation, which is exactly why the rule has to be enforced
+    // where memory is taken rather than remembered per call site.
+    //
+    // Degrading is cheap, so prefer it to failing: the chunk sweep put 8 experts within 5%
+    // of 32 (59 s vs 56 s), so a short-on-memory model gives up very little by staging
+    // less at a time. If even one expert will not fit, decline and let the caller run the
+    // per-expert path, which allocates nothing beyond one expert's scratch.
+    let per_expert: u64 = active.iter().map(|(ex, _, _)| ex.bytes()).max().unwrap_or(0);
+    let staging_per_expert = per_expert.saturating_mul(2); // pinned host + device arena
+    let mut chunk = group_chunk_experts().unwrap_or(active.len()).max(1);
+    if staging_per_expert > 0 {
+        // Quarter of headroom: KV, activations and the read buffers draw on the same
+        // remainder, and a staging buffer that consumed all of it would simply move the
+        // kill to the next allocator.
+        let budget = crate::ram::manager().map(|m| m.headroom() / 4).unwrap_or(u64::MAX);
+        let fits = (budget / staging_per_expert) as usize;
+        if fits == 0 {
+            GROUP_SCRATCH.with(|c| c.set(gsc));
+            return false;
+        }
+        chunk = chunk.min(fits);
+        crate::ram::set_usage(
+            crate::ram::Class::Scratch,
+            staging_per_expert.saturating_mul(chunk as u64),
+        );
+    }
     let mut ok = true;
     let mut done = 0usize;   // rows consumed so far, to slice x_all/y_all per chunk
     for part in active.chunks(chunk) {

@@ -2181,9 +2181,27 @@ fn ram_target(total: u64) -> u64 {
 /// 0.06-0.24 tok/s — worse than the 40 GB default it was meant to beat. The caller cannot
 /// know the resident dense tier, the KV for the live context, or the GPU's share of a
 /// unified pool; all three are known here.
+///
+/// `resident` is the **host** dense tier; the GPU's duplicate of it is added here rather
+/// than at the call sites. Charging it to the ledger but not to this clamp is exactly the
+/// bug that shipped once: GLM-5.2 reported `dense 34 GB` (17 host + 17 duplicate) and, in
+/// the same breath, `fill to ~89 GB` — 123 GB of intent on a 121 GB box. It did not swap,
+/// because swap is off; earlyoom SIGTERMed it 43 s in. Deriving the duplicate inside the
+/// clamp means a future call site cannot forget it.
 fn clamp_fill_to_headroom(requested: u64, resident: u64, total: u64) -> u64 {
+    let dense = resident.saturating_add(colibri_engine::ram::device_duplicate_bytes());
+    fill_within_headroom(requested, dense, total)
+}
+
+/// The arithmetic of [`clamp_fill_to_headroom`], taking the *full* dense cost (host copy
+/// plus any device duplicate) explicitly.
+///
+/// Split out so the invariant can be tested without writing the process-global duplicate:
+/// tests run in parallel, and a test that mutates shared state to set up its own case has
+/// silently changed another test's math in this repo before.
+fn fill_within_headroom(requested: u64, dense_ram: u64, total: u64) -> u64 {
     let headroom = ram_target(total)
-        .saturating_sub(resident)
+        .saturating_sub(dense_ram)
         .saturating_sub(RUNTIME_RESERVE);
     requested.min(headroom)
 }
@@ -3291,6 +3309,30 @@ mod tests {
     /// serve process reached 108.7 GiB RSS, 3 GB went to swap, and serve throughput fell to
     /// 0.06-0.24 tok/s — worse than the 40 GB default it was meant to beat. The knob is
     /// gone; this pins the invariant that outlived it.
+    /// The GPU's duplicate of the dense tier must come out of the fill, not just the ledger.
+    ///
+    /// GLM-5.2 shipped for one commit with `dense 34 GB` charged (17 host + 17 duplicate)
+    /// and `fill to ~89 GB` planned in the same run — 123 GB of intent on a 121 GB box.
+    /// With swap off that is not a slowdown: earlyoom SIGTERMed it 43 s in, and a 12-token
+    /// smoke test had passed because the cache never grew far enough to reach the target.
+    #[test]
+    fn fill_target_subtracts_the_device_weight_duplicate() {
+        let gb = |n: u64| n << 30;
+        let total = gb(121);
+        let resident = gb(17); // GLM-5.2's host dense tier
+
+        // Zero-copy: only the host copy is charged.
+        assert_eq!(fill_within_headroom(u64::MAX, resident, total) >> 30, 89);
+
+        // Upload: the duplicate is real RAM on GB10 and must come out of the fill too.
+        let uploaded = fill_within_headroom(u64::MAX, resident * 2, total);
+        assert_eq!(uploaded >> 30, 72, "116 - (17 + 17) dense - 10 runtime");
+        assert!(
+            uploaded + resident * 2 + RUNTIME_RESERVE <= ram_target(total),
+            "fill + both weight copies + reserve must fit the 96% ceiling"
+        );
+    }
+
     #[test]
     fn fill_target_cannot_exceed_non_expert_headroom() {
         let gb = |n: u64| n << 30;

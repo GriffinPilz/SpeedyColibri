@@ -2689,6 +2689,93 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
     return 1;
 }
 
+/* Grouped NVFP4 **SwiGLU** experts — the three-tensor twin of the relu2 group above.
+ *
+ * MiniMax-M2.7, MiniMax-M3 and GLM-5.2 had no grouped path at all. `activation().relu2`
+ * is false for them, so the dispatcher offered them the *fp8* group, which declines on
+ * fmt=5 and drops every one of them to the per-expert entry point:
+ * ~15872 separate `coli_cuda_expert_mlp_nvfp4` calls per prefill, each paying its own
+ * input H2D, weight staging, output D2H, stream sync and scratch-mutex acquire. That is
+ * the whole 40.4 vs 0.9 tok/s prefill gap against Nemotron, which has had this since #37.
+ *
+ * The win is not fewer kernels — it is one round trip for the whole group instead of one
+ * per expert, and **no weight staging at all**: weights are handed to the kernels as host
+ * pointers, exactly as the relu2 group does, so the coherence cost that measured >=15x the
+ * kernel simply does not arise. Per-expert slices of the pooled x/gate/up/y buffers keep
+ * the arithmetic identical to the ungrouped path.
+ *
+ * Same guard rails as its twin: every expert must agree on device, format and dims, or the
+ * call declines and the caller falls back per-expert. */
+extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
+        ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,
+        const int *rows,int count,float *y,const float *x){
+    if(!gates||!ups||!downs||!rows||!x||!y||count<1)return 0;
+    ColiCudaTensor *first=gates[0]; if(!first)return 0;
+    int device=first->device,D=first->I,I=first->O,total=0;
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        if(!g||!u||!d||rows[c]<1||g->fmt!=5||u->fmt!=5||d->fmt!=5||
+           g->device!=device||u->device!=device||d->device!=device||
+           g->I!=D||g->O!=I||u->I!=D||u->O!=I||d->I!=I||d->O!=D)return 0;
+        total+=rows[c];
+    }
+    DeviceContext *ctx=find_ctx(device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    size_t xb=(size_t)total*D*sizeof(float),ib=(size_t)total*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert group nvfp4 input upload"))return 0;
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+    int off=0;
+    for(int c=0;c<count;c++){
+        int r=rows[c];
+        const uint8_t *gw=(const uint8_t*)gates[c]->weights,*uw=(const uint8_t*)ups[c]->weights,
+                      *dw=(const uint8_t*)downs[c]->weights;
+        const uint8_t *gbs=(const uint8_t*)gates[c]->bscale,*ubs=(const uint8_t*)ups[c]->bscale,
+                      *dbs=(const uint8_t*)downs[c]->bscale;
+        float gg=gates[c]->gscale,ug=ups[c]->gscale,dg=downs[c]->gscale;
+        // This expert's slice of the pooled buffers: rows [off, off+r).
+        float *xc=ctx->x+(size_t)off*D,*gc=ctx->gate+(size_t)off*I,
+              *uc=ctx->up+(size_t)off*I,*yc=ctx->y+(size_t)off*D;
+        if(r==1&&!s_tiled){
+            nvfp4_gemv_dispatch(gc,xc,gw,gbs,gg,D,I,ctx->stream);
+            nvfp4_gemv_dispatch(uc,xc,uw,ubs,ug,D,I,ctx->stream);
+            act_mul(gc,uc,(size_t)I,ctx->stream);
+            nvfp4_gemv_dispatch(yc,gc,dw,dbs,dg,I,D,ctx->stream);
+        }else{
+            // Weight-stationary for the small-M rows a routed expert actually sees;
+            // `nvfp4_wsmm_launch` declines above S=32 and the WMMA tile takes over.
+            bool did_ws=false;
+            if(nvfp4_wsmm_launch(gc,xc,gw,gbs,gg,r,D,I,ctx->stream)){
+                nvfp4_wsmm_launch(uc,xc,uw,ubs,ug,r,D,I,ctx->stream);
+                act_mul(gc,uc,(size_t)r*I,ctx->stream);
+                did_ws=nvfp4_wsmm_launch(yc,gc,dw,dbs,dg,r,I,D,ctx->stream);
+            }
+            if(!did_ws){
+                dim3 hidden((unsigned)((I+63)/64),(unsigned)((r+15)/16));
+                dim3 output((unsigned)((D+63)/64),(unsigned)((r+15)/16));
+                nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(gc,uc,xc,gw,uw,gbs,ubs,gg,ug,r,D,I);
+                act_mul(gc,uc,(size_t)r*I,ctx->stream);
+                nvfp4_matmul<<<output,128,0,ctx->stream>>>(yc,gc,dw,dbs,dg,r,I,D);
+            }
+        }
+        off+=r;
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert group nvfp4 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert group nvfp4 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group nvfp4 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+    return 1;
+}
+
 
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,

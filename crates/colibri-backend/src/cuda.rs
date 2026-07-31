@@ -178,6 +178,16 @@ extern "C" {
         x: *const f32,
     ) -> c_int;
     #[allow(clippy::too_many_arguments)]
+    fn coli_cuda_expert_group_nvfp4(
+        gates: *const *mut ColiCudaTensor,
+        ups: *const *mut ColiCudaTensor,
+        downs: *const *mut ColiCudaTensor,
+        rows: *const c_int,
+        count: c_int,
+        y: *mut f32,
+        x: *const f32,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
     fn coli_cuda_attention_absorb_batch(
         kv_b: *mut ColiCudaTensor,
         ctx: *mut f32,
@@ -789,6 +799,32 @@ pub unsafe fn expert_seg_nvfp4_relu2_raw(
         downs.as_ptr(),
         rows.as_ptr(),
         ups.len() as c_int,
+        y,
+        x,
+    ) != 0
+}
+
+/// Grouped NVFP4 **SwiGLU** experts (M2.7 / M3 / GLM-5.2): the three-tensor twin of
+/// [`expert_group_nvfp4_relu2_raw`]. These models previously had no grouped path at all and
+/// fell through to one `expert_mlp_nvfp4` call per expert — ~15872 round trips per prefill.
+pub unsafe fn expert_group_nvfp4_raw(
+    gates: &[*mut ColiCudaTensor],
+    ups: &[*mut ColiCudaTensor],
+    downs: &[*mut ColiCudaTensor],
+    rows: &[i32],
+    y: *mut f32,
+    x: *const f32,
+) -> bool {
+    let count = gates.len();
+    if count == 0 || ups.len() != count || downs.len() != count || rows.len() != count {
+        return false;
+    }
+    coli_cuda_expert_group_nvfp4(
+        gates.as_ptr(),
+        ups.as_ptr(),
+        downs.as_ptr(),
+        rows.as_ptr(),
+        count as c_int,
         y,
         x,
     ) != 0

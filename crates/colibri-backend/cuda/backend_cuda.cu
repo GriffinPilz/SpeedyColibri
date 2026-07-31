@@ -2802,7 +2802,30 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
                     for(int k=0;k<6;k++){ std::memcpy(dst+at,src[k],len[k]); at+=len[k]; }
                 }
             };
-            if(nthr<=1){ pack_range(0,count); }
+            /* COLI_GROUP_DIRECT=1: skip the pinned intermediate and issue the copies
+             * straight from the source host pointers into the arena slots. Trades the CPU
+             * pack (5.89 GB/s, fault-bound on scattered pool/mmap pages) for 6 async
+             * transfers per expert out of PAGEABLE memory. Per-expert devcopy measured
+             * 1-2 GB/s doing that, but it also synchronised per expert; here 150+ copies
+             * are queued before anything waits, so the driver can pipeline them. Worth an
+             * A/B precisely because the recorded evidence does not settle it. */
+            static int s_direct=-1;
+            if(s_direct<0){const char*e=getenv("COLI_GROUP_DIRECT");s_direct=e&&atoi(e);}
+            if(s_direct){
+                for(int c=0;c<count;c++){
+                    uint8_t *dst=(uint8_t*)ctx->lres+(size_t)c*per;
+                    const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
+                                           (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
+                                           (const uint8_t*)ups[c]->bscale,(const uint8_t*)downs[c]->bscale};
+                    size_t len[6]={gnb,gnb,dnb,gsb,gsb,dsb};
+                    size_t at=0;
+                    for(int k=0;k<6;k++){
+                        cudaMemcpyAsync(dst+at,src[k],len[k],cudaMemcpyHostToDevice,ctx->stream);
+                        at+=len[k];
+                    }
+                }
+            }
+            else if(nthr<=1){ pack_range(0,count); }
             else{
                 std::vector<std::thread> th; th.reserve(nthr);
                 int span=(count+(int)nthr-1)/(int)nthr;
@@ -2816,7 +2839,8 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
             double pack_ms=std::chrono::duration<double,std::milli>(
                 std::chrono::steady_clock::now()-t_pack).count();
             auto t_h2d=std::chrono::steady_clock::now();
-            resident=cuda_ok(cudaMemcpyAsync(ctx->lres,ctx->host_lres,wtot,
+            resident = s_direct ? cuda_ok(cudaGetLastError(),"expert group nvfp4 direct upload")
+                                : cuda_ok(cudaMemcpyAsync(ctx->lres,ctx->host_lres,wtot,
                                              cudaMemcpyHostToDevice,ctx->stream),
                              "expert group nvfp4 layer-resident upload");
             /* COLI_GROUP_EVT=1: split the group's transfer from its kernels. Without this

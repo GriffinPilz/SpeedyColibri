@@ -267,6 +267,14 @@ pub fn pin_profile() -> (u64, u64, u64, u64) {
 /// neutral. Unlimited is that same plateau.
 ///
 /// `COLI_BUF_POOL` still sets it, so every A/B in the table above reproduces exactly.
+///
+/// **Measured neutral on speed** (2026-07-31, cap=128 vs unset, one binary, 2 reps ABBA,
+/// token-identical): M2.7 wall 52 s unset / 50 s capped, moe 29.0 / 28.1 s; GLM pack
+/// 37-40 GB/s unset / 30-36 capped with `cpu ~= elapsed` in both arms. This change is
+/// justified by the K3-vs-GLM asymmetry above, **not** by a throughput claim — and in
+/// practice it is a no-op for the current fleet, because at these span sizes the byte cap
+/// already binds first for GLM and the count cap barely bound for M2.7. K3, the model it
+/// exists for, is still unmeasured.
 fn pool_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {

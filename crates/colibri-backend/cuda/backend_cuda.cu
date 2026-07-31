@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 #include <mutex>
+#include <chrono>
 
 struct ColiCudaTensor {
     void *weights;
@@ -2713,6 +2714,8 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
  *
  * Same guard rails as its twin: every expert must agree on device, format and dims, or the
  * call declines and the caller falls back per-expert. */
+static int g_grp_evt=-1; static double g_grp_pack_ms=0, g_grp_bytes=0; static long long g_grp_chunks=0;
+
 extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
         ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,
         const int *rows,int count,float *y,const float *x){
@@ -2771,6 +2774,7 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
         }
         if(wtot&&reserve_bytes((void**)&ctx->lres,&ctx->lres_cap,wtot)&&
            reserve_pinned(&ctx->host_lres,&ctx->host_lres_cap,wtot)){
+            auto t_pack=std::chrono::steady_clock::now();
             uint8_t *hp=(uint8_t*)ctx->host_lres; size_t at=0;
             for(int c=0;c<count;c++){
                 size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
@@ -2784,6 +2788,24 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
             resident=cuda_ok(cudaMemcpyAsync(ctx->lres,ctx->host_lres,wtot,
                                              cudaMemcpyHostToDevice,ctx->stream),
                              "expert group nvfp4 layer-resident upload");
+            /* COLI_GROUP_EVT=1: split the group's transfer from its kernels. Without this
+             * the grouped path reports gpu-ffn=0 — it has no counter at all — so the one
+             * number rule 3 needs (are we transfer-bound or kernel-bound at 1.26 GB/s
+             * against a ~51 GB/s ceiling?) could not be obtained. Host-side memcpy into the
+             * pinned buffer is timed too: it is single-threaded and ~105 GB per prefill, so
+             * it is a candidate in its own right. */
+            if(g_grp_evt<0){const char*e=getenv("COLI_GROUP_EVT");g_grp_evt=e&&atoi(e);}
+            if(g_grp_evt){
+                cudaStreamSynchronize(ctx->stream);
+                double ms=std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-t_pack).count();
+                g_grp_pack_ms+=ms; g_grp_bytes+=(double)wtot; g_grp_chunks++;
+                if((g_grp_chunks%200)==0)
+                    fprintf(stderr,"[group-evt] chunks=%lld staged=%.1f GB in %.2f s = %.2f GB/s "
+                            "(pack+H2D, %d experts/chunk)\n",
+                            g_grp_chunks,g_grp_bytes/1e9,g_grp_pack_ms/1e3,
+                            (g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),count);
+            }
         }
     }
 

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 struct ColiCudaTensor {
@@ -1649,8 +1650,17 @@ static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
 }
 
+/* Reallocation counters. A cudaMallocHost of ~176 MB costs ~100 ms, so if the grouped
+ * path re-reserves per chunk that alone is ~20 s over a prefill — the right order for the
+ * pack's unexplained time, given a standalone benchmark of the same copy runs at 64 GB/s
+ * while the pack manages 6. Counted rather than assumed: three mechanism guesses have
+ * already been wrong here. */
+long long g_res_pin_hit=0,g_res_pin_alloc=0,g_res_dev_hit=0,g_res_dev_alloc=0;
+
 static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
-    if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    if(*cap>=bytes){g_res_pin_hit++;return 1;}
+    g_res_pin_alloc++;
+    if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
 
@@ -2717,6 +2727,7 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
  * Same guard rails as its twin: every expert must agree on device, format and dims, or the
  * call declines and the caller falls back per-expert. */
 static int g_grp_evt=-1; static double g_grp_pack_ms=0, g_grp_h2d_ms=0, g_grp_bytes=0; static long long g_grp_chunks=0;
+static double g_grp_thr_sum=0, g_grp_thr_max=0, g_grp_thr_cpu=0; static long long g_grp_nthr=0;
 
 extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
         ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,
@@ -2776,6 +2787,42 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
         }
         if(wtot&&reserve_bytes((void**)&ctx->lres,&ctx->lres_cap,wtot)&&
            reserve_pinned(&ctx->host_lres,&ctx->host_lres_cap,wtot)){
+            /* COLI_PACK_PROBE=1: one-shot A/B inside the real pack, at the real moment, in
+             * the real process, on one thread. Same byte count, same pinned destination,
+             * only the SOURCE differs: the engine's own expert buffer versus a private
+             * malloc. A standalone reproduction of this copy runs at 64 GB/s while the pack
+             * manages 6, and every property of the copy itself is eliminated (scattered
+             * sources, pinned destination, thread count, buffer reallocation), so the source
+             * mapping is what is left to test — and it is the one thing a standalone
+             * benchmark cannot reproduce.
+             *
+             * Each source is copied twice. A cold-then-warm pair separates first-touch fault
+             * cost from steady-state read cost: slow-then-fast is faults, slow-then-slow with
+             * a fast malloc source is the mapping itself. */
+            static int s_probe=-1;
+            if(s_probe<0){const char*e=getenv("COLI_PACK_PROBE");s_probe=e&&atoi(e);}
+            if(s_probe==1&&count>0){
+                s_probe=2;                       // one shot; it perturbs the chunk it runs in
+                size_t n=(size_t)I*((D+1)/2);
+                uint8_t *scratch=(uint8_t*)malloc(n);
+                if(scratch){
+                    memset(scratch,0x5a,n);      // pre-fault, so this is steady-state reads
+                    uint8_t *dst=(uint8_t*)ctx->host_lres;
+                    const uint8_t *e0=(const uint8_t*)gates[0]->weights;
+                    double t[4]; auto mark=std::chrono::steady_clock::now();
+                    #define PROBE(i,src) std::memcpy(dst,(src),n); { auto z=std::chrono::steady_clock::now(); \
+                        t[i]=std::chrono::duration<double>(z-mark).count(); mark=z; }
+                    PROBE(0,e0)                  // expert source, cold
+                    PROBE(1,e0)                  // expert source, warm — same pages
+                    PROBE(2,scratch)             // private source, warm
+                    PROBE(3,(const uint8_t*)ups[0]->weights)   // a second expert source, cold
+                    #undef PROBE
+                    fprintf(stderr,"[pack-probe] %.1f MB/copy | expert cold %.2f warm %.2f "
+                            "| malloc %.2f | expert2 cold %.2f  (GB/s)\n",
+                            n/1e6,(n/1e9)/t[0],(n/1e9)/t[1],(n/1e9)/t[2],(n/1e9)/t[3]);
+                    free(scratch);
+                }
+            }
             auto t_pack=std::chrono::steady_clock::now();
             uint8_t *hp=(uint8_t*)ctx->host_lres;
             size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
@@ -2789,9 +2836,33 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
              * 1.26 GB/s is slow even for one core: it is fault- and latency-bound, not
              * bandwidth-bound, and that is exactly the shape that parallelises.
              * Each expert writes a disjoint `per`-byte slot, so no synchronisation. */
-            unsigned nthr=std::thread::hardware_concurrency(); if(!nthr)nthr=8;
+            /* COLI_PACK_THREADS overrides the fan-out. hardware_concurrency() is the wrong
+             * default here and the counters say why: the pack's threads spend 85% of their
+             * life off-CPU (10.5 s of CPU against 68.9 s of elapsed), queued behind the
+             * expert reader's own pool on the same 20 cores. Threads added to a saturated
+             * runqueue do not copy faster, they just take the reader's slots. */
+            static int s_pthr=-1;
+            if(s_pthr<0){const char*e=getenv("COLI_PACK_THREADS");s_pthr=e?atoi(e):0;}
+            unsigned nthr=s_pthr>0?(unsigned)s_pthr:std::thread::hardware_concurrency();
+            if(!nthr)nthr=8;
             if(nthr>(unsigned)count)nthr=(unsigned)count;
+            /* Per-thread busy time against the pack's wall time. A single-threaded copy from a
+             * real expert source measures 26-30 GB/s in this same process, so 13 threads
+             * should retire a 237 MB chunk in well under a millisecond; the chunk takes ~75.
+             * Only three shapes can produce that, and these two counters separate them: if
+             * max-thread ~= wall the threads are genuinely busy and the copies are slow in
+             * aggregate (contention or faults); if max-thread << wall the time is in spawn,
+             * join, or outside the copies entirely. */
+            std::atomic<double> thr_sum{0.0}, thr_max{0.0}, thr_cpu{0.0};
             auto pack_range=[&](int lo,int hi){
+                auto t_thr=std::chrono::steady_clock::now();
+                /* Thread CPU time beside thread elapsed. The copies retire 30x slower in
+                 * aggregate than the same copy does alone in this process, and only two
+                 * things do that: the thread is off-CPU (oversubscribed against the reader's
+                 * pool) or it is on-CPU and stalled on memory. cpu << elapsed is the first,
+                 * cpu ~= elapsed the second — and they want different fixes, so guessing
+                 * between them is what this avoids. */
+                timespec c0,c1; clock_gettime(CLOCK_THREAD_CPUTIME_ID,&c0);
                 for(int c=lo;c<hi;c++){
                     uint8_t *dst=hp+(size_t)c*per;
                     const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
@@ -2801,6 +2872,16 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
                     size_t at=0;
                     for(int k=0;k<6;k++){ std::memcpy(dst+at,src[k],len[k]); at+=len[k]; }
                 }
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID,&c1);
+                double cpu=(c1.tv_sec-c0.tv_sec)*1e3+(c1.tv_nsec-c0.tv_nsec)/1e6;
+                double q=thr_cpu.load(std::memory_order_relaxed);
+                while(!thr_cpu.compare_exchange_weak(q,q+cpu,std::memory_order_relaxed)){}
+                double e=std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-t_thr).count();
+                double s=thr_sum.load(std::memory_order_relaxed);   // fetch_add on a double is C++20
+                while(!thr_sum.compare_exchange_weak(s,s+e,std::memory_order_relaxed)){}
+                double m=thr_max.load(std::memory_order_relaxed);
+                while(e>m&&!thr_max.compare_exchange_weak(m,e,std::memory_order_relaxed)){}
             };
             /* COLI_GROUP_DIRECT=1: skip the pinned intermediate and issue the copies
              * straight from the source host pointers into the arena slots. Trades the CPU
@@ -2856,12 +2937,18 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
                     std::chrono::steady_clock::now()-t_h2d).count();
                 g_grp_pack_ms+=pack_ms; g_grp_h2d_ms+=h2d_ms;
                 g_grp_bytes+=(double)wtot; g_grp_chunks++;
+                g_grp_thr_sum+=thr_sum.load(std::memory_order_relaxed);
+                g_grp_thr_max+=thr_max.load(std::memory_order_relaxed);
+                g_grp_thr_cpu+=thr_cpu.load(std::memory_order_relaxed);
+                g_grp_nthr+=nthr;
                 if((g_grp_chunks%200)==0)
                     fprintf(stderr,"[group-evt] chunks=%lld staged=%.1f GB | pack %.2f s = %.2f GB/s "
-                            "| H2D %.2f s = %.2f GB/s | %d experts/chunk\n",
+                            "| H2D %.2f s = %.2f GB/s | %d experts/chunk | pinned %lld hit/%lld alloc "
+                            "| thr %lld/chunk elapsed-max %.2f s elapsed-sum %.2f s cpu-sum %.2f s\n",
                             g_grp_chunks,g_grp_bytes/1e9,
                             g_grp_pack_ms/1e3,(g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),
-                            g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),count);
+                            g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),count,g_res_pin_hit,g_res_pin_alloc,
+                            g_grp_nthr/g_grp_chunks,g_grp_thr_max/1e3,g_grp_thr_sum/1e3,g_grp_thr_cpu/1e3);
             }
         }
     }

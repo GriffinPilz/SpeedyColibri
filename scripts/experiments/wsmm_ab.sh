@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-set -u
-REPO=/home/dgx1/SpeedyColibri-nemotron
-C=/home/dgx1/models/Nemotron-3-Super-120B-container
-PORT=8098; SIG="serve $C $PORT"; OUT=/tmp/wsmm_ab; rm -rf $OUT; mkdir -p $OUT
-stop(){ pkill -f "$SIG" 2>/dev/null; for _ in $(seq 1 40); do ss -ltn 2>/dev/null|grep -q ":$PORT "||return; sleep 2; done; pkill -9 -f "$SIG" 2>/dev/null; sleep 3; }
-arm(){ local tag=$1 ws=$2
-  echo "########## $tag  NVFP4_WSMM=$ws ##########"; stop
-  setsid nohup env COLI_PROFILE=1 COLI_RELU2_EVT=1 COLI_NVFP4_WSMM=$ws "$REPO/target/release/coli" serve "$C" "$PORT" </dev/null >$OUT/s-$tag.log 2>&1 &
-  for _ in $(seq 1 450); do grep -q "OpenAI-compatible server" $OUT/s-$tag.log && break; sleep 2; done
-  grep -q "OpenAI-compatible server" $OUT/s-$tag.log || { echo SERVER_FAILED; tail -5 $OUT/s-$tag.log; return; }
-  python3 "$REPO/scripts/experiments/warm_prefill.py" 127.0.0.1:$PORT 6 /tmp/passage2.txt 2>&1 | tee $OUT/c-$tag.log | grep -Ei "median|token id"
-  grep "relu2-evt" $OUT/s-$tag.log | tail -2 | sed "s/^/  /"
-  stop; echo; }
-# ABBA on off off on
-arm b1-on 1; arm b2-off 0; arm b3-off 0; arm b4-on 1
-echo "=== per-arm generated token (cross-arm identity) ==="
-for t in b1-on b2-off b3-off b4-on; do
-  tok=$(grep -oE "completion=[0-9]+ text=.[^\x27]*" $OUT/c-$t.log | head -1)
-  echo "$t: $(grep -oE \"text=.[^,]*\" $OUT/c-$t.log | head -1)"
-done
-echo WSMM_AB_DONE
+# OBSOLETE — kept only so the result is findable. Do not run it expecting an A/B.
+#
+# This toggled COLI_NVFP4_WSMM to compare the weight-stationary NVFP4 expert GEMM against
+# the WMMA tile. That knob no longer exists: `nvfp4_wsmm_launch` selects the smallest MT
+# bucket >= S and declines above 32, and S = tokens*top_k/n_experts already carries both the
+# model and the cluster shape, so there was nothing for an override to decide that the
+# launcher was not deciding better.
+#
+# It is stubbed rather than deleted because if it still ran, both arms would set an ignored
+# variable, produce identical configurations, and report ~1.00x — a false negative that
+# reads exactly like "the kernel does not help".
+#
+# Results it produced, both token-identical:
+#   Nemotron (relu2, serve, warm prefill) : 1.24x wall, 1.48x on the kernel   (#90)
+#   MiniMax-M2.7 (SwiGLU, prefill)        : 1.16x gpu-ffn, 258623 -> 222521 ms
+#
+# The larger M2.7 lever turned out to be elsewhere: expert weight staging was gated on
+# S >= 16 and a routed expert only ever sees S ~ 4, so it read dirty host pages on every
+# expert call. Removing that gate is 1.24x gpu-ffn on its own. See
+# `coli_cuda_expert_mlp_nvfp4` in crates/colibri-backend/cuda/backend_cuda.cu.
+echo "wsmm_ab.sh is obsolete: COLI_NVFP4_WSMM was removed — the kernel is chosen from S." >&2
+echo "See the header of this file for the measurements it produced." >&2
+exit 1

@@ -1980,13 +1980,17 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
     // zero-copy GPU read pays a cache-coherence penalty on every (dirty) weight line —
     // measured ~2.8x/matmul slower than reading clean device memory. Stage them through
     // one streaming H2D copy per weight (resolves coherence in bulk), then run the
-    // kernels on device pointers. Prefill-gated (COLI_FFN_DEVCOPY_MIN, default 16): at
-    // small S the copy can't amortize. COLI_FFN_DEVCOPY=0 forces the old zero-copy path.
+    // kernels on device pointers. The old `S >= 16` gate assumed small S could not amortize
+    // the copy; measured on the NVFP4 twin it is the opposite — a routed expert sees
+    // S = tokens*top_k/n_experts (~4), and staging won 1.24x there. Same reasoning applies
+    // here: the penalty is per dirty weight line, so it scales with the WEIGHT, not with S,
+    // and S only decides how much useful work amortizes it. COLI_FFN_DEVCOPY=0 forces the
+    // old zero-copy path. (Not re-measured on the fp8 path — see the NVFP4 twin.)
     const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const float *gsc=gate->scales,*usc=up->scales,*dsc=down->scales;
-    static int s_dc=-1,s_dcmin=16;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
-    if(s_dc&&S>=s_dcmin){
+    static int s_dc=-1;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    if(s_dc){
         size_t gwb=(size_t)I*D,dwb=(size_t)D*I;
         if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gwb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gwb)&&
            reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dwb)&&reserve(&ctx->esg,&ctx->esg_cap,(size_t)I*sizeof(float))&&
@@ -2102,13 +2106,24 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
     const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const uint8_t *gbs=(const uint8_t*)gate->bscale,*ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
     float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
-    // Prefill devcopy (COLI_FFN_DEVCOPY, default on for S>=COLI_FFN_DEVCOPY_MIN=16): stage
-    // nibbles + ue4m3 block scales to device so the tiled kernel reads clean memory instead
-    // of freshly-pread (dirty, coherence-heavy) host pages — the fp8-path win. Decode (S==1
-    // gemv) never reaches this; zero-copy stays the decode path.
-    static int s_dc=-1,s_dcmin=16;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
-    if(s_dc&&S>=s_dcmin){
+    // Stage nibbles + ue4m3 block scales to device so the tiled kernel reads clean memory
+    // instead of freshly-pread (dirty, coherence-heavy) host pages. Decode (S==1 gemv)
+    // never reaches this branch; zero-copy stays the decode path.
+    //
+    // This used to require S >= 16, and that threshold was wrong for every routed-expert
+    // model. An expert in prefill does not see the prompt length — it sees
+    // S = tokens*top_k/n_experts, which for MiniMax-M2.7 (top_k 8, 256 experts) is ~4 at a
+    // 128-token prompt and ~16 at 512. So the models this exists for sat at or below the
+    // gate and read dirty pages on all ~15872 expert calls of a prefill. Measured on M2.7,
+    // ABBA-interleaved, 4 runs per arm, tokens identical in all 8: gpu-ffn median
+    // 227468 ms at the old gate vs 184007 ms always-staged — **1.24x**, wall 1.20x.
+    //
+    // There is no threshold left to tune: if control reaches here S > 1, and staging won at
+    // the smallest S the fleet actually produces. Reinstating a minimum would need a
+    // measured S where zero-copy wins, and none is known.
+    static int s_dc=-1;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    if(s_dc){
         size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (gate/up, down)
         size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
         if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gnb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gnb)&&
@@ -2131,17 +2146,23 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
         act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
         nvfp4_gemv_dispatch(ctx->y,ctx->gate,dw,dbs,dg,I,D,ctx->stream);
     }else{
-        // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32), the same
-        // #90 fix the relu2 expert already had: at prefill this expert sees only
-        // S = tokens*top_k/n_experts rows (~16 on M2.7, ~26 on Nemotron), so the WMMA tile
-        // re-dequants the whole weight per 16-row m-tile and runs at ~0.26% of tensor peak.
-        // Reading each weight once and accumulating over all S rows in registers is the win.
-        // Wiring it only into relu2 left the three SwiGLU models (M2.7/M3/GLM) on WMMA —
-        // 57% of an M2.7 prefill sat in this branch.
-        static int s_ws=-1;
-        if(s_ws<0){const char*e=getenv("COLI_NVFP4_WSMM");s_ws=(!e||atoi(e));}
+        // Weight-stationary small-M path, the same #90 fix the relu2 expert already had: at
+        // prefill this expert sees only S = tokens*top_k/n_experts rows (~4-16 on M2.7,
+        // ~26 on Nemotron), so the WMMA tile re-dequants the whole weight per 16-row m-tile
+        // and runs at ~0.26% of tensor peak. Reading each weight once and accumulating over
+        // all S rows in registers is the win. Wiring it only into relu2 left the three
+        // SwiGLU models (M2.7/M3/GLM) on WMMA. Measured on M2.7, ABBA, tokens identical:
+        // gpu-ffn 258623 -> 222521 ms, **1.16x**.
+        //
+        // Not a knob. `nvfp4_wsmm_launch` selects the smallest MT bucket >= S and declines
+        // above 32, where the MMA amortizes and WMMA is the better kernel — and S is
+        // already the only thing that decides this. It carries the model (top_k /
+        // n_experts) and the cluster shape: under expert parallelism a node owns fewer
+        // experts, so each expert it does own sees proportionally MORE rows and slides
+        // toward the WMMA end on its own. An env override could only disagree with the
+        // shape actually being computed.
         bool did_ws=false;
-        if(s_ws&&nvfp4_wsmm_launch(ctx->gate,ctx->x,gw,gbs,gg,S,D,I,ctx->stream)){
+        if(nvfp4_wsmm_launch(ctx->gate,ctx->x,gw,gbs,gg,S,D,I,ctx->stream)){
             // Same S ⇒ the up/down launches take the same MT bucket and cannot decline.
             nvfp4_wsmm_launch(ctx->up,ctx->x,uw,ubs,ug,S,D,I,ctx->stream);
             act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
@@ -2207,12 +2228,14 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
     const uint8_t *uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const uint8_t *ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
     float ug=up->gscale,dg=down->gscale;
-    // Prefill devcopy (COLI_FFN_DEVCOPY, default on for S>=COLI_FFN_DEVCOPY_MIN=16): stage
-    // up/down nibbles + ue4m3 block scales to device so the tiled kernel reads clean memory
-    // instead of freshly-pread host pages. Decode (S==1 gemv) stays zero-copy.
-    static int s_dc=-1,s_dcmin=16;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
-    if(s_dc&&S>=s_dcmin){
+    // Stage up/down nibbles + ue4m3 block scales to device so the tiled kernel reads clean
+    // memory instead of freshly-pread host pages. Decode (S==1 gemv) stays zero-copy.
+    // The old `S >= 16` gate is gone for the reason measured on the SwiGLU twin: a routed
+    // expert never sees the prompt length, only S = tokens*top_k/n_experts, so the gate
+    // excluded exactly the models it was written for.
+    static int s_dc=-1;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    if(s_dc){
         size_t unb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (up, down)
         size_t usb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
         if(reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,unb)&&reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dnb)&&
@@ -2254,14 +2277,13 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
                 nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
         }
     }else{
-        // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32): reads each
-        // weight once and amortizes the dequant across all S rows, vs the WMMA path's
-        // per-16-row-m-tile re-dequant at ~1/8 MMA utilization (#90). Falls through to WMMA
-        // for S>32 (large-M experts, where the MMA amortizes) or when disabled.
-        static int s_ws=-1;
-        if(s_ws<0){const char*e=getenv("COLI_NVFP4_WSMM");s_ws=(!e||atoi(e));}
+        // Weight-stationary small-M path: reads each weight once and amortizes the dequant
+        // across all S rows, vs the WMMA path's per-16-row-m-tile re-dequant at ~1/8 MMA
+        // utilization (#90). `nvfp4_wsmm_launch` declines above S=32, where the MMA
+        // amortizes, and the call falls through to WMMA — see the SwiGLU twin for why S is
+        // the whole decision and this is not a knob.
         bool did_ws=false;
-        if(s_ws){
+        {
             if(nvfp4_wsmm_launch(ctx->up,ctx->x,uw,ubs,ug,S,D,I,ctx->stream)){
                 relu2_inplace<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)S*I);
                 did_ws=nvfp4_wsmm_launch(ctx->y,ctx->up,dw,dbs,dg,S,I,D,ctx->stream);

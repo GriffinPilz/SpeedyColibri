@@ -18,6 +18,9 @@ source "$(dirname "$0")/lib.sh"
 MODEL="$1"; SUITE="${2:-all}"
 load_model "$MODEL"; need_coli; need_container
 cd "$REPO_ROOT"
+# Claim the box for the duration. Anything that would contend for the NVMe or the network
+# — notably a Hugging Face container upload — tests this and refuses to start.
+bench_lock_acquire
 
 REPS="${BENCH_REPS:-3}"
 NTOK_PROMPT="$(wc -w <<<"$PROMPT_TOKENS")"

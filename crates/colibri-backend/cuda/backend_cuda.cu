@@ -1988,9 +1988,15 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
     // old zero-copy path. (Not re-measured on the fp8 path — see the NVFP4 twin.)
     const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const float *gsc=gate->scales,*usc=up->scales,*dsc=down->scales;
+    // Same per-PATH gate as the NVFP4 twins: the S==1 gemv reads each weight once, so
+    // staging it is a pure loss. See the relu2 path for the 11.04 -> 9.8 tok/s this cost
+    // on Nemotron decode when the replacement for `S >= 16` was left out.
+    static int s_gemv_pre=-1;
+    if(s_gemv_pre<0){const char*e=getenv("COLI_FFN_GEMV");s_gemv_pre=e&&atoi(e);}
+    const bool row_path=(s_gemv_pre&&S==1);
     static int s_dc=-1;
     if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
-    if(s_dc){
+    if(s_dc&&!row_path){
         size_t gwb=(size_t)I*D,dwb=(size_t)D*I;
         if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gwb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gwb)&&
            reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dwb)&&reserve(&ctx->esg,&ctx->esg_cap,(size_t)I*sizeof(float))&&
@@ -2146,12 +2152,19 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
     // ABBA-interleaved, 4 runs per arm, tokens identical in all 8: gpu-ffn median
     // 227468 ms at the old gate vs 184007 ms always-staged — **1.24x**, wall 1.20x.
     //
-    // There is no threshold left to tune: if control reaches here S > 1, and staging won at
-    // the smallest S the fleet actually produces. Reinstating a minimum would need a
-    // measured S where zero-copy wins, and none is known.
+    // Gated on the path actually taken, NOT on a row-count threshold. The single-row gemv
+    // below reads the weights ONCE, so staging them costs a full H2D copy to save nothing —
+    // and decode is exactly that path. Removing the old `S >= 16` gate without this
+    // condition made every decode step stage its experts (~15.8 MB each on Nemotron) and
+    // cost **9.8 vs 11.04 tok/s**. `S >= 16` had been keeping decode out by accident; the
+    // real predicate is "am I about to run the tiled/WSMM kernel", which re-reads the
+    // weight per m-tile and therefore does benefit.
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+    const bool row_path=(S==1&&!s_tiled);
     static int s_dc=-1;
     if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
-    if(s_dc){
+    if(s_dc&&!row_path){
         size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (gate/up, down)
         size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
         if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gnb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gnb)&&
@@ -2168,9 +2181,7 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
         }
     }
     if(s_evt) cudaEventRecord(s_v1,ctx->stream);
-    static int s_tiled=-1;
-    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
-    if(S==1&&!s_tiled){
+    if(row_path){
         nvfp4_gemv_dispatch(ctx->gate,ctx->x,gw,gbs,gg,D,I,ctx->stream);
         nvfp4_gemv_dispatch(ctx->up,  ctx->x,uw,ubs,ug,D,I,ctx->stream);
         act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
@@ -2269,13 +2280,21 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
     const uint8_t *ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
     float ug=up->gscale,dg=down->gscale;
     // Stage up/down nibbles + ue4m3 block scales to device so the tiled kernel reads clean
-    // memory instead of freshly-pread host pages. Decode (S==1 gemv) stays zero-copy.
+    // memory instead of freshly-pread host pages.
+    //
     // The old `S >= 16` gate is gone for the reason measured on the SwiGLU twin: a routed
     // expert never sees the prompt length, only S = tokens*top_k/n_experts, so the gate
-    // excluded exactly the models it was written for.
+    // excluded exactly the models it was written for. But it must be replaced by the
+    // per-PATH condition below, not by nothing — **"decode stays zero-copy" is load-bearing
+    // and `S >= 16` was enforcing it by accident.** Staging on the single-row path copies
+    // the whole weight to save one read of it: Nemotron decode went 11.04 -> 9.8 tok/s
+    // before this was gated. `exact` (MTP verify) also takes the row path.
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+    const bool row_path=((S==1&&!s_tiled)||exact);
     static int s_dc=-1;
     if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
-    if(s_dc){
+    if(s_dc&&!row_path){
         size_t unb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (up, down)
         size_t usb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
         if(reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,unb)&&reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dnb)&&
@@ -2289,15 +2308,13 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
         }
     }
     if(s_evt) cudaEventRecord(s_e1,ctx->stream);
-    static int s_tiled=-1;
-    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     // `exact`: force the per-row gemv path for EVERY row, even at S>1. This makes a
     // multi-row (collided-expert) call bit-identical to S separate S==1 decode calls —
     // needed by the MTP verify forward, whose S>1 logits must match sequential decode to
     // the bit or a near-tie argmax forks the accepted token from DRAFT=0. The WSMM/WMMA
     // paths below reduce over K in a different order, so they cannot be used for verify.
     // S is tiny at verify, so the lost row-parallelism costs nothing there.
-    if((S==1&&!s_tiled)||exact){
+    if(row_path){
         int tpb=256,wpb=tpb>>5;
         for(int r=0;r<S;r++){
             const float *xr=ctx->x+(size_t)r*D; float *tr=ctx->up+(size_t)r*I; float *yr=ctx->y+(size_t)r*D;

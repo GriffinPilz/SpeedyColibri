@@ -48,6 +48,40 @@ mem_reset() {
   sleep "${MEM_RESET_SETTLE:-3}"
 }
 
+# Declare that a measurement is in progress, so anything that would compete for the drive
+# or the network refuses to start.
+#
+# Everything this harness measures is sensitive to the NVMe: expert-load is the bulk of a
+# decode step, and prefill reads hundreds of GB. A concurrent bulk transfer — a Hugging Face
+# container upload is ~1.85 TB across the fleet — does not merely add noise, it changes the
+# quantity being measured. Two independent stale benchmark processes contending on this box
+# already produced an hour of numbers that were silently measuring each other.
+#
+# The lock is advisory and self-cleaning: the trap fires on normal exit and on INT/TERM, and
+# a stale lock from a killed run is detected by checking whether the recorded PID is alive.
+BENCH_LOCK="${BENCH_LOCK:-/tmp/colibri-bench.lock}"
+
+bench_lock_acquire() {
+  if [[ -f "$BENCH_LOCK" ]]; then
+    local pid; pid=$(cat "$BENCH_LOCK" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "harness: a measurement is already running (pid $pid) — refusing to start a second" >&2
+      exit 1
+    fi
+    echo "harness: clearing stale lock from dead pid ${pid:-?}" >&2
+  fi
+  echo $$ > "$BENCH_LOCK"
+  trap 'rm -f "$BENCH_LOCK"' EXIT INT TERM
+}
+
+# True while a measurement holds the lock. For non-bench tooling (uploads, fetches) to test.
+bench_lock_held() {
+  local pid
+  [[ -f "$BENCH_LOCK" ]] || return 1
+  pid=$(cat "$BENCH_LOCK" 2>/dev/null)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
 # Median of numeric args (integers or floats).
 median() {
   printf "%s\n" "$@" | sort -n | awk '

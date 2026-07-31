@@ -2655,7 +2655,31 @@ const DISK_BOUND_READ_THREADS: usize = 12;
 /// M2.7 serve against the 40 GB streaming cap, and a small heap next to a large page cache
 /// is precisely the arm that lost. But do not cite this table as current, and do not tune
 /// this constant expecting it to matter until the tier competition is resolved.
-const MMAP_MIN_COVERAGE_PCT: u64 = 80;
+///
+/// **Raised 80 → 100 on 2026-07-31: at 80 it was a measured 1.27× REGRESSION on M2.7.**
+///
+/// The threshold is no longer a proxy — it is the condition this doc already states two
+/// paragraphs up, that mapping only pays when spans are *actually resident when touched*.
+/// 100% is that condition. Anything less means some fraction of touches is a synchronous
+/// disk read, and the grouped expert path turned that from a reader's problem into
+/// everyone's: the pack memcpys every staged expert on the CPU, so a non-resident page is a
+/// **major fault inside the copy**.
+///
+/// M2.7 at 84% coverage, 128-tok prefill, 2 reps ABBA, token-identical:
+///
+/// | | wall | pack | pgmajfault | moe | expert-load |
+/// |---|---|---|---|---|---|
+/// | **mapped off** | **39-43 s** | **1.96-2.13 s** | **0** | **18.9 s** | 12.1 s |
+/// | mapped on (80) | 49-56 s | 7.79-15.56 s | 159k-311k | 28.8 s | 13.5 s |
+///
+/// Note `expert-load` is no better mapped — the tier this gate exists to help does not gain,
+/// while `moe` loses 1.52×. It also removes a variance problem, not just a mean one: mapped
+/// off spans 1.96-2.13 s, mapped on 7.79-15.56 s. That spread is the "M2.7 bimodality" that
+/// two other hypotheses (pack thread count, buffer-pool cap) were wrongly blamed for.
+///
+/// Nemotron (155% coverage) still qualifies and is unaffected in practice — it preloads, so
+/// its expert-load is ~2 ms either way. GLM (18%) and M3 (37%) were already below the gate.
+const MMAP_MIN_COVERAGE_PCT: u64 = 100;
 
 /// Wire the expert cache to **fill RAM safely, for every model**. It grows toward a fill
 /// target and a background monitor evicts LRU experts under memory pressure so the box can
@@ -3749,11 +3773,20 @@ mod tests {
         // Every measured mmap arm. M3 is the one that matters: it sits ABOVE the O_DIRECT
         // threshold, so gating mmap on that constant (as this first did) turns mapping on
         // for a model where it measured 9.6% SLOWER.
+        // **M2.7 flipped to `false` on 2026-07-31.** The 5.65x above is superseded: it was
+        // measured when the READER was the mapping's only consumer. The grouped expert path
+        // added a second one that memcpys every staged expert on the CPU, so a non-resident
+        // page became a major fault *inside the copy*. Re-measured at 84% coverage, 2 reps
+        // ABBA, token-identical: mapped off 39-43 s wall / pack 1.96-2.13 s / 0 major
+        // faults, mapped on 49-56 s / pack 7.79-15.56 s / 159k-311k faults. `expert-load`,
+        // the tier this gate exists to help, does not gain (12.1 vs 13.5 s) while `moe`
+        // loses 1.52x.
         for (name, cov, want_map) in [
-            ("minimax-m2.7", 86u64, true), // 2987 -> 529 ms, 5.65x
-            ("minimax-m3", 47, false),     // 7851 -> 8605 ms, 0.91x
-            ("glm-5.2", 26, false),        // 14694 -> 15080 ms, 0.97x
+            ("minimax-m2.7", 86u64, false), // was 5.65x; now 1.27x SLOWER, see above
+            ("minimax-m3", 47, false),      // 7851 -> 8605 ms, 0.91x
+            ("glm-5.2", 26, false),         // 14694 -> 15080 ms, 0.97x
             ("kimi-k3", 7, false),
+            ("nemotron-3-super", 155, true), // fits outright; preloads, so ~2 ms either way
         ] {
             assert_eq!(
                 cov >= MMAP_MIN_COVERAGE_PCT,
@@ -3761,10 +3794,13 @@ mod tests {
                 "{name} at {cov}% coverage should have mmap={want_map}"
             );
         }
-        // Bounded by the measured neighbours, so it cannot be tuned onto a known result.
-        assert!(
-            (48..=86).contains(&MMAP_MIN_COVERAGE_PCT),
-            "mmap threshold {MMAP_MIN_COVERAGE_PCT} escaped the measured interval (47%, 86%)"
+        // The threshold is no longer a tuned proxy, so it is no longer bracketed by a
+        // measured interval. It is the CONDITION mapping requires — that a span is resident
+        // when touched — and 100% is the only value that states it. Below 100 some fraction
+        // of touches is a synchronous disk read, which is exactly what 84% cost M2.7.
+        assert_eq!(
+            MMAP_MIN_COVERAGE_PCT, 100,
+            "mapping pays only when the set is fully resident; anything less admits faults"
         );
         // The two paths are MUTUALLY EXCLUSIVE, and not merely by taste: O_DIRECT never
         // populates the page cache, so with both on the residency gate can never succeed

@@ -1383,6 +1383,22 @@ where
             // two facts. These four separate the candidates: `fail` is the driver refusing,
             // `capped` is the budget ledger, and all-zero means nothing ever reached
             // `pin_alloc` — a pool already populated by the time the hook arrived.
+            // Peak per class, which is what a reserve has to cover. RUNTIME_RESERVE is a
+            // flat 10 GB standing in for Scratch + ReadBuf + the CUDA context; these are the
+            // measured numbers it should be derived from.
+            if let Some(m) = crate::ram::manager() {
+                use crate::ram::Class::*;
+                eprintln!(
+                    "[profile] ram peak: dense {:.1} | experts {:.1} | kv {:.1} | scratch {:.1} \
+                     | readbuf {:.1} GB (ceiling {:.1})",
+                    m.peak_in(Dense) as f64 / 1e9,
+                    m.peak_in(Experts) as f64 / 1e9,
+                    m.peak_in(Kv) as f64 / 1e9,
+                    m.peak_in(Scratch) as f64 / 1e9,
+                    m.peak_in(ReadBuf) as f64 / 1e9,
+                    m.ceiling() as f64 / 1e9,
+                );
+            }
             let (pok, pfail, pbytes, pcap) = colibri_core::quant::pin_profile();
             eprintln!(
                 "[profile] page-lock: {pok} ok / {pfail} failed / {pcap} capped | {:.1} GB locked",

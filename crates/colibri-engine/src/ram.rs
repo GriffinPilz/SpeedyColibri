@@ -81,11 +81,19 @@ pub struct RamManager {
     /// Per-class breakdown, for reporting only. Updated after the CAS succeeds, so it may
     /// lag `total` by a few instructions — never read it to make an admission decision.
     per_class: [AtomicU64; N_CLASSES],
+    /// High-water mark per class. Never decremented — a reserve must cover the peak, and
+    /// the peak is transient (a prefill chunk's activations, a group's staging buffers).
+    peak_per_class: [AtomicU64; N_CLASSES],
 }
 
 impl RamManager {
     pub fn new(ceiling: u64) -> RamManager {
-        RamManager { ceiling, total: AtomicU64::new(0), per_class: Default::default() }
+        RamManager {
+            ceiling,
+            total: AtomicU64::new(0),
+            per_class: Default::default(),
+            peak_per_class: Default::default(),
+        }
     }
 
     pub fn ceiling(&self) -> u64 {
@@ -98,6 +106,28 @@ impl RamManager {
 
     pub fn committed_in(&self, class: Class) -> u64 {
         self.per_class[class as usize].load(Ordering::Relaxed)
+    }
+
+    /// High-water mark for a class over the process's life.
+    ///
+    /// The *current* commitment cannot size a reserve — a reserve has to cover the peak, and
+    /// the peak is transient by definition (a prefill chunk's activations, a group's staging
+    /// buffers). `RUNTIME_RESERVE` is a flat 10 GB standing in for exactly these numbers, so
+    /// measuring them is the prerequisite to deriving it.
+    pub fn peak_in(&self, class: Class) -> u64 {
+        self.peak_per_class[class as usize].load(Ordering::Relaxed)
+    }
+
+    /// Raise the high-water mark for `class` if `now` exceeds it.
+    fn note_peak(&self, class: Class, now: u64) {
+        let slot = &self.peak_per_class[class as usize];
+        let mut seen = slot.load(Ordering::Relaxed);
+        while now > seen {
+            match slot.compare_exchange_weak(seen, now, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => seen = actual,
+            }
+        }
     }
 
     /// What the expert arena may take: everything the rigid classes will not need.
@@ -135,7 +165,10 @@ impl RamManager {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.per_class[class as usize].fetch_add(bytes, Ordering::Relaxed);
+                    let now = self.per_class[class as usize]
+                        .fetch_add(bytes, Ordering::Relaxed)
+                        + bytes;
+                    self.note_peak(class, now);
                     return Some(Commitment { mgr: Arc::clone(self), class, bytes });
                 }
                 Err(observed) => cur = observed, // someone else moved it; re-test the fit
@@ -163,6 +196,7 @@ impl RamManager {
     /// while the cache was holding it.
     pub fn set_usage(&self, class: Class, bytes: u64) -> u64 {
         let prev = self.per_class[class as usize].swap(bytes, Ordering::AcqRel);
+        self.note_peak(class, bytes);
         // Keep `total` consistent with the per-class figure. Signed delta, applied as one
         // add or one sub, so concurrent commits in other classes are never clobbered.
         if bytes >= prev {

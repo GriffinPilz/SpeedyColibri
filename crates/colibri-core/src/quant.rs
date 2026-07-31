@@ -249,13 +249,31 @@ pub fn pin_profile() -> (u64, u64, u64, u64) {
 ///
 /// The three neutral models are neutral *by construction* — they reject no returns even
 /// at 32 — not by luck.
+/// **The count cap is off by default; [`pool_max_bytes`] is the live bound.**
+///
+/// A count is the wrong unit and the old default of 128 was a constant that helped some
+/// models and quietly hurt others. Entries range from ~1 MB (Kimi-K3's MXFP4 spans) to
+/// ~21 MB (GLM's coalesced experts), so 128 entries meant **128 MB retained for K3 against
+/// 2.7 GB for GLM** — for the model with the *most* spans per batch, the count cap bound at
+/// a twentieth of the byte cap it was supposed to sit under, and every return past it was a
+/// real `munmap`. That is the same failure the cap was raised from 32 to fix, still present
+/// for small-span models.
+///
+/// The byte cap adapts in exactly the dimension that matters: small spans retain more
+/// buffers, large spans retain fewer, and the memory ceiling is protected either way. So
+/// the count cap has nothing left to do. Its own documentation already called it "a coarse
+/// secondary limit kept so the A/B above stays reproducible", and the measured table says
+/// 4096 adds nothing over 64 — i.e. once the cap stops binding, raising it further is
+/// neutral. Unlimited is that same plateau.
+///
+/// `COLI_BUF_POOL` still sets it, so every A/B in the table above reproduces exactly.
 fn pool_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("COLI_BUF_POOL")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(128)
+            .unwrap_or(usize::MAX)
     })
 }
 

@@ -1167,12 +1167,14 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     // instead of a synchronous upload/kernel/download per expert — the per-expert
     // round-trip is what dominates moe-compute. Falls through per-expert if it can't run.
     #[cfg(feature = "cuda")]
-    // The gateless ReLU² grouped path is DEFAULT-ON (it declines outside decode, so it
-    // cannot hit the prefill devcopy gap); the fp8 SwiGLU one keeps its opt-in default,
-    // which earlier work chose on prefill evidence. `COLI_EXPERT_GROUP=0` disables both.
-    if (activation().relu2 && crate::gpu::expert_group_relu2_enabled())
-        || crate::gpu::expert_group_enabled()
-    {
+    // Enter unconditionally and let each backend decide — every `try_*` below declines
+    // cleanly and falls through per-expert. The gateless ReLU² path is default-on (it
+    // declines outside decode); the NVFP4 SwiGLU path is now default-on too, because with
+    // per-layer pinned residency it is a measured win rather than the ~3% round-trip
+    // shuffle that grouping alone was; the fp8 SwiGLU one keeps its opt-in default, which
+    // earlier work chose on prefill evidence and which nothing here re-measured.
+    #[allow(clippy::overly_complex_bool_expr)]
+    if true {
         let mut active = Vec::with_capacity(per_expert.len());
         for (e, rows, rw) in &per_expert {
             active.push((provider.expert(layer, *e)?, rows.clone(), rw.clone()));
@@ -1181,13 +1183,15 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         // and would read a gate tensor these experts don't ship.
         let grouped = if activation().relu2 {
             crate::gpu::try_expert_group_relu2(&active, activations, d, &mut out)
-        } else if active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5) {
+        } else if !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5) {
             // NVFP4 SwiGLU (M2.7 / M3 / GLM-5.2). Until this arm existed these models were
             // offered the fp8 group, which declines on fmt 5, so every one of them fell
             // through to a per-expert call — the path that pays per-expert weight staging.
             crate::gpu::try_expert_group_nvfp4(&active, activations, d, &mut out)
-        } else {
+        } else if crate::gpu::expert_group_enabled() {
             crate::gpu::try_expert_group(&active, activations, d, &mut out)
+        } else {
+            false
         };
         if grouped {
             return Ok(out);

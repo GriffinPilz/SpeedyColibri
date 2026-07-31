@@ -1223,6 +1223,35 @@ fn fit_usize(v: &mut Vec<usize>, n: usize) -> &mut [usize] {
 ///
 /// Returns false — leaving `out` untouched — if unavailable/ineligible, so the caller falls
 /// back to the per-expert loop.
+/// Experts staged per transfer in the grouped NVFP4 SwiGLU path (`COLI_GROUP_CHUNK`;
+/// `0` = the whole layer in one go).
+///
+/// **32, measured.** M2.7, 128-token prefill, one binary, tokens identical ([517]) at
+/// every point:
+///
+/// | experts/transfer | 1 | 8 | **32** | 128 | whole layer |
+/// |---|---|---|---|---|---|
+/// | wall | 77 s | 59 s | **56 s** | 66 s | 66 s |
+///
+/// It is a real optimum, not a monotone curve, which is why it is worth pinning rather
+/// than defaulting to "as big as possible". Small chunks pay the per-transfer latency once
+/// per expert and never let the copy engine get going; whole-layer chunks need a pinned
+/// buffer and a device arena sized to every expert the layer routed, and stall the first
+/// GEMM behind the last byte of the last expert. 32 amortizes the transfer while still
+/// letting compute start early.
+const GROUP_CHUNK_DEFAULT: usize = 32;
+
+fn group_chunk_experts() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        match std::env::var("COLI_GROUP_CHUNK").ok().and_then(|s| s.parse::<usize>().ok()) {
+            Some(0) => None,                 // explicit 0 = whole layer
+            Some(n) => Some(n),
+            None => Some(GROUP_CHUNK_DEFAULT),
+        }
+    })
+}
+
 /// Grouped NVFP4 **SwiGLU** experts (MiniMax-M2.7 / M3 / GLM-5.2).
 ///
 /// These models had no grouped path at all: `activation().relu2` is false for them, so the
@@ -1279,38 +1308,63 @@ pub fn try_expert_group_nvfp4(
     }
     let y_all = fit_f32(&mut gsc.y_all, total * d);
 
-    let mut gs: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
-    let mut us: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
-    let mut ds: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
-    let mut rws: Vec<i32> = Vec::with_capacity(active.len());
-    let mut keep = Vec::with_capacity(active.len() * 3);
-    let mut all_wrapped = true;
-    for (ex, rows, _) in active {
-        let (Some(gt), Some(ut), Some(dt)) =
-            (wrap_fresh(&ex.gate), wrap_fresh(&ex.up), wrap_fresh(&ex.down))
-        else {
-            all_wrapped = false;
+    // How many experts are staged per transfer (`COLI_GROUP_CHUNK`, 0 = the whole layer).
+    //
+    // This is the knob the residency win actually turns on, so it is worth a sweep rather
+    // than a guess. Bigger chunks amortize the per-transfer latency over more weight and
+    // give the copy engine a longer run; smaller chunks need a smaller pinned buffer and a
+    // smaller device arena, and start the first GEMM sooner. The arena is sized to the
+    // chunk, so this also bounds the device memory the path holds.
+    let chunk = group_chunk_experts().unwrap_or(active.len()).max(1);
+    let mut ok = true;
+    let mut done = 0usize;   // rows consumed so far, to slice x_all/y_all per chunk
+    for part in active.chunks(chunk) {
+        let part_rows: usize = part.iter().map(|(_, r, _)| r.len()).sum();
+        let mut gs: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(part.len());
+        let mut us: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(part.len());
+        let mut ds: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(part.len());
+        let mut rws: Vec<i32> = Vec::with_capacity(part.len());
+        let mut keep = Vec::with_capacity(part.len() * 3);
+        let mut all_wrapped = true;
+        for (ex, rows, _) in part {
+            let (Some(gt), Some(ut), Some(dt)) =
+                (wrap_fresh(&ex.gate), wrap_fresh(&ex.up), wrap_fresh(&ex.down))
+            else {
+                all_wrapped = false;
+                break;
+            };
+            gs.push(gt.as_raw());
+            us.push(ut.as_raw());
+            ds.push(dt.as_raw());
+            rws.push(rows.len() as i32);
+            keep.push(gt);
+            keep.push(ut);
+            keep.push(dt);
+        }
+        if !all_wrapped {
+            drop(keep);
+            ok = false;
             break;
+        }
+        // SAFETY: the wrapped tensors stay alive in `keep` until after the call, which is
+        // synchronous through its own D2H; the sub-slices hold `part_rows * d` floats each.
+        let called = unsafe {
+            cuda::expert_group_nvfp4_raw(
+                &gs,
+                &us,
+                &ds,
+                &rws,
+                y_all[done * d..(done + part_rows) * d].as_mut_ptr(),
+                x_all[done * d..(done + part_rows) * d].as_ptr(),
+            )
         };
-        gs.push(gt.as_raw());
-        us.push(ut.as_raw());
-        ds.push(dt.as_raw());
-        rws.push(rows.len() as i32);
-        keep.push(gt);
-        keep.push(ut);
-        keep.push(dt);
-    }
-    if !all_wrapped {
         drop(keep);
-        GROUP_SCRATCH.with(|c| c.set(gsc));
-        return false;
+        if !called {
+            ok = false;
+            break;
+        }
+        done += part_rows;
     }
-    // SAFETY: the wrapped tensors stay alive in `keep` until after the call, which is
-    // synchronous through its own D2H; x_all/y_all each hold `total * d` floats.
-    let ok = unsafe {
-        cuda::expert_group_nvfp4_raw(&gs, &us, &ds, &rws, y_all.as_mut_ptr(), x_all.as_ptr())
-    };
-    drop(keep);
     if ok {
         for gg in 0..total {
             let (t, wgt) = (token_of[gg], weight_of[gg]);

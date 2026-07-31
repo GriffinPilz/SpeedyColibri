@@ -1686,7 +1686,13 @@ fn cmd_repack(args: &[String]) -> ExitCode {
 /// reports swap usage precisely so that state is visible rather than silently spoiling the
 /// next twenty runs — which is exactly what happened here before it existed.
 fn cmd_dropcache(args: &[String]) -> ExitCode {
-    let Some(container) = args.first() else {
+    // `args` is the whole argv — every other command indexes from 2 (argv[0], subcommand).
+    // This read `args.first()`, so it took the *binary path* as the container, failed with
+    // "Not a directory", and exited 1. `mem_reset` pipes it under `set -euo pipefail`, so
+    // every `scripts/bench.sh` suite aborted immediately after printing its header and
+    // produced no output at all. A benchmark harness that silently measures nothing is
+    // worse than one that crashes.
+    let Some(container) = args.get(2) else {
         eprintln!("usage: coli dropcache <container-dir>");
         return ExitCode::from(2);
     };

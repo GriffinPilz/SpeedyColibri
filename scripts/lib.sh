@@ -39,7 +39,11 @@ need_source()    { [[ -d "$SOURCE" ]]    || die "source missing: $SOURCE (model 
 # whatever runs next).
 mem_reset() {
   [[ -x "$COLI_BIN" && -d "$CONTAINER" ]] || return 0
-  "$COLI_BIN" dropcache "$CONTAINER" 2>/dev/null | sed 's/^/    /'
+  # `|| true` is load-bearing: callers run under `set -euo pipefail`, so a non-zero
+  # dropcache takes the whole suite down between printing its header and its first result.
+  # That is exactly what happened — an argv indexing bug made dropcache exit 1, and every
+  # bench.sh run produced no output while looking like it had merely been slow.
+  "$COLI_BIN" dropcache "$CONTAINER" 2>/dev/null | sed 's/^/    /' || true
   # Let the kernel actually complete the reclaim before the next arm starts timing.
   sleep "${MEM_RESET_SETTLE:-3}"
 }

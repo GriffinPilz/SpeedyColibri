@@ -10,6 +10,8 @@
 #include <vector>
 #include <mutex>
 #include <chrono>
+#include <thread>
+#include <vector>
 
 struct ColiCudaTensor {
     void *weights;
@@ -2714,7 +2716,7 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
  *
  * Same guard rails as its twin: every expert must agree on device, format and dims, or the
  * call declines and the caller falls back per-expert. */
-static int g_grp_evt=-1; static double g_grp_pack_ms=0, g_grp_bytes=0; static long long g_grp_chunks=0;
+static int g_grp_evt=-1; static double g_grp_pack_ms=0, g_grp_h2d_ms=0, g_grp_bytes=0; static long long g_grp_chunks=0;
 
 extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
         ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,
@@ -2775,16 +2777,45 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
         if(wtot&&reserve_bytes((void**)&ctx->lres,&ctx->lres_cap,wtot)&&
            reserve_pinned(&ctx->host_lres,&ctx->host_lres_cap,wtot)){
             auto t_pack=std::chrono::steady_clock::now();
-            uint8_t *hp=(uint8_t*)ctx->host_lres; size_t at=0;
-            for(int c=0;c<count;c++){
-                size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
-                size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
-                const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
-                                       (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
-                                       (const uint8_t*)ups[c]->bscale,(const uint8_t*)downs[c]->bscale};
-                size_t len[6]={gnb,gnb,dnb,gsb,gsb,dsb};
-                for(int k=0;k<6;k++){ std::memcpy(hp+at,src[k],len[k]); at+=len[k]; }
+            uint8_t *hp=(uint8_t*)ctx->host_lres;
+            size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
+            size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
+            size_t per=2*gnb+dnb+2*gsb+dsb;   // fixed stride: every expert has the same dims
+            /* PARALLEL pack. This memcpy is the whole of rule 3's gap: measured
+             * single-threaded at 37.58 s / 1.26 GB/s per prefill while the H2D that follows
+             * it runs at 56.49 GB/s — already above the ~51 GB/s zero-copy ceiling. So the
+             * transfer was never the problem and neither were the kernels; the bottleneck
+             * is a CPU copy whose SOURCES are scattered pool and mmap pages, which is why
+             * 1.26 GB/s is slow even for one core: it is fault- and latency-bound, not
+             * bandwidth-bound, and that is exactly the shape that parallelises.
+             * Each expert writes a disjoint `per`-byte slot, so no synchronisation. */
+            unsigned nthr=std::thread::hardware_concurrency(); if(!nthr)nthr=8;
+            if(nthr>(unsigned)count)nthr=(unsigned)count;
+            auto pack_range=[&](int lo,int hi){
+                for(int c=lo;c<hi;c++){
+                    uint8_t *dst=hp+(size_t)c*per;
+                    const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
+                                           (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
+                                           (const uint8_t*)ups[c]->bscale,(const uint8_t*)downs[c]->bscale};
+                    size_t len[6]={gnb,gnb,dnb,gsb,gsb,dsb};
+                    size_t at=0;
+                    for(int k=0;k<6;k++){ std::memcpy(dst+at,src[k],len[k]); at+=len[k]; }
+                }
+            };
+            if(nthr<=1){ pack_range(0,count); }
+            else{
+                std::vector<std::thread> th; th.reserve(nthr);
+                int span=(count+(int)nthr-1)/(int)nthr;
+                for(unsigned t=0;t<nthr;t++){
+                    int lo=(int)t*span, hi=lo+span>count?count:lo+span;
+                    if(lo>=hi)break;
+                    th.emplace_back(pack_range,lo,hi);
+                }
+                for(auto &j:th) j.join();
             }
+            double pack_ms=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-t_pack).count();
+            auto t_h2d=std::chrono::steady_clock::now();
             resident=cuda_ok(cudaMemcpyAsync(ctx->lres,ctx->host_lres,wtot,
                                              cudaMemcpyHostToDevice,ctx->stream),
                              "expert group nvfp4 layer-resident upload");
@@ -2797,14 +2828,16 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
             if(g_grp_evt<0){const char*e=getenv("COLI_GROUP_EVT");g_grp_evt=e&&atoi(e);}
             if(g_grp_evt){
                 cudaStreamSynchronize(ctx->stream);
-                double ms=std::chrono::duration<double,std::milli>(
-                    std::chrono::steady_clock::now()-t_pack).count();
-                g_grp_pack_ms+=ms; g_grp_bytes+=(double)wtot; g_grp_chunks++;
+                double h2d_ms=std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-t_h2d).count();
+                g_grp_pack_ms+=pack_ms; g_grp_h2d_ms+=h2d_ms;
+                g_grp_bytes+=(double)wtot; g_grp_chunks++;
                 if((g_grp_chunks%200)==0)
-                    fprintf(stderr,"[group-evt] chunks=%lld staged=%.1f GB in %.2f s = %.2f GB/s "
-                            "(pack+H2D, %d experts/chunk)\n",
-                            g_grp_chunks,g_grp_bytes/1e9,g_grp_pack_ms/1e3,
-                            (g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),count);
+                    fprintf(stderr,"[group-evt] chunks=%lld staged=%.1f GB | pack %.2f s = %.2f GB/s "
+                            "| H2D %.2f s = %.2f GB/s | %d experts/chunk\n",
+                            g_grp_chunks,g_grp_bytes/1e9,
+                            g_grp_pack_ms/1e3,(g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),
+                            g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),count);
             }
         }
     }

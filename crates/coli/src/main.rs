@@ -259,7 +259,11 @@ fn cmd_qerr(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(78usize);
-    let pop = if experts { "routed experts" } else { "resident" };
+    let pop = if experts {
+        "routed experts"
+    } else {
+        "resident"
+    };
 
     match colibri_engine::quant_error(snap, scheme, n_layers, limit, experts) {
         Ok(errs) if errs.is_empty() => {
@@ -311,7 +315,9 @@ fn cmd_requant_nvfp4(args: &[String]) -> ExitCode {
         (Some(a), Some(b)) => (a, b),
         _ => {
             eprintln!("usage: coli requant-nvfp4 <e4m3-container-dir> <output-container-dir>");
-            eprintln!("  re-quantizes routed experts e4m3 -> NVFP4; everything else copied through");
+            eprintln!(
+                "  re-quantizes routed experts e4m3 -> NVFP4; everything else copied through"
+            );
             return ExitCode::from(2);
         }
     };
@@ -322,8 +328,11 @@ fn cmd_requant_nvfp4(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (hidden, moe_inter, n_layers) =
-        (cfg.hidden as usize, cfg.moe_inter as usize, cfg.n_layers as usize);
+    let (hidden, moe_inter, n_layers) = (
+        cfg.hidden as usize,
+        cfg.moe_inter as usize,
+        cfg.n_layers as usize,
+    );
     eprintln!(
         "[requant-nvfp4] {indir} -> {outdir}  (hidden={hidden} moe_inter={moe_inter} n_layers={n_layers})"
     );
@@ -393,7 +402,10 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         }
     };
     let env_u32 = |k: &str, d: u32| {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
     // Detect the source architecture from its config: the MiniMax GQA family (M3/M2)
     // needs the block_sparse_moe→mlp / w1w2w3 name remapping, its layer count comes from
@@ -401,9 +413,14 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     // per-model (M3 yes, M2 no — read from the config). Missing config → falls back to GLM.
     let src_cfg = colibri_core::Config::load(indir).ok();
     let minimax = src_cfg.as_ref().map(|c| c.arch.is_gqa()).unwrap_or(false);
-    let nemotron =
-        src_cfg.as_ref().map(|c| c.arch == colibri_core::Arch::NemotronH).unwrap_or(false);
-    let kimi = src_cfg.as_ref().map(|c| c.arch == colibri_core::Arch::KimiK3).unwrap_or(false);
+    let nemotron = src_cfg
+        .as_ref()
+        .map(|c| c.arch == colibri_core::Arch::NemotronH)
+        .unwrap_or(false);
+    let kimi = src_cfg
+        .as_ref()
+        .map(|c| c.arch == colibri_core::Arch::KimiK3)
+        .unwrap_or(false);
     let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
     let n_layers = if minimax || nemotron || kimi {
         src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)
@@ -451,7 +468,9 @@ fn cmd_convert(args: &[String]) -> ExitCode {
             (false, true) => "mxfp4 (passthrough)",
             (false, false) => "nvfp4",
         },
-        opts.ebits, opts.io_bits, opts.n_layers
+        opts.ebits,
+        opts.io_bits,
+        opts.n_layers
     );
     let t0 = std::time::Instant::now();
     let res = colibri_engine::convert_snapshot(indir, outdir, opts, |fi, n, st| {
@@ -500,7 +519,10 @@ fn cmd_load(args: &[String]) -> ExitCode {
         Ok(m) => {
             let dense = m.layers.iter().filter(|l| !l.sparse).count();
             let sparse = m.layers.len() - dense;
-            println!("loaded {} layers ({dense} dense, {sparse} MoE)", m.layers.len());
+            println!(
+                "loaded {} layers ({dense} dense, {sparse} MoE)",
+                m.layers.len()
+            );
             println!(
                 "embed [{},{}] fmt={}  lm_head [{},{}]  final_norm[{}]",
                 m.embed.o,
@@ -543,7 +565,12 @@ fn cmd_gen(args: &[String]) -> ExitCode {
 
     // Bit-widths default to int8 (int8-resident container); overridable via env for
     // the C-vs-Rust validation harness (e.g. COLI_DBITS=16 for the exact f32 path).
-    let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let envbits = |k: &str, d: u32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
     let opts = colibri_engine::LoadOptions {
         dbits: envbits("COLI_DBITS", 8),
         ebits: envbits("COLI_EBITS", 8),
@@ -573,8 +600,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     }
 
     // Usage history first — both the hot-aware sharding and AUTOPIN read it.
-    let usage_path =
-        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let usage_path = std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
     let mut history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
 
     // Cluster-aware expert sharding. Single-node keeps every expert local; multi-node
@@ -602,7 +628,13 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
     let owned_ids: Vec<u32> = sharding.local_experts(cluster.this_node).collect();
-    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, &owned_ids, model.resident_bytes());
+    let _maxres = wire_adaptive_cache(
+        &provider,
+        &model.cfg,
+        model.ebits as u32,
+        &owned_ids,
+        model.resident_bytes(),
+    );
     preload_all_experts(&provider, &model.cfg, _maxres, &owned_ids);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn, model.cfg.n_experts as u64);
@@ -733,10 +765,20 @@ fn cmd_cluster(args: &[String]) -> ExitCode {
         .and_then(|s| s.parse::<f64>().ok())
         .map(|s| std::time::Duration::from_secs_f64(s.clamp(0.5, 60.0)))
         .unwrap_or_else(|| std::time::Duration::from_secs(4));
-    let rank: u32 = std::env::var("COLI_NODE_RANK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let port: u16 = std::env::var("COLI_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
+    let rank: u32 = std::env::var("COLI_NODE_RANK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let port: u16 = std::env::var("COLI_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
 
-    eprintln!("[cluster] scanning the fabric for {:.0}s (UDP :{}) ...", window.as_secs_f64(), colibri_cluster::discovery::DISC_PORT);
+    eprintln!(
+        "[cluster] scanning the fabric for {:.0}s (UDP :{}) ...",
+        window.as_secs_f64(),
+        colibri_cluster::discovery::DISC_PORT
+    );
     let d = colibri_cluster::discover(rank, port, window);
     let mut out = std::io::stdout();
     if let Err(e) = colibri_cluster::discovery::print_report(&d, &mut out) {
@@ -748,7 +790,10 @@ fn cmd_cluster(args: &[String]) -> ExitCode {
 
 /// Port a `worker` binds (and a `serve` peer connects to) for expert exchange.
 fn expert_port() -> u16 {
-    std::env::var("COLI_EXPERT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(48800)
+    std::env::var("COLI_EXPERT_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48800)
 }
 
 /// Peer addresses for every *other* rank in the cluster, validated.
@@ -788,7 +833,8 @@ fn missing_peer_ranks(
 
 /// Parse `COLI_PEERS="1=host:port,2=host:port"` into a node→address map (the
 /// expert servers of the other nodes).
-fn parse_peers() -> Result<std::collections::HashMap<colibri_cluster::NodeId, std::net::SocketAddr>, String> {
+fn parse_peers(
+) -> Result<std::collections::HashMap<colibri_cluster::NodeId, std::net::SocketAddr>, String> {
     use std::net::ToSocketAddrs;
     let mut map = std::collections::HashMap::new();
     let s = std::env::var("COLI_PEERS").unwrap_or_default();
@@ -796,7 +842,10 @@ fn parse_peers() -> Result<std::collections::HashMap<colibri_cluster::NodeId, st
         let (rank, addr) = entry
             .split_once('=')
             .ok_or_else(|| format!("bad COLI_PEERS entry '{entry}' (want rank=host:port)"))?;
-        let rank: u32 = rank.trim().parse().map_err(|_| format!("bad rank in '{entry}'"))?;
+        let rank: u32 = rank
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad rank in '{entry}'"))?;
         let sa = addr
             .trim()
             .to_socket_addrs()
@@ -817,12 +866,17 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     let snap = match args.get(2) {
         Some(p) => p.clone(),
         None => {
-            eprintln!("usage: coli worker <snapshot-dir> [port]  (set COLI_NODE_RANK / COLI_NUM_NODES)");
+            eprintln!(
+                "usage: coli worker <snapshot-dir> [port]  (set COLI_NODE_RANK / COLI_NUM_NODES)"
+            );
             return ExitCode::from(2);
         }
     };
     let cluster = colibri_cluster::ClusterConfig::from_env();
-    let port = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(expert_port);
+    let port = args
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(expert_port);
 
     // Leak the model to 'static so the (process-lifetime) expert server thread can
     // hold a persistent cache of this node's shard.
@@ -836,8 +890,7 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     // The map comes first: it decides which experts this node may load. The same
     // history feeds it, so its fingerprint must match every other node's — the
     // driver's handshake enforces that, and the printed values let you eyeball it.
-    let usage_path =
-        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let usage_path = std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
     let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
     let sharding = build_sharding(&cluster, model.cfg.n_experts as u32, &history);
     let owned = sharding.count_for(cluster.this_node);
@@ -855,7 +908,13 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     let budget = ram_budget();
     let provider = std::sync::Arc::new(colibri_engine::ExpertCache::new(base, budget));
     let owned_ids: Vec<u32> = sharding.local_experts(cluster.this_node).collect();
-    let _maxres = wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, &owned_ids, model.resident_bytes());
+    let _maxres = wire_adaptive_cache(
+        &provider,
+        &model.cfg,
+        model.ebits as u32,
+        &owned_ids,
+        model.resident_bytes(),
+    );
     preload_all_experts(&provider, &model.cfg, _maxres, &owned_ids);
     if let Some(topn) = prefetch_topn() {
         provider.enable_prefetch(topn, model.cfg.n_experts as u64);
@@ -888,12 +947,21 @@ fn cmd_worker(args: &[String]) -> ExitCode {
                 &mut outputs,
             );
         } else {
-            eprintln!("[worker] attention request for out-of-range layer {}", req.layer);
+            eprintln!(
+                "[worker] attention request for out-of-range layer {}",
+                req.layer
+            );
         }
-        colibri_cluster::AttnResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
+        colibri_cluster::AttnResponse {
+            outputs,
+            n_tokens: req.n_tokens,
+            hidden: req.hidden,
+        }
     };
-    let bound = match colibri_cluster::serve_cluster(addr, fingerprint, move |req| {
-        match colibri_engine::compute_experts_partial(
+    let bound = match colibri_cluster::serve_cluster(
+        addr,
+        fingerprint,
+        move |req| match colibri_engine::compute_experts_partial(
             &*provider,
             req.layer as usize,
             &req.experts,
@@ -902,9 +970,11 @@ fn cmd_worker(args: &[String]) -> ExitCode {
             req.n_tokens,
             req.hidden,
         ) {
-            Ok(outputs) => {
-                colibri_cluster::ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
-            }
+            Ok(outputs) => colibri_cluster::ExpertResponse {
+                outputs,
+                n_tokens: req.n_tokens,
+                hidden: req.hidden,
+            },
             Err(e) => {
                 eprintln!("[worker] expert compute error: {e}");
                 colibri_cluster::ExpertResponse {
@@ -913,8 +983,9 @@ fn cmd_worker(args: &[String]) -> ExitCode {
                     hidden: req.hidden,
                 }
             }
-        }
-    }, attn) {
+        },
+        attn,
+    ) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("coli worker: bind {addr}: {e}");
@@ -971,7 +1042,12 @@ fn cmd_genbatch(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let envbits = |k: &str, d: u32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
     let opts = colibri_engine::LoadOptions {
         dbits: envbits("COLI_DBITS", 8),
         ebits: envbits("COLI_EBITS", 8),
@@ -1109,7 +1185,10 @@ fn cmd_genbatch(args: &[String]) -> ExitCode {
         if single == outs[0] {
             println!("VERIFY PASS: slot0 batched == single-sequence ({ngen} tok)");
         } else {
-            println!("VERIFY FAIL: slot0 diverged\n single:  {single:?}\n batched: {:?}", outs[0]);
+            println!(
+                "VERIFY FAIL: slot0 diverged\n single:  {single:?}\n batched: {:?}",
+                outs[0]
+            );
         }
     }
     ExitCode::SUCCESS
@@ -1162,7 +1241,11 @@ fn finish_gen(
     match colibri_engine::generate_greedy(model, &mut kv, provider, prompt, n_new) {
         Ok(seq) => {
             println!("prompt: {prompt:?}");
-            println!("generated ({} tok): {:?}", seq.len() - prompt.len(), &seq[prompt.len()..]);
+            println!(
+                "generated ({} tok): {:?}",
+                seq.len() - prompt.len(),
+                &seq[prompt.len()..]
+            );
             #[cfg(feature = "cuda")]
             {
                 println!(
@@ -1262,11 +1345,26 @@ fn select_shard_names(
 }
 
 // Little-endian framing for the shard-distribute wire protocol.
-fn wr_u64<W: std::io::Write>(w: &mut W, v: u64) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
-fn wr_u32<W: std::io::Write>(w: &mut W, v: u32) -> std::io::Result<()> { w.write_all(&v.to_le_bytes()) }
-fn rd_u64<R: std::io::Read>(r: &mut R) -> std::io::Result<u64> { let mut b = [0u8; 8]; r.read_exact(&mut b)?; Ok(u64::from_le_bytes(b)) }
-fn rd_u32<R: std::io::Read>(r: &mut R) -> std::io::Result<u32> { let mut b = [0u8; 4]; r.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
-fn wr_path<W: std::io::Write>(w: &mut W, s: &str) -> std::io::Result<()> { wr_u32(w, s.len() as u32)?; w.write_all(s.as_bytes()) }
+fn wr_u64<W: std::io::Write>(w: &mut W, v: u64) -> std::io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+fn wr_u32<W: std::io::Write>(w: &mut W, v: u32) -> std::io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+fn rd_u64<R: std::io::Read>(r: &mut R) -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+fn rd_u32<R: std::io::Read>(r: &mut R) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+fn wr_path<W: std::io::Write>(w: &mut W, s: &str) -> std::io::Result<()> {
+    wr_u32(w, s.len() as u32)?;
+    w.write_all(s.as_bytes())
+}
 fn rd_path<R: std::io::Read>(r: &mut R) -> std::io::Result<String> {
     let n = rd_u32(r)? as usize;
     let mut b = vec![0u8; n];
@@ -1310,7 +1408,9 @@ fn cmd_shard_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let read_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let read_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -1328,8 +1428,17 @@ fn cmd_shard_serve(args: &[String]) -> ExitCode {
             }
         };
         let _ = stream.set_nodelay(true);
-        let nodes = match rd_u32(&mut stream) { Ok(v) => v, Err(e) => { eprintln!("[shard-serve] handshake: {e}"); continue; } };
-        let rank = match rd_u32(&mut stream) { Ok(v) => v, Err(_) => continue };
+        let nodes = match rd_u32(&mut stream) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[shard-serve] handshake: {e}");
+                continue;
+            }
+        };
+        let rank = match rd_u32(&mut stream) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         if nodes < 1 || rank >= nodes {
             eprintln!("[shard-serve] bad request nodes={nodes} rank={rank}");
             continue;
@@ -1362,16 +1471,18 @@ fn cmd_shard_serve(args: &[String]) -> ExitCode {
                 let is_st = p.extension().map(|e| e == "safetensors").unwrap_or(false);
                 let is_usage = p.file_name().map(|f| f == ".coli_usage").unwrap_or(false);
                 if p.is_file() && !is_st && !is_usage {
-                    if let (Some(fname), Ok(m)) =
-                        (p.file_name().and_then(|f| f.to_str()).map(String::from), std::fs::metadata(&p))
-                    {
+                    if let (Some(fname), Ok(m)) = (
+                        p.file_name().and_then(|f| f.to_str()).map(String::from),
+                        std::fs::metadata(&p),
+                    ) {
                         meta.push((fname, p, m.len()));
                     }
                 }
             }
         }
         let gb: f64 = (items.iter().map(|t| t.nbytes).sum::<u64>()
-            + meta.iter().map(|(_, _, s)| *s).sum::<u64>()) as f64 / 1e9;
+            + meta.iter().map(|(_, _, s)| *s).sum::<u64>()) as f64
+            / 1e9;
         eprintln!(
             "[shard-serve] peer rank {rank}/{nodes}: {} tensors, {} shard files + {} meta, {gb:.1} GB",
             items.len(), groups.len(), meta.len()
@@ -1386,11 +1497,17 @@ fn cmd_shard_serve(args: &[String]) -> ExitCode {
                 let mut header = String::from("{");
                 let mut rel = 0u64;
                 for (gi, t) in grp.iter().enumerate() {
-                    if gi > 0 { header.push(','); }
+                    if gi > 0 {
+                        header.push(',');
+                    }
                     let shape: Vec<String> = t.shape.iter().map(|d| d.to_string()).collect();
                     header.push_str(&format!(
                         "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
-                        t.name, t.dtype.safetensors_str(), shape.join(","), rel, rel + t.nbytes
+                        t.name,
+                        t.dtype.safetensors_str(),
+                        shape.join(","),
+                        rel,
+                        rel + t.nbytes
                     ));
                     rel += t.nbytes;
                 }
@@ -1414,7 +1531,9 @@ fn cmd_shard_serve(args: &[String]) -> ExitCode {
                         let shards = &shards;
                         scope.spawn(move || loop {
                             let i = cursor.fetch_add(1, Ordering::Relaxed);
-                            if i >= grp.len() { break; }
+                            if i >= grp.len() {
+                                break;
+                            }
                             let mut buf = vec![0u8; grp[i].nbytes as usize];
                             if shards.read_raw(&grp[i].name, &mut buf).is_ok() {
                                 let _ = tx.send((i, buf));
@@ -1422,12 +1541,19 @@ fn cmd_shard_serve(args: &[String]) -> ExitCode {
                         });
                     }
                     drop(tx);
-                    for (i, buf) in rx { bufs[i] = Some(buf); }
+                    for (i, buf) in rx {
+                        bufs[i] = Some(buf);
+                    }
                 });
                 for b in &bufs {
                     match b {
                         Some(bytes) => w.write_all(bytes)?,
-                        None => return Err(std::io::Error::new(std::io::ErrorKind::Other, "shard-serve: tensor read failed")),
+                        None => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "shard-serve: tensor read failed",
+                            ))
+                        }
                     }
                 }
             }
@@ -1442,7 +1568,8 @@ fn cmd_shard_serve(args: &[String]) -> ExitCode {
         match res {
             Ok(()) => eprintln!(
                 "[shard-serve] peer rank {rank} done: {gb:.1} GB in {:.1}s ({:.2} GB/s)",
-                t0.elapsed().as_secs_f64(), gb / t0.elapsed().as_secs_f64().max(1e-9)
+                t0.elapsed().as_secs_f64(),
+                gb / t0.elapsed().as_secs_f64().max(1e-9)
             ),
             Err(e) => eprintln!("[shard-serve] peer rank {rank} error: {e}"),
         }
@@ -1493,7 +1620,10 @@ fn cmd_shard_pull(args: &[String]) -> ExitCode {
         for _ in 0..n_files {
             let path = rd_path(&mut r)?;
             let size = rd_u64(&mut r)?;
-            let mut f = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(out_dir.join(&path))?);
+            let mut f = std::io::BufWriter::with_capacity(
+                8 << 20,
+                std::fs::File::create(out_dir.join(&path))?,
+            );
             let mut left = size;
             let mut buf = vec![0u8; 8 << 20];
             while left > 0 {
@@ -1509,7 +1639,10 @@ fn cmd_shard_pull(args: &[String]) -> ExitCode {
     })();
     match res {
         Ok((nf, total)) => {
-            eprintln!("shard-pull: received {nf} files, {:.1} GB → {out}", total as f64 / 1e9);
+            eprintln!(
+                "shard-pull: received {nf} files, {:.1} GB → {out}",
+                total as f64 / 1e9
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1569,7 +1702,11 @@ fn cmd_shard_export(args: &[String]) -> ExitCode {
     let me = colibri_cluster::NodeId(rank);
 
     let names = select_shard_names(&shards, &sharding, me, n_experts);
-    let bytes: u64 = names.iter().filter_map(|n| shards.find(n)).map(|t| t.nbytes).sum();
+    let bytes: u64 = names
+        .iter()
+        .filter_map(|n| shards.find(n))
+        .map(|t| t.nbytes)
+        .sum();
     let n_exp = names.iter().filter(|n| expert_id_of(n).is_some()).count();
     eprintln!(
         "shard-export rank {rank}/{nodes}: {} tensors ({} resident + {n_exp} expert), {:.1} GB, owns {} experts",
@@ -1701,7 +1838,9 @@ fn cmd_dropcache(args: &[String]) -> ExitCode {
             .ok()
             .and_then(|s| {
                 s.lines().find(|l| l.starts_with(key)).and_then(|l| {
-                    l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                    l.split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<u64>().ok())
                 })
             })
             .unwrap_or(0)
@@ -1748,7 +1887,11 @@ fn cmd_iobench(args: &[String]) -> ExitCode {
         }
     };
     let total_mb: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2048);
-    let bs: usize = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(2048) * 1024;
+    let bs: usize = args
+        .get(4)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2048)
+        * 1024;
     let qd: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(20);
 
     let file = match std::fs::File::open(&path) {
@@ -1779,7 +1922,8 @@ fn cmd_iobench(args: &[String]) -> ExitCode {
         })
         .collect();
     let total_bytes = (nblocks * bs) as f64;
-    let drop_cache = || unsafe { libc::posix_fadvise(fd, 0, flen as libc::off_t, libc::POSIX_FADV_DONTNEED) };
+    let drop_cache =
+        || unsafe { libc::posix_fadvise(fd, 0, flen as libc::off_t, libc::POSIX_FADV_DONTNEED) };
     println!(
         "iobench {path}: {nblocks} × {} KiB = {:.2} GB cold random reads, qd={qd}",
         bs / 1024,
@@ -1818,7 +1962,10 @@ fn cmd_iobench(args: &[String]) -> ExitCode {
         }
     });
     let a = ta.elapsed().as_secs_f64();
-    println!("  (A) threaded pread ×{qd}   : {:.2} GB/s  ({a:.2}s)", total_bytes / a / 1e9);
+    println!(
+        "  (A) threaded pread ×{qd}   : {:.2} GB/s  ({a:.2}s)",
+        total_bytes / a / 1e9
+    );
 
     // (B) io_uring, buffered.
     drop_cache();
@@ -1871,7 +2018,13 @@ fn cmd_iobench(_args: &[String]) -> ExitCode {
 /// buffers and offsets to be 512-aligned (they are: block-aligned offsets, page-aligned
 /// buffers). Returns whether SQPOLL was successfully enabled.
 #[cfg(target_os = "linux")]
-fn iouring_read(fd: i32, bs: usize, qd: usize, offsets: &[u64], direct: bool) -> std::io::Result<bool> {
+fn iouring_read(
+    fd: i32,
+    bs: usize,
+    qd: usize,
+    offsets: &[u64],
+    direct: bool,
+) -> std::io::Result<bool> {
     use io_uring::{opcode, types, IoUring};
     let (mut ring, sqpoll) = match IoUring::builder().setup_sqpoll(2000).build(qd as u32) {
         Ok(r) => (r, true),
@@ -1962,9 +2115,8 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
     };
     let (hidden, moe_inter) = (cfg.hidden as usize, cfg.moe_inter as usize);
     let elayout = colibri_engine::moe::ExpertLayout::for_arch(cfg.arch);
-    let wn = |l: usize, e: usize, suf: &str| {
-        format!("model.layers.{l}.mlp.experts.{e}.{suf}.weight")
-    };
+    let wn =
+        |l: usize, e: usize, suf: &str| format!("model.layers.{l}.mlp.experts.{e}.{suf}.weight");
     // Default to the first layer that actually has routed experts (GLM: layer 3).
     let layer = match args.get(4).and_then(|s| s.parse().ok()) {
         Some(l) => l,
@@ -1983,7 +2135,13 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
 
     // Per-expert byte counts (gate+up+down weights; scales are the tiny sidecars).
-    let names = |e: usize| [wn(layer, e, "gate_proj"), wn(layer, e, "up_proj"), wn(layer, e, "down_proj")];
+    let names = |e: usize| {
+        [
+            wn(layer, e, "gate_proj"),
+            wn(layer, e, "up_proj"),
+            wn(layer, e, "down_proj"),
+        ]
+    };
     let sizes: Vec<usize> = names(0).iter().map(|n| shards.nbytes(n) as usize).collect();
     let span: usize = sizes.iter().sum();
     let total_bytes = (span * n_experts) as f64;
@@ -2008,9 +2166,16 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
         total_bytes / t0.elapsed().as_secs_f64() / 1e9
     );
 
-    println!("{:<34} {:>9} {:>10} {:>8}", "phase", "total ms", "ms/expert", "GB/s");
+    println!(
+        "{:<34} {:>9} {:>10} {:>8}",
+        "phase", "total ms", "ms/expert", "GB/s"
+    );
     let report = |name: &str, secs: f64, bytes: f64| {
-        let gbs = if bytes > 0.0 { format!("{:.2}", bytes / secs / 1e9) } else { "-".into() };
+        let gbs = if bytes > 0.0 {
+            format!("{:.2}", bytes / secs / 1e9)
+        } else {
+            "-".into()
+        };
         println!(
             "{:<34} {:>9.1} {:>10.3} {:>8}",
             name,
@@ -2026,11 +2191,17 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
     for (i, t) in [threads, 1].into_iter().enumerate() {
         let t0 = std::time::Instant::now();
         for e in 0..n_experts {
-            let ex = colibri_engine::moe::load_expert(&shards, elayout, hidden, moe_inter, 4, layer, e, t)
-                .expect("load_expert");
+            let ex = colibri_engine::moe::load_expert(
+                &shards, elayout, hidden, moe_inter, 4, layer, e, t,
+            )
+            .expect("load_expert");
             std::hint::black_box(&ex);
         }
-        full[i] = report(&format!("full load_expert (T={t})"), t0.elapsed().as_secs_f64(), total_bytes);
+        full[i] = report(
+            &format!("full load_expert (T={t})"),
+            t0.elapsed().as_secs_f64(),
+            total_bytes,
+        );
     }
 
     // 2b. Pooled batch: all experts through one continuously-streaming worker set
@@ -2039,9 +2210,10 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
     {
         let eids: Vec<usize> = (0..n_experts).collect();
         let t0 = std::time::Instant::now();
-        let exps =
-            colibri_engine::moe::load_experts_batch(&shards, elayout, hidden, moe_inter, 4, layer, &eids, threads)
-                .expect("load_experts_batch");
+        let exps = colibri_engine::moe::load_experts_batch(
+            &shards, elayout, hidden, moe_inter, 4, layer, &eids, threads,
+        )
+        .expect("load_experts_batch");
         std::hint::black_box(&exps);
         report(
             &format!("pooled batch load (T={threads})"),
@@ -2060,7 +2232,11 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
             let ws = shards.read_raw_shared(&nr, t).expect("read_raw_shared");
             std::hint::black_box(&ws);
         }
-        read[i] = report(&format!("coalesced read, fresh alloc (T={t})"), t0.elapsed().as_secs_f64(), total_bytes);
+        read[i] = report(
+            &format!("coalesced read, fresh alloc (T={t})"),
+            t0.elapsed().as_secs_f64(),
+            total_bytes,
+        );
     }
 
     // 5. Read into one REUSED, pre-faulted buffer (single-thread) — no allocation.
@@ -2070,12 +2246,18 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
         let nm = names(e);
         let mut off = 0;
         for (j, n) in nm.iter().enumerate() {
-            shards.read_raw(n, &mut reused[off..off + sizes[j]]).expect("read_raw");
+            shards
+                .read_raw(n, &mut reused[off..off + sizes[j]])
+                .expect("read_raw");
             off += sizes[j];
         }
         std::hint::black_box(&reused);
     }
-    let reused_s = report("read into reused buffer (T=1)", t0.elapsed().as_secs_f64(), total_bytes);
+    let reused_s = report(
+        "read into reused buffer (T=1)",
+        t0.elapsed().as_secs_f64(),
+        total_bytes,
+    );
 
     // 6. Fresh allocation + touch one byte per page — mmap/munmap churn + zero-fill
     //    faults, the allocation cost the read path pays before any byte arrives.
@@ -2094,7 +2276,11 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
         }
         std::hint::black_box(&v);
     }
-    let alloc_s = report("fresh alloc + page-touch only", t0.elapsed().as_secs_f64(), total_bytes);
+    let alloc_s = report(
+        "fresh alloc + page-touch only",
+        t0.elapsed().as_secs_f64(),
+        total_bytes,
+    );
 
     // 7. Scale sidecar reads only (3 small preads + f32 convert, fresh vecs).
     let t0 = std::time::Instant::now();
@@ -2122,17 +2308,36 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
             }
         });
     }
-    let spawn_s = report(&format!("thread spawn/join only ({nt} thr)"), t0.elapsed().as_secs_f64(), 0.0);
+    let spawn_s = report(
+        &format!("thread spawn/join only ({nt} thr)"),
+        t0.elapsed().as_secs_f64(),
+        0.0,
+    );
 
     let ms = |s: f64| s * 1e3 / n_experts as f64;
     println!("\nattribution (ms/expert, warm):");
-    println!("  chunking delta (full T={threads} vs T=1): {:+.3}", ms(full[0]) - ms(full[1]));
-    println!("  alloc cost (fresh vs reused read):        {:+.3}  (direct alloc+fault: {:.3})",
-        ms(read[1]) - ms(reused_s), ms(alloc_s));
-    println!("  scales + QTensor (full - read, T=1):      {:+.3}  (scales alone: {:.3})",
-        ms(full[1]) - ms(read[1]), ms(scales_s));
-    println!("  spawn overhead ({nt} threads):              {:.3}", ms(spawn_s));
-    println!("  pure read, reused buf:                    {:.3}", ms(reused_s));
+    println!(
+        "  chunking delta (full T={threads} vs T=1): {:+.3}",
+        ms(full[0]) - ms(full[1])
+    );
+    println!(
+        "  alloc cost (fresh vs reused read):        {:+.3}  (direct alloc+fault: {:.3})",
+        ms(read[1]) - ms(reused_s),
+        ms(alloc_s)
+    );
+    println!(
+        "  scales + QTensor (full - read, T=1):      {:+.3}  (scales alone: {:.3})",
+        ms(full[1]) - ms(read[1]),
+        ms(scales_s)
+    );
+    println!(
+        "  spawn overhead ({nt} threads):              {:.3}",
+        ms(spawn_s)
+    );
+    println!(
+        "  pure read, reused buf:                    {:.3}",
+        ms(reused_s)
+    );
     ExitCode::SUCCESS
 }
 
@@ -2477,7 +2682,9 @@ const MMAP_MIN_COVERAGE_PCT: u64 = 80;
 /// Always via [`colibri_core::Config::moe_layers`], never `layer_kind` directly.
 fn expert_footprint(cfg: &colibri_core::Config, per_expert: u64, owned_experts: u64) -> u64 {
     let (n_moe, _probe) = cfg.moe_layers();
-    per_expert.saturating_mul(owned_experts).saturating_mul(n_moe as u64)
+    per_expert
+        .saturating_mul(owned_experts)
+        .saturating_mul(n_moe as u64)
 }
 
 /// will hold it with no eviction. `preload_all_experts` uses this to decide whether an
@@ -2525,18 +2732,27 @@ where
     let probe_expert = owned.first().copied().unwrap_or(0) as usize;
     let per = match provider.expert(probe_layer, probe_expert) {
         Ok(e) => (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64,
-        Err(_) => {
-            colibri_engine::capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, ebits)
-        }
+        Err(_) => colibri_engine::capacity::bytes_per_expert(
+            cfg.hidden as u64,
+            cfg.moe_inter as u64,
+            ebits,
+        ),
     };
     // Only the experts THIS node owns are ever loaded here, so coverage must be measured
     // against the shard — not `cfg.n_experts`. Using the whole model's count made a 2-rank
     // worker see ~630 GB against 121 GB of RAM (16% "coverage"), pick the ≫-RAM regime, cap
     // at 40 GB and never preload — reintroducing the lazy cold-load that #42 fixed, on every
     // worker, in a way that would only show up as bad 2-node numbers.
-    let owned_experts = if owned.is_empty() { cfg.n_experts as u64 } else { owned.len() as u64 };
+    let owned_experts = if owned.is_empty() {
+        cfg.n_experts as u64
+    } else {
+        owned.len() as u64
+    };
     let total_expert_bytes = expert_footprint(cfg, per, owned_experts);
-    debug_assert_eq!(total_expert_bytes, per.saturating_mul(owned_experts).saturating_mul(n_moe));
+    debug_assert_eq!(
+        total_expert_bytes,
+        per.saturating_mul(owned_experts).saturating_mul(n_moe)
+    );
     // Achievable expert residency: the `TARGET_RAM_PCT` footprint minus the dense tier and
     // the non-KV runtime. Coverage is then model-intrinsic — "what share of this model's
     // experts can actually stay resident on this box?" — and drives the cache regime, the
@@ -2619,6 +2835,14 @@ where
             fill_target >> 30,
         );
     }
+    // Page-locking gets the same grant, for the same reason and from the same number. A
+    // GPU copy out of pageable memory is bounced through the driver's staging buffer, so
+    // an expert whose buffer is page-locked can be DMA'd where it lies instead of being
+    // packed into a pinned intermediate first. `fill_target` is the right bound because a
+    // buffer inside it is memory this process was always going to hold — locking it takes
+    // nothing the cache had not already taken. Models that serve experts as mmap views
+    // (M2.7, Nemotron) allocate no heap buffer to lock and simply never draw on this.
+    colibri_core::quant::set_pin_budget(fill_target);
     // Register with the RAM ledger before a single expert is read, so every later
     // allocation — KV, activations, staging — is admitted against a total that already
     // knows what the model itself costs. This is the arbiter that did not exist when the
@@ -2763,8 +2987,10 @@ fn preload_all_experts<P>(
     // kinds only (Kda/Attn) while every layer past `first_dense` still carries experts, so
     // the `is_empty()` form built an EMPTY preload list for it and would have preloaded
     // nothing had K3 ever reached the near-fit regime (a K3 slice can).
-    let has_moe_kind =
-        cfg.layer_kind.iter().any(|k| matches!(k, colibri_core::LayerKind::Moe));
+    let has_moe_kind = cfg
+        .layer_kind
+        .iter()
+        .any(|k| matches!(k, colibri_core::LayerKind::Moe));
     let moe_layers: Vec<usize> = if has_moe_kind {
         cfg.layer_kind
             .iter()
@@ -2817,9 +3043,12 @@ fn prefetch_topn() -> Option<usize> {
     let ahead = std::env::var("COLI_PREFETCH_AHEAD").ok().as_deref() != Some("0");
     match std::env::var("COLI_PREFETCH").ok().as_deref() {
         None | Some("") | Some("0") => ahead.then_some(0),
-        Some("1") => {
-            Some(std::env::var("COLI_PREFETCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(16))
-        }
+        Some("1") => Some(
+            std::env::var("COLI_PREFETCH_N")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16),
+        ),
         Some(v) => Some(v.parse().unwrap_or(16)),
     }
 }
@@ -2923,7 +3152,11 @@ pub(crate) fn build_sharding(
             nw.iter().copied().min().unwrap_or(0),
             nw.iter().copied().max().unwrap_or(0),
         );
-        let imbalance = if min > 0 { max as f64 / min as f64 } else { f64::INFINITY };
+        let imbalance = if min > 0 {
+            max as f64 / min as f64
+        } else {
+            f64::INFINITY
+        };
         println!(
             "sharding: hot-aware (traffic-balanced), fingerprint {:#018x} — per-node load \
              max/min {:.2}x (contiguous would cluster hot experts). Verify this fingerprint \
@@ -3009,22 +3242,38 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
     let kv_bytes = kv_per_tok * ctx + kv_fixed;
 
     let ram_bytes = ram_gb * gib;
-    let expert_budget =
-        ram_bytes.saturating_sub((dense_gb + working_gb) * gib).saturating_sub(kv_bytes);
+    let expert_budget = ram_bytes
+        .saturating_sub((dense_gb + working_gb) * gib)
+        .saturating_sub(kv_bytes);
     let per_node = experts_in_budget(expert_budget, bpe).min(total_experts);
-    let pct = |n: u64| if total_experts > 0 { 100.0 * n as f64 / total_experts as f64 } else { 0.0 };
+    let pct = |n: u64| {
+        if total_experts > 0 {
+            100.0 * n as f64 / total_experts as f64
+        } else {
+            0.0
+        }
+    };
 
-    println!("model: hidden={} moe_inter={} experts/layer={} attn_layers={} sparse_layers={}",
-        cfg.hidden, cfg.moe_inter, cfg.n_experts, cfg.n_layers, sparse_layers);
-    println!("per expert (nvfp4 ~4-bit): {:.2} MB   total routed: {total_experts} → {:.0} GB",
-        mb(bpe), gb(total_experts * bpe));
+    println!(
+        "model: hidden={} moe_inter={} experts/layer={} attn_layers={} sparse_layers={}",
+        cfg.hidden, cfg.moe_inter, cfg.n_experts, cfg.n_layers, sparse_layers
+    );
+    println!(
+        "per expert (nvfp4 ~4-bit): {:.2} MB   total routed: {total_experts} → {:.0} GB",
+        mb(bpe),
+        gb(total_experts * bpe)
+    );
     // Report the layers that actually hold KV, not the total: a hybrid stack caches on
     // only its attention layers (Nemotron-H: 8 of 88; Kimi-K3: 24 of 93). Shared with the
     // reservation rather than reimplemented — this used to be a second copy of the
     // predicate, which is how the earlier KV accounting bugs got in.
     let kv_layers = colibri_engine::KvCache::kv_layers(&cfg);
-    println!("KV cache: {:.1} KB/token ({} of {} layers cache KV)",
-        kv_per_tok as f64 / 1024.0, kv_layers, cfg.n_layers);
+    println!(
+        "KV cache: {:.1} KB/token ({} of {} layers cache KV)",
+        kv_per_tok as f64 / 1024.0,
+        kv_layers,
+        cfg.n_layers
+    );
     if kv_fixed > 0 {
         println!(
             "  + {:.0} MB/sequence fixed recurrent state (O(1) in context, per concurrent \
@@ -3032,19 +3281,34 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
             mb(kv_fixed)
         );
     }
-    println!("  8 GB KV holds ~{} tokens ({}K)",
+    println!(
+        "  8 GB KV holds ~{} tokens ({}K)",
         context_in_kv_budget(8 * gib, kv_per_tok),
-        context_in_kv_budget(8 * gib, kv_per_tok) / 1024);
+        context_in_kv_budget(8 * gib, kv_per_tok) / 1024
+    );
     for &c in &[131072u64, 262144, 524288] {
         println!("  {}K context → {:.1} GB KV", c / 1024, gb(kv_per_tok * c));
     }
     println!();
-    println!("budget: {ram_gb} GB − {dense_gb} dense − {working_gb} working{} → {:.0} GB for experts",
-        if ctx > 0 { format!(" − {:.0} KV({}K ctx)", gb(kv_bytes), ctx / 1024) } else { String::new() },
-        gb(expert_budget));
-    println!("==> resident experts per node: {per_node} ({:.0}% of all {total_experts})", pct(per_node));
+    println!(
+        "budget: {ram_gb} GB − {dense_gb} dense − {working_gb} working{} → {:.0} GB for experts",
+        if ctx > 0 {
+            format!(" − {:.0} KV({}K ctx)", gb(kv_bytes), ctx / 1024)
+        } else {
+            String::new()
+        },
+        gb(expert_budget)
+    );
+    println!(
+        "==> resident experts per node: {per_node} ({:.0}% of all {total_experts})",
+        pct(per_node)
+    );
     if ctx > 0 {
-        println!("    (keeping {}K-token context in a {}-GB KV cache)", ctx / 1024, kv_bytes.div_ceil(gib));
+        println!(
+            "    (keeping {}K-token context in a {}-GB KV cache)",
+            ctx / 1024,
+            kv_bytes.div_ceil(gib)
+        );
     }
     ExitCode::SUCCESS
 }
@@ -3141,11 +3405,19 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
     let mut ids = tok.encode(&text);
     ids.truncate(max_tokens);
     if ids.len() < 2 {
-        eprintln!("coli ppl: need >= 2 tokens (got {}), give it more text", ids.len());
+        eprintln!(
+            "coli ppl: need >= 2 tokens (got {}), give it more text",
+            ids.len()
+        );
         return ExitCode::from(2);
     }
 
-    let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let envbits = |k: &str, d: u32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
     let opts = colibri_engine::LoadOptions {
         dbits: envbits("COLI_DBITS", 8),
         ebits: envbits("COLI_EBITS", 8),
@@ -3200,7 +3472,10 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
         let lg = colibri_engine::logits(&model, &hidden[pos * d..(pos + 1) * d]);
         let target = ids[pos + 1] as usize;
         if target >= lg.len() {
-            eprintln!("coli ppl: token id {target} out of range for vocab {}", lg.len());
+            eprintln!(
+                "coli ppl: token id {target} out of range for vocab {}",
+                lg.len()
+            );
             return ExitCode::FAILURE;
         }
         sum += -logprob_of(&lg, target) as f64;
@@ -3213,7 +3488,10 @@ fn cmd_ppl(args: &[String]) -> ExitCode {
     println!("resident/expert: {resident_fmt} / {expert_fmt}   (as stored in the container)");
     println!("mean NLL      : {nll:.4} nats/token");
     println!("perplexity    : {:.3}   <- lower is better", nll.exp());
-    println!("top-1 match   : {:.1}%  ({top1}/{n})", top1 as f64 / n as f64 * 100.0);
+    println!(
+        "top-1 match   : {:.1}%  ({top1}/{n})",
+        top1 as f64 / n as f64 * 100.0
+    );
     eprintln!("[ppl] {:.1}s", t0.elapsed().as_secs_f64());
     ExitCode::SUCCESS
 }
@@ -3237,7 +3515,12 @@ fn cmd_tf(args: &[String]) -> ExitCode {
         eprintln!("coli tf: provide at least one token id");
         return ExitCode::from(2);
     }
-    let envbits = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let envbits = |k: &str, d: u32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
     let opts = colibri_engine::LoadOptions {
         dbits: envbits("COLI_DBITS", 8),
         ebits: envbits("COLI_EBITS", 8),
@@ -3259,7 +3542,12 @@ fn cmd_tf(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let preds: Vec<i32> = (0..ids.len())
-        .map(|pos| colibri_engine::argmax(&colibri_engine::logits(&model, &hidden[pos * d..(pos + 1) * d])) as i32)
+        .map(|pos| {
+            colibri_engine::argmax(&colibri_engine::logits(
+                &model,
+                &hidden[pos * d..(pos + 1) * d],
+            )) as i32
+        })
         .collect();
     println!("tf preds ({}): {preds:?}", preds.len());
     ExitCode::SUCCESS
@@ -3276,7 +3564,10 @@ fn cmd_config(args: &[String]) -> ExitCode {
     };
     match colibri_core::Config::load(snap) {
         Ok(c) => {
-            println!("hidden={}  layers={}  heads={}", c.hidden, c.n_layers, c.n_heads);
+            println!(
+                "hidden={}  layers={}  heads={}",
+                c.hidden, c.n_layers, c.n_heads
+            );
             println!(
                 "experts={}  topk={}  moe_inter={}  shared={}",
                 c.n_experts, c.topk, c.moe_inter, c.n_shared
@@ -3357,7 +3648,11 @@ mod tests {
             ram_target(total) - resident - RUNTIME_RESERVE,
             "the clamp must BE the headroom, not merely respect it"
         );
-        assert_eq!(clamped >> 30, 103, "96% of 121 GiB, less 3 dense and 10 runtime");
+        assert_eq!(
+            clamped >> 30,
+            103,
+            "96% of 121 GiB, less 3 dense and 10 runtime"
+        );
 
         // The whole point of the target: nearly all of RAM ends up holding model, not
         // held back "just in case". Experts + dense must reach at least 85% of MemTotal.
@@ -3396,10 +3691,10 @@ mod tests {
     #[test]
     fn narrow_reader_gate_matches_the_measured_models() {
         for (name, cov, want_narrow) in [
-            ("kimi-k3", 7u64, true),       // 26364 -> 22531 ms at 8 threads
-            ("glm-5.2", 26, true),         // 12017 -> 10402 ms at 8 threads
-            ("minimax-m3", 46, false),     // 3718 -> 8611..16092 ms at 8 threads: 2-4x WORSE
-            ("minimax-m2.7", 86, false),   // 481 -> 485 ms: neutral, all mmap views
+            ("kimi-k3", 7u64, true),          // 26364 -> 22531 ms at 8 threads
+            ("glm-5.2", 26, true),            // 12017 -> 10402 ms at 8 threads
+            ("minimax-m3", 46, false),        // 3718 -> 8611..16092 ms at 8 threads: 2-4x WORSE
+            ("minimax-m2.7", 86, false),      // 481 -> 485 ms: neutral, all mmap views
             ("nemotron-3-super", 172, false), // preload 12.0 s -> 29.5 s at 8 threads
         ] {
             assert_eq!(
@@ -3476,10 +3771,10 @@ mod tests {
     fn o_direct_threshold_matches_the_measured_models() {
         // (name, coverage %, O_DIRECT should be ON)
         let measured = [
-            ("kimi-k3", 7u64, true),      // 31350 -> 28788 ms, 1.089x
-            ("glm-5.2", 27, true),        // 16957 -> 14812 ms, 1.145x
-            ("minimax-m3", 47, false),    // buffered 6232 vs 6755
-            ("minimax-m2.7", 86, false),  // buffered 4166 vs 4444; warm rep read 0 bytes
+            ("kimi-k3", 7u64, true),     // 31350 -> 28788 ms, 1.089x
+            ("glm-5.2", 27, true),       // 16957 -> 14812 ms, 1.145x
+            ("minimax-m3", 47, false),   // buffered 6232 vs 6755
+            ("minimax-m2.7", 86, false), // buffered 4166 vs 4444; warm rep read 0 bytes
         ];
         for (name, cov, want_direct) in measured {
             assert_eq!(
@@ -3536,14 +3831,20 @@ mod tests {
         // naive predicate.
         assert!(!cfg.layer_kind.is_empty());
         assert_eq!(
-            cfg.layer_kind.iter().filter(|k| **k == colibri_core::LayerKind::Moe).count(),
+            cfg.layer_kind
+                .iter()
+                .filter(|k| **k == colibri_core::LayerKind::Moe)
+                .count(),
             0
         );
 
         const PER: u64 = 17_547_264; // one real K3 expert, MXFP4
         let got = expert_footprint(&cfg, PER, cfg.n_experts as u64);
         assert_eq!(got, PER * 896 * 92, "must charge all 92 MoE layers");
-        assert!(got > 1_400_000_000_000, "K3's expert set is ~1.4 TB, got {got}");
+        assert!(
+            got > 1_400_000_000_000,
+            "K3's expert set is ~1.4 TB, got {got}"
+        );
 
         // A sharded node charges only what it owns, so coverage reflects the shard.
         assert_eq!(expert_footprint(&cfg, PER, 448), PER * 448 * 92);
@@ -3599,7 +3900,10 @@ mod tests {
         let a: Vec<f32> = vec![0.3, -1.2, 4.5, 2.0];
         let b: Vec<f32> = a.iter().map(|x| x + 500.0).collect();
         for t in 0..a.len() {
-            assert!((logprob_of(&a, t) - logprob_of(&b, t)).abs() < 1e-4, "not shift-invariant");
+            assert!(
+                (logprob_of(&a, t) - logprob_of(&b, t)).abs() < 1e-4,
+                "not shift-invariant"
+            );
         }
     }
 
@@ -3646,10 +3950,19 @@ mod tests {
         // The regression that shipped: on an idle box MemAvailable counts page cache as
         // free, so the reserves alone pick 87 GB — past the cliff, 4x slower. The cap is
         // what actually prevents this; the subtraction never could.
-        let no_cap = SPARK_AVAIL.saturating_sub(1 * GB).saturating_sub(WORKING_RESERVE) / GB;
-        assert!(no_cap > 70, "premise: reserves alone pick {no_cap} GB, past the cliff");
+        let no_cap = SPARK_AVAIL
+            .saturating_sub(1 * GB)
+            .saturating_sub(WORKING_RESERVE)
+            / GB;
+        assert!(
+            no_cap > 70,
+            "premise: reserves alone pick {no_cap} GB, past the cliff"
+        );
         let with_cap = budget_from(SPARK_AVAIL, 1 * GB, Some(SPARK_TOTAL)) / GB;
-        assert!(with_cap < 70, "cap failed to pull {with_cap} GB back below the cliff");
+        assert!(
+            with_cap < 70,
+            "cap failed to pull {with_cap} GB back below the cliff"
+        );
     }
 
     #[test]
@@ -3659,7 +3972,10 @@ mod tests {
         // the reserve exists to prevent.
         for (avail, reserve) in [(0, 0), (1 * GB, 0), (8 * GB, 64 * GB), (0, u64::MAX)] {
             let b = budget_from(avail, reserve, Some(SPARK_TOTAL));
-            assert!(b <= MIN_BUDGET, "underflowed to {b} bytes for avail={avail} reserve={reserve}");
+            assert!(
+                b <= MIN_BUDGET,
+                "underflowed to {b} bytes for avail={avail} reserve={reserve}"
+            );
         }
     }
 
@@ -3682,7 +3998,11 @@ mod tests {
             let total = total_gb * GB;
             // Idle: MemAvailable ~= total, so only the cap can bind.
             let b = budget_from(total, 0, Some(total)) / GB;
-            assert_eq!(b, total_gb / CACHE_CAP_DIVISOR, "cap did not track a {total_gb} GB box");
+            assert_eq!(
+                b,
+                total_gb / CACHE_CAP_DIVISOR,
+                "cap did not track a {total_gb} GB box"
+            );
         }
     }
 
@@ -3716,7 +4036,10 @@ mod tests {
         // to sail through startup verification (nothing to verify) and only fail on
         // the first token with "no address for node 1".
         assert_eq!(missing_peer_ranks(2, NodeId(0), &HashMap::new()), vec![1]);
-        assert_eq!(missing_peer_ranks(4, NodeId(2), &HashMap::new()), vec![0, 1, 3]);
+        assert_eq!(
+            missing_peer_ranks(4, NodeId(2), &HashMap::new()),
+            vec![0, 1, 3]
+        );
     }
 
     #[test]

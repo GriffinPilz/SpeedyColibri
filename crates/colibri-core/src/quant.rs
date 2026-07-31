@@ -124,28 +124,42 @@ pub fn set_host_pin_hooks(reg: fn(*mut u8, usize) -> bool, unreg: fn(*mut u8)) {
     let _ = HOST_PIN.set((reg, unreg));
 }
 
-/// Ceiling on page-locked bytes (`COLI_PIN_MAX_MB`, default 8192).
+/// Bytes the engine has granted for page-locking, set per model by [`set_pin_budget`].
+static PIN_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Grant page-locking a budget, in bytes. **Pass the expert-cache fill target** — the same
+/// per-model number the RAM ledger is given for `Class::Experts`.
 ///
-/// **This bound is the load-bearing part, not the pinning.** Page-locked memory cannot be
-/// reclaimed by the kernel, and under max residency the expert cache holds *tens of GB* of
-/// pooled buffers — pinning all of them would make most of a 121 GB box unreclaimable and
-/// hand back the memory ceiling that `memory-ceiling-is-real` and the RAM ledger exist to
-/// hold. Worse, it would pass a short smoke test: the ceiling is only violated once the
-/// cache has filled, which a 12-token run never reaches.
+/// This replaced a flat 8 GB default whose justification was wrong. That default claimed
+/// page-locking would make memory unreclaimable and endanger the ceiling. What gets locked
+/// here are *live, anonymous, dirty* heap allocations held by the expert cache, and with
+/// swap off the kernel cannot reclaim those pages whether they are locked or not. Locking
+/// them takes nothing from the ceiling that holding them had not already taken.
 ///
-/// A few GB is enough to matter here regardless, because the pool *recycles*: the bytes
-/// that need to be pinned are the ones in flight for the current group, not the whole
-/// resident set. Buffers past the cap simply stay pageable and take the pack, which is the
-/// behaviour that shipped before any of this.
+/// A flat cap was also actively harmful: under max residency the cache holds tens of GB, so
+/// an 8 GB ceiling would leave most experts on the slow path in exactly the regime we ship.
+/// The bound that is real is the one the ledger already computes per model — the expert
+/// grant, derived from that model's coverage and headroom — because a buffer inside that
+/// grant is memory the process was always going to hold.
+///
+/// Zero (the default, when no engine has set it) means **do not page-lock at all**, which
+/// keeps exactly the behaviour that shipped before any of this. That is the right default
+/// for tests, CPU-only builds, and any caller that has not thought about it.
+pub fn set_pin_budget(bytes: u64) {
+    PIN_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Ceiling on page-locked bytes: `COLI_PIN_MAX_MB` if set (for experiments), else the
+/// engine's per-model grant from [`set_pin_budget`], else zero.
 fn pin_max_bytes() -> u64 {
-    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
+    static ENV: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| {
         std::env::var("COLI_PIN_MAX_MB")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8192u64)
-            << 20
-    })
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|m| m << 20)
+    });
+    env.unwrap_or_else(|| PIN_BUDGET.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Page-lock a freshly allocated pool buffer, if there is a device to pin it for.

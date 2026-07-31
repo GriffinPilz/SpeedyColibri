@@ -52,7 +52,6 @@ const WARMUP_TOKENS: usize = 8;
 /// 30 s is well beyond a typical decode and well inside any sane client timeout.
 const KV_QUEUE_SECS: u64 = 30;
 
-
 /// Parse a token count like `32k`, `1m`, or `131072`.
 fn parse_ctx(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
@@ -98,7 +97,10 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             rest = &rest[1..];
             p
         }
-        None => std::env::var("COLI_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_PORT),
+        None => std::env::var("COLI_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_PORT),
     };
 
     // Warm-up prompts: the remaining positional args as one prompt, plus each
@@ -108,7 +110,11 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         warmups.push(rest.join(" "));
     }
     if let Ok(w) = std::env::var("COLI_WARMUP") {
-        warmups.extend(w.split('|').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+        warmups.extend(
+            w.split('|')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        );
     }
 
     // ---- load model + tokenizer -------------------------------------------
@@ -174,8 +180,8 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // when a large request finally allocates its KV.
     const CTX_RAM_RESERVE: u64 = 18 << 30;
     let kv_pt = (kv_bytes_per_token(&model.cfg) as u64).max(1); // already includes device shadow
-    // Subtract the fixed per-sequence state (Mamba2) before dividing: it is not a
-    // per-token cost, so folding it into `kv_pt` would scale it with context.
+                                                                // Subtract the fixed per-sequence state (Mamba2) before dividing: it is not a
+                                                                // per-token cost, so folding it into `kv_pt` would scale it with context.
     let kv_fixed = KvCache::fixed_bytes(&model.cfg) as u64;
     let ram_ctx = colibri_engine::total_ram_bytes()
         .map(|t| (t.saturating_sub(CTX_RAM_RESERVE).saturating_sub(kv_fixed) / kv_pt) as usize)
@@ -199,9 +205,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     if budget == u64::MAX {
         // No /proc/meminfo (non-Linux dev box): the budget is unbounded, and printing
         // it as a number renders "17179869184 GB". Say what actually happened.
-        println!(
-            "[serve] expert cache: unbounded (no MemAvailable to budget from)"
-        );
+        println!("[serve] expert cache: unbounded (no MemAvailable to budget from)");
     } else {
         println!(
             "[serve] expert cache: {:.0} GB initial budget (adaptive); KV reserved per \
@@ -209,12 +213,15 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             budget as f64 / gib,
             kv_worst_case as f64 / gib,
             ctx_len,
-            if cfg!(feature = "cuda") { ", incl. device shadow" } else { "" }
+            if cfg!(feature = "cuda") {
+                ", incl. device shadow"
+            } else {
+                ""
+            }
         );
     }
 
-    let usage_path =
-        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let usage_path = std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
     let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
 
     // The expert->node map comes first: it gates what this node may load (below), and
@@ -240,7 +247,13 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     );
     let provider = std::sync::Arc::new(ExpertCache::new(base, budget));
     let owned_ids: Vec<u32> = sharding.local_experts(cluster.this_node).collect();
-    let maxres = crate::wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, &owned_ids, model.resident_bytes());
+    let maxres = crate::wire_adaptive_cache(
+        &provider,
+        &model.cfg,
+        model.ebits as u32,
+        &owned_ids,
+        model.resident_bytes(),
+    );
     crate::preload_all_experts(&provider, &model.cfg, maxres, &owned_ids);
     if let Some(topn) = crate::prefetch_topn() {
         provider.enable_prefetch(topn, model.cfg.n_experts as u64);
@@ -303,15 +316,26 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         if ids.is_empty() {
             continue;
         }
-        eprintln!("[serve] warm-up {}/{}: {} tokens", i + 1, warmups.len(), ids.len());
+        eprintln!(
+            "[serve] warm-up {}/{}: {} tokens",
+            i + 1,
+            warmups.len(),
+            ids.len()
+        );
         let mut kv = mk_kv(model, ids.len() + WARMUP_TOKENS);
-        if let Err(e) = colibri_engine::generate_greedy(model, &mut kv, &*provider, &ids, WARMUP_TOKENS) {
+        if let Err(e) =
+            colibri_engine::generate_greedy(model, &mut kv, &*provider, &ids, WARMUP_TOKENS)
+        {
             eprintln!("[serve] warm-up failed: {e}");
         }
     }
     if !warmups.is_empty() {
         let s = provider.stats();
-        eprintln!("[serve] warm-up done: {} experts resident ({:.1} GB)", s.resident, s.bytes as f64 / (1u64 << 30) as f64);
+        eprintln!(
+            "[serve] warm-up done: {} experts resident ({:.1} GB)",
+            s.resident,
+            s.bytes as f64 / (1u64 << 30) as f64
+        );
     }
 
     // ---- listen -----------------------------------------------------------
@@ -335,13 +359,18 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         crate::version_string()
     );
     let kv_at_ctx = KvCache::bytes_for(&model.cfg, ctx_len) as f64 / (1u64 << 30) as f64;
-    let model_max_str =
-        if model.cfg.max_ctx > 0 { model.cfg.max_ctx.to_string() } else { "unknown".to_string() };
+    let model_max_str = if model.cfg.max_ctx > 0 {
+        model.cfg.max_ctx.to_string()
+    } else {
+        "unknown".to_string()
+    };
     println!(
         "[serve]   context length: {ctx_len} tokens (model max {model_max_str}; up to {:.1} GB KV) — set COLI_CTX to change",
         kv_at_ctx
     );
-    println!("[serve]   POST /v1/chat/completions   POST /v1/completions   GET /v1/models   GET /health");
+    println!(
+        "[serve]   POST /v1/chat/completions   POST /v1/completions   GET /v1/models   GET /health"
+    );
 
     // Scan the ConnectX/RoCE fabric and print the other Sparks we can see, so the
     // operator can verify the multi-node wiring at startup, then keep beaconing so
@@ -351,7 +380,10 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(3.0);
     if disc_secs > 0.0 {
-        let rank: u32 = std::env::var("COLI_NODE_RANK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let rank: u32 = std::env::var("COLI_NODE_RANK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let d = colibri_cluster::discover(rank, port, Duration::from_secs_f64(disc_secs));
         let _ = colibri_cluster::discovery::print_report(&d, &mut std::io::stdout());
         colibri_cluster::discovery::spawn_beacon(rank, port);
@@ -450,14 +482,32 @@ fn handle(
             );
             send_json(&mut stream, 200, &body);
         }
-        ("POST", "/v1/completions") => {
-            complete(&mut stream, model, provider, tok, model_id, &req.body, false, ctx_len)
-        }
-        ("POST", "/v1/chat/completions") => {
-            complete(&mut stream, model, provider, tok, model_id, &req.body, true, ctx_len)
-        }
+        ("POST", "/v1/completions") => complete(
+            &mut stream,
+            model,
+            provider,
+            tok,
+            model_id,
+            &req.body,
+            false,
+            ctx_len,
+        ),
+        ("POST", "/v1/chat/completions") => complete(
+            &mut stream,
+            model,
+            provider,
+            tok,
+            model_id,
+            &req.body,
+            true,
+            ctx_len,
+        ),
         ("OPTIONS", _) => send_json(&mut stream, 204, ""),
-        _ => send_json(&mut stream, 404, "{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}"),
+        _ => send_json(
+            &mut stream,
+            404,
+            "{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}",
+        ),
     }
 }
 
@@ -492,7 +542,11 @@ fn read_request<R: BufRead>(reader: &mut R) -> Option<Request> {
     if content_length > 0 {
         reader.read_exact(&mut body).ok()?;
     }
-    Some(Request { method, path, body: String::from_utf8_lossy(&body).into_owned() })
+    Some(Request {
+        method,
+        path,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
 }
 
 /// Shared handler for `/v1/completions` (chat=false) and `/v1/chat/completions`
@@ -551,7 +605,11 @@ fn complete(
         }
     };
     if ids.is_empty() {
-        send_json(stream, 400, "{\"error\":{\"message\":\"empty prompt\",\"type\":\"invalid_request_error\"}}");
+        send_json(
+            stream,
+            400,
+            "{\"error\":{\"message\":\"empty prompt\",\"type\":\"invalid_request_error\"}}",
+        );
         return;
     }
 
@@ -572,7 +630,11 @@ fn complete(
     }
     let max_tokens = requested_max.min(ctx_len - ids.len());
 
-    let object = if chat { "chat.completion" } else { "text_completion" };
+    let object = if chat {
+        "chat.completion"
+    } else {
+        "text_completion"
+    };
     let id = format!("cmpl-{}", ids.len().wrapping_mul(2654435761) ^ max_tokens);
     // The KV cache commits lazily (grows with tokens produced), so we reserve only the
     // PROMPT's KV — what prefill commits at once. The generation tail grows one token at a
@@ -589,8 +651,11 @@ fn complete(
     // smaller than it is. A request too large for the whole rigid budget is rejected at
     // once, because waiting cannot help it and it would block the queue behind it.
     let rigid = colibri_engine::ram::manager()
-        .map(|m| m.ceiling().saturating_sub(m.committed_in(colibri_engine::ram::Class::Dense))
-            .saturating_sub(m.committed_in(colibri_engine::ram::Class::Experts)))
+        .map(|m| {
+            m.ceiling()
+                .saturating_sub(m.committed_in(colibri_engine::ram::Class::Dense))
+                .saturating_sub(m.committed_in(colibri_engine::ram::Class::Experts))
+        })
         .unwrap_or(u64::MAX);
     let (verdict, kv_commit) = colibri_engine::ram::commit_or_wait(
         colibri_engine::ram::Class::Kv,
@@ -634,9 +699,13 @@ fn complete(
     let mut kv = mk_kv(model, ids.len() + max_tokens);
 
     if stream_mode {
-        stream_completion(stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv);
+        stream_completion(
+            stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv,
+        );
     } else {
-        block_completion(stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv);
+        block_completion(
+            stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv,
+        );
     }
     drop(kv); // free the KV before the commitment that covers it
 }
@@ -755,7 +824,14 @@ fn block_completion(
     let seq = match colibri_engine::generate_greedy(model, kv, provider, prompt, max_tokens) {
         Ok(s) => s,
         Err(e) => {
-            send_json(stream, 500, &format!("{{\"error\":{{\"message\":{},\"type\":\"internal_error\"}}}}", jstr(&e.to_string())));
+            send_json(
+                stream,
+                500,
+                &format!(
+                    "{{\"error\":{{\"message\":{},\"type\":\"internal_error\"}}}}",
+                    jstr(&e.to_string())
+                ),
+            );
             return;
         }
     };
@@ -764,13 +840,21 @@ fn block_completion(
     // streaming path already excludes it; keep the two consistent.
     let full = &seq[prompt.len()..];
     let hit_stop = full.last().is_some_and(|t| model.cfg.stop_ids.contains(t));
-    let cont = if hit_stop { &full[..full.len() - 1] } else { full };
+    let cont = if hit_stop {
+        &full[..full.len() - 1]
+    } else {
+        full
+    };
     let text = tok.decode(cont);
     let finish = if hit_stop { "stop" } else { "length" };
     let choice = if chat {
         format!("{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":{}}},\"finish_reason\":{}}}", jstr(&text), jstr(finish))
     } else {
-        format!("{{\"index\":0,\"text\":{},\"finish_reason\":{}}}", jstr(&text), jstr(finish))
+        format!(
+            "{{\"index\":0,\"text\":{},\"finish_reason\":{}}}",
+            jstr(&text),
+            jstr(finish)
+        )
     };
     let usage = format!(
         "{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}",
@@ -805,7 +889,11 @@ fn stream_completion(
     chat: bool,
     kv: &mut KvCache,
 ) {
-    let chunk_obj = if chat { "chat.completion.chunk" } else { "text_completion" };
+    let chunk_obj = if chat {
+        "chat.completion.chunk"
+    } else {
+        "text_completion"
+    };
     // SSE response headers.
     let headers = "HTTP/1.1 200 OK\r\n\
         Content-Type: text/event-stream\r\n\
@@ -966,8 +1054,14 @@ mod tests {
              <|im_start|>assistant\n<think></think>"
         );
         // The regression this fixes: none of the GLM control tokens may appear.
-        assert!(!s.contains("[gMASK]"), "GLM opener leaked into the Nemotron prompt");
-        assert!(!s.contains("<|user|>"), "GLM role markers leaked into the Nemotron prompt");
+        assert!(
+            !s.contains("[gMASK]"),
+            "GLM opener leaked into the Nemotron prompt"
+        );
+        assert!(
+            !s.contains("<|user|>"),
+            "GLM role markers leaked into the Nemotron prompt"
+        );
     }
 
     /// No messages still yields a valid generation prompt (not an empty string),
@@ -983,7 +1077,9 @@ mod tests {
     #[test]
     fn model_id_from_hf_cache_path() {
         assert_eq!(
-            model_id_from("/root/.cache/huggingface/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/abc123"),
+            model_id_from(
+                "/root/.cache/huggingface/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/abc123"
+            ),
             "nvidia/GLM-5.2-NVFP4"
         );
         assert_eq!(model_id_from("/data/glm52-nvfp4/"), "glm52-nvfp4");

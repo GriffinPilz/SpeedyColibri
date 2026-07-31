@@ -39,7 +39,10 @@ fn main() {
 
 /// `<short-sha>` or `<short-sha>-dirty`, or `None` outside a git checkout.
 fn git_rev() -> Option<String> {
-    let out = Command::new("git").args(["rev-parse", "--short", "HEAD"]).output().ok()?;
+    let out = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

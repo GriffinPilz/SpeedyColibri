@@ -2753,7 +2753,26 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
  * call declines and the caller falls back per-expert. */
 static int g_grp_evt=-1; static double g_grp_pack_ms=0, g_grp_h2d_ms=0, g_grp_bytes=0; static long long g_grp_chunks=0;
 static double g_grp_thr_sum=0, g_grp_thr_max=0, g_grp_thr_cpu=0; static long long g_grp_nthr=0;
-static long long g_grp_pin_experts=0, g_grp_all_experts=0;
+static long long g_grp_pin_experts=0, g_grp_all_experts=0, g_grp_last_count=0;
+
+/* Every-200-chunks was the only reporting, and it made a comparison wrong: a run that ends
+ * at chunk 340 last printed at 200, so "47.4 GB staged" was two thirds of a total being
+ * read against the reader's complete 119-130 GB. That is where the "the reader drains 2.7x
+ * what the pack stages" reading came from. Print the finished totals at exit so a number
+ * taken from this line is the whole run. */
+static void grp_evt_report(void){
+    if(!g_grp_chunks)return;
+    fprintf(stderr,"[group-evt FINAL] chunks=%lld staged=%.1f GB | pack %.2f s = %.2f GB/s "
+            "| H2D %.2f s = %.2f GB/s | %lld experts/chunk "
+            "| thr %lld/chunk elapsed-max %.2f s elapsed-sum %.2f s cpu-sum %.2f s "
+            "| DMA-direct %lld/%lld experts (%.0f%%)\n",
+            g_grp_chunks,g_grp_bytes/1e9,
+            g_grp_pack_ms/1e3,(g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),
+            g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),g_grp_last_count,
+            g_grp_nthr/g_grp_chunks,g_grp_thr_max/1e3,g_grp_thr_sum/1e3,g_grp_thr_cpu/1e3,
+            g_grp_pin_experts,g_grp_all_experts,
+            g_grp_all_experts?100.0*g_grp_pin_experts/g_grp_all_experts:0.0);
+}
 
 extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
         ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,
@@ -3021,6 +3040,9 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
              * it is a candidate in its own right. */
             if(g_grp_evt<0){const char*e=getenv("COLI_GROUP_EVT");g_grp_evt=e&&atoi(e);}
             if(g_grp_evt){
+                static bool s_atexit=false;
+                if(!s_atexit){s_atexit=true;atexit(grp_evt_report);}
+                g_grp_last_count=count;
                 cudaStreamSynchronize(ctx->stream);
                 double h2d_ms=std::chrono::duration<double,std::milli>(
                     std::chrono::steady_clock::now()-t_h2d).count();

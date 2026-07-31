@@ -10,7 +10,7 @@
 //! presenting as a slowdown rather than a crash. So the invariant under test is symmetry:
 //! every registration is released before its allocation goes away.
 
-use colibri_core::quant::{pin_profile, set_host_pin_hooks};
+use colibri_core::quant::{pin_profile, set_host_pin_hooks, set_pin_budget};
 use colibri_core::SharedBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -44,6 +44,32 @@ fn every_page_lock_is_released_before_its_memory_is_freed() {
     std::env::set_var("COLI_BUF_POOL", "0");
     set_host_pin_hooks(fake_register, fake_unregister);
 
+    // --- no grant means no page-locking ----------------------------------------------
+    // The default budget is zero, and that is the safe default rather than an oversight:
+    // a caller that has not sized a grant gets exactly the behaviour that shipped before
+    // page-locking existed.
+    {
+        let _ungranted = SharedBuf::with_len(BIG);
+        assert!(
+            REGISTERED.lock().unwrap().is_empty(),
+            "nothing is page-locked until the engine grants a budget"
+        );
+    }
+    assert_eq!(pin_profile().0, 0, "no grant, no locks");
+    // A zero grant reports as *capped*, not as *failed* — the distinction matters when
+    // reading these counters in a real run: capped is the ceiling working, failed is the
+    // driver refusing.
+    let capped_ungranted = pin_profile().3;
+    assert_eq!(
+        capped_ungranted, 1,
+        "the ungranted buffer was left pageable by the ceiling"
+    );
+
+    // Grant enough for the buffers below but not for all of them, so both the granted and
+    // the capped path are exercised.
+    const N: usize = 6;
+    set_pin_budget((BIG * 4) as u64);
+
     // --- below the pool threshold is never registered --------------------------------
     {
         let _small = SharedBuf::with_len(4096);
@@ -54,7 +80,6 @@ fn every_page_lock_is_released_before_its_memory_is_freed() {
     }
 
     // --- allocate, use, drop; every one is rejected by the pool and must be released ---
-    const N: usize = 6;
     for _ in 0..N {
         let mut b = SharedBuf::with_len(BIG);
         b.as_mut_slice()[0] = 1; // touch it, as the read path would
@@ -76,7 +101,34 @@ fn every_page_lock_is_released_before_its_memory_is_freed() {
         "no registration outlives its allocation"
     );
     assert_eq!(bytes, 0, "the locked-byte ledger returns to zero");
-    assert_eq!(capped, 0, "6 x 2 MiB is nowhere near the page-lock ceiling");
+    // Each buffer is dropped immediately, so the ledger falls back to zero between them
+    // and all six fit under a 4-buffer grant. What the grant must never do is let the
+    // locked total exceed it at any instant — that is the assertion above on `bytes`.
+    assert_eq!(
+        capped, capped_ungranted,
+        "with the grant in place and one buffer live at a time, nothing more is capped"
+    );
+
+    // --- the ceiling actually caps ----------------------------------------------------
+    // Hold them all at once this time. Past the grant, allocation continues and simply
+    // stays pageable, which is the fallback the whole design leans on.
+    {
+        let _held: Vec<_> = (0..N).map(|_| SharedBuf::with_len(BIG)).collect();
+        let (_, _, bytes_held, capped_held) = pin_profile();
+        assert!(
+            bytes_held <= (BIG * 4) as u64,
+            "locked bytes never exceed the grant"
+        );
+        assert!(
+            capped_held > 0,
+            "the buffers past the grant are left pageable"
+        );
+    }
+    assert_eq!(
+        pin_profile().2,
+        0,
+        "releasing them returns the ledger to zero"
+    );
 
     // --- a recycled buffer is NOT re-registered ---------------------------------------
     // Registering the same address twice is a driver error, and the pool hands the same

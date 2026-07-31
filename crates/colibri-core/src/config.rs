@@ -424,7 +424,10 @@ impl Config {
             max_ctx: gi("max_position_embeddings"),
             n_group: gi("n_group"),
             topk_group: gi("topk_group"),
-            norm_topk: r.get("norm_topk_prob").and_then(Json::as_bool).unwrap_or(false),
+            norm_topk: r
+                .get("norm_topk_prob")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             stop_ids: Vec::new(),
             index_topk: gi("index_topk"),
             index_nh: gi("index_n_heads"),
@@ -494,7 +497,10 @@ impl Config {
             if freq < 1 {
                 freq = 1;
             }
-            let off = r.get("index_skip_topk_offset").and_then(Json::as_i64).unwrap_or(2) as i32;
+            let off = r
+                .get("index_skip_topk_offset")
+                .and_then(Json::as_i64)
+                .unwrap_or(2) as i32;
             for (i, slot) in c.idx_type.iter_mut().enumerate() {
                 let ii = i as i32;
                 if let Some(arr) = it {
@@ -546,10 +552,7 @@ impl Config {
         // first-dense count = leading zeros of `moe_layer_freq` (dense layers precede
         // the MoE stack); fall back to `first_k_dense_replace` if the list is absent.
         let first_dense = match t.get("moe_layer_freq").and_then(Json::as_array) {
-            Some(arr) => arr
-                .iter()
-                .take_while(|v| v.as_i64() == Some(0))
-                .count() as i32,
+            Some(arr) => arr.iter().take_while(|v| v.as_i64() == Some(0)).count() as i32,
             None => gt("first_k_dense_replace"),
         };
 
@@ -561,7 +564,10 @@ impl Config {
         // leading dense layers are 0). Absent config → dense everywhere.
         let sac = t.get("sparse_attention_config");
         let sg = |k: &str, d: i32| {
-            sac.and_then(|s| s.get(k)).and_then(Json::as_i64).map(|v| v as i32).unwrap_or(d)
+            sac.and_then(|s| s.get(k))
+                .and_then(Json::as_i64)
+                .map(|v| v as i32)
+                .unwrap_or(d)
         };
         let index_nh = sg("sparse_num_index_heads", 0);
         let index_hd = sg("sparse_index_dim", 0);
@@ -569,13 +575,15 @@ impl Config {
         let index_topk_blocks = sg("sparse_topk_blocks", 0);
         let index_local_blocks = sg("sparse_local_block", 0);
         let nlc = (gt("num_hidden_layers").max(0) as usize).min(MAX_LAYERS_IDX);
-        let idx_type: Vec<bool> =
-            match sac.and_then(|s| s.get("sparse_attention_freq")).and_then(Json::as_array) {
-                Some(arr) => {
-                    (0..nlc).map(|i| arr.get(i).and_then(Json::as_i64).unwrap_or(0) != 0).collect()
-                }
-                None => vec![false; nlc],
-            };
+        let idx_type: Vec<bool> = match sac
+            .and_then(|s| s.get("sparse_attention_freq"))
+            .and_then(Json::as_array)
+        {
+            Some(arr) => (0..nlc)
+                .map(|i| arr.get(i).and_then(Json::as_i64).unwrap_or(0) != 0)
+                .collect(),
+            None => vec![false; nlc],
+        };
 
         let mut c = Config {
             hidden: gt("hidden_size"),
@@ -586,7 +594,7 @@ impl Config {
             moe_inter: gt("intermediate_size"), // expert FFN width
             dense_inter: gt("dense_intermediate_size"),
             first_dense,
-            q_lora: 0, // GQA: no query LoRA
+            q_lora: 0,  // GQA: no query LoRA
             kv_lora: 0, // GQA: no latent KV
             qk_nope,
             qk_rope,
@@ -610,8 +618,15 @@ impl Config {
             index_local_blocks,
             idx_type,
             eps: t.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
-            theta: t.get("rope_theta").and_then(Json::as_f64).unwrap_or(10000.0) as f32,
-            attn_scale: if head_dim > 0 { 1.0 / (head_dim as f32).sqrt() } else { 0.0 },
+            theta: t
+                .get("rope_theta")
+                .and_then(Json::as_f64)
+                .unwrap_or(10000.0) as f32,
+            attn_scale: if head_dim > 0 {
+                1.0 / (head_dim as f32).sqrt()
+            } else {
+                0.0
+            },
             routed_scale: t
                 .get("routed_scaling_factor")
                 .and_then(Json::as_f64)
@@ -619,10 +634,19 @@ impl Config {
             arch,
             n_kv_heads: gt("num_key_value_heads"),
             shared_inter: gt("shared_intermediate_size"),
-            qk_norm: t.get("use_qk_norm").and_then(Json::as_bool).unwrap_or(false),
-            gemma_norm: t.get("use_gemma_norm").and_then(Json::as_bool).unwrap_or(false),
+            qk_norm: t
+                .get("use_qk_norm")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+            gemma_norm: t
+                .get("use_gemma_norm")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             swiglu_oai: act == "swigluoai",
-            swiglu_alpha: t.get("swiglu_alpha").and_then(Json::as_f64).unwrap_or(1.702) as f32,
+            swiglu_alpha: t
+                .get("swiglu_alpha")
+                .and_then(Json::as_f64)
+                .unwrap_or(1.702) as f32,
             swiglu_limit: t.get("swiglu_limit").and_then(Json::as_f64).unwrap_or(7.0) as f32,
             sigmoid_route: scoring == "sigmoid",
             // Nemotron-H-only fields (unused by MiniMax).
@@ -679,9 +703,18 @@ impl Config {
     /// mis-sizes the expert cache by the entire model.
     pub fn moe_layers(&self) -> (usize, usize) {
         if let Some(idx) = self.layer_kind.iter().position(|k| *k == LayerKind::Moe) {
-            (self.layer_kind.iter().filter(|k| **k == LayerKind::Moe).count(), idx)
+            (
+                self.layer_kind
+                    .iter()
+                    .filter(|k| **k == LayerKind::Moe)
+                    .count(),
+                idx,
+            )
         } else {
-            ((self.n_layers - self.first_dense).max(0) as usize, self.first_dense.max(0) as usize)
+            (
+                (self.n_layers - self.first_dense).max(0) as usize,
+                self.first_dense.max(0) as usize,
+            )
         }
     }
 
@@ -703,7 +736,10 @@ impl Config {
         let gt = |k: &str| gi_in(t, k);
         let lac = t.get("linear_attn_config");
         let lg = |k: &str, d: i32| {
-            lac.and_then(|s| s.get(k)).and_then(Json::as_i64).map(|v| v as i32).unwrap_or(d)
+            lac.and_then(|s| s.get(k))
+                .and_then(Json::as_i64)
+                .map(|v| v as i32)
+                .unwrap_or(d)
         };
         let nlc = (gt("num_hidden_layers").max(0) as usize).min(MAX_LAYERS_IDX);
 
@@ -719,7 +755,11 @@ impl Config {
             .unwrap_or_default();
         let layer_kind: Vec<LayerKind> = (0..nlc)
             .map(|i| {
-                if full.contains(&(i as i64 + 1)) { LayerKind::Attn } else { LayerKind::Kda }
+                if full.contains(&(i as i64 + 1)) {
+                    LayerKind::Attn
+                } else {
+                    LayerKind::Kda
+                }
             })
             .collect();
 
@@ -744,7 +784,10 @@ impl Config {
             max_ctx: gt("max_position_embeddings"),
             n_group: gt("num_expert_group").max(1),
             topk_group: gt("topk_group").max(1),
-            norm_topk: t.get("moe_renormalize").and_then(Json::as_bool).unwrap_or(false),
+            norm_topk: t
+                .get("moe_renormalize")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             stop_ids: Vec::new(),
             // No DSA lightning indexer on K3 — sparsity is the KDA mixer, not a
             // block-sparse index over a dense cache.
@@ -756,7 +799,10 @@ impl Config {
             index_local_blocks: 0,
             idx_type: Vec::new(),
             eps: t.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-5) as f32,
-            theta: t.get("rope_theta").and_then(Json::as_f64).unwrap_or(10000.0) as f32,
+            theta: t
+                .get("rope_theta")
+                .and_then(Json::as_f64)
+                .unwrap_or(10000.0) as f32,
             attn_scale: 0.0,
             routed_scale: t
                 .get("routed_scaling_factor")
@@ -789,12 +835,18 @@ impl Config {
             relu2: false,
             mamba_dt_min: 0.0,
             situ: t.get("hidden_act").and_then(Json::as_str) == Some("situ"),
-            situ_beta: t.get("activation_situ_beta").and_then(Json::as_f64).unwrap_or(1.0) as f32,
+            situ_beta: t
+                .get("activation_situ_beta")
+                .and_then(Json::as_f64)
+                .unwrap_or(1.0) as f32,
             situ_linear_beta: t
                 .get("activation_situ_linear_beta")
                 .and_then(Json::as_f64)
                 .unwrap_or(0.0) as f32,
-            mla_nope: t.get("mla_use_nope").and_then(Json::as_bool).unwrap_or(false),
+            mla_nope: t
+                .get("mla_use_nope")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             kda_n_heads: lg("num_heads", 0),
             kda_head_dim: lg("head_dim", 0),
             kda_d_conv: lg("short_conv_kernel_size", 0),
@@ -836,7 +888,12 @@ impl Config {
         }
         ckr!("linear_attn_config.num_heads", c.kda_n_heads, 1, 1 << 16);
         ckr!("linear_attn_config.head_dim", c.kda_head_dim, 1, 1 << 16);
-        ckr!("linear_attn_config.short_conv_kernel_size", c.kda_d_conv, 1, 1 << 8);
+        ckr!(
+            "linear_attn_config.short_conv_kernel_size",
+            c.kda_d_conv,
+            1,
+            1 << 8
+        );
         ckr!("routed_expert_hidden_size", c.moe_latent, 0, 1 << 24);
         ckr!("kv_lora_rank", c.kv_lora, 1, 1 << 16);
         // The driver takes `layer_idx % attn_res_block_size`, so 0 would divide by zero,
@@ -865,14 +922,19 @@ impl Config {
         let qk_nope = head_dim - qk_rope;
 
         // Per-layer mixer kinds from the hybrid pattern; length must == num_hidden_layers.
-        let layer_kind =
-            parse_hybrid_pattern(r.get("hybrid_override_pattern").and_then(Json::as_str).unwrap_or(""),
-                                 "hybrid_override_pattern")?;
+        let layer_kind = parse_hybrid_pattern(
+            r.get("hybrid_override_pattern")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+            "hybrid_override_pattern",
+        )?;
         // The MTP speculative head's own sublayer sequence (`"*E"` on Nemotron-H-MTP:
         // an attention block then a latent-MoE block). Absent on checkpoints without a
         // head, in which case this stays empty and the engine simply never loads one.
         let mtp_layer_kind = parse_hybrid_pattern(
-            r.get("mtp_hybrid_override_pattern").and_then(Json::as_str).unwrap_or(""),
+            r.get("mtp_hybrid_override_pattern")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
             "mtp_hybrid_override_pattern",
         )?;
 
@@ -901,7 +963,10 @@ impl Config {
             max_ctx: gi("max_position_embeddings"),
             n_group: gi("n_group").max(1),
             topk_group: gi("topk_group").max(1),
-            norm_topk: r.get("norm_topk_prob").and_then(Json::as_bool).unwrap_or(true),
+            norm_topk: r
+                .get("norm_topk_prob")
+                .and_then(Json::as_bool)
+                .unwrap_or(true),
             stop_ids: Vec::new(),
             index_topk: 0,
             index_nh: 0,
@@ -913,7 +978,11 @@ impl Config {
             // Nemotron-H uses `layer_norm_epsilon` (also mirrored as `norm_eps`), both 1e-5.
             eps: gf("layer_norm_epsilon", gf("norm_eps", 1e-5)) as f32,
             theta: gf("rope_theta", 10000.0) as f32,
-            attn_scale: if head_dim > 0 { 1.0 / (head_dim as f32).sqrt() } else { 0.0 },
+            attn_scale: if head_dim > 0 {
+                1.0 / (head_dim as f32).sqrt()
+            } else {
+                0.0
+            },
             routed_scale: gf("routed_scaling_factor", 1.0) as f32,
             arch: Arch::NemotronH,
             n_kv_heads: gi("num_key_value_heads"),
@@ -963,7 +1032,12 @@ impl Config {
         ckr!("n_groups", c.mamba_n_groups, 1, c.mamba_n_heads);
         ckr!("chunk_size", c.mamba_chunk, 1, 1 << 16);
         ckr!("moe_latent_size", c.moe_latent, 1, 1 << 20);
-        ckr!("moe_shared_expert_intermediate_size", c.shared_inter, 1, 1 << 24);
+        ckr!(
+            "moe_shared_expert_intermediate_size",
+            c.shared_inter,
+            1,
+            1 << 24
+        );
         if c.layer_kind.len() != c.n_layers as usize {
             return Err(ConfigError::Unsupported(format!(
                 "nemotron_h: hybrid_override_pattern length {} != num_hidden_layers {}",
@@ -1268,22 +1342,40 @@ mod tests {
         .unwrap();
         let c = Config::from_json(&text).expect("nemotron_h parse");
         assert_eq!(c.arch, Arch::NemotronH);
-        assert!(!c.arch.is_gqa(), "NemotronH is not blanket-GQA (per-layer dispatch)");
+        assert!(
+            !c.arch.is_gqa(),
+            "NemotronH is not blanket-GQA (per-layer dispatch)"
+        );
         assert_eq!(c.hidden, 4096);
         assert_eq!(c.n_kv_heads, 2);
         assert_eq!((c.qk_rope, c.qk_nope, c.qk_head), (128, 0, 128)); // full rope
         assert_eq!(c.mamba_d_state, 128);
-        assert_eq!((c.mamba_n_heads, c.mamba_head_dim, c.mamba_inter), (128, 64, 8192));
-        assert_eq!((c.mamba_n_groups, c.mamba_d_conv, c.mamba_chunk), (8, 4, 128));
-        assert_eq!((c.moe_latent, c.moe_inter, c.shared_inter), (1024, 2688, 5376));
+        assert_eq!(
+            (c.mamba_n_heads, c.mamba_head_dim, c.mamba_inter),
+            (128, 64, 8192)
+        );
+        assert_eq!(
+            (c.mamba_n_groups, c.mamba_d_conv, c.mamba_chunk),
+            (8, 4, 128)
+        );
+        assert_eq!(
+            (c.moe_latent, c.moe_inter, c.shared_inter),
+            (1024, 2688, 5376)
+        );
         assert!(c.relu2 && c.sigmoid_route && c.norm_topk);
         assert_eq!(c.routed_scale, 5.0);
         assert!((c.mamba_dt_min - 0.001).abs() < 1e-9);
         assert_eq!(
             c.layer_kind,
             vec![
-                LayerKind::Mamba, LayerKind::Moe, LayerKind::Mamba, LayerKind::Moe,
-                LayerKind::Mamba, LayerKind::Moe, LayerKind::Mamba, LayerKind::Attn,
+                LayerKind::Mamba,
+                LayerKind::Moe,
+                LayerKind::Mamba,
+                LayerKind::Moe,
+                LayerKind::Mamba,
+                LayerKind::Moe,
+                LayerKind::Mamba,
+                LayerKind::Attn,
             ]
         );
         // No `mtp_hybrid_override_pattern` in this checkpoint -> no head sublayers, but
@@ -1315,9 +1407,17 @@ mod tests {
         )
         .unwrap();
         let c = Config::from_json(&text).expect("nemotron_h + mtp parse");
-        assert_eq!(c.layer_kind.len(), 8, "main stack unchanged by the head pattern");
+        assert_eq!(
+            c.layer_kind.len(),
+            8,
+            "main stack unchanged by the head pattern"
+        );
         assert_eq!(c.mtp_layer_kind, vec![LayerKind::Attn, LayerKind::Moe]);
-        assert_eq!(c.mtp_head_layers(), 2, "head occupies n_layers and n_layers+1");
+        assert_eq!(
+            c.mtp_head_layers(),
+            2,
+            "head occupies n_layers and n_layers+1"
+        );
     }
 
     /// A bad character in the head pattern must be rejected with the HEAD's field name,
@@ -1341,7 +1441,10 @@ mod tests {
         .unwrap();
         match Config::from_json(&text) {
             Err(ConfigError::Unsupported(m)) => {
-                assert!(m.contains("mtp_hybrid_override_pattern"), "wrong field named: {m}")
+                assert!(
+                    m.contains("mtp_hybrid_override_pattern"),
+                    "wrong field named: {m}"
+                )
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -1359,7 +1462,10 @@ mod tests {
             "n_groups":8,"chunk_size":128}"#,
         )
         .unwrap();
-        assert!(matches!(Config::from_json(&text), Err(ConfigError::Unsupported(_))));
+        assert!(matches!(
+            Config::from_json(&text),
+            Err(ConfigError::Unsupported(_))
+        ));
     }
 
     // ---- Kimi-K3 ----------------------------------------------------------------
@@ -1405,12 +1511,32 @@ mod tests {
         assert_eq!(c.arch, Arch::KimiK3);
         assert!(!c.arch.is_gqa(), "K3 is MLA + KDA, not the GQA family");
         assert_eq!(c.layer_kind.len(), 93);
-        assert_eq!(c.layer_kind[0], LayerKind::Kda, "config layer 1 -> index 0, KDA");
-        assert_eq!(c.layer_kind[3], LayerKind::Attn, "config layer 4 -> index 3, MLA");
+        assert_eq!(
+            c.layer_kind[0],
+            LayerKind::Kda,
+            "config layer 1 -> index 0, KDA"
+        );
+        assert_eq!(
+            c.layer_kind[3],
+            LayerKind::Attn,
+            "config layer 4 -> index 3, MLA"
+        );
         assert_eq!(c.layer_kind[91], LayerKind::Attn, "config 92");
-        assert_eq!(c.layer_kind[92], LayerKind::Attn, "config 93, the trailing MLA layer");
-        let n_attn = c.layer_kind.iter().filter(|k| **k == LayerKind::Attn).count();
-        let n_kda = c.layer_kind.iter().filter(|k| **k == LayerKind::Kda).count();
+        assert_eq!(
+            c.layer_kind[92],
+            LayerKind::Attn,
+            "config 93, the trailing MLA layer"
+        );
+        let n_attn = c
+            .layer_kind
+            .iter()
+            .filter(|k| **k == LayerKind::Attn)
+            .count();
+        let n_kda = c
+            .layer_kind
+            .iter()
+            .filter(|k| **k == LayerKind::Kda)
+            .count();
         assert_eq!((n_attn, n_kda), (24, 69));
     }
 
@@ -1424,7 +1550,10 @@ mod tests {
         assert_eq!((c.n_experts, c.topk, c.n_shared), (896, 16, 2));
         assert_eq!(c.moe_latent, 3584, "Stable LatentMoE bottleneck");
         assert_eq!(c.shared_inter, 6144, "2 x 3072, fused in the checkpoint");
-        assert_eq!((c.kv_lora, c.qk_nope, c.qk_rope, c.v_head), (512, 128, 64, 128));
+        assert_eq!(
+            (c.kv_lora, c.qk_nope, c.qk_rope, c.v_head),
+            (512, 128, 64, 128)
+        );
         // The MLA per-head query width, fixed up after the literal like GLM's. This is
         // the attention geometry only — the GQA full-KV charge is gated on
         // `allocates_gqa_kv` (false for K3), so a non-zero `qk_head` costs no KV.
@@ -1436,8 +1565,14 @@ mod tests {
         // `situ` applies to the dense MLP, the shared experts AND the routed experts.
         assert!(c.situ, "hidden_act = situ");
         assert_eq!((c.situ_beta, c.situ_linear_beta), (4.0, 25.0));
-        assert!(!c.swiglu_oai && !c.relu2, "situ must not also select another variant");
-        assert!((c.attn_scale - 1.0 / 192f32.sqrt()).abs() < 1e-9, "scale = q_head_dim^-0.5");
+        assert!(
+            !c.swiglu_oai && !c.relu2,
+            "situ must not also select another variant"
+        );
+        assert!(
+            (c.attn_scale - 1.0 / 192f32.sqrt()).abs() < 1e-9,
+            "scale = q_head_dim^-0.5"
+        );
         assert_eq!((c.kda_n_heads, c.kda_head_dim, c.kda_d_conv), (96, 128, 4));
         assert_eq!((c.first_dense, c.max_ctx, c.vocab), (1, 1048576, 163840));
         assert!(c.sigmoid_route && c.norm_topk);
@@ -1452,7 +1587,10 @@ mod tests {
     fn kimi_k3_is_not_swallowed_by_the_minimax_m3_text_config_check() {
         let c = kimi_k3_cfg(K3_ATTN).expect("kimi_k3 parse");
         assert_eq!(c.arch, Arch::KimiK3, "must not fall through to MinimaxM3");
-        assert!(!c.layer_kind.is_empty(), "M3 would have left layer_kind empty");
+        assert!(
+            !c.layer_kind.is_empty(),
+            "M3 would have left layer_kind empty"
+        );
     }
 
     /// MoE-ness is NOT on the `layer_kind` axis for K3: every layer past `first_dense`
@@ -1461,7 +1599,10 @@ mod tests {
     #[test]
     fn kimi_k3_moe_layers_come_from_the_prefix_rule() {
         let c = kimi_k3_cfg(K3_ATTN).expect("kimi_k3 parse");
-        assert!(!c.layer_kind.contains(&LayerKind::Moe), "no Moe on the mixer axis");
+        assert!(
+            !c.layer_kind.contains(&LayerKind::Moe),
+            "no Moe on the mixer axis"
+        );
         assert_eq!(c.moe_layers(), (92, 1), "layers 1..=92, probe at the first");
     }
 
@@ -1480,7 +1621,11 @@ mod tests {
         )
         .unwrap();
         let c = Config::from_json(&text).expect("nemotron parse");
-        assert_eq!(c.moe_layers(), (3, 1), "the three 'E' layers, first at index 1");
+        assert_eq!(
+            c.moe_layers(),
+            (3, 1),
+            "the three 'E' layers, first at index 1"
+        );
     }
 
     /// A `full_attn_layers` list that names no layer of this stack (e.g. someone fed it
@@ -1490,6 +1635,9 @@ mod tests {
     #[test]
     fn kimi_k3_rejects_a_full_attn_list_naming_no_layer() {
         assert!(matches!(kimi_k3_cfg(""), Err(ConfigError::Unsupported(_))));
-        assert!(matches!(kimi_k3_cfg("500,900"), Err(ConfigError::Unsupported(_))));
+        assert!(matches!(
+            kimi_k3_cfg("500,900"),
+            Err(ConfigError::Unsupported(_))
+        ));
     }
 }

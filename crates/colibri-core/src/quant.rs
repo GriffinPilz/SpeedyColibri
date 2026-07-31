@@ -57,7 +57,11 @@ enum Store {
     /// The owner is a type-erased `Arc` so the mapping itself can live in
     /// `colibri-safetensors` (which has `libc`) rather than dragging platform code
     /// into this crate.
-    View { ptr: *const u8, len: usize, _owner: std::sync::Arc<dyn std::any::Any + Send + Sync> },
+    View {
+        ptr: *const u8,
+        len: usize,
+        _owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    },
 }
 
 // SAFETY: a `View` is immutable for its whole life and its bytes stay mapped as long as
@@ -73,10 +77,131 @@ struct Pool {
     bytes: u64,
 }
 
-static BUF_POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool { bufs: Vec::new(), bytes: 0 });
+static BUF_POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool {
+    bufs: Vec::new(),
+    bytes: 0,
+});
 
 /// Don't pool buffers smaller than this — tiny reads don't pay the fault cost.
 const POOL_MIN_BYTES: usize = 1 << 20;
+
+/// Page-lock hooks, installed by the CUDA backend once a device exists.
+///
+/// A GPU copy out of *pageable* host memory is bounced through the driver's own staging
+/// buffer; out of *registered* memory it is a straight DMA. That difference is the whole
+/// reason the expert staging path has to copy every expert into a pinned buffer before
+/// uploading it — a copy that was measured at 10.5 CPU-seconds per M2.7 prefill, spent on a
+/// box whose cores were already oversubscribed. Pinning the pool's own allocations lets the
+/// upload read them where they already are.
+///
+/// The pool is the right place for this because it is bounded and it recycles: registration
+/// is paid once per *allocation*, not once per expert, and a few dozen buffers then serve
+/// every expert for the rest of the run.
+///
+/// Unset when there is no CUDA device, which is also what makes this free for CPU-only
+/// builds — no hook, no registration, and the allocation path is exactly what it was.
+type PinHooks = (fn(*mut u8, usize) -> bool, fn(*mut u8));
+static HOST_PIN: std::sync::OnceLock<PinHooks> = std::sync::OnceLock::new();
+
+/// Base pointers currently page-locked by [`pin_alloc`].
+///
+/// Needed because hooks are installed *after* startup: buffers allocated before then are
+/// unregistered, and unregistering one would be a driver error on memory it never locked.
+/// Tracking what we actually registered is what keeps release symmetric with acquire.
+static PINNED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Page-locks succeeded / failed, and the bytes currently locked.
+pub static PIN_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PIN_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PIN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Allocations left pageable because [`pin_max_bytes`] was already reached. Non-zero is
+/// normal and healthy — it is the ceiling doing its job, not a failure.
+pub static PIN_CAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Install the page-lock hooks. Called by the CUDA backend from `init`; idempotent.
+pub fn set_host_pin_hooks(reg: fn(*mut u8, usize) -> bool, unreg: fn(*mut u8)) {
+    let _ = HOST_PIN.set((reg, unreg));
+}
+
+/// Ceiling on page-locked bytes (`COLI_PIN_MAX_MB`, default 8192).
+///
+/// **This bound is the load-bearing part, not the pinning.** Page-locked memory cannot be
+/// reclaimed by the kernel, and under max residency the expert cache holds *tens of GB* of
+/// pooled buffers — pinning all of them would make most of a 121 GB box unreclaimable and
+/// hand back the memory ceiling that `memory-ceiling-is-real` and the RAM ledger exist to
+/// hold. Worse, it would pass a short smoke test: the ceiling is only violated once the
+/// cache has filled, which a 12-token run never reaches.
+///
+/// A few GB is enough to matter here regardless, because the pool *recycles*: the bytes
+/// that need to be pinned are the ones in flight for the current group, not the whole
+/// resident set. Buffers past the cap simply stay pageable and take the pack, which is the
+/// behaviour that shipped before any of this.
+fn pin_max_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_PIN_MAX_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8192u64)
+            << 20
+    })
+}
+
+/// Page-lock a freshly allocated pool buffer, if there is a device to pin it for.
+fn pin_alloc(v: &mut Vec<u8>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((reg, _)) = HOST_PIN.get() else {
+        return;
+    };
+    if v.capacity() < POOL_MIN_BYTES {
+        return;
+    }
+    if PIN_BYTES.load(Relaxed) + v.capacity() as u64 > pin_max_bytes() {
+        PIN_CAPPED.fetch_add(1, Relaxed);
+        return;
+    }
+    let p = v.as_mut_ptr();
+    // `cudaHostRegister` wants a page-aligned range. At >= 1 MiB malloc serves the
+    // allocation via mmap so this holds, but a `false` here is a silent no-pin rather
+    // than a driver error, and the counter says which happened.
+    if (p as usize) % 4096 != 0 {
+        PIN_FAIL.fetch_add(1, Relaxed);
+        return;
+    }
+    if reg(p, v.capacity()) {
+        PINNED.lock().unwrap().insert(p as usize);
+        PIN_OK.fetch_add(1, Relaxed);
+        PIN_BYTES.fetch_add(v.capacity() as u64, Relaxed);
+    } else {
+        PIN_FAIL.fetch_add(1, Relaxed);
+    }
+}
+
+/// Release a page-lock before the allocation is freed. A registration that outlives its
+/// memory is a dangling page-lock in the driver, so this must run on every free path.
+fn unpin_alloc(v: &mut Vec<u8>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((_, unreg)) = HOST_PIN.get() else {
+        return;
+    };
+    let p = v.as_mut_ptr();
+    if PINNED.lock().unwrap().remove(&(p as usize)) {
+        unreg(p);
+        PIN_BYTES.fetch_sub(v.capacity() as u64, Relaxed);
+    }
+}
+
+/// `(page-locks taken, failed, bytes currently locked, capped by the ceiling)`.
+pub fn pin_profile() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PIN_OK.load(Relaxed),
+        PIN_FAIL.load(Relaxed),
+        PIN_BYTES.load(Relaxed),
+        PIN_CAPPED.load(Relaxed),
+    )
+}
 
 /// Max pooled entries (`COLI_BUF_POOL`; `0` disables recycling).
 ///
@@ -113,7 +238,10 @@ const POOL_MIN_BYTES: usize = 1 << 20;
 fn pool_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("COLI_BUF_POOL").ok().and_then(|s| s.parse().ok()).unwrap_or(128)
+        std::env::var("COLI_BUF_POOL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128)
     })
 }
 
@@ -159,6 +287,7 @@ pub fn arena_init(slot_bytes: usize, slots: usize) -> u64 {
         for p in (0..slot_bytes).step_by(4096) {
             unsafe { std::ptr::write_volatile(v.as_mut_ptr().add(p), 0) };
         }
+        pin_alloc(&mut v); // arena slots live for the process, so this is paid once each
         pool.bytes += v.capacity() as u64;
         pool.bufs.push(v);
     }
@@ -183,7 +312,10 @@ pub fn arena_cfg() -> Option<(usize, usize)> {
 fn pool_max_bytes() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("COLI_BUF_POOL_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(2048u64)
+        std::env::var("COLI_BUF_POOL_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048u64)
             << 20
     })
 }
@@ -249,7 +381,9 @@ impl SharedBuf {
                 v.truncate(len);
                 v.resize(len, 0);
                 POOL_HITS.fetch_add(1, Relaxed);
-                return SharedBuf { store: Store::Heap(v) };
+                return SharedBuf {
+                    store: Store::Heap(v),
+                };
             }
             POOL_MISSES.fetch_add(1, Relaxed);
             // Arena mode, right-sized request, no slot free: every slot is currently
@@ -282,7 +416,9 @@ impl SharedBuf {
                         v.truncate(len);
                         v.resize(len, 0);
                         POOL_HITS.fetch_add(1, Relaxed);
-                        return SharedBuf { store: Store::Heap(v) };
+                        return SharedBuf {
+                            store: Store::Heap(v),
+                        };
                     }
                     drop(p);
                     spins += 1;
@@ -299,7 +435,11 @@ impl SharedBuf {
                 }
             }
         }
-        SharedBuf { store: Store::Heap(vec![0u8; len]) }
+        let mut v = vec![0u8; len];
+        pin_alloc(&mut v);
+        SharedBuf {
+            store: Store::Heap(v),
+        }
     }
 
     /// Wrap `len` bytes at `ptr` that are owned by `owner`, without copying.
@@ -313,7 +453,13 @@ impl SharedBuf {
         ptr: *const u8,
         len: usize,
     ) -> SharedBuf {
-        SharedBuf { store: Store::View { ptr, len, _owner: owner } }
+        SharedBuf {
+            store: Store::View {
+                ptr,
+                len,
+                _owner: owner,
+            },
+        }
     }
 
     /// True when this buffer is a borrowed view rather than an owned allocation.
@@ -340,7 +486,9 @@ impl Drop for SharedBuf {
     fn drop(&mut self) {
         // Only heap allocations are recycled. A view owns nothing — pooling its bytes
         // would hand a mapped region out as a scratch buffer for the next read.
-        let Store::Heap(v) = &mut self.store else { return };
+        let Store::Heap(v) = &mut self.store else {
+            return;
+        };
         let v = std::mem::take(v);
         if v.capacity() >= POOL_MIN_BYTES {
             use std::sync::atomic::Ordering::Relaxed;
@@ -357,7 +505,12 @@ impl Drop for SharedBuf {
                 POOL_PUSHES.fetch_add(1, Relaxed);
             } else {
                 // Rejected: `v` is dropped here, and at >=1 MB malloc served it via mmap,
-                // so this is a real munmap with page-table teardown — the 2057 ms.
+                // so this is a real munmap with page-table teardown — the 2057 ms. Release
+                // the page-lock first: the driver must not be left holding a registration
+                // for memory that is about to be handed back to the kernel.
+                drop(pool);
+                let mut v = v;
+                unpin_alloc(&mut v);
                 POOL_DROPS.fetch_add(1, Relaxed);
                 POOL_DROP_BYTES.fetch_add(cap, Relaxed);
             }
@@ -584,7 +737,11 @@ mod tests {
             *b = i as u8;
         }
         let arc = std::sync::Arc::new(sb);
-        let v = Bytes::Shared { buf: arc.clone(), off: 16, len: 8 };
+        let v = Bytes::Shared {
+            buf: arc.clone(),
+            off: 16,
+            len: 8,
+        };
         assert_eq!(&*v, &[16, 17, 18, 19, 20, 21, 22, 23]);
         assert_eq!(v.len(), 8);
     }

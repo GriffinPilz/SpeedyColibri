@@ -20,7 +20,11 @@ const SLOTS: usize = 8;
 fn arena_claims_its_memory_once_and_then_recycles_by_overwrite() {
     // --- the grant is exact ---------------------------------------------------------
     let claimed = arena_init(SLOT, SLOTS);
-    assert_eq!(claimed, (SLOT * SLOTS) as u64, "the arena claims exactly what it was asked");
+    assert_eq!(
+        claimed,
+        (SLOT * SLOTS) as u64,
+        "the arena claims exactly what it was asked"
+    );
     assert_eq!(arena_cfg(), Some((SLOT, SLOTS)));
 
     // --- lending out every slot does not allocate ------------------------------------
@@ -31,7 +35,11 @@ fn arena_claims_its_memory_once_and_then_recycles_by_overwrite() {
         let mut addrs: Vec<usize> = held.iter().map(|b| b.as_ptr() as usize).collect();
         addrs.sort_unstable();
         addrs.dedup();
-        assert_eq!(addrs.len(), SLOTS, "every lent slot must be distinct memory");
+        assert_eq!(
+            addrs.len(),
+            SLOTS,
+            "every lent slot must be distinct memory"
+        );
     } // all returned here
 
     // --- and re-taking them costs NO fresh allocation --------------------------------
@@ -63,10 +71,15 @@ fn arena_claims_its_memory_once_and_then_recycles_by_overwrite() {
     arena_init(SLOT, more);
     let (_, m0, _, d0, _) = pool_profile();
     {
-        let held: Vec<_> = (0..(SLOTS + more)).map(|_| SharedBuf::with_len(SLOT)).collect();
+        let held: Vec<_> = (0..(SLOTS + more))
+            .map(|_| SharedBuf::with_len(SLOT))
+            .collect();
         assert_eq!(held.len(), SLOTS + more);
     }
     let (_, m1, _, d1, _) = pool_profile();
-    assert_eq!(d1, d0, "a return past the organic cap must still be accepted in arena mode");
+    assert_eq!(
+        d1, d0,
+        "a return past the organic cap must still be accepted in arena mode"
+    );
     assert_eq!(m1, m0, "and taking every slot must not allocate");
 }

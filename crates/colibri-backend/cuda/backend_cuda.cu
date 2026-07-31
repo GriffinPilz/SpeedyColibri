@@ -1763,6 +1763,31 @@ extern "C" int coli_cuda_pageable_access(int device) {
     return v;
 }
 
+/* Page-lock a host allocation the engine already owns, so the GPU can DMA straight out of
+ * it. This is what lets the expert staging path skip its CPU pack: a copy out of PAGEABLE
+ * memory is bounced through the driver's own staging buffer (measured at 1-2 GB/s, and the
+ * reason COLI_GROUP_DIRECT came out 2.3x slower), while a copy out of registered memory is
+ * a straight DMA at the 56 GB/s this box actually does.
+ *
+ * Registration is per allocation, not per use — the expert buffer pool recycles a bounded
+ * set of allocations, so the cost is paid once each and amortised over every later expert
+ * that lands in that slot.
+ *
+ * Returns 0 on failure and CLEARS the error, which matters more than it looks: a sticky
+ * CUDA error turns the next unrelated launch into a silent CPU fallback. Failing to pin is
+ * allowed — the caller keeps the pack. Failing quietly and poisoning the context is not. */
+extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
+    if (!p || !bytes) return 0;
+    cudaError_t e = cudaHostRegister(p, bytes, cudaHostRegisterDefault);
+    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
+    return 1;
+}
+
+extern "C" void coli_cuda_host_unregister(void *p) {
+    if (!p) return;
+    if (cudaHostUnregister(p) != cudaSuccess) cudaGetLastError();
+}
+
 extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
     size_t count = 0, bytes = 0;
     for (int i = 0; i < g_nctx; i++) if (device < 0 || g_ctx[i].device == device) {
@@ -2728,6 +2753,7 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
  * call declines and the caller falls back per-expert. */
 static int g_grp_evt=-1; static double g_grp_pack_ms=0, g_grp_h2d_ms=0, g_grp_bytes=0; static long long g_grp_chunks=0;
 static double g_grp_thr_sum=0, g_grp_thr_max=0, g_grp_thr_cpu=0; static long long g_grp_nthr=0;
+static long long g_grp_pin_experts=0, g_grp_all_experts=0;
 
 extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
         ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,
@@ -2836,6 +2862,40 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
              * 1.26 GB/s is slow even for one core: it is fault- and latency-bound, not
              * bandwidth-bound, and that is exactly the shape that parallelises.
              * Each expert writes a disjoint `per`-byte slot, so no synchronisation. */
+            /* Per-expert route selection, and the reason this is asked of the POINTER rather
+             * than of the model: an expert's bytes reach us either as a recycled pool
+             * allocation or as a view into an mmap of the container, and which one it is
+             * varies by model, by coverage, and within a single run. Enumerating the models
+             * that "use heap buffers" is exactly the closed-set mistake that has silently
+             * skipped a model three times in this file. cudaPointerGetAttributes knows.
+             *
+             * A source the driver has page-locked can be DMA'd from directly, so that expert
+             * needs no CPU copy at all. An unregistered source still has to be packed, because
+             * a copy out of pageable memory bounces through the driver's staging buffer —
+             * that is what made COLI_GROUP_DIRECT 2.3x slower, and it is a property of the
+             * memory, not of the idea. Mixed groups are normal and both routes land in the
+             * same device arena slot, so they compose.
+             *
+             * COLI_PIN_DIRECT=0 forces everything back through the pack. */
+            static int s_pindirect=-1;
+            if(s_pindirect<0){const char*e=getenv("COLI_PIN_DIRECT");s_pindirect=(!e||atoi(e));}
+            std::vector<uint8_t> pinned((size_t)count,0);
+            int npin=0;
+            if(s_pindirect){
+                for(int c=0;c<count;c++){
+                    const void *sp[6]={gates[c]->weights,ups[c]->weights,downs[c]->weights,
+                                       gates[c]->bscale,ups[c]->bscale,downs[c]->bscale};
+                    int all=1;
+                    for(int k=0;k<6&&all;k++){
+                        cudaPointerAttributes a{};
+                        if(cudaPointerGetAttributes(&a,sp[k])!=cudaSuccess){cudaGetLastError();all=0;}
+                        else if(a.type!=cudaMemoryTypeHost)all=0;
+                    }
+                    pinned[(size_t)c]=(uint8_t)all; npin+=all;
+                }
+            }
+            g_grp_pin_experts+=npin; g_grp_all_experts+=count;
+
             /* COLI_PACK_THREADS overrides the fan-out. hardware_concurrency() is the wrong
              * default here and the counters say why: the pack's threads spend 85% of their
              * life off-CPU (10.5 s of CPU against 68.9 s of elapsed), queued behind the
@@ -2864,6 +2924,7 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
                  * between them is what this avoids. */
                 timespec c0,c1; clock_gettime(CLOCK_THREAD_CPUTIME_ID,&c0);
                 for(int c=lo;c<hi;c++){
+                    if(pinned[(size_t)c])continue;   // DMA'd straight from its source below
                     uint8_t *dst=hp+(size_t)c*per;
                     const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
                                            (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
@@ -2906,6 +2967,7 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
                     }
                 }
             }
+            else if(npin>=count){ /* nothing to pack — every source is DMA-able */ }
             else if(nthr<=1){ pack_range(0,count); }
             else{
                 std::vector<std::thread> th; th.reserve(nthr);
@@ -2920,10 +2982,37 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
             double pack_ms=std::chrono::duration<double,std::milli>(
                 std::chrono::steady_clock::now()-t_pack).count();
             auto t_h2d=std::chrono::steady_clock::now();
-            resident = s_direct ? cuda_ok(cudaGetLastError(),"expert group nvfp4 direct upload")
-                                : cuda_ok(cudaMemcpyAsync(ctx->lres,ctx->host_lres,wtot,
-                                             cudaMemcpyHostToDevice,ctx->stream),
-                             "expert group nvfp4 layer-resident upload");
+            if(s_direct){
+                resident=cuda_ok(cudaGetLastError(),"expert group nvfp4 direct upload");
+            }else if(npin>0){
+                /* Mixed group: one transfer per expert, from whichever side that expert's
+                 * bytes are already on. Kept off the npin==0 path deliberately — splitting
+                 * one `wtot` transfer into `count` of them is a few percent of launch
+                 * overhead for no gain when nothing is pinned, and this path is on by
+                 * default, so it must cost nothing in the case where it can't help. */
+                for(int c=0;c<count;c++){
+                    uint8_t *dst=(uint8_t*)ctx->lres+(size_t)c*per;
+                    if(!pinned[(size_t)c]){
+                        cudaMemcpyAsync(dst,(const uint8_t*)ctx->host_lres+(size_t)c*per,per,
+                                        cudaMemcpyHostToDevice,ctx->stream);
+                        continue;
+                    }
+                    const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
+                                           (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
+                                           (const uint8_t*)ups[c]->bscale,(const uint8_t*)downs[c]->bscale};
+                    size_t len[6]={gnb,gnb,dnb,gsb,gsb,dsb};
+                    size_t at=0;
+                    for(int k=0;k<6;k++){
+                        cudaMemcpyAsync(dst+at,src[k],len[k],cudaMemcpyHostToDevice,ctx->stream);
+                        at+=len[k];
+                    }
+                }
+                resident=cuda_ok(cudaGetLastError(),"expert group nvfp4 mixed upload");
+            }else{
+                resident=cuda_ok(cudaMemcpyAsync(ctx->lres,ctx->host_lres,wtot,
+                                     cudaMemcpyHostToDevice,ctx->stream),
+                                 "expert group nvfp4 layer-resident upload");
+            }
             /* COLI_GROUP_EVT=1: split the group's transfer from its kernels. Without this
              * the grouped path reports gpu-ffn=0 — it has no counter at all — so the one
              * number rule 3 needs (are we transfer-bound or kernel-bound at 1.26 GB/s
@@ -2944,11 +3033,14 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
                 if((g_grp_chunks%200)==0)
                     fprintf(stderr,"[group-evt] chunks=%lld staged=%.1f GB | pack %.2f s = %.2f GB/s "
                             "| H2D %.2f s = %.2f GB/s | %d experts/chunk | pinned %lld hit/%lld alloc "
-                            "| thr %lld/chunk elapsed-max %.2f s elapsed-sum %.2f s cpu-sum %.2f s\n",
+                            "| thr %lld/chunk elapsed-max %.2f s elapsed-sum %.2f s cpu-sum %.2f s "
+                            "| DMA-direct %lld/%lld experts (%.0f%%)\n",
                             g_grp_chunks,g_grp_bytes/1e9,
                             g_grp_pack_ms/1e3,(g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),
                             g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),count,g_res_pin_hit,g_res_pin_alloc,
-                            g_grp_nthr/g_grp_chunks,g_grp_thr_max/1e3,g_grp_thr_sum/1e3,g_grp_thr_cpu/1e3);
+                            g_grp_nthr/g_grp_chunks,g_grp_thr_max/1e3,g_grp_thr_sum/1e3,g_grp_thr_cpu/1e3,
+                            g_grp_pin_experts,g_grp_all_experts,
+                            g_grp_all_experts?100.0*g_grp_pin_experts/g_grp_all_experts:0.0);
             }
         }
     }

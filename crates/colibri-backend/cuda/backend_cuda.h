@@ -64,6 +64,11 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
 
 /* 1 if the device can read pageable host memory directly (zero-copy wrap works). */
 COLI_CUDA_DLLEXPORT int coli_cuda_pageable_access(int device);
+/* Page-lock host memory the engine already owns, so the GPU can DMA out of it without
+ * the driver bouncing the copy through its own staging buffer. Returns 0 on failure
+ * (and clears the error) — the caller is expected to fall back, not to fail. */
+COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *p, size_t bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *p);
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.

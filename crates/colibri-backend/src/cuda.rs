@@ -67,6 +67,8 @@ extern "C" {
         device: c_int,
     ) -> c_int;
     fn coli_cuda_pageable_access(device: c_int) -> c_int;
+    fn coli_cuda_host_register(p: *mut c_void, bytes: usize) -> c_int;
+    fn coli_cuda_host_unregister(p: *mut c_void);
     fn coli_cuda_set_weight_zerocopy(on: c_int);
     fn coli_cuda_tensor_wrap_mxfp4(
         tensor: *mut *mut ColiCudaTensor,
@@ -321,8 +323,28 @@ pub fn device_count() -> i32 {
 }
 
 /// Initialize the given CUDA device ordinals. Returns whether init succeeded.
+///
+/// Installs the host-pinning hooks on success. They are what lets the expert staging path
+/// DMA straight out of a pooled buffer instead of copying it first; without a device there
+/// is nothing to pin *for*, so they stay uninstalled and the pool allocates as it always did.
 pub fn init(devices: &[i32]) -> bool {
-    unsafe { coli_cuda_init(devices.as_ptr(), devices.len() as c_int) != 0 }
+    let ok = unsafe { coli_cuda_init(devices.as_ptr(), devices.len() as c_int) != 0 };
+    if ok {
+        colibri_core::quant::set_host_pin_hooks(host_register, host_unregister);
+    }
+    ok
+}
+
+/// Page-lock `bytes` at `p`. `false` means the memory stays pageable — a fallback, not an
+/// error: every caller keeps a working path for unpinned memory.
+pub fn host_register(p: *mut u8, bytes: usize) -> bool {
+    unsafe { coli_cuda_host_register(p as *mut c_void, bytes) != 0 }
+}
+
+/// Release a registration taken by [`host_register`]. Must be called before the allocation
+/// is freed — a registration outliving its memory is a dangling page-lock in the driver.
+pub fn host_unregister(p: *mut u8) {
+    unsafe { coli_cuda_host_unregister(p as *mut c_void) }
 }
 
 /// Release all CUDA resources.

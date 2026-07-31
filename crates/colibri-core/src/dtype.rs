@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(f16_to_f32(0xC000), -2.0);
         assert!(f16_to_f32(0x7C00).is_infinite()); // +inf
         assert!(f16_to_f32(0x7E00).is_nan()); // nan
-        // smallest positive subnormal 2^-24
+                                              // smallest positive subnormal 2^-24
         assert!((f16_to_f32(0x0001) - 2f32.powi(-24)).abs() < 1e-30);
     }
 
@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(f8e4m3_to_f32(0xB8), -1.0); // sign + exp7 man0
         assert_eq!(f8e4m3_to_f32(0x7E), 448.0); // exp15 man6 -> max finite
         assert!(f8e4m3_to_f32(0x7F).is_nan()); // S.1111.111
-        // smallest positive subnormal: man1, exp0 -> 2^-9
+                                               // smallest positive subnormal: man1, exp0 -> 2^-9
         assert_eq!(f8e4m3_to_f32(0x01), 2f32.powi(-9));
         assert_eq!(f8e4m3_to_f32(0x80), 0.0); // -0 reads as 0.0 == -0.0
     }
@@ -243,7 +243,11 @@ mod tests {
         for b in 1u8..=254 {
             let v = f8e8m0_to_f32(b);
             assert!(v > 0.0 && v.is_finite());
-            assert_eq!(v.to_bits() & 0x007F_FFFF, 0, "byte {b} is not a power of two");
+            assert_eq!(
+                v.to_bits() & 0x007F_FFFF,
+                0,
+                "byte {b} is not a power of two"
+            );
         }
         assert!(!f8e8m0_to_f32(0).is_normal() && f8e8m0_to_f32(0) > 0.0);
         // Independent construction: halving from 1.0 must reproduce the decode exactly.

@@ -929,10 +929,27 @@ __host__ static inline int nvfp4_u32_ok(const uint8_t *w,int K){
     return ((Kh&3)==0) && ((((uintptr_t)w)&3)==0);
 }
 
+/* Default is 2 (byte/lane, no shared x), NOT 3 (uint32/lane), and the reason is
+ * correctness rather than speed.
+ *
+ * Mode 3 is selected per call by `nvfp4_u32_ok`, which tests the weight POINTER. Expert
+ * weights come from a recycling buffer pool, so the same expert lands at a different heap
+ * address on every run — mode 3 for one run, the mode-2 fallback for the next, two
+ * different float summation orders, two different answers. MiniMax-M2.7 decode diverged at
+ * token 7 across three identical back-to-back runs; forcing mode 2 made all three
+ * byte-identical. (mmap-served spans are unaffected: page-aligned base plus a fixed file
+ * offset is reproducible, which is why short warm runs looked deterministic.)
+ *
+ * It also costs nothing to fix. M2.7 decode, two pairs: mode 3 gave 6.57/6.69 tok/s and
+ * mode 2 gave 7.03/6.87 — mode 2 is *faster*, matching the earlier finding that read width
+ * stops paying past 32 B/warp. Mode 3 was buying non-determinism for no throughput.
+ *
+ * The modes remain selectable via COLI_NVFP4_GEMV for A/B; 3 is non-deterministic on any
+ * pooled buffer and must not be used to produce reference output. */
 static void nvfp4_gemv_dispatch(float *y,const float *x,const uint8_t *w,const uint8_t *bs,
         float g,int K,int N,cudaStream_t s){
     static int s_mode=-1;
-    if(s_mode<0){const char*e=getenv("COLI_NVFP4_GEMV");s_mode=e?atoi(e):3;}
+    if(s_mode<0){const char*e=getenv("COLI_NVFP4_GEMV");s_mode=e?atoi(e):2;}
     const int tpb=256,wpb=tpb>>5;
     unsigned blocks=(unsigned)((N+wpb-1)/wpb);
     size_t shm=(size_t)K*sizeof(float);

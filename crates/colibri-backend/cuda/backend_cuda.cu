@@ -1779,7 +1779,20 @@ extern "C" int coli_cuda_pageable_access(int device) {
 extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
     if (!p || !bytes) return 0;
     cudaError_t e = cudaHostRegister(p, bytes, cudaHostRegisterDefault);
-    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
+    if (e != cudaSuccess) {
+        /* Report the first failure and the first one after any success. 10266 of 10283
+         * registrations failed on GLM after ~0.2 GB had been locked, and a bare pass/fail
+         * counter cannot tell a hard driver limit from a wrong flag — one is a reason to
+         * delete this path, the other is a one-word fix. */
+        static int s_reported = 0;
+        if (!s_reported) {
+            s_reported = 1;
+            fprintf(stderr, "[page-lock] cudaHostRegister(%p, %zu) failed: %s (%d)\n",
+                    p, bytes, cudaGetErrorString(e), (int)e);
+        }
+        cudaGetLastError();
+        return 0;
+    }
     return 1;
 }
 

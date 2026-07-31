@@ -176,13 +176,16 @@ fn pin_alloc(v: &mut Vec<u8>) {
         return;
     }
     let p = v.as_mut_ptr();
-    // `cudaHostRegister` wants a page-aligned range. At >= 1 MiB malloc serves the
-    // allocation via mmap so this holds, but a `false` here is a silent no-pin rather
-    // than a driver error, and the counter says which happened.
-    if (p as usize) % 4096 != 0 {
-        PIN_FAIL.fetch_add(1, Relaxed);
-        return;
-    }
+    // There was a `p % 4096 == 0` guard here, on the reasoning that `cudaHostRegister`
+    // wants a page-aligned range and that malloc serves >= 1 MiB via mmap so it would hold.
+    // **It does not hold, and the guard silently disabled the whole feature**: glibc returns
+    // an mmap'd chunk offset by its 16-byte header, so almost every buffer failed the guard
+    // and the driver was never asked. Measured on GLM: 17 registered, 10266 "failed", and
+    // not one of those failures was a CUDA call — the error print added to diagnose it never
+    // fired because there was nothing to print.
+    //
+    // The driver handles a non-page-aligned range itself. Ask it, and let the failure
+    // counter mean what it says.
     if reg(p, v.capacity()) {
         PINNED.lock().unwrap().insert(p as usize);
         PIN_OK.fetch_add(1, Relaxed);

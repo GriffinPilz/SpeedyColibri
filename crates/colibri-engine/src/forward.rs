@@ -1378,6 +1378,16 @@ where
                 "[profile] buf pool: {ph} hits / {pm} misses | {pp} recycled / {pd} rejected ({:.1} GB re-freed)",
                 pdb as f64 / 1e9,
             );
+            // Page-locking reports 0% DMA-direct on every model while the hooks are
+            // installed and the budget is set, so the failure is somewhere between those
+            // two facts. These four separate the candidates: `fail` is the driver refusing,
+            // `capped` is the budget ledger, and all-zero means nothing ever reached
+            // `pin_alloc` — a pool already populated by the time the hook arrived.
+            let (pok, pfail, pbytes, pcap) = colibri_core::quant::pin_profile();
+            eprintln!(
+                "[profile] page-lock: {pok} ok / {pfail} failed / {pcap} capped | {:.1} GB locked",
+                pbytes as f64 / 1e9,
+            );
             let (calls, threads, spawn) = colibri_safetensors::batch_pool_profile();
             eprintln!(
                 "[profile] drain pool: {} batches, {} OS threads created ({:.0}/batch) | spawn-issue {:.0} ms",

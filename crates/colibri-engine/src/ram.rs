@@ -179,6 +179,30 @@ impl RamManager {
     }
 }
 
+/// Bytes of *duplicate* RAM the GPU's copy of the resident weights costs.
+///
+/// On GB10 "VRAM" is the same LPDDR5X as the host, so uploading resident weights does not
+/// move them to a separate pool — it makes a second copy in the one 121 GB pool. Load-time
+/// sizing already knows this (it budgets `resident * 2` before choosing upload), but the
+/// ledger was only ever told about the host copy, so a 17 GB dense tier on GLM-5.2 hid
+/// 17 GB from every later admission decision and KV was granted against it twice.
+///
+/// Lives here, not in `gpu`, for two reasons: `gpu` is `cfg(feature = "cuda")` so callers
+/// would need the same cfg to ask an unconditional question, and the mode itself is held in
+/// a thread-local `Cell` set on the loading thread — reading that from the thread which
+/// installs the ledger returns the default, which errs toward "looks fine".
+static DEVICE_DUP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Record the duplicate at the point the residency mode is chosen.
+pub fn set_device_duplicate_bytes(b: u64) {
+    DEVICE_DUP_BYTES.store(b, Ordering::Relaxed);
+}
+
+/// Duplicate RAM held by the device weight copy; `0` under zero-copy or without CUDA.
+pub fn device_duplicate_bytes() -> u64 {
+    DEVICE_DUP_BYTES.load(Ordering::Relaxed)
+}
+
 /// Set a class's usage on the process manager, returning the remaining headroom.
 /// `u64::MAX` when no manager is installed, so an unmanaged path is unconstrained.
 pub fn set_usage(class: Class, bytes: u64) -> u64 {

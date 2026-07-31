@@ -922,6 +922,14 @@ pub fn load_model_with(
             total >> 30
         );
         gpu::set_weight_residency(mode);
+        // Publish the duplicate so the RAM ledger can charge for it. On GB10 the device
+        // copy is a second copy in the *same* pool, which is why `fits` budgets
+        // `resident * 2` above — the ledger has to charge the same way or it grants KV
+        // against memory the weights already hold.
+        crate::ram::set_device_duplicate_bytes(match mode {
+            gpu::WeightResidency::Upload => resident,
+            gpu::WeightResidency::ZeroCopy => 0,
+        });
     }
     if device_cache_weights {
         model.embed.gpu_eligible = true;

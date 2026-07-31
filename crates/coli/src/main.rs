@@ -2559,7 +2559,23 @@ where
     // tier, the KV for the live context, or the GPU's share of a unified pool — the three
     // terms that decide whether a fill is safe. Every one of those is available here, so
     // the budget is computed, not asked for.
-    let requested = if near_fit { natural_fill } else { total / CACHE_CAP_DIVISOR };
+    // **Max residency for every model.** `natural_fill` is what is left of the 96% ceiling
+    // after the dense tier (now including its device duplicate) and `RUNTIME_RESERVE`, so
+    // asking for it is asking for every byte that is actually free.
+    //
+    // This was previously gated to `near_fit` models because extending it to all of them
+    // failed hard: MiniMax-M3 filled toward its "94 GB headroom", exhausted 16 GB of swap
+    // and generated zero tokens. That fill was never 94 GB of *free* memory. M3's dense
+    // tier is 12 GB and `WeightResidency::Upload` duplicates it, and the duplicate was
+    // charged to nobody — so the real total was 94 + 12 + 12 = 118 GB on a 121 GB box,
+    // before a single KV byte. Three things changed underneath that failure: the duplicate
+    // is now in the ledger (so `natural_fill` is ~82 GB for M3, not 94), `Class::Experts`
+    // is committed so KV admission can see the cache, and swap is off, so an accounting
+    // mistake fails loudly instead of degrading everything for hours.
+    //
+    // `clamp_fill_to_headroom` below is what bounds this; there is no second regime left to
+    // pick, so `near_fit` no longer selects a budget — it only reports.
+    let requested = natural_fill;
     // `headroom` accounts for everything in RAM that is NOT experts: the resident dense
     // tier plus the serving process's own runtime (KV, activations, GPU staging, read
     // buffers). It bounds the fill unconditionally. No-op for a small-resident model
@@ -2584,7 +2600,12 @@ where
     // knows what the model itself costs. This is the arbiter that did not exist when the
     // expert cache filled MiniMax-M3 to 94 GB and inference then allocated on top of it.
     let mgr = colibri_engine::ram::init_manager(ram_target(total));
-    if let Some(c) = mgr.commit(colibri_engine::ram::Class::Dense, resident) {
+    // Charge the device duplicate too. On GB10 `WeightResidency::Upload` copies the dense
+    // tier into the *same* 121 GB pool, so it costs `resident` a second time — 17 GB on
+    // GLM-5.2. Load-time sizing already budgets `resident * 2`; the ledger did not, so it
+    // was handing that memory out again to KV.
+    let dense_ram = resident.saturating_add(colibri_engine::ram::device_duplicate_bytes());
+    if let Some(c) = mgr.commit(colibri_engine::ram::Class::Dense, dense_ram) {
         c.hold_forever(); // dense weights live for the process
     }
     // The expert arena is **not** wired here yet. It was, and the first real-model run
@@ -2606,12 +2627,17 @@ where
     // committed budget below is the honest one: the ledger tracks the dense tier and
     // admits requests against it, without claiming an arena that does not exist.
     eprintln!(
-        "[ram] ceiling {} GB = {}% of {} GB | dense {} GB | {} GB for experts + KV + \
+        "[ram] ceiling {} GB = {}% of {} GB | dense {} GB{} | {} GB for experts + KV + \
          activations (arena not yet wired: expert memory is still pooled, not pre-granted)",
         mgr.ceiling() >> 30,
         TARGET_RAM_PCT,
         total >> 30,
-        resident >> 30,
+        dense_ram >> 30,
+        if colibri_engine::ram::device_duplicate_bytes() > 0 {
+            format!(" (incl. {} GB device duplicate)", resident >> 30)
+        } else {
+            String::new()
+        },
         mgr.ceiling().saturating_sub(mgr.committed()) >> 30,
     );
     // Swap state changes what a memory-accounting bug looks like, so say which mode this

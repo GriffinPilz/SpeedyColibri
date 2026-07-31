@@ -2835,14 +2835,34 @@ where
             fill_target >> 30,
         );
     }
-    // Page-locking gets the same grant, for the same reason and from the same number. A
-    // GPU copy out of pageable memory is bounced through the driver's staging buffer, so
-    // an expert whose buffer is page-locked can be DMA'd where it lies instead of being
-    // packed into a pinned intermediate first. `fill_target` is the right bound because a
-    // buffer inside it is memory this process was always going to hold — locking it takes
-    // nothing the cache had not already taken. Models that serve experts as mmap views
-    // (M2.7, Nemotron) allocate no heap buffer to lock and simply never draw on this.
-    colibri_core::quant::set_pin_budget(fill_target);
+    // **Page-locking expert buffers is OFF: a measured net loss at every budget.** No
+    // `set_pin_budget` call, so the default of zero stands and nothing is locked.
+    //
+    // The idea was sound and it works exactly as designed — a page-locked buffer is DMA'd
+    // where it lies instead of being packed into a pinned intermediate first, which took
+    // GLM to 93% DMA-direct and all but deleted the pack (7.75 s -> 0.92 s, 300 GB/s). It
+    // still loses, monotonically, because the two costs are not the same currency. Measured
+    // on GLM, 128-tok prefill, tokens identical in every arm:
+    //
+    // | COLI_PIN_MAX_MB | locked | pack | expert-load | moe | wall |
+    // |---|---|---|---|---|---|
+    // | **0 (this)** | 0 | 7.72 s | **18.1 s** | **42.3 s** | **77 s** |
+    // | 2048 | 2.2 GB | 7.41 s | 22.4 s | 45.7 s | 79 s |
+    // | 8192 | 4.8 GB | 4.73 s | 39.3 s | 59.9 s | 97 s |
+    // | 32768 | 12.8 GB | 2.96 s | 47.1 s | 67.1 s | 100 s |
+    //
+    // The pack costs CPU — ~7 s, and cheap. Locked pages cannot be reclaimed, so they
+    // evict page cache, and the reader pays that back as NVMe I/O at +29 s. Every GB
+    // locked buys pack time at a worse exchange rate than it sells reader time. Even 2 GB
+    // is a loss, so there is no small budget that wins.
+    //
+    // This also corrects the reasoning that removed an earlier flat cap: locking live
+    // anonymous pages is *not* free when swap is off. It does not cost swap — it costs the
+    // page cache, which is the tier the streaming models actually run on.
+    //
+    // Kept behind `COLI_PIN_MAX_MB` rather than deleted: the machinery is what proves the
+    // pack is removable, and a future reader that does not lean on the page cache
+    // (O_DIRECT throughout, or genuinely resident experts) would flip this trade.
     // Register with the RAM ledger before a single expert is read, so every later
     // allocation — KV, activations, staging — is admitted against a total that already
     // knows what the model itself costs. This is the arbiter that did not exist when the

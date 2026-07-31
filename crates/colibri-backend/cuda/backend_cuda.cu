@@ -2100,9 +2100,27 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
        !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
        !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    // Per-call GPU-timeline split (COLI_NVFP4_EVT=1), mirroring COLI_RELU2_EVT. This was
+    // the ONLY expert entry point without one, and it is the one the SwiGLU models take —
+    // so the question "where do M2.7's ~12 ms per expert call go?" had no instrument.
+    // 62 layers x 256 experts = ~15872 calls per prefill, ~7.6 MB of weights each, which
+    // works out to ~0.6 GB/s against a GPU that does hundreds: the GEMM cannot be that
+    // slow, so the split between STAGING and KERNELS is the thing to see.
+    // Bucketed by input width D so the shared expert and the routed experts stay separable.
+    static int s_evt=-1; static cudaEvent_t s_v0=0,s_v1=0,s_v2=0;
+    struct NvEvt { int d; double stage_ms,kern_ms; long calls,rows,wbytes; };
+    static NvEvt s_nv[4]={}; static int s_nnv=0;
+    if(s_evt<0){ const char*e=getenv("COLI_NVFP4_EVT"); s_evt=e&&atoi(e);
+        if(s_evt){cudaEventCreate(&s_v0);cudaEventCreate(&s_v1);cudaEventCreate(&s_v2);} }
+    NvEvt *nv=nullptr;
+    if(s_evt){
+        for(int i=0;i<s_nnv;i++) if(s_nv[i].d==D){ nv=&s_nv[i]; break; }
+        if(!nv&&s_nnv<4){ s_nv[s_nnv].d=D; nv=&s_nv[s_nnv++]; }
+    }
     std::memcpy(ctx->host_x,x,xb);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                                "expert nvfp4 input upload"))return 0;
+    if(s_evt) cudaEventRecord(s_v0,ctx->stream);
     const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const uint8_t *gbs=(const uint8_t*)gate->bscale,*ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
     float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
@@ -2136,8 +2154,10 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
             cudaMemcpyAsync(ctx->ebsu,ubs,gsb,cudaMemcpyHostToDevice,ctx->stream);
             cudaMemcpyAsync(ctx->ebsd,dbs,dsb,cudaMemcpyHostToDevice,ctx->stream);
             gw=ctx->ewg;uw=ctx->ewu;dw=ctx->ewd;gbs=ctx->ebsg;ubs=ctx->ebsu;dbs=ctx->ebsd;
+            if(nv) nv->wbytes+=(long)(gnb+gnb+dnb+gsb+gsb+dsb);
         }
     }
+    if(s_evt) cudaEventRecord(s_v1,ctx->stream);
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     if(S==1&&!s_tiled){
@@ -2176,10 +2196,20 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
             nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
         }
     }
+    if(s_evt) cudaEventRecord(s_v2,ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert nvfp4 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "expert nvfp4 output download")||
        !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert nvfp4 synchronize"))return 0;
+    if(nv){ float sm=0,km=0; cudaEventElapsedTime(&sm,s_v0,s_v1); cudaEventElapsedTime(&km,s_v1,s_v2);
+        nv->stage_ms+=sm; nv->kern_ms+=km; nv->calls++; nv->rows+=S;
+        if(nv->calls%2000==0) for(int i=0;i<s_nnv;i++){ NvEvt *e=&s_nv[i]; fprintf(stderr,
+            "[nvfp4-evt] D=%d calls=%ld rows=%ld stage=%.2fs (%.2f GB, %.2f GB/s) kernel=%.2fs "
+            "avg_rows=%.1f per_call=%.3fms\n",
+            e->d,e->calls,e->rows,e->stage_ms/1e3,e->wbytes/1e9,
+            e->stage_ms>0?(e->wbytes/1e9)/(e->stage_ms/1e3):0.0,e->kern_ms/1e3,
+            e->calls?(double)e->rows/e->calls:0.0,
+            e->calls?(e->stage_ms+e->kern_ms)/e->calls:0.0); } }
     std::memcpy(y,ctx->host_y,xb);
     return 1;
 }

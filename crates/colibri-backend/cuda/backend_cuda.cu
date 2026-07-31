@@ -2767,6 +2767,9 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
 static int g_grp_evt=-1; static double g_grp_pack_ms=0, g_grp_h2d_ms=0, g_grp_bytes=0; static long long g_grp_chunks=0;
 static double g_grp_thr_sum=0, g_grp_thr_max=0, g_grp_thr_cpu=0; static long long g_grp_nthr=0;
 static long long g_grp_pin_experts=0, g_grp_all_experts=0, g_grp_last_count=0;
+/* Groups that met the rows-per-expert crossover vs those too small to amortise staging.
+ * A run that is mostly `skipped` is decode; mostly `staged` is prefill. */
+static long long g_lres_staged=0, g_lres_skipped=0;
 
 /* Every-200-chunks was the only reporting, and it made a comparison wrong: a run that ends
  * at chunk 340 last printed at 200, so "47.4 GB staged" was two thirds of a total being
@@ -2778,13 +2781,13 @@ static void grp_evt_report(void){
     fprintf(stderr,"[group-evt FINAL] chunks=%lld staged=%.1f GB | pack %.2f s = %.2f GB/s "
             "| H2D %.2f s = %.2f GB/s | %lld experts/chunk "
             "| thr %lld/chunk elapsed-max %.2f s elapsed-sum %.2f s cpu-sum %.2f s "
-            "| DMA-direct %lld/%lld experts (%.0f%%)\n",
+            "| DMA-direct %lld/%lld experts (%.0f%%) | groups staged %lld / skipped %lld\n",
             g_grp_chunks,g_grp_bytes/1e9,
             g_grp_pack_ms/1e3,(g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),
             g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),g_grp_last_count,
             g_grp_nthr/g_grp_chunks,g_grp_thr_max/1e3,g_grp_thr_sum/1e3,g_grp_thr_cpu/1e3,
             g_grp_pin_experts,g_grp_all_experts,
-            g_grp_all_experts?100.0*g_grp_pin_experts/g_grp_all_experts:0.0);
+            g_grp_all_experts?100.0*g_grp_pin_experts/g_grp_all_experts:0.0,g_lres_staged,g_lres_skipped);
 }
 
 extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
@@ -2835,9 +2838,33 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
      * or the pinned buffer cannot be reserved, so a large layer degrades instead of failing. */
     static int s_lres=-1;
     if(s_lres<0){const char*e=getenv("COLI_LAYER_RESIDENT");s_lres=(!e||atoi(e));}
+
+    /* Stage only when the rows AMORTISE it. Enabled unconditionally, this was a **2.02x
+     * regression on serve**: decode routes one token, so a group stages ~190 MB of expert
+     * weights to compute ONE ROW each. That can never pay, and it was invisible because the
+     * path was built and measured on prefill.
+     *
+     * M2.7 serve, bench_serve 12 prompts x 32 tok, ABBA, pass1/pass2:
+     *   staged always   2.85 / 3.08 tok/s
+     *   staged never    5.20 / 6.31 tok/s   <- and 6.31 beats the 5.26 in the notes
+     *
+     * The threshold is bandwidth arithmetic, not a tuned number. With R rows per expert and
+     * W bytes of weights, reading them zero-copy costs R*W/51 GB/s; staging costs the CPU
+     * pack (W/40, measured) plus the H2D (W/56, measured) plus R*W/273 for the device reads.
+     * Staging wins when R*(1/51 - 1/273) > 1/40 + 1/56, i.e. R > 2.7. Decode is R=1 and
+     * loses; a 128-token prefill at top-8 over 256 experts is R=4 and wins, which is exactly
+     * the split the two measurements show.
+     *
+     * Deliberately expressed per EXPERT, not per token or per phase: `rows` is what the
+     * arithmetic is about, it is already known here, and it needs no caller to classify
+     * itself — a phase flag would have to be plumbed through every arch and would be the
+     * closed-set trap again. */
+    const long lres_min_rows = 3;   // ceil of the R > 2.7 crossover above
+    const bool stage_pays = total >= lres_min_rows*(long)count;
+    if(stage_pays) g_lres_staged++; else g_lres_skipped++;
     bool resident=false;
     size_t wtot=0;
-    if(s_lres){
+    if(s_lres&&stage_pays){
         for(int c=0;c<count;c++){
             size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
             size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
@@ -3069,13 +3096,13 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
                     fprintf(stderr,"[group-evt] chunks=%lld staged=%.1f GB | pack %.2f s = %.2f GB/s "
                             "| H2D %.2f s = %.2f GB/s | %d experts/chunk | pinned %lld hit/%lld alloc "
                             "| thr %lld/chunk elapsed-max %.2f s elapsed-sum %.2f s cpu-sum %.2f s "
-                            "| DMA-direct %lld/%lld experts (%.0f%%)\n",
+                            "| DMA-direct %lld/%lld experts (%.0f%%) | groups staged %lld / skipped %lld\n",
                             g_grp_chunks,g_grp_bytes/1e9,
                             g_grp_pack_ms/1e3,(g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),
                             g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),count,g_res_pin_hit,g_res_pin_alloc,
                             g_grp_nthr/g_grp_chunks,g_grp_thr_max/1e3,g_grp_thr_sum/1e3,g_grp_thr_cpu/1e3,
                             g_grp_pin_experts,g_grp_all_experts,
-                            g_grp_all_experts?100.0*g_grp_pin_experts/g_grp_all_experts:0.0);
+                            g_grp_all_experts?100.0*g_grp_pin_experts/g_grp_all_experts:0.0,g_lres_staged,g_lres_skipped);
             }
         }
     }

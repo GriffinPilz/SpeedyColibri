@@ -758,6 +758,29 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
             // prints both, with the actual gap between ticks, so they can be told apart.
             let trace = std::env::var("COLI_GUARD_TRACE").map(|v| v != "0").unwrap_or(false);
             let mut prev_tick = std::time::Instant::now();
+            // What we have LEARNED this box will actually hold, which is not what the
+            // load-time plan predicted. `fill_target` is an estimate built from the dense
+            // tier and a flat runtime reserve; on K3 the dense tier alone came in 4 GB over
+            // its estimate. This is the measured answer, and it only ever moves in response
+            // to real memory pressure. AIMD: the guard cuts it hard, the tick below earns
+            // it back slowly.
+            //
+            // SEEDED FROM MEASUREMENT, NOT FROM THE PLAN. `fill_target` is computed before
+            // the dense tier is loaded, from an *estimate* of it; by the time this thread
+            // starts, the real number is observable. On K3 that estimate was 4 GB light
+            // (54 GiB planned, 62.06 GB actual), and seeding the cap at the planned 56.10 GB
+            // let the cache reach it — RSS 121.6 GB on a 130.66 GB box — before the guard
+            // fired even once, so the AIMD below never got to engage at all. Whatever is
+            // genuinely free right now, less room to brake in, is the honest ceiling; the
+            // plan remains the upper bound, so a model with real headroom is unaffected.
+            let mut learned_cap = match available_ram_bytes() {
+                Some(a) => fill_target.min(
+                    a.saturating_sub(danger_floor)
+                        .saturating_sub(MAX_BRAKE)
+                        .max(FLOOR_MIN),
+                ),
+                None => fill_target,
+            };
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
                 let avail = match available_ram_bytes() {
@@ -770,11 +793,12 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 if trace {
                     eprintln!(
                         "[guard] gap={gap_ms}ms avail={:.2} GB drop={:.2} GB cache={:.2} GB \
-                         budget={:.2} GB",
+                         budget={:.2} GB cap={:.2} GB",
                         avail as f64 / 1e9,
                         prev_avail.saturating_sub(avail) as f64 / 1e9,
                         resident as f64 / 1e9,
                         cache.budget.load(Ordering::Relaxed) as f64 / 1e9,
+                        learned_cap as f64 / 1e9,
                     );
                 }
 
@@ -832,6 +856,14 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                             resident.saturating_sub(after) as f64 / 1e9,
                         );
                     }
+                    // MULTIPLICATIVE DECREASE. Without this the correction was thrown away
+                    // on the very next tick: the soft path below used to reset the budget
+                    // straight back to `fill_target`, so the cache refilled at full read
+                    // bandwidth and was back at the wall ~2 s later. Measured on K3 as a
+                    // 56 -> 37 -> 56 GB sawtooth against the OOM line, every cycle a coin
+                    // flip against a scheduling gap. The guard is supposed to be a
+                    // backstop; resetting its cut made it the operating point.
+                    learned_cap = new_budget;
                     low_ticks = 0;
                     continue;
                 }
@@ -842,9 +874,19 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 } else {
                     0
                 };
-                // Hold `fill_target` minus whatever callers have reserved (e.g. live KV
+                // ADDITIVE INCREASE. The guard's cut above is multiplicative and permanent
+                // until earned back, and it is earned back only while there is real room —
+                // slowly, so the *cap's* growth rate is what bounds our consumption rate.
+                // That is the property that makes this loop stable: the cache can never
+                // again approach the floor faster than `CAP_RECOVER_PER_TICK`, which is
+                // ~0.64 GB/s against the 8.24 GB/s an unbounded refill managed. A 461 ms
+                // scheduling gap then costs ~0.3 GB instead of 3.12 GB.
+                if avail > danger_floor {
+                    learned_cap = recover_cap(learned_cap, fill_target);
+                }
+                // Hold the learned cap minus whatever callers have reserved (e.g. live KV
                 // caches), so the monitor never refills experts into space a request needs.
-                let held = fill_target.saturating_sub(cache.reserved.load(Ordering::Relaxed));
+                let held = learned_cap.saturating_sub(cache.reserved.load(Ordering::Relaxed));
                 let new_budget = if low_ticks >= SUSTAIN {
                     resident.saturating_sub(danger_floor - avail).max(FLOOR_MIN)
                 } else {
@@ -1023,6 +1065,33 @@ fn braking_floor(hard_floor: u64, drop_per_tick: u64) -> u64 {
     hard_floor.saturating_add(drop_per_tick.saturating_mul(BRAKE_TICKS).min(MAX_BRAKE))
 }
 
+/// Bytes the learned cap earns back per tick once memory pressure has passed. See
+/// [`recover_cap`].
+const CAP_RECOVER_PER_TICK: u64 = 64 << 20;
+
+/// One additive-increase step on the learned cap.
+///
+/// The cap is the loop's memory: the guard cuts it multiplicatively the moment it has to
+/// evict, and this earns it back at a fixed, deliberately slow rate. Two things fall out,
+/// and both were failures observed on K3 before this existed:
+///
+/// 1. **The guard's correction survives.** The soft path used to reset the budget straight
+///    back to `fill_target` on the next non-firing tick, so the cache refilled at full read
+///    bandwidth and was back at the OOM line ~2 s later — a 56 -> 37 -> 56 GB sawtooth with
+///    the guard as the operating point rather than a backstop.
+/// 2. **Consumption becomes rate-limited by us, not by the drive.** The cache can only grow
+///    into headroom the cap has already granted, so approach speed is `CAP_RECOVER_PER_TICK`
+///    per tick (~0.64 GB/s) rather than the ~8.24 GB/s an unbounded refill managed. A late
+///    poll then costs ~0.3 GB instead of the 3.12 GB one measured 461 ms gap swallowed.
+///
+/// The cap never exceeds the load-time plan, so a model that never trips the guard — every
+/// model that already passed the ceiling check — behaves exactly as before.
+fn recover_cap(learned_cap: u64, fill_target: u64) -> u64 {
+    learned_cap
+        .saturating_add(CAP_RECOVER_PER_TICK)
+        .min(fill_target)
+}
+
 /// Available RAM in bytes, best-effort. Reads `/proc/meminfo` `MemAvailable` on
 /// Linux (the DGX Spark target); returns `None` elsewhere (e.g. macOS dev boxes),
 /// where the caller should fall back to an explicit budget.
@@ -1112,6 +1181,43 @@ mod tests {
              kill line, which is less than the {per_tick} consumed per tick",
             floor - earlyoom
         );
+    }
+
+    /// The stability invariant of the whole loop, in the units it was measured in.
+    ///
+    /// K3's unbounded refill reached 8.24 GB/s. Once the guard has cut the cap, the cache
+    /// can only grow into headroom the cap has granted, so approach speed is the cap's
+    /// recovery rate. That has to stay far enough under the read bandwidth that a late poll
+    /// is survivable — the worst gap observed was 461 ms.
+    #[test]
+    fn cap_recovery_is_slow_enough_to_survive_a_late_poll() {
+        const TICK_MS: u64 = 100; // must track spawn_adaptive_budget's TICK_MS
+        let recover_per_s = CAP_RECOVER_PER_TICK * (1000 / TICK_MS);
+        let measured_unbounded_fill = 8_240_000_000u64; // K3, before the cap existed
+        assert!(
+            recover_per_s * 8 < measured_unbounded_fill,
+            "cap recovery {recover_per_s} B/s must be well under the {measured_unbounded_fill} \
+             B/s an unbounded refill reached, or the guard is back to racing the drive"
+        );
+        // The worst scheduling gap seen was 461 ms. What can vanish in it must stay small
+        // next to the margin the braking floor buys.
+        let worst_gap_ms = 461u64;
+        let lost = recover_per_s * worst_gap_ms / 1000;
+        assert!(
+            lost < 1 << 30,
+            "a {worst_gap_ms} ms blind window may cost at most ~1 GB, got {lost}"
+        );
+    }
+
+    /// The cap earns headroom back but never past the load-time plan — so a model that
+    /// never trips the guard is unaffected by any of this.
+    #[test]
+    fn cap_recovery_is_bounded_by_the_plan() {
+        let target = 50u64 << 30;
+        assert_eq!(recover_cap(target, target), target, "never exceeds the plan");
+        assert_eq!(recover_cap(target - 1, target), target, "clamps, not overshoots");
+        assert_eq!(recover_cap(0, target), CAP_RECOVER_PER_TICK);
+        assert_eq!(recover_cap(u64::MAX, target), target, "must not overflow");
     }
 
     /// One pathological tick must not demand evicting the world; the brake term is only

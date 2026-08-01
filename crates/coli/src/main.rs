@@ -118,7 +118,58 @@ See PORTING.md for the C->Rust port status."#
     );
 }
 
+/// Make `free()` actually return expert-sized allocations to the OS.
+///
+/// **glibc's mmap threshold is dynamic.** It starts at 128 KiB and ratchets *upward* every
+/// time an mmap'd block is freed, up to 32 MiB. So a process that recycles large buffers
+/// silently migrates them from `mmap` (where `free` is `munmap` and the pages go back to
+/// the kernel) into the malloc arena (where `free` retains them). Nothing reports this: the
+/// allocation succeeds, the free succeeds, and RSS simply never comes down again.
+///
+/// That is not a theoretical concern here — it is what made the expert cache's central
+/// promise false. Measured on Kimi-K3 (2026-08-01, `COLI_GUARD_TRACE=1`): the OOM guard
+/// evicted the cache from **45.31 GB to 18.53 GB** — 26.8 GB of experts — while process RSS
+/// climbed **85 GB to 122 GB** and `MemAvailable` fell the entire time, until earlyoom
+/// SIGTERMed it. The guard was working perfectly (`gap=100ms` on every tick); eviction
+/// decrements `state.bytes` and the memory does not come back. K3's ~17.5 MB MXFP4 spans
+/// are exactly the size that gets captured by the ratchet.
+///
+/// Setting `M_MMAP_THRESHOLD` explicitly **disables the dynamic adjustment** (documented
+/// glibc behaviour), pinning expert-sized allocations to `mmap` so a free is a `munmap`.
+/// With it, `MemAvailable` recovers across a guard fire (3.99 -> 6.84 GB) and the cache
+/// regrows (37.57 -> 54.15 GB) — neither of which happened before.
+///
+/// The cost is a syscall and page faults per large alloc, which is exactly what the buffer
+/// pool in `colibri_core::quant` exists to amortise: hot-path allocations hit the pool and
+/// never reach the allocator, so this is paid only on a pool miss. 2 MiB rather than the
+/// pool's 1 MiB notion so ordinary sub-huge-page allocations are unaffected.
+///
+/// `M_TRIM_THRESHOLD` is set for the same reason in the other direction: it governs how
+/// much free top-of-heap is retained before `sbrk` gives it back.
+#[cfg(target_os = "linux")]
+fn return_freed_memory_to_the_os() {
+    // Overridable because the right value is span-size dependent and a future model may
+    // want a different one — but it defaults ON, because the failure it prevents is a
+    // silent OOM kill rather than a slowdown.
+    let thr = std::env::var("COLI_MMAP_THRESHOLD_MB")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2);
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, thr * 1024 * 1024);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, thr * 1024 * 1024);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn return_freed_memory_to_the_os() {}
+
 fn main() -> ExitCode {
+    // Before any allocation that matters. See the function's own doc: without this,
+    // evicting an expert does not give its memory back and the cache's "LRU-evict under
+    // pressure — never OOM" guarantee is false.
+    return_freed_memory_to_the_os();
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
 

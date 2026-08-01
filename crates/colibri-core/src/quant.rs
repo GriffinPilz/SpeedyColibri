@@ -255,7 +255,7 @@ pub fn pin_profile() -> (u64, u64, u64, u64) {
 /// **The count cap is off by default; [`pool_max_bytes`] is the live bound.**
 ///
 /// A count is the wrong unit and the old default of 128 was a constant that helped some
-/// models and quietly hurt others. Entries range from ~1 MB (Kimi-K3's MXFP4 spans) to
+/// models and quietly hurt others. Entries range from ~1 MB (small MXFP4 spans) to
 /// ~21 MB (GLM's coalesced experts), so 128 entries meant **128 MB retained for K3 against
 /// 2.7 GB for GLM** — for the model with the *most* spans per batch, the count cap bound at
 /// a twentieth of the byte cap it was supposed to sit under, and every return past it was a
@@ -345,20 +345,37 @@ pub fn arena_cfg() -> Option<(usize, usize)> {
     ARENA.lock().unwrap().map(|a| (a.slot_bytes, a.slots))
 }
 
-/// Max **bytes** retained (`COLI_BUF_POOL_MB`, default 2048).
+/// Max **bytes** retained (`COLI_BUF_POOL_MB`, default 16384).
 ///
-/// A count is the wrong unit here: entries range from 1 MB (K3's MXFP4 spans) to ~21 MB
-/// (GLM's coalesced experts), so the same cap means 128 MB for one model and 2.7 GB for
-/// another. This is the bound that actually protects the memory ceiling
-/// (see `memory-ceiling-is-real`); `pool_max` is a coarse secondary limit kept so the
-/// A/B above stays reproducible.
+/// This is the LIVE bound — the count cap above is off by default — so it is the one that
+/// has to fit every model, and at 2048 it did not.
+///
+/// **Kimi-K3 measured, 32-tok prompt, ABBA, token-identical:**
+///
+/// | cap | wall | moe | expert-load | rejected returns |
+/// |---|---|---|---|---|
+/// | 2048 MB | 121 / 123 s | 50.3 / 51.0 s | 36.3 / 37.1 s | **6751 (118.5 GB re-freed)** |
+/// | **16384 MB** | **117 / 114 s** | **49.1 / 49.6 s** | **35.1 / 35.6 s** | **0 (0.0 GB)** |
+///
+/// K3's spans are ~17.5 MB and there are many of them in flight, so 2048 MB retained only
+/// ~117 buffers and rejected 6751 returns — and a rejected return is a real `munmap` with
+/// page-table teardown, which is the exact churn this cap exists to prevent. Raising it
+/// removes all of it for ~4-6%.
+///
+/// Raising the default is safe for the models that do not need it because this bounds
+/// **retention, not allocation**: a model that never returns more than it uses never retains
+/// more. GLM's ~21 MB spans settle around 2.7 GB either way.
+///
+/// A count is the wrong unit here and was tried: entries range from a few MB to ~21 MB, so
+/// the same count means wildly different memory per model. This is also the bound that
+/// protects the memory ceiling (see `memory-ceiling-is-real`).
 fn pool_max_bytes() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("COLI_BUF_POOL_MB")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2048u64)
+            .unwrap_or(16384u64)
             << 20
     })
 }

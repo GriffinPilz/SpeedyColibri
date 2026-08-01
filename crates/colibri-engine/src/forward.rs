@@ -95,7 +95,11 @@ pub fn current_step() -> u64 {
 pub(crate) fn draft_budget() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("DRAFT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(63)
+        std::env::var("DRAFT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(63)
     })
 }
 /// Largest sequence length that runs the Mamba2 seq scan in BIT-exact (strict
@@ -142,7 +146,9 @@ pub fn layer_forward<P: ExpertProvider>(
     tmp: &mut [f32],
     dsa_sel: &mut Option<Vec<Vec<u32>>>,
 ) -> io::Result<()> {
-    layer_forward_kind(model, kv, provider, l, li, None, x, s, pos_base, nrm, tmp, dsa_sel)
+    layer_forward_kind(
+        model, kv, provider, l, li, None, x, s, pos_base, nrm, tmp, dsa_sel,
+    )
 }
 
 /// [`layer_forward`] with an explicit mixer `kind`, for layers that are NOT in
@@ -193,11 +199,18 @@ pub fn layer_forward_kind<P: ExpertProvider>(
     let d = cfg.hidden as usize;
     // in_ln -> attention -> residual
     for si in 0..s {
-        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
+        rmsnorm(
+            &mut nrm[si * d..(si + 1) * d],
+            &x[si * d..(si + 1) * d],
+            &l.in_ln,
+            cfg.eps,
+        );
     }
     if cfg.arch.is_gqa() {
         // MiniMax-M3: grouped-query attention (no MLA latent, no DSA indexer).
-        timed(&ATTN_US, || attention_gqa(cfg, l, li, kv, nrm, s, pos_base, tmp));
+        timed(&ATTN_US, || {
+            attention_gqa(cfg, l, li, kv, nrm, s, pos_base, tmp)
+        });
     } else {
         // GLM DSA selection sharing: a FULL indexer layer (idx_type == true) computes
         // its own top-k selection; SHARED layers (false) reuse the most recent FULL
@@ -215,12 +228,33 @@ pub fn layer_forward_kind<P: ExpertProvider>(
                 if let Some(cc) = cluster_ctx() {
                     if cc.sharding.num_nodes() > 1 {
                         return attention_sharded(
-                            cfg, l, li, kv, nrm, s, pos_base, tmp, reused, &cc.sharding, &*cc.transport,
+                            cfg,
+                            l,
+                            li,
+                            kv,
+                            nrm,
+                            s,
+                            pos_base,
+                            tmp,
+                            reused,
+                            &cc.sharding,
+                            &*cc.transport,
                         );
                     }
                 }
             }
-            Ok(attention_with(cfg, l, li, kv, nrm, s, pos_base, tmp, AttnCore::Reconstruct, reused))
+            Ok(attention_with(
+                cfg,
+                l,
+                li,
+                kv,
+                nrm,
+                s,
+                pos_base,
+                tmp,
+                AttnCore::Reconstruct,
+                reused,
+            ))
         })?;
         if is_full {
             *dsa_sel = computed;
@@ -231,12 +265,19 @@ pub fn layer_forward_kind<P: ExpertProvider>(
     }
     // post_ln -> MoE/dense -> residual
     for si in 0..s {
-        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
+        rmsnorm(
+            &mut nrm[si * d..(si + 1) * d],
+            &x[si * d..(si + 1) * d],
+            &l.post_ln,
+            cfg.eps,
+        );
     }
     if l.sparse {
         // with_shared only when the model actually has a shared expert (GLM/M3 do;
         // MiniMax-M2 has none — n_shared 0, shared_intermediate_size 0).
-        timed(&MOE_US, || moe(cfg, l, li, nrm, s, tmp, cfg.n_shared > 0, provider))?;
+        timed(&MOE_US, || {
+            moe(cfg, l, li, nrm, s, tmp, cfg.n_shared > 0, provider)
+        })?;
     } else {
         timed(&DENSE_US, || dense_mlp(l, nrm, s, tmp));
     }
@@ -271,15 +312,22 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     let d = cfg.hidden as usize;
     // in_ln (the block's only norm) -> mixer -> residual.
     for si in 0..s {
-        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
+        rmsnorm(
+            &mut nrm[si * d..(si + 1) * d],
+            &x[si * d..(si + 1) * d],
+            &l.in_ln,
+            cfg.eps,
+        );
     }
     match kind {
         LayerKind::Mamba => timed(&MAMBA_US, || mamba2_mixer(cfg, l, kv, li, nrm, s, tmp)),
         // NoPE GQA attention (no rotary, no QK-norm — see `attention_gqa`).
-        LayerKind::Attn => timed(&ATTN_US, || attention_gqa(cfg, l, li, kv, nrm, s, pos_base, tmp)),
-        LayerKind::Moe => {
-            timed(&MOE_US, || crate::moe::nemotron_moe(cfg, l, li, nrm, s, tmp, provider))?
-        }
+        LayerKind::Attn => timed(&ATTN_US, || {
+            attention_gqa(cfg, l, li, kv, nrm, s, pos_base, tmp)
+        }),
+        LayerKind::Moe => timed(&MOE_US, || {
+            crate::moe::nemotron_moe(cfg, l, li, nrm, s, tmp, provider)
+        })?,
         // Reaching here means a Kimi-K3 model was routed into the Nemotron-H forward
         // path. KDA is a different mixer (linear/delta-rule, not a selective scan), so
         // there is nothing to approximate with — fail loudly rather than run the wrong one.
@@ -390,7 +438,12 @@ struct AttnResState {
 impl AttnResState {
     fn new(embeddings: Vec<f32>, bs: usize) -> Self {
         assert!(bs > 0, "kimi: attn_res_block_size must be > 0");
-        AttnResState { prefix: embeddings, blocks: Vec::new(), have_prefix: true, bs }
+        AttnResState {
+            prefix: embeddings,
+            blocks: Vec::new(),
+            have_prefix: true,
+            bs,
+        }
     }
 
     /// Snapshot the accumulator if `li` is a block boundary. Call once per layer, after
@@ -458,7 +511,11 @@ pub fn kimi_forward<P: ExpertProvider>(
     let mut embeddings = vec![0f32; s * d];
     timed(&EMBED_US, || {
         for (i, &tok) in ids.iter().enumerate() {
-            embed_row(&model.embed, tok as usize, &mut embeddings[i * d..(i + 1) * d]);
+            embed_row(
+                &model.embed,
+                tok as usize,
+                &mut embeddings[i * d..(i + 1) * d],
+            );
         }
     });
     // `from_json_kimi` range-checks `attn_res_block_size`, so it cannot be 0 here.
@@ -495,25 +552,46 @@ pub fn kimi_forward<P: ExpertProvider>(
         // ---- attention sublayer -------------------------------------------
         timed(&ATTNRES_US, || {
             apply_attn_res(
-                &st.prefix, &st.blocks, &l.attn_res_norm, &l.attn_res_proj, cfg.eps, s, d, &mut h,
+                &st.prefix,
+                &st.blocks,
+                &l.attn_res_norm,
+                &l.attn_res_proj,
+                cfg.eps,
+                s,
+                d,
+                &mut h,
             )
         });
         // After that mix and before the mixer, so a candidate is the state as it
         // ENTERED this layer — the reference's ordering exactly.
         st.maybe_snapshot(li);
         for si in 0..s {
-            rmsnorm(&mut nrm[si * d..(si + 1) * d], &h[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
+            rmsnorm(
+                &mut nrm[si * d..(si + 1) * d],
+                &h[si * d..(si + 1) * d],
+                &l.in_ln,
+                cfg.eps,
+            );
         }
         match cfg.layer_kind[li] {
-            LayerKind::Kda => {
-                timed(&KDA_US, || crate::kda::kda_mixer(cfg, l, kv, li, &nrm, s, &mut tmp))
-            }
+            LayerKind::Kda => timed(&KDA_US, || {
+                crate::kda::kda_mixer(cfg, l, kv, li, &nrm, s, &mut tmp)
+            }),
             // Gated MLA. K3 ships no DSA indexer, so `attention_with` finds `ix_wk`
             // absent and runs dense — no selection to thread between layers.
             _ => {
                 timed(&ATTN_US, || {
                     attention_with(
-                        cfg, l, li, kv, &nrm, s, pos_base, &mut tmp, AttnCore::Reconstruct, None,
+                        cfg,
+                        l,
+                        li,
+                        kv,
+                        &nrm,
+                        s,
+                        pos_base,
+                        &mut tmp,
+                        AttnCore::Reconstruct,
+                        None,
                     )
                 });
             }
@@ -525,14 +603,28 @@ pub fn kimi_forward<P: ExpertProvider>(
         // there is always at least one candidate.
         timed(&ATTNRES_US, || {
             apply_attn_res(
-                &st.prefix, &st.blocks, &l.mlp_res_norm, &l.mlp_res_proj, cfg.eps, s, d, &mut h,
+                &st.prefix,
+                &st.blocks,
+                &l.mlp_res_norm,
+                &l.mlp_res_proj,
+                cfg.eps,
+                s,
+                d,
+                &mut h,
             )
         });
         for si in 0..s {
-            rmsnorm(&mut nrm[si * d..(si + 1) * d], &h[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
+            rmsnorm(
+                &mut nrm[si * d..(si + 1) * d],
+                &h[si * d..(si + 1) * d],
+                &l.post_ln,
+                cfg.eps,
+            );
         }
         if l.sparse {
-            timed(&MOE_US, || crate::moe::kimi_moe(cfg, l, li, &nrm, s, &mut tmp, provider))?;
+            timed(&MOE_US, || {
+                crate::moe::kimi_moe(cfg, l, li, &nrm, s, &mut tmp, provider)
+            })?;
         } else {
             timed(&DENSE_US, || dense_mlp(l, &nrm, s, &mut tmp));
         }
@@ -646,8 +738,14 @@ pub fn mamba2_mixer(
     let kk = cfg.mamba_d_conv as usize;
     let proj_out = d_inner + conv_dim + nh;
 
-    let in_proj = l.mamba_in_proj.as_ref().expect("mamba layer missing in_proj");
-    let out_proj = l.mamba_out_proj.as_ref().expect("mamba layer missing out_proj");
+    let in_proj = l
+        .mamba_in_proj
+        .as_ref()
+        .expect("mamba layer missing in_proj");
+    let out_proj = l
+        .mamba_out_proj
+        .as_ref()
+        .expect("mamba layer missing out_proj");
 
     // Reused across layers and calls — see `MambaScratch`. Moved out and back rather than
     // held borrowed, so the body below is unchanged apart from the slice types.
@@ -697,7 +795,7 @@ pub fn mamba2_mixer(
         causal_conv1d_silu(aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk)
     });
     let conv_out = &conv_aug[hist * conv_dim..aug_len * conv_dim]; // [s, conv_dim]
-    // Next state = the last k input columns of the augmented buffer.
+                                                                   // Next state = the last k input columns of the augmented buffer.
     kv.mamba_conv_row_mut(layer)
         .copy_from_slice(&aug[(aug_len - kk) * conv_dim..aug_len * conv_dim]);
 
@@ -747,13 +845,23 @@ pub fn mamba2_mixer(
                     crate::mamba2::step_head_scalars(dims, dt, &l.mamba_a_log, &l.mamba_dt_bias);
                 let st = kv.mamba_ssm_mut(layer);
                 crate::gpu::try_mamba2_scan(
-                    &mut st.data, &mut yv, h, b, c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng,
+                    &mut st.data,
+                    &mut yv,
+                    h,
+                    b,
+                    c,
+                    &dt_h,
+                    &da_h,
+                    &l.mamba_d,
+                    nh,
+                    hd,
+                    ds,
+                    ng,
                 )
                 .then_some(yv)
             } else {
-                let (dt_h, da_h) = crate::mamba2::seq_head_scalars(
-                    dims, dt, &l.mamba_a_log, &l.mamba_dt_bias, s,
-                );
+                let (dt_h, da_h) =
+                    crate::mamba2::seq_head_scalars(dims, dt, &l.mamba_a_log, &l.mamba_dt_bias, s);
                 let st = kv.mamba_ssm_mut(layer);
                 // Small S (MTP verify / tiny prefills) reduces d_state in strict nn-order so
                 // the S>1 logits are BIT-identical to the S==1 decode path — otherwise a
@@ -761,7 +869,19 @@ pub fn mamba2_mixer(
                 // prefill keeps the fast tree-sum (the strict serial sum would bottleneck it).
                 let exact = s <= mamba_exact_seq_max();
                 crate::gpu::try_mamba2_scan_seq(
-                    &mut st.data, &mut yv, h, b, c, &dt_h, &da_h, &l.mamba_d, nh, hd, ds, ng, s,
+                    &mut st.data,
+                    &mut yv,
+                    h,
+                    b,
+                    c,
+                    &dt_h,
+                    &da_h,
+                    &l.mamba_d,
+                    nh,
+                    hd,
+                    ds,
+                    ng,
+                    s,
                     exact,
                 )
                 .then_some(yv)
@@ -837,8 +957,7 @@ pub fn forward<P: ExpertProvider>(
     // decode to the bit — pairs with the Mamba `exact` scan gate. Held for this forward's
     // scope; large-S prefill keeps the fast WSMM/WMMA path. See gpu::ExactExpertsGuard.
     #[cfg(feature = "cuda")]
-    let _exact_guard =
-        crate::gpu::ExactExpertsGuard::new(s > 1 && s <= mamba_exact_seq_max());
+    let _exact_guard = crate::gpu::ExactExpertsGuard::new(s > 1 && s <= mamba_exact_seq_max());
 
     // token embeddings
     let mut x = vec![0f32; s * d];
@@ -923,7 +1042,12 @@ fn layer_forward_batched<P: ExpertProvider>(
     let n = positions.len();
     // in_ln -> attention (per sequence) -> residual
     for si in 0..n {
-        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.in_ln, cfg.eps);
+        rmsnorm(
+            &mut nrm[si * d..(si + 1) * d],
+            &x[si * d..(si + 1) * d],
+            &l.in_ln,
+            cfg.eps,
+        );
     }
     timed(&ATTN_US, || {
         for si in 0..n {
@@ -963,10 +1087,17 @@ fn layer_forward_batched<P: ExpertProvider>(
     }
     // post_ln -> MoE/dense (ONCE over all N rows — the amortization) -> residual
     for si in 0..n {
-        rmsnorm(&mut nrm[si * d..(si + 1) * d], &x[si * d..(si + 1) * d], &l.post_ln, cfg.eps);
+        rmsnorm(
+            &mut nrm[si * d..(si + 1) * d],
+            &x[si * d..(si + 1) * d],
+            &l.post_ln,
+            cfg.eps,
+        );
     }
     if l.sparse {
-        timed(&MOE_US, || moe(cfg, l, li, nrm, n, tmp, cfg.n_shared > 0, provider))?;
+        timed(&MOE_US, || {
+            moe(cfg, l, li, nrm, n, tmp, cfg.n_shared > 0, provider)
+        })?;
     } else {
         timed(&DENSE_US, || dense_mlp(l, nrm, n, tmp));
     }
@@ -1154,7 +1285,10 @@ where
     forward(model, kv, provider, prompt, 0, &mut hidden)?;
     if timing {
         let ms = t_pre.elapsed().as_secs_f64() * 1e3;
-        eprintln!("[timing] prefill {s} tok: {ms:.1} ms ({:.1} tok/s)", s as f64 / (ms / 1e3));
+        eprintln!(
+            "[timing] prefill {s} tok: {ms:.1} ms ({:.1} tok/s)",
+            s as f64 / (ms / 1e3)
+        );
     }
     let mut logits_us = 0u64;
     let mut logit = {
@@ -1238,13 +1372,18 @@ where
         forwards += 1;
         let ms = t.elapsed().as_secs_f64() * 1e3;
         if timing {
-            eprintln!("[timing] decode tok {}: {ms:.1} ms ({:.2} tok/s)", pos - s, 1e3 / ms);
+            eprintln!(
+                "[timing] decode tok {}: {ms:.1} ms ({:.2} tok/s)",
+                pos - s,
+                1e3 / ms
+            );
         }
         decode_ms.push(ms);
 
         let tl = std::time::Instant::now();
-        let los: Vec<Vec<f32>> =
-            (0..sb).map(|i| logits(model, &h_all[i * d..(i + 1) * d])).collect();
+        let los: Vec<Vec<f32>> = (0..sb)
+            .map(|i| logits(model, &h_all[i * d..(i + 1) * d]))
+            .collect();
         logits_us += tl.elapsed().as_micros() as u64;
 
         // Accept the longest prefix that matches what the model itself would
@@ -1293,7 +1432,11 @@ where
         eprintln!(
             "[MTP] {accepted}/{proposed} drafts accepted ({:.0}%), {:.2} tok/forward",
             100.0 * accepted as f64 / proposed as f64,
-            if forwards > 0 { emitted as f64 / forwards as f64 } else { 0.0 }
+            if forwards > 0 {
+                emitted as f64 / forwards as f64
+            } else {
+                0.0
+            }
         );
     }
     if timing && !decode_ms.is_empty() {
@@ -1383,6 +1526,10 @@ where
             // two facts. These four separate the candidates: `fail` is the driver refusing,
             // `capped` is the budget ledger, and all-zero means nothing ever reached
             // `pin_alloc` — a pool already populated by the time the hook arrived.
+            // Charge the buffer pool to Class::ReadBuf before reading the peaks, so the
+            // line below reports it. It was committed nowhere, which is why `readbuf` read
+            // 0.0 GB on every model.
+            crate::ram::set_usage(crate::ram::Class::ReadBuf, colibri_core::pool_live_bytes());
             // Peak per class, which is what a reserve has to cover. RUNTIME_RESERVE is a
             // flat 10 GB standing in for Scratch + ReadBuf + the CUDA context; these are the
             // measured numbers it should be derived from.
@@ -1478,7 +1625,9 @@ mod tests {
 
     // Deterministic pseudo-random-ish weight for reproducible tests.
     fn wv(n: usize, seed: usize) -> Vec<f32> {
-        (0..n).map(|i| (((i + seed) as f32 * 0.41).sin() * 0.5) + 0.05).collect()
+        (0..n)
+            .map(|i| (((i + seed) as f32 * 0.41).sin() * 0.5) + 0.05)
+            .collect()
     }
 
     // A Mamba layer over `mamba_cfg`, with f32 (exact) projection weights so the test
@@ -1487,8 +1636,7 @@ mod tests {
         let d = cfg.hidden as usize; // 4
         let d_inner = cfg.mamba_inter as usize; // 4
         let nh = cfg.mamba_n_heads as usize; // 2
-        let conv_dim =
-            d_inner + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize; // 8
+        let conv_dim = d_inner + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize; // 8
         let proj_out = d_inner + conv_dim + nh; // 14
         let k = cfg.mamba_d_conv as usize; // 2
         let mut l = Layer::default();
@@ -1544,7 +1692,10 @@ mod tests {
             );
         }
         // Sanity: the mixer actually did something (not all zeros).
-        assert!(out_full.iter().any(|v| v.abs() > 1e-6), "mixer produced all-zero output");
+        assert!(
+            out_full.iter().any(|v| v.abs() > 1e-6),
+            "mixer produced all-zero output"
+        );
     }
 
     /// A fresh mixer with zero state must reproduce the stateless primitives directly:
@@ -1569,8 +1720,11 @@ mod tests {
         // Reference: replay the mixer math with the standalone primitives (zero state).
         let mut proj = vec![0f32; s * proj_out];
         matmul_qt(&mut proj, &x, l.mamba_in_proj.as_ref().unwrap(), s);
-        let (mut gate, mut hbc, mut dt) =
-            (vec![0f32; s * d_inner], vec![0f32; s * conv_dim], vec![0f32; s * nh]);
+        let (mut gate, mut hbc, mut dt) = (
+            vec![0f32; s * d_inner],
+            vec![0f32; s * conv_dim],
+            vec![0f32; s * nh],
+        );
         for t in 0..s {
             let b = t * proj_out;
             gate[t * d_inner..(t + 1) * d_inner].copy_from_slice(&proj[b..b + d_inner]);
@@ -1579,8 +1733,11 @@ mod tests {
             dt[t * nh..(t + 1) * nh].copy_from_slice(&proj[b + d_inner + conv_dim..b + proj_out]);
         }
         let conv = causal_conv1d_silu(&hbc, &l.mamba_conv_w, &l.mamba_conv_b, s, conv_dim, k);
-        let (mut h, mut bb, mut cc) =
-            (vec![0f32; s * d_inner], vec![0f32; s * gn], vec![0f32; s * gn]);
+        let (mut h, mut bb, mut cc) = (
+            vec![0f32; s * d_inner],
+            vec![0f32; s * gn],
+            vec![0f32; s * gn],
+        );
         for t in 0..s {
             let b = t * conv_dim;
             h[t * d_inner..(t + 1) * d_inner].copy_from_slice(&conv[b..b + d_inner]);
@@ -1596,7 +1753,16 @@ mod tests {
         };
         let mut st = crate::mamba2::SsmState::zeros(nh, cfg.mamba_head_dim as usize, ds);
         let y = selective_scan(
-            dims, &mut st, &h, &bb, &cc, &dt, &l.mamba_a_log, &l.mamba_d, &l.mamba_dt_bias, s,
+            dims,
+            &mut st,
+            &h,
+            &bb,
+            &cc,
+            &dt,
+            &l.mamba_a_log,
+            &l.mamba_d,
+            &l.mamba_dt_bias,
+            s,
         );
         let yn = gated_rmsnorm(&y, &gate, &l.mamba_norm, s, d_inner, ng, cfg.eps);
         let mut expect = vec![0f32; s * d];
@@ -1606,7 +1772,12 @@ mod tests {
         let mut out = vec![0f32; s * d];
         mamba2_mixer(&cfg, &l, &mut kv, 0, &x, s, &mut out);
         for i in 0..s * d {
-            assert!((out[i] - expect[i]).abs() < 1e-5, "at {i}: {} vs {}", out[i], expect[i]);
+            assert!(
+                (out[i] - expect[i]).abs() < 1e-5,
+                "at {i}: {} vs {}",
+                out[i],
+                expect[i]
+            );
         }
     }
 
@@ -1640,8 +1811,14 @@ mod tests {
         apply_attn_res(&prefix, &blocks, &norm, &proj, 1e-5, s, d, &mut out);
 
         let expect = [
-            0.055048401, -0.14826655, 0.27699308, 0.46382627, //
-            -0.069_257_09, 0.013403297, 0.46532293, 0.16417568,
+            0.055048401,
+            -0.14826655,
+            0.27699308,
+            0.46382627, //
+            -0.069_257_09,
+            0.013403297,
+            0.46532293,
+            0.16417568,
         ];
         for i in 0..s * d {
             assert!(
@@ -1679,7 +1856,10 @@ mod tests {
         let mut b = vec![0f32; s * d];
         apply_attn_res(&prefix, &blocks, &norm, &proj, 1e-5, s, d, &mut a);
         apply_attn_res(&prefix, &blocks, &proj, &norm, 1e-5, s, d, &mut b);
-        assert_eq!(a, b, "score weight is norm*proj — swapping them must be a no-op");
+        assert_eq!(
+            a, b,
+            "score weight is norm*proj — swapping them must be a no-op"
+        );
     }
 
     /// Every token mixes only its OWN candidates. Perturbing token 1's state must leave
@@ -1707,7 +1887,12 @@ mod tests {
     /// Drive [`AttnResState`] over a stack the way `kimi_forward` does, with `outs` as
     /// the sublayer outputs in order (two per layer). Returns the final accumulator and
     /// the saved candidates. `d == 1`, so every value is checkable by hand.
-    fn run_state(bs: usize, embed: f32, n_layers: usize, outs: &[f32]) -> (Vec<f32>, Vec<Vec<f32>>) {
+    fn run_state(
+        bs: usize,
+        embed: f32,
+        n_layers: usize,
+        outs: &[f32],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let mut st = AttnResState::new(vec![embed], bs);
         for li in 0..n_layers {
             st.maybe_snapshot(li);
@@ -1728,7 +1913,11 @@ mod tests {
         // L1: no snapshot   -> 3+4=7 -> 7+5=12
         // L2: snapshot [12] -> reset -> 6 -> 6+7=13
         let (prefix, blocks) = run_state(2, 10.0, 3, &[1.0, 2.0, 4.0, 5.0, 6.0, 7.0]);
-        assert_eq!(prefix, vec![13.0], "post-boundary output must REPLACE the accumulator");
+        assert_eq!(
+            prefix,
+            vec![13.0],
+            "post-boundary output must REPLACE the accumulator"
+        );
         assert_eq!(blocks, vec![vec![10.0], vec![12.0]]);
     }
 
@@ -1738,7 +1927,11 @@ mod tests {
     #[test]
     fn attn_res_state_snapshots_the_state_entering_the_layer() {
         let (_, blocks) = run_state(2, 10.0, 1, &[1.0, 2.0]);
-        assert_eq!(blocks, vec![vec![10.0]], "candidate must predate this layer's mixer");
+        assert_eq!(
+            blocks,
+            vec![vec![10.0]],
+            "candidate must predate this layer's mixer"
+        );
     }
 
     /// Layer 0 is always a boundary, so there is always ≥1 candidate by the time the FFN
@@ -1764,6 +1957,10 @@ mod tests {
             st.accumulate(&[1.0]);
             st.accumulate(&[1.0]);
         }
-        assert_eq!(st.blocks.len(), 8, "93 layers / block 12 -> boundaries at 0,12,..,84");
+        assert_eq!(
+            st.blocks.len(),
+            8,
+            "93 layers / block 12 -> boundaries at 0,12,..,84"
+        );
     }
 }

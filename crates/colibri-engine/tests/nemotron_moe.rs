@@ -27,7 +27,9 @@ const S: usize = 2; // tokens
 
 // Deterministic pseudo-random-ish weight, distinct per `seed`.
 fn wv(n: usize, seed: usize) -> Vec<f32> {
-    (0..n).map(|i| (((i + seed) as f32 * 0.41).sin() * 0.5) + 0.05).collect()
+    (0..n)
+        .map(|i| (((i + seed) as f32 * 0.41).sin() * 0.5) + 0.05)
+        .collect()
 }
 
 // Gateless ReLU² FFN reference: `down(relu(up·x)²)`, mirroring `nemotron_moe`'s experts
@@ -87,7 +89,10 @@ fn nemotron_cfg() -> Config {
         "n_groups":1, "chunk_size":2, "layer_norm_epsilon":1e-5
     }}"#
     );
-    File::create(dir.join("config.json")).unwrap().write_all(json.as_bytes()).unwrap();
+    File::create(dir.join("config.json"))
+        .unwrap()
+        .write_all(json.as_bytes())
+        .unwrap();
     let cfg = Config::load(&dir).unwrap();
     std::fs::remove_dir_all(&dir).ok();
     cfg
@@ -103,8 +108,18 @@ fn nemotron_moe_matches_latent_flow_reference() {
     let mut l = Layer::default();
     l.router = wv(N_EXPERTS * HIDDEN, 1); // f32 router
     l.router_bias = vec![0.0; N_EXPERTS];
-    l.fc1_latent = Some(qtensor_from_f32(&wv(LATENT * HIDDEN, 2), LATENT, HIDDEN, 16));
-    l.fc2_latent = Some(qtensor_from_f32(&wv(HIDDEN * LATENT, 3), HIDDEN, LATENT, 16));
+    l.fc1_latent = Some(qtensor_from_f32(
+        &wv(LATENT * HIDDEN, 2),
+        LATENT,
+        HIDDEN,
+        16,
+    ));
+    l.fc2_latent = Some(qtensor_from_f32(
+        &wv(HIDDEN * LATENT, 3),
+        HIDDEN,
+        LATENT,
+        16,
+    ));
     // Shared expert (gateless ReLU²): up_proj/down_proj on the hidden state.
     l.up_proj = qtensor_from_f32(&wv(SHARED_INTER * HIDDEN, 4), SHARED_INTER, HIDDEN, 16);
     l.down_proj = qtensor_from_f32(&wv(HIDDEN * SHARED_INTER, 5), HIDDEN, SHARED_INTER, 16);
@@ -115,7 +130,14 @@ fn nemotron_moe_matches_latent_flow_reference() {
     for e in 0..N_EXPERTS {
         let up = qtensor_from_f32(&wv(MOE_INTER * LATENT, 20 + e), MOE_INTER, LATENT, 16);
         let down = qtensor_from_f32(&wv(LATENT * MOE_INTER, 40 + e), LATENT, MOE_INTER, 16);
-        experts.insert((0, e), Arc::new(Expert { up, down, ..Default::default() }));
+        experts.insert(
+            (0, e),
+            Arc::new(Expert {
+                up,
+                down,
+                ..Default::default()
+            }),
+        );
     }
     let provider = MapProvider { experts };
 
@@ -128,7 +150,11 @@ fn nemotron_moe_matches_latent_flow_reference() {
     matmul_qt(&mut h_lat, &x, l.fc1_latent.as_ref().unwrap(), S);
     let mut moe_lat = vec![0f32; S * LATENT];
     for t in 0..S {
-        let (idx, w) = route(&cfg, &logits[t * N_EXPERTS..(t + 1) * N_EXPERTS], &l.router_bias);
+        let (idx, w) = route(
+            &cfg,
+            &logits[t * N_EXPERTS..(t + 1) * N_EXPERTS],
+            &l.router_bias,
+        );
         assert_eq!(idx.len(), TOPK);
         for (j, &e) in idx.iter().enumerate() {
             let ex = &provider.experts[&(0, e)];
@@ -157,5 +183,8 @@ fn nemotron_moe_matches_latent_flow_reference() {
             expect[i]
         );
     }
-    assert!(out.iter().any(|v| v.abs() > 1e-6), "moe produced all-zero output");
+    assert!(
+        out.iter().any(|v| v.abs() > 1e-6),
+        "moe produced all-zero output"
+    );
 }

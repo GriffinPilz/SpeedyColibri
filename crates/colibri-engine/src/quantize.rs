@@ -116,10 +116,12 @@ mod tests {
         let w = vec![-2.0f32, -1.0, 0.0, 1.0];
         let (q2, s) = pack_int2(&w, 1, 4, 2);
         assert!((s[0] - 2.0).abs() < 1e-6); // amax 2 / qmax 1
-        // v = round(w/s): -1,-0.5->0 (ties even),0,0.5->0 ... check via dequant path
+                                            // v = round(w/s): -1,-0.5->0 (ties even),0,0.5->0 ... check via dequant path
         let byte = q2[0];
         // decode each 2-bit field: ((byte>>(k*2))&3)-2
-        let decoded: Vec<i32> = (0..4).map(|k| (((byte >> (k * 2)) & 3) as i32) - 2).collect();
+        let decoded: Vec<i32> = (0..4)
+            .map(|k| (((byte >> (k * 2)) & 3) as i32) - 2)
+            .collect();
         // s=2: -2/2=-1, -1/2=-0.5->0(even), 0, 1/2=0.5->0(even)
         assert_eq!(decoded, vec![-1, 0, 0, 0]);
     }
@@ -136,8 +138,8 @@ mod tests {
     fn ties_to_even_matches_lrintf() {
         // 2.5 and 3.5 both round to even (2 and 4) under lrintf/round_ties_even.
         let w = vec![2.5f32, 3.5, 3.0, -3.0]; // O=1, I=4, amax=3.5? -> qmax path
-        // Force s=1 by picking amax=qmax: use bits=8 (qmax=127) is messy; instead
-        // check round_ties_even directly on the values we'd feed.
+                                              // Force s=1 by picking amax=qmax: use bits=8 (qmax=127) is messy; instead
+                                              // check round_ties_even directly on the values we'd feed.
         let _ = w;
         assert_eq!(2.5f32.round_ties_even(), 2.0);
         assert_eq!(3.5f32.round_ties_even(), 4.0);

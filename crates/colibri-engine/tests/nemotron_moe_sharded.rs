@@ -31,7 +31,9 @@ const TOPK: usize = 2;
 const S: usize = 2;
 
 fn wv(n: usize, seed: usize) -> Vec<f32> {
-    (0..n).map(|i| (((i + seed) as f32 * 0.41).sin() * 0.5) + 0.05).collect()
+    (0..n)
+        .map(|i| (((i + seed) as f32 * 0.41).sin() * 0.5) + 0.05)
+        .collect()
 }
 
 struct MapProvider {
@@ -74,7 +76,10 @@ fn nemotron_cfg() -> Config {
         "n_groups":1, "chunk_size":2, "layer_norm_epsilon":1e-5
     }}"#
     );
-    File::create(dir.join("config.json")).unwrap().write_all(json.as_bytes()).unwrap();
+    File::create(dir.join("config.json"))
+        .unwrap()
+        .write_all(json.as_bytes())
+        .unwrap();
     let cfg = Config::load(&dir).unwrap();
     std::fs::remove_dir_all(&dir).ok();
     cfg
@@ -88,8 +93,18 @@ fn nemotron_moe_sharded_two_nodes_equals_single_node() {
     let mut l = Layer::default();
     l.router = wv(N_EXPERTS * HIDDEN, 1);
     l.router_bias = vec![0.0; N_EXPERTS];
-    l.fc1_latent = Some(qtensor_from_f32(&wv(LATENT * HIDDEN, 2), LATENT, HIDDEN, 16));
-    l.fc2_latent = Some(qtensor_from_f32(&wv(HIDDEN * LATENT, 3), HIDDEN, LATENT, 16));
+    l.fc1_latent = Some(qtensor_from_f32(
+        &wv(LATENT * HIDDEN, 2),
+        LATENT,
+        HIDDEN,
+        16,
+    ));
+    l.fc2_latent = Some(qtensor_from_f32(
+        &wv(HIDDEN * LATENT, 3),
+        HIDDEN,
+        LATENT,
+        16,
+    ));
     l.up_proj = qtensor_from_f32(&wv(SHARED_INTER * HIDDEN, 4), SHARED_INTER, HIDDEN, 16);
     l.down_proj = qtensor_from_f32(&wv(HIDDEN * SHARED_INTER, 5), HIDDEN, SHARED_INTER, 16);
 
@@ -97,7 +112,14 @@ fn nemotron_moe_sharded_two_nodes_equals_single_node() {
     for e in 0..N_EXPERTS {
         let up = qtensor_from_f32(&wv(MOE_INTER * LATENT, 20 + e), MOE_INTER, LATENT, 16);
         let down = qtensor_from_f32(&wv(LATENT * MOE_INTER, 40 + e), LATENT, MOE_INTER, 16);
-        experts.insert((0, e), Arc::new(Expert { up, down, ..Default::default() }));
+        experts.insert(
+            (0, e),
+            Arc::new(Expert {
+                up,
+                down,
+                ..Default::default()
+            }),
+        );
     }
     // Both "nodes" read one map here — this test is about the split/exchange/fold math,
     // not about ownership enforcement (covered by `provider_refuses_experts_owned_by_another_node`).
@@ -109,7 +131,10 @@ fn nemotron_moe_sharded_two_nodes_equals_single_node() {
     // cluster context is a process-global OnceLock and cannot be removed once installed.
     let mut out_single = vec![0f32; S * HIDDEN];
     nemotron_moe(&cfg, &l, 0, &x, S, &mut out_single, &*provider).unwrap();
-    assert!(out_single.iter().any(|v| v.abs() > 1e-6), "reference produced all-zero output");
+    assert!(
+        out_single.iter().any(|v| v.abs() > 1e-6),
+        "reference produced all-zero output"
+    );
 
     // 2 nodes, contiguous blocks: node 0 owns {0,1}, node 1 owns {2,3}.
     let sharding = ExpertSharding::new(2, N_EXPERTS as u32);
@@ -118,25 +143,36 @@ fn nemotron_moe_sharded_two_nodes_equals_single_node() {
     // It is dimension-agnostic (`req.hidden` is the *expert input* width), so it serves
     // the latent space here without any Nemotron-specific knowledge.
     let hp = provider.clone();
-    let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
-        let outputs = compute_experts_partial(
-            &*hp,
-            req.layer as usize,
-            &req.experts,
-            &req.weights,
-            &req.activations,
-            req.n_tokens,
-            req.hidden,
-        )
-        .unwrap();
-        ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
-    })
+    let addr = serve_experts(
+        "127.0.0.1:0".parse().unwrap(),
+        sharding.fingerprint(),
+        move |req| {
+            let outputs = compute_experts_partial(
+                &*hp,
+                req.layer as usize,
+                &req.experts,
+                &req.weights,
+                &req.activations,
+                req.n_tokens,
+                req.hidden,
+            )
+            .unwrap();
+            ExpertResponse {
+                outputs,
+                n_tokens: req.n_tokens,
+                hidden: req.hidden,
+            }
+        },
+    )
     .unwrap();
 
     let mut peers = HashMap::new();
     peers.insert(NodeId(1), addr);
     let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
-    set_cluster(ClusterCtx { sharding, transport: Box::new(transport) });
+    set_cluster(ClusterCtx {
+        sharding,
+        transport: Box::new(transport),
+    });
 
     let mut out_sharded = vec![0f32; S * HIDDEN];
     nemotron_moe(&cfg, &l, 0, &x, S, &mut out_sharded, &*provider).unwrap();

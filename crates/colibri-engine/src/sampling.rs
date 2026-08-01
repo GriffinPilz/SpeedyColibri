@@ -77,7 +77,11 @@ pub fn sample_top_p(logits: &[f32], cfg: SampleConfig, uniform: f32) -> usize {
 
     // indices sorted by descending probability
     let mut order: Vec<usize> = (0..probs.len()).collect();
-    order.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // smallest nucleus with cumulative mass >= top_p
     let mut cum = 0.0f32;

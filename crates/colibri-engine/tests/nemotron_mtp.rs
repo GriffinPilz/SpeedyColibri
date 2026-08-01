@@ -44,7 +44,7 @@ const M_K: usize = 2;
 const D_INNER: usize = M_NH * M_HD; // 4
 const CONV_DIM: usize = D_INNER + 2 * M_NG * M_DS; // 8
 const IN_PROJ: usize = D_INNER + CONV_DIM + M_NH; // 14
-// latent MoE
+                                                  // latent MoE
 const E: usize = 4;
 const TOPK: usize = 2;
 const MOE_INTER: usize = 4;
@@ -59,7 +59,11 @@ fn temp_dir() -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let mut p = PathBuf::from(base);
-    p.push(format!("colibri-nemomtp-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    p.push(format!(
+        "colibri-nemomtp-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -123,8 +127,14 @@ fn moe_layer(i: usize, t: &mut Vec<(String, usize)>) {
     t.push((p("mixer.shared_experts.up_proj.weight"), SHARED_INTER * D));
     t.push((p("mixer.shared_experts.down_proj.weight"), D * SHARED_INTER));
     for e in 0..E {
-        t.push((p(&format!("mixer.experts.{e}.up_proj.weight")), MOE_INTER * LATENT));
-        t.push((p(&format!("mixer.experts.{e}.down_proj.weight")), LATENT * MOE_INTER));
+        t.push((
+            p(&format!("mixer.experts.{e}.up_proj.weight")),
+            MOE_INTER * LATENT,
+        ));
+        t.push((
+            p(&format!("mixer.experts.{e}.down_proj.weight")),
+            LATENT * MOE_INTER,
+        ));
     }
 }
 
@@ -213,7 +223,10 @@ fn nemotron_mtp_head_loads_two_sublayers() {
     let qkv = a.qkv_proj.as_ref().expect("head attention must fuse q/k/v");
     assert_eq!((qkv.o as usize, qkv.i as usize), ((H + 2 * KVH) * HD, D));
     assert_eq!((a.o.o as usize, a.o.i as usize), (D, H * HD));
-    assert!(a.q_norm.is_empty() && a.k_norm.is_empty(), "Nemotron attention is no-qk-norm");
+    assert!(
+        a.q_norm.is_empty() && a.k_norm.is_empty(),
+        "Nemotron attention is no-qk-norm"
+    );
     assert_eq!(a.in_ln.len(), D);
 
     // sublayer 1: latent projections + router + gateless shared expert.
@@ -221,10 +234,16 @@ fn nemotron_mtp_head_loads_two_sublayers() {
     assert!(e.sparse);
     assert_eq!(e.router.len(), E * D);
     assert_eq!(e.router_bias.len(), E);
-    let (fc1, fc2) = (e.fc1_latent.as_ref().unwrap(), e.fc2_latent.as_ref().unwrap());
+    let (fc1, fc2) = (
+        e.fc1_latent.as_ref().unwrap(),
+        e.fc2_latent.as_ref().unwrap(),
+    );
     assert_eq!((fc1.o as usize, fc1.i as usize), (LATENT, D));
     assert_eq!((fc2.o as usize, fc2.i as usize), (D, LATENT));
-    assert_eq!((e.up_proj.o as usize, e.up_proj.i as usize), (SHARED_INTER, D));
+    assert_eq!(
+        (e.up_proj.o as usize, e.up_proj.i as usize),
+        (SHARED_INTER, D)
+    );
 
     // The head's own tensors: eh_proj consumes [e ; h] so it is 2D wide.
     assert_eq!((mtp.eh_proj.o as usize, mtp.eh_proj.i as usize), (D, 2 * D));
@@ -238,9 +257,18 @@ fn nemotron_mtp_head_loads_two_sublayers() {
 
     // Resident head weights must be GPU-eligible: they are NOT in `model.layers`, so the
     // loop in `load_model_with` never sees them (the `gpu_eligible` trap).
-    assert!(qkv.gpu_eligible && a.o.gpu_eligible, "head attention projections");
-    assert!(fc1.gpu_eligible && fc2.gpu_eligible, "head latent projections");
-    assert!(e.up_proj.gpu_eligible && e.down_proj.gpu_eligible, "head shared expert");
+    assert!(
+        qkv.gpu_eligible && a.o.gpu_eligible,
+        "head attention projections"
+    );
+    assert!(
+        fc1.gpu_eligible && fc2.gpu_eligible,
+        "head latent projections"
+    );
+    assert!(
+        e.up_proj.gpu_eligible && e.down_proj.gpu_eligible,
+        "head shared expert"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -261,7 +289,10 @@ fn nemotron_mtp_head_gets_two_kv_rows() {
     let m = load_model_with(&dir, LoadOptions::default()).unwrap();
     let kv = KvCache::for_model(&m, 16);
     assert_eq!(kv.kv_start.len(), NL + 2, "one KV row per head sublayer");
-    assert!(kv.kv_start[..NL].iter().all(|&s| s == 0), "main stack starts at 0");
+    assert!(
+        kv.kv_start[..NL].iter().all(|&s| s == 0),
+        "main stack starts at 0"
+    );
     assert_eq!(kv.kv_start[MTP0], KV_UNSET);
     assert_eq!(kv.kv_start[MTP1], KV_UNSET);
     std::fs::remove_dir_all(&dir).ok();
@@ -276,7 +307,10 @@ fn incomplete_nemotron_mtp_head_is_ignored() {
         // sublayer 0 (attention)
         format!("model.layers.{MTP0}.mixer.v_proj.weight"),
         // sublayer 1 (MoE) — the last expert is exactly what a truncated shard loses
-        format!("model.layers.{MTP1}.mixer.experts.{}.down_proj.weight", E - 1),
+        format!(
+            "model.layers.{MTP1}.mixer.experts.{}.down_proj.weight",
+            E - 1
+        ),
         // the head's own fusion input
         format!("model.layers.{MTP0}.eh_proj.weight"),
         // the head's final norm (source: mtp.layers.1.final_layernorm)
@@ -284,8 +318,10 @@ fn incomplete_nemotron_mtp_head_is_ignored() {
     ] {
         let dir = temp_dir();
         std::fs::write(dir.join("config.json"), config_json(true)).unwrap();
-        let tensors: Vec<(String, usize)> =
-            tensor_list(true).into_iter().filter(|(n, _)| *n != dropped).collect();
+        let tensors: Vec<(String, usize)> = tensor_list(true)
+            .into_iter()
+            .filter(|(n, _)| *n != dropped)
+            .collect();
         write_tensors(&dir, &tensors);
 
         let m = load_model_with(&dir, LoadOptions::default()).expect("load");
@@ -311,7 +347,10 @@ fn nemotron_mtp_head_drafts_and_absorbs() {
     forward(&model, &mut kv, &provider, &prompt, 0, &mut hidden).expect("prefill");
 
     let lo = logits(&model, &hidden[(prompt.len() - 1) * D..]);
-    assert!(lo.iter().all(|v| v.is_finite()), "prefill logits must be finite");
+    assert!(
+        lo.iter().all(|v| v.is_finite()),
+        "prefill logits must be finite"
+    );
     let next = colibri_engine::argmax(&lo) as i32;
 
     let kv_idx = prompt.len();
@@ -323,12 +362,18 @@ fn nemotron_mtp_head_drafts_and_absorbs() {
 
     assert_eq!(drafts.len(), g, "room for g drafts in a 32-token cache");
     for &t in &drafts {
-        assert!((0..VOCAB as i32).contains(&t), "draft {t} out of vocab range");
+        assert!(
+            (0..VOCAB as i32).contains(&t),
+            "draft {t} out of vocab range"
+        );
     }
     // Both sublayers ran, at their own indices, from the same partial start.
     assert_eq!(kv.kv_start[MTP0], kv_idx - 1);
     assert_eq!(kv.kv_start[MTP1], kv_idx - 1);
-    assert!(kv.kv_start[..NL].iter().all(|&s| s == 0), "main stack unaffected");
+    assert!(
+        kv.kv_start[..NL].iter().all(|&s| s == 0),
+        "main stack unaffected"
+    );
 
     // Deterministic: same inputs -> same drafts.
     let mut kv2 = KvCache::for_model(&model, 32);
@@ -347,8 +392,15 @@ fn nemotron_mtp_head_drafts_and_absorbs() {
     assert_eq!(drafts, d2, "drafting must be deterministic");
 
     // Absorb the verified prefix: runs the head for its KV side effect only.
-    colibri_engine::mtp_absorb(&model, &mut kv, &provider, &drafts[..1], last_hidden, kv_idx)
-        .expect("absorb");
+    colibri_engine::mtp_absorb(
+        &model,
+        &mut kv,
+        &provider,
+        &drafts[..1],
+        last_hidden,
+        kv_idx,
+    )
+    .expect("absorb");
 
     std::fs::remove_dir_all(&dir).ok();
 }

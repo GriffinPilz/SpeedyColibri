@@ -129,7 +129,9 @@ fn parse_rules(spec: &str) -> Result<Vec<Rule>, String> {
             "nvfp4" => SimScheme::Nvfp4,
             n => SimScheme::Int(
                 n.parse::<u32>()
-                    .map_err(|_| format!("bad COLI_QSIM scheme {n:?} (want `nvfp4` or a bit count)"))
+                    .map_err(|_| {
+                        format!("bad COLI_QSIM scheme {n:?} (want `nvfp4` or a bit count)")
+                    })
                     .and_then(|b| {
                         if (2..=16).contains(&b) {
                             Ok(b)
@@ -180,9 +182,9 @@ fn simulate(t: &mut QTensor, scheme: SimScheme) -> (usize, f64, f64) {
     let w = crate::convert::dequantize_qtensor_pub(t);
     let approx = match scheme {
         SimScheme::Nvfp4 => crate::convert::quantize_nvfp4_sim_pub(&w, o, i),
-        SimScheme::Int(bits) => {
-            crate::convert::dequantize_qtensor_pub(&crate::quantize::qtensor_from_f32(&w, o, i, bits))
-        }
+        SimScheme::Int(bits) => crate::convert::dequantize_qtensor_pub(
+            &crate::quantize::qtensor_from_f32(&w, o, i, bits),
+        ),
     };
     let mut re = crate::quantize::qtensor_from_f32(&approx, o, i, bits);
     re.gpu_eligible = t.gpu_eligible;
@@ -219,7 +221,14 @@ fn apply_layer(l: &mut Layer, class: Class, scheme: SimScheme) -> (usize, f64, f
             opt(&mut l.fc2_latent);
         }
         Class::Shared => {
-            for t in [&mut l.sh_gate, &mut l.sh_up, &mut l.sh_down, &mut l.gate_proj, &mut l.up_proj, &mut l.down_proj] {
+            for t in [
+                &mut l.sh_gate,
+                &mut l.sh_up,
+                &mut l.sh_down,
+                &mut l.gate_proj,
+                &mut l.up_proj,
+                &mut l.down_proj,
+            ] {
                 acc(simulate(t, scheme));
             }
         }
@@ -233,7 +242,13 @@ fn apply_layer(l: &mut Layer, class: Class, scheme: SimScheme) -> (usize, f64, f
             }
         }
         Class::All => {
-            for c in [Class::MambaIn, Class::MambaOut, Class::Latent, Class::Shared, Class::Attn] {
+            for c in [
+                Class::MambaIn,
+                Class::MambaOut,
+                Class::Latent,
+                Class::Shared,
+                Class::Attn,
+            ] {
                 acc(apply_layer(l, c, scheme));
             }
         }
@@ -247,7 +262,9 @@ fn apply_layer(l: &mut Layer, class: Class, scheme: SimScheme) -> (usize, f64, f
 /// weights: a silent no-op would be indistinguishable from "that precision costs
 /// nothing", which is the single most dangerous way this tool could mislead.
 pub fn apply_qsim(model: &mut Model) {
-    let Ok(spec) = std::env::var("COLI_QSIM") else { return };
+    let Ok(spec) = std::env::var("COLI_QSIM") else {
+        return;
+    };
     if spec.trim().is_empty() {
         return;
     }
@@ -323,10 +340,19 @@ mod tests {
     fn rejects_typos_instead_of_silently_doing_nothing() {
         // The failure mode this guards: a misspelled class silently simulating nothing
         // reads as "that precision is free" — the most expensive possible wrong answer.
-        assert!(parse_rules("mmba:nvfp4").is_err(), "misspelled class must error");
-        assert!(parse_rules("mamba:fp4").is_err(), "unknown scheme must error");
+        assert!(
+            parse_rules("mmba:nvfp4").is_err(),
+            "misspelled class must error"
+        );
+        assert!(
+            parse_rules("mamba:fp4").is_err(),
+            "unknown scheme must error"
+        );
         assert!(parse_rules("mamba").is_err(), "missing scheme must error");
-        assert!(parse_rules("mamba:99").is_err(), "out-of-range width must error");
+        assert!(
+            parse_rules("mamba:99").is_err(),
+            "out-of-range width must error"
+        );
         // ...and the valid form it is easy to typo *into* must still parse.
         assert!(parse_rules("mamba:nvfp4").is_ok());
     }
@@ -369,7 +395,13 @@ mod tests {
         let mut t4 = base.clone();
         simulate(&mut t4, SimScheme::Nvfp4);
 
-        assert!(rms(&t8) < base_err * 1.5, "int8-on-int8 should be ~identity");
-        assert!(rms(&t4) > base_err * 3.0, "nvfp4 must visibly degrade vs int8");
+        assert!(
+            rms(&t8) < base_err * 1.5,
+            "int8-on-int8 should be ~identity"
+        );
+        assert!(
+            rms(&t4) > base_err * 3.0,
+            "nvfp4 must visibly degrade vs int8"
+        );
     }
 }

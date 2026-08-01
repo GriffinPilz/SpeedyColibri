@@ -170,7 +170,11 @@ pub fn swiglu_oai(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
 #[inline]
 pub fn situ(gate: f32, up: f32, beta: f32, linear_beta: f32) -> f32 {
     let a = beta * (gate / beta).tanh() * sigmoid(gate);
-    let u = if linear_beta > 0.0 { linear_beta * (up / linear_beta).tanh() } else { up };
+    let u = if linear_beta > 0.0 {
+        linear_beta * (up / linear_beta).tanh()
+    } else {
+        up
+    };
     a * u
 }
 
@@ -269,7 +273,10 @@ mod situ_tests {
             (2.0, 0.0, 0.0),
         ] {
             let got = situ(g, u, b, lb);
-            assert!((got - want).abs() < 1e-6, "situ({g},{u}) = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "situ({g},{u}) = {got}, want {want}"
+            );
         }
     }
 
@@ -281,15 +288,26 @@ mod situ_tests {
         let (b, lb) = (4.0f32, 25.0f32);
         let big = situ(100.0, 100.0, b, lb);
         assert!((big - 99.93293).abs() < 1e-3, "saturated value {big}");
-        assert!(big < b * lb, "must be bounded by beta*linear_beta = {}", b * lb);
+        assert!(
+            big < b * lb,
+            "must be bounded by beta*linear_beta = {}",
+            b * lb
+        );
         // Doubling a large `up` must NOT double the output (a passthrough would).
         let (a1, a2) = (situ(1.0, 200.0, b, lb), situ(1.0, 400.0, b, lb));
-        assert!((a2 / a1) < 1.05, "up half is not clamped: ratio {}", a2 / a1);
+        assert!(
+            (a2 / a1) < 1.05,
+            "up half is not clamped: ratio {}",
+            a2 / a1
+        );
 
         // linear_beta <= 0 means "unset": `up` passes through untouched.
         assert!((situ(1.0, 2.0, b, 0.0) - 1.43239911).abs() < 1e-6);
         let lin = situ(1.0, 400.0, b, 0.0) / situ(1.0, 200.0, b, 0.0);
-        assert!((lin - 2.0).abs() < 1e-4, "unset linear_beta must be linear, got {lin}");
+        assert!(
+            (lin - 2.0).abs() < 1e-4,
+            "unset linear_beta must be linear, got {lin}"
+        );
     }
 
     /// The gate half saturates at +/-beta rather than growing like SiLU.
@@ -298,7 +316,10 @@ mod situ_tests {
         let (b, lb) = (4.0f32, 25.0f32);
         let u = 1.0f32;
         let uu = lb * (u / lb).tanh();
-        assert!((situ(50.0, u, b, lb) / uu - b).abs() < 1e-3, "gate should saturate to beta");
+        assert!(
+            (situ(50.0, u, b, lb) / uu - b).abs() < 1e-3,
+            "gate should saturate to beta"
+        );
         // Large negative gate -> ~0 (sigmoid kills it), never a large negative value.
         assert!(situ(-100.0, 5.0, b, lb).abs() < 1e-6);
     }

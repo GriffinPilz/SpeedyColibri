@@ -183,10 +183,17 @@ fn nemotron_container_name(name: &str, n_layers: usize) -> Option<String> {
         // Same block-norm canonicalization as the main stack: the sublayer's own
         // `norm.weight` becomes `input_layernorm.weight`; the gated `mixer.norm.weight`
         // keeps its `.mixer.` marker and is left alone.
-        let tail = if tail == "norm.weight" { "input_layernorm.weight" } else { tail };
+        let tail = if tail == "norm.weight" {
+            "input_layernorm.weight"
+        } else {
+            tail
+        };
         return Some(format!("model.layers.{li}.{tail}"));
     }
-    let mut n = name.strip_prefix("backbone.").map(|r| format!("model.{r}")).unwrap_or_else(|| name.to_string());
+    let mut n = name
+        .strip_prefix("backbone.")
+        .map(|r| format!("model.{r}"))
+        .unwrap_or_else(|| name.to_string());
     // `model.embeddings.weight` → `model.embed_tokens.weight`.
     n = n.replace("model.embeddings.weight", "model.embed_tokens.weight");
     // Canonicalize the norm names so the engine's generic completeness check + final-norm
@@ -224,7 +231,10 @@ fn m3_container_name(name: &str) -> Option<String> {
             return None;
         }
     }
-    let mut n = name.strip_prefix("language_model.").unwrap_or(name).to_string();
+    let mut n = name
+        .strip_prefix("language_model.")
+        .unwrap_or(name)
+        .to_string();
     n = n.replace(".block_sparse_moe.", ".mlp.");
     // Expert sub-weights: w1 = gate, w3 = up, w2 = down.
     n = n
@@ -260,12 +270,21 @@ fn m3_container_name(name: &str) -> Option<String> {
 ///   model-level `output_attn_res_{norm,proj}` pass through; they have no analogue in any
 ///   other arch but are plain small tensors.
 fn kimi_container_name(name: &str) -> Option<String> {
-    for drop in ["vision_tower", "mm_projector", "multi_modal_projector", "visual", "image_"] {
+    for drop in [
+        "vision_tower",
+        "mm_projector",
+        "multi_modal_projector",
+        "visual",
+        "image_",
+    ] {
         if name.contains(drop) {
             return None;
         }
     }
-    let mut n = name.strip_prefix("language_model.").unwrap_or(name).to_string();
+    let mut n = name
+        .strip_prefix("language_model.")
+        .unwrap_or(name)
+        .to_string();
     // Latent projections FIRST: they contain the substrings `down_proj`/`up_proj`, so
     // renaming them before the expert w1/w2/w3 rewrite keeps the two rules independent.
     n = n
@@ -375,7 +394,11 @@ fn classify_head(
         if !keep_idx {
             return Kind::Skip;
         }
-        return if name.contains("k_norm") { Kind::F32 } else { Kind::Q };
+        return if name.contains("k_norm") {
+            Kind::F32
+        } else {
+            Kind::Q
+        };
     }
     for k in ["indexers_proj", "eh_proj", "enorm", "hnorm", "shared_head"] {
         if name.contains(k) {
@@ -388,7 +411,9 @@ fn classify_head(
                 if name.contains("eh_proj") {
                     return Kind::Q;
                 }
-                if name.contains("enorm") || name.contains("hnorm") || name.contains("shared_head.norm")
+                if name.contains("enorm")
+                    || name.contains("hnorm")
+                    || name.contains("shared_head.norm")
                 {
                     return Kind::F32;
                 }
@@ -473,16 +498,17 @@ fn classify_nemotron(name: &str) -> Kind {
 ///   - `U8` + `name_scale`                    → NVFP4 (modelopt)
 ///   - BF16/F16/F32                           → straight convert
 fn dequant(shards: &Shards, name: &str) -> io::Result<(Vec<f32>, Vec<i64>)> {
-    let t = shards
-        .find(name)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}")))?;
+    let t = shards.find(name).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}"))
+    })?;
 
     match t.dtype {
         // Per-tensor FP8 (modelopt): a single F32 `name_scale`. Real modelopt NVFP4
         // checkpoints use this for the non-expert linears, alongside NVFP4 experts.
         // The weight dtype is what separates this from NVFP4 — both carry `_scale`.
         DType::F8E4M3 | DType::F8E5M2
-            if !shards.has(&format!("{name}_scale_inv")) && shards.has(&format!("{name}_scale")) =>
+            if !shards.has(&format!("{name}_scale_inv"))
+                && shards.has(&format!("{name}_scale")) =>
         {
             let sname = format!("{name}_scale");
             let st = shards.find(&sname).unwrap();
@@ -677,7 +703,10 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 /// widths are no longer produced (int4/int2 removed here — routed experts use the
 /// NVFP4/e4m3 paths instead).
 fn quantize(name: &str, w: &[f32], o: usize, i: usize, bits: u32) -> (OutTensor, OutTensor) {
-    assert!(bits >= 8, "quantize() produces int8 only; got bits={bits} (< 8)");
+    assert!(
+        bits >= 8,
+        "quantize() produces int8 only; got bits={bits} (< 8)"
+    );
     let (q, s) = quantize_rows(w, o, i, bits);
     let codes: Vec<u8> = q.iter().map(|&x| x as u8).collect();
     let scale = s;
@@ -847,9 +876,9 @@ enum ReqOut {
 
 /// Copy one tensor through unchanged (raw on-disk bytes, same dtype + shape).
 fn copy_raw(name: &str, shards: &Shards) -> io::Result<ReqOut> {
-    let t = shards
-        .find(name)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}")))?;
+    let t = shards.find(name).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}"))
+    })?;
     let mut bytes = vec![0u8; t.nbytes as usize];
     shards.read_raw(name, &mut bytes)?;
     Ok(ReqOut::Raw(OutTensor {
@@ -920,8 +949,18 @@ fn requant_resident_one(name: &str, shards: &Shards) -> io::Result<Option<ReqOut
     let (mut blob, bsc, g) = quantize_nvfp4(&w, o, i);
     blob.extend_from_slice(&bsc);
     Ok(Some(ReqOut::Nvfp4(
-        OutTensor { name: name.to_string(), dtype: "U8", shape: vec![blob.len() as i64], bytes: blob },
-        OutTensor { name: format!("{name}.g"), dtype: "F32", shape: vec![1], bytes: f32_bytes(&[g]) },
+        OutTensor {
+            name: name.to_string(),
+            dtype: "U8",
+            shape: vec![blob.len() as i64],
+            bytes: blob,
+        },
+        OutTensor {
+            name: format!("{name}.g"),
+            dtype: "F32",
+            shape: vec![1],
+            bytes: f32_bytes(&[g]),
+        },
     )))
 }
 
@@ -952,7 +991,9 @@ fn requant_one(
     // (attention q/k/v/o, Mamba in_proj/out_proj, fc1/fc2_latent, shared experts);
     // embeddings and `lm_head` are `Kind::Io` and are deliberately NOT touched — they
     // were never simulated, and the io tier is quality-critical.
-    if resident_nvfp4 && name.ends_with(".weight") && classify(name, n_layers, true, false) == Kind::Q
+    if resident_nvfp4
+        && name.ends_with(".weight")
+        && classify(name, n_layers, true, false) == Kind::Q
     {
         if let Some(out) = requant_resident_one(name, shards)? {
             return Ok(out);
@@ -974,7 +1015,11 @@ fn requant_one(
         if t.numel as usize != o * i {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{name}: expected {o}x{i}={} e4m3 codes, got {}", o * i, t.numel),
+                format!(
+                    "{name}: expected {o}x{i}={} e4m3 codes, got {}",
+                    o * i,
+                    t.numel
+                ),
             ));
         }
         let mut codes = vec![0u8; o * i];
@@ -991,8 +1036,18 @@ fn requant_one(
         let (mut blob, bsc, g) = quantize_nvfp4(&w, o, i);
         blob.extend_from_slice(&bsc); // weight = nibbles ++ block-scales (one coalesced read)
         return Ok(ReqOut::Nvfp4(
-            OutTensor { name: name.to_string(), dtype: "U8", shape: vec![blob.len() as i64], bytes: blob },
-            OutTensor { name: format!("{name}.g"), dtype: "F32", shape: vec![1], bytes: f32_bytes(&[g]) },
+            OutTensor {
+                name: name.to_string(),
+                dtype: "U8",
+                shape: vec![blob.len() as i64],
+                bytes: blob,
+            },
+            OutTensor {
+                name: format!("{name}.g"),
+                dtype: "F32",
+                shape: vec![1],
+                bytes: f32_bytes(&[g]),
+            },
         ));
     }
     copy_raw(name, shards)
@@ -1033,7 +1088,11 @@ pub fn requant_experts_nvfp4(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&t| t > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4));
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+        });
 
     // Reborrow as `&Shards` so the worker `move` closures copy the reference instead of
     // moving the owned `Shards` (which `by_file` still borrows). Mirrors `process_names_parallel`.
@@ -1052,7 +1111,9 @@ pub fn requant_experts_nvfp4(
                     scope.spawn(move || {
                         slice
                             .iter()
-                            .map(|&nm| requant_one(nm, sref, n_layers, hidden, moe_inter, resident_nvfp4))
+                            .map(|&nm| {
+                                requant_one(nm, sref, n_layers, hidden, moe_inter, resident_nvfp4)
+                            })
                             .collect::<io::Result<Vec<_>>>()
                     })
                 })
@@ -1116,8 +1177,18 @@ fn quantize_nvfp4_out(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, 
     let (mut blob, bsc, g) = quantize_nvfp4(w, o, i);
     blob.extend_from_slice(&bsc);
     (
-        OutTensor { name: name.to_string(), dtype: "U8", shape: vec![blob.len() as i64], bytes: blob },
-        OutTensor { name: format!("{name}.g"), dtype: "F32", shape: vec![1], bytes: f32_bytes(&[g]) },
+        OutTensor {
+            name: name.to_string(),
+            dtype: "U8",
+            shape: vec![blob.len() as i64],
+            bytes: blob,
+        },
+        OutTensor {
+            name: format!("{name}.g"),
+            dtype: "F32",
+            shape: vec![1],
+            bytes: f32_bytes(&[g]),
+        },
     )
 }
 
@@ -1322,7 +1393,11 @@ pub(crate) fn quantize_nvfp4_sim(w: &[f32], o: usize, i: usize) -> Vec<f32> {
             let sf = ue4m3_round(bmax / E2M1_LEVELS[7] / global);
             let eff = sf * global;
             for (k, &v) in blk.iter().enumerate() {
-                out[r * i + c + k] = if eff > 0.0 { e2m1_round(v / eff) * eff } else { 0.0 };
+                out[r * i + c + k] = if eff > 0.0 {
+                    e2m1_round(v / eff) * eff
+                } else {
+                    0.0
+                };
             }
             c = end;
         }
@@ -1433,8 +1508,16 @@ pub fn quant_error(
             name: name.to_string(),
             o,
             i,
-            rms_rel: if rms_ref > 0.0 { rms_err / rms_ref } else { 0.0 },
-            max_rel: if rms_ref > 0.0 { max_abs / rms_ref } else { 0.0 },
+            rms_rel: if rms_ref > 0.0 {
+                rms_err / rms_ref
+            } else {
+                0.0
+            },
+            max_rel: if rms_ref > 0.0 {
+                max_abs / rms_ref
+            } else {
+                0.0
+            },
             snr_db: if rms_err > 0.0 && rms_ref > 0.0 {
                 20.0 * (rms_ref / rms_err).log10()
             } else {
@@ -1562,8 +1645,13 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
         shape,
         bytes: f32_bytes(w),
     };
-    match classify_head(&out_name, opts.n_layers, opts.keep_indexer, opts.mtp_only, opts.mtp_layers)
-    {
+    match classify_head(
+        &out_name,
+        opts.n_layers,
+        opts.keep_indexer,
+        opts.mtp_only,
+        opts.mtp_layers,
+    ) {
         Kind::Skip => Ok(TensorOut::Skip),
         Kind::F32 => {
             let (mut w, shape) = dequant(shards, name)?;
@@ -1605,7 +1693,11 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             } else {
                 // Resident weights (attention/dense/shared) at `ebits`, embeddings/lm_head
                 // at `io_bits` — int8 by default.
-                let bits = if matches!(kind, Kind::Io) { opts.io_bits } else { opts.ebits };
+                let bits = if matches!(kind, Kind::Io) {
+                    opts.io_bits
+                } else {
+                    opts.ebits
+                };
                 quantize(&out_name, &w, o, i, bits)
             };
             Ok(TensorOut::Quant(codes_t, scale_t))
@@ -1631,7 +1723,9 @@ fn process_names_parallel(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&t| t > 0)
         .unwrap_or_else(|| {
-            std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4)
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
         });
     let nthreads = cap.min(n);
     let chunk = n.div_ceil(nthreads);
@@ -1641,7 +1735,10 @@ fn process_names_parallel(
             .chunks(chunk)
             .map(|slice| {
                 scope.spawn(move || {
-                    slice.iter().map(|&nm| process_one(nm, shards, opts)).collect::<io::Result<Vec<_>>>()
+                    slice
+                        .iter()
+                        .map(|&nm| process_one(nm, shards, opts))
+                        .collect::<io::Result<Vec<_>>>()
                 })
             })
             .collect();
@@ -1708,9 +1805,9 @@ pub fn convert_snapshot(
         }
         if !codes.is_empty() || !floats.is_empty() {
             codes.extend(floats); // code block first, then all F32 tensors
-            // `mtp_only` emits `mtp-NNNNN` so its head shards can be dropped straight
-            // into an existing head-less container without colliding with its
-            // `out-NNNNN` shards (the loader globs every `*.safetensors`).
+                                  // `mtp_only` emits `mtp-NNNNN` so its head shards can be dropped straight
+                                  // into an existing head-less container without colliding with its
+                                  // `out-NNNNN` shards (the loader globs every `*.safetensors`).
             let path = if opts.mtp_only {
                 outdir.join(format!("mtp-{fi:05}.safetensors"))
             } else {
@@ -1757,7 +1854,8 @@ mod tests {
             Some("model.layers.5.mlp.experts.7.gate_proj.weight")
         );
         assert_eq!(
-            m("language_model.model.layers.5.block_sparse_moe.experts.7.w2.weight_scale").as_deref(),
+            m("language_model.model.layers.5.block_sparse_moe.experts.7.w2.weight_scale")
+                .as_deref(),
             Some("model.layers.5.mlp.experts.7.down_proj.weight_scale")
         );
         assert_eq!(
@@ -1776,7 +1874,8 @@ mod tests {
             Some("model.layers.3.mlp.e_score_correction_bias")
         );
         assert_eq!(
-            m("language_model.model.layers.3.block_sparse_moe.shared_experts.up_proj.weight").as_deref(),
+            m("language_model.model.layers.3.block_sparse_moe.shared_experts.up_proj.weight")
+                .as_deref(),
             Some("model.layers.3.mlp.shared_experts.up_proj.weight")
         );
         // Attention (GQA) + norms + lm_head pass through after the prefix strip.
@@ -1784,7 +1883,10 @@ mod tests {
             m("language_model.model.layers.0.self_attn.q_norm.weight").as_deref(),
             Some("model.layers.0.self_attn.q_norm.weight")
         );
-        assert_eq!(m("language_model.lm_head.weight").as_deref(), Some("lm_head.weight"));
+        assert_eq!(
+            m("language_model.lm_head.weight").as_deref(),
+            Some("lm_head.weight")
+        );
         // Dropped: vision tower, multimodal projectors, MTP/next-n module.
         assert!(m("vision_tower.vision_model.embeddings.patch_embedding.weight").is_none());
         assert!(m("multi_modal_projector.linear_1.weight").is_none());
@@ -1797,11 +1899,28 @@ mod tests {
     #[test]
     fn float_to_e4m3_matches_hardware() {
         let cases: &[(f32, u8)] = &[
-            (0.0, 0x00), (0.1, 0x1D), (0.5, 0x30), (1.0, 0x38), (1.5, 0x3C),
-            (2.0, 0x40), (3.14159, 0x45), (7.0, 0x4E), (15.5, 0x58), (100.0, 0x6C),
-            (448.0, 0x7E), (500.0, 0x7E), (-1.0, 0xB8), (-0.5, 0xB0), (-256.0, 0xF8),
-            (0.015625, 0x08), (0.0078125, 0x04), (0.001, 0x01), (2.5, 0x42),
-            (0.3, 0x2A), (0.017, 0x09), (255.9, 0x78),
+            (0.0, 0x00),
+            (0.1, 0x1D),
+            (0.5, 0x30),
+            (1.0, 0x38),
+            (1.5, 0x3C),
+            (2.0, 0x40),
+            (3.14159, 0x45),
+            (7.0, 0x4E),
+            (15.5, 0x58),
+            (100.0, 0x6C),
+            (448.0, 0x7E),
+            (500.0, 0x7E),
+            (-1.0, 0xB8),
+            (-0.5, 0xB0),
+            (-256.0, 0xF8),
+            (0.015625, 0x08),
+            (0.0078125, 0x04),
+            (0.001, 0x01),
+            (2.5, 0x42),
+            (0.3, 0x2A),
+            (0.017, 0x09),
+            (255.9, 0x78),
         ];
         for &(x, want) in cases {
             let got = float_to_e4m3(x);
@@ -1837,10 +1956,16 @@ mod tests {
         };
         let (e16, e8) = (err(16), err(8));
         assert!(e16 < 1e-9, "f32 round trip must be exact, got {e16}");
-        assert!(e8 > 1e-6, "int8 on a wide-dynamic-range row should show real error, got {e8}");
+        assert!(
+            e8 > 1e-6,
+            "int8 on a wide-dynamic-range row should show real error, got {e8}"
+        );
         // The metric must react in the right direction: int8 loses measurably more
         // than the exact f32 baseline it approximates.
-        assert!(e8 > e16, "int8 error ({e8}) must exceed the exact f32 baseline ({e16})");
+        assert!(
+            e8 > e16,
+            "int8 error ({e8}) must exceed the exact f32 baseline ({e16})"
+        );
     }
 
     #[test]
@@ -1854,7 +1979,11 @@ mod tests {
         // 5.0 is an exact tie between 4.0 (code 6) and 6.0 (code 7); ties-to-even
         // picks the even code, i.e. 4.0. Asserted because a tie is where a rounding
         // implementation silently drifts from the hardware's.
-        assert_eq!(e2m1_round(5.0), 4.0, "tie 4/6 must resolve to the even code");
+        assert_eq!(
+            e2m1_round(5.0),
+            4.0,
+            "tie 4/6 must resolve to the even code"
+        );
         assert_eq!(e2m1_round(100.0), 6.0, "saturates at the max magnitude");
         assert_eq!(e2m1_round(0.2), 0.0, "below half the first step -> 0");
         // ue4m3: powers of two and the documented max are exact.
@@ -1863,7 +1992,10 @@ mod tests {
             assert_eq!(ue4m3_round(p), p, "ue4m3 power of two {p} not preserved");
         }
         assert_eq!(ue4m3_round(UE4M3_MAX), UE4M3_MAX);
-        assert!(ue4m3_round(1e30) <= UE4M3_MAX, "must not invent a scale past the max");
+        assert!(
+            ue4m3_round(1e30) <= UE4M3_MAX,
+            "must not invent a scale past the max"
+        );
     }
 
     #[test]
@@ -1892,7 +2024,10 @@ mod tests {
         };
         let int8 = rel(&dequantize_qtensor(&qtensor_from_f32(&w, o, i, 8)));
         let nvfp4 = rel(&quantize_nvfp4_sim(&w, o, i));
-        assert!(nvfp4 < int8, "nvfp4 {nvfp4:.4} should beat per-row int8 {int8:.4}");
+        assert!(
+            nvfp4 < int8,
+            "nvfp4 {nvfp4:.4} should beat per-row int8 {int8:.4}"
+        );
     }
 
     #[test]
@@ -1905,7 +2040,11 @@ mod tests {
             .collect();
         let approx = quantize_nvfp4_sim(&w, o, i);
         let diff = w.iter().zip(&approx).filter(|(a, b)| a != b).count();
-        assert!(diff > w.len() / 4, "only {diff}/{} values changed — sim is a no-op?", w.len());
+        assert!(
+            diff > w.len() / 4,
+            "only {diff}/{} values changed — sim is a no-op?",
+            w.len()
+        );
     }
 
     #[test]
@@ -1945,7 +2084,10 @@ mod tests {
             sr += (b as f64).powi(2);
         }
         let rel = (se / sr.max(1e-30)).sqrt();
-        assert!(rel < 1e-4, "decode(quantize_nvfp4) vs sim rel-RMS {rel:e} too large");
+        assert!(
+            rel < 1e-4,
+            "decode(quantize_nvfp4) vs sim rel-RMS {rel:e} too large"
+        );
     }
 
     #[test]
@@ -1957,13 +2099,22 @@ mod tests {
         // and deliberately not asserted here — see ConvertOpts' docs for why the
         // 0.52-vs-0.35 reading is confounded by the swap cliff.
         let d = ConvertOpts::default();
-        assert_eq!(d.ebits, 8, "resident weights (attention/dense/shared) must default to 8-bit");
+        assert_eq!(
+            d.ebits, 8,
+            "resident weights (attention/dense/shared) must default to 8-bit"
+        );
         assert_eq!(d.io_bits, 8);
         // Routed experts default to NVFP4 (4-bit block-scaled), independent of `ebits`:
         // raising the resident width must not flip experts onto the 8-bit e4m3 path.
         assert!(!d.xfp8, "routed experts must default to NVFP4, not e4m3");
-        let hi = ConvertOpts { ebits: 16, ..Default::default() };
-        assert!(!hi.xfp8, "raising ebits must not drag the experts up with it");
+        let hi = ConvertOpts {
+            ebits: 16,
+            ..Default::default()
+        };
+        assert!(
+            !hi.xfp8,
+            "raising ebits must not drag the experts up with it"
+        );
     }
     use std::path::PathBuf;
 
@@ -2041,7 +2192,12 @@ mod tests {
             &indir.join("m.safetensors"),
             &[
                 (w, "F8_E4M3", &[2, 2], vec![0x38, 0x40, 0xB8, 0x30]),
-                (&format!("{w}_scale"), "F32", &[], 3.0f32.to_le_bytes().to_vec()),
+                (
+                    &format!("{w}_scale"),
+                    "F32",
+                    &[],
+                    3.0f32.to_le_bytes().to_vec(),
+                ),
             ],
         );
         let shards = Shards::open(&indir).unwrap();
@@ -2067,7 +2223,12 @@ mod tests {
             &indir.join("model-00000.safetensors"),
             &[
                 (w, "U8", &[2, 32], packed.clone()),
-                (&w.replace("weight_packed", "weight_scale"), "U8", &[2, 2], scale.clone()),
+                (
+                    &w.replace("weight_packed", "weight_scale"),
+                    "U8",
+                    &[2, 2],
+                    scale.clone(),
+                ),
             ],
         );
         let shards = Shards::open(&indir).unwrap();
@@ -2087,7 +2248,12 @@ mod tests {
         assert_eq!(tag.bytes, 1.0f32.to_le_bytes().to_vec());
 
         // Byte count must agree with what QTensor::bytes() charges for fmt=6.
-        let qt = colibri_core::QTensor { fmt_code: 6, o: 2, i: 64, ..Default::default() };
+        let qt = colibri_core::QTensor {
+            fmt_code: 6,
+            o: 2,
+            i: 64,
+            ..Default::default()
+        };
         assert_eq!(qt.bytes(), blob.bytes.len() as i64 + 4);
         std::fs::remove_dir_all(&indir).ok();
     }
@@ -2104,7 +2270,12 @@ mod tests {
             &[
                 (w, "U8", &[2, 32], vec![0u8; 64]),
                 // ceil(64/16) = 4 columns -> NVFP4 blocking, not MX.
-                (&w.replace("weight_packed", "weight_scale"), "U8", &[2, 4], vec![0u8; 8]),
+                (
+                    &w.replace("weight_packed", "weight_scale"),
+                    "U8",
+                    &[2, 4],
+                    vec![0u8; 8],
+                ),
             ],
         );
         let shards = Shards::open(&indir).unwrap();
@@ -2150,9 +2321,19 @@ mod tests {
             &indir.join("model-00000.safetensors"),
             &[
                 (w, "U8", &[1, 2], vec![0x42u8, 0x5A]),
-                (&format!("{w}_scale"), "F8_E4M3", &[1, 1], vec![f8e4m3_byte(1.0)]),
+                (
+                    &format!("{w}_scale"),
+                    "F8_E4M3",
+                    &[1, 1],
+                    vec![f8e4m3_byte(1.0)],
+                ),
                 // 2048.0 >= 1 → looks like the reciprocal
-                (&format!("{w}_scale_2"), "F32", &[], 2048.0f32.to_le_bytes().to_vec()),
+                (
+                    &format!("{w}_scale_2"),
+                    "F32",
+                    &[],
+                    2048.0f32.to_le_bytes().to_vec(),
+                ),
             ],
         );
         let shards = Shards::open(&indir).unwrap();
@@ -2181,7 +2362,12 @@ mod tests {
                     &[1, 8],
                     vec![f8e4m3_byte(1.0); 8],
                 ),
-                (&format!("{w}_scale_2"), "F32", &[], 0.5f32.to_le_bytes().to_vec()),
+                (
+                    &format!("{w}_scale_2"),
+                    "F32",
+                    &[],
+                    0.5f32.to_le_bytes().to_vec(),
+                ),
             ],
         );
         let shards = Shards::open(&indir).unwrap();
@@ -2201,7 +2387,12 @@ mod tests {
             &d1.join("m.safetensors"),
             &[
                 ("a.weight", "F8_E4M3", &[2, 2], vec![0x38; 4]),
-                ("a.weight_scale_inv", "F32", &[1, 1], 1.0f32.to_le_bytes().to_vec()),
+                (
+                    "a.weight_scale_inv",
+                    "F32",
+                    &[1, 1],
+                    1.0f32.to_le_bytes().to_vec(),
+                ),
             ],
         );
         assert_eq!(detect_format(&d1).unwrap(), SourceFormat::Fp8);
@@ -2214,7 +2405,12 @@ mod tests {
             &[
                 ("a.weight", "U8", &[1, 2], vec![0x42, 0x5A]),
                 ("a.weight_scale", "F8_E4M3", &[1, 1], vec![f8e4m3_byte(1.0)]),
-                ("a.weight_scale_2", "F32", &[], 0.5f32.to_le_bytes().to_vec()),
+                (
+                    "a.weight_scale_2",
+                    "F32",
+                    &[],
+                    0.5f32.to_le_bytes().to_vec(),
+                ),
             ],
         );
         assert_eq!(detect_format(&d2).unwrap(), SourceFormat::Nvfp4);
@@ -2299,7 +2495,10 @@ mod tests {
         );
         // rows come from `.qs`, cols from numel/rows — the derivation resident_nvfp4_dims uses
         let (o, i) = (4096usize, flat_numel / 4096);
-        assert_eq!(i, 8192, "cols must derive from numel/rows, not from the shape");
+        assert_eq!(
+            i, 8192,
+            "cols must derive from numel/rows, not from the shape"
+        );
     }
 
     #[test]
@@ -2327,8 +2526,9 @@ mod tests {
         // side drifts, every resident weight silently decodes to garbage. Pin the contract:
         // encode, then decode the way `moe.rs`/`linear.rs` do, and compare to the input.
         let (o, i) = (3usize, 32usize);
-        let w: Vec<f32> =
-            (0..o * i).map(|k| ((k as f32) * 0.317).sin() * (1.0 + (k % 5) as f32)).collect();
+        let w: Vec<f32> = (0..o * i)
+            .map(|k| ((k as f32) * 0.317).sin() * (1.0 + (k % 5) as f32))
+            .collect();
         let (mut blob, bsc, g) = quantize_nvfp4(&w, o, i);
         let nib_bytes = o * i.div_ceil(2);
         let bs_bytes = o * i.div_ceil(16);
@@ -2355,25 +2555,47 @@ mod tests {
             sr += (*b as f64).powi(2);
         }
         let rel = (se / sr).sqrt();
-        assert!(rel < 0.15, "resident nvfp4 round trip rel-rms {rel} — layout mismatch?");
-        assert!(got.iter().any(|v| *v != 0.0), "decoded all zeros — layout mismatch");
+        assert!(
+            rel < 0.15,
+            "resident nvfp4 round trip rel-rms {rel} — layout mismatch?"
+        );
+        assert!(
+            got.iter().any(|v| *v != 0.0),
+            "decoded all zeros — layout mismatch"
+        );
     }
 
     fn classify_rules() {
-        assert_eq!(classify("model.embed_tokens.weight", 78, false, false), Kind::Io);
+        assert_eq!(
+            classify("model.embed_tokens.weight", 78, false, false),
+            Kind::Io
+        );
         assert_eq!(classify("lm_head.weight", 78, false, false), Kind::Io);
         assert_eq!(classify("model.norm.weight", 78, false, false), Kind::F32);
         assert_eq!(
             classify("model.layers.3.input_layernorm.weight", 78, false, false),
             Kind::F32
         );
-        assert_eq!(classify("model.layers.3.mlp.gate.weight", 78, false, false), Kind::F32); // router
         assert_eq!(
-            classify("model.layers.3.mlp.gate.e_score_correction_bias", 78, false, false),
+            classify("model.layers.3.mlp.gate.weight", 78, false, false),
+            Kind::F32
+        ); // router
+        assert_eq!(
+            classify(
+                "model.layers.3.mlp.gate.e_score_correction_bias",
+                78,
+                false,
+                false
+            ),
             Kind::F32
         );
         assert_eq!(
-            classify("model.layers.3.mlp.experts.7.gate_proj.weight", 78, false, false),
+            classify(
+                "model.layers.3.mlp.experts.7.gate_proj.weight",
+                78,
+                false,
+                false
+            ),
             Kind::X
         );
         assert_eq!(
@@ -2381,25 +2603,49 @@ mod tests {
             Kind::Q // dense MLP (layer < first MoE)
         );
         assert_eq!(
-            classify("model.layers.5.self_attn.kv_b_proj.weight", 78, false, false),
+            classify(
+                "model.layers.5.self_attn.kv_b_proj.weight",
+                78,
+                false,
+                false
+            ),
             Kind::Q
         );
         // dropped classes
         assert_eq!(
-            classify("model.layers.3.mlp.experts.7.gate_proj.weight_scale_inv", 78, false, false),
+            classify(
+                "model.layers.3.mlp.experts.7.gate_proj.weight_scale_inv",
+                78,
+                false,
+                false
+            ),
             Kind::Skip
         );
         assert_eq!(
-            classify("model.layers.0.self_attn.indexer.wk.weight", 78, false, false),
+            classify(
+                "model.layers.0.self_attn.indexer.wk.weight",
+                78,
+                false,
+                false
+            ),
             Kind::Skip
         );
 
         // MTP head (layer index n_layers) is KEPT by default so the container ships
         // MTP-ready. Its own fusion inputs, attention, router, norms, and experts all
         // classify as they would for a normal layer.
-        assert_eq!(classify("model.layers.78.eh_proj.weight", 78, false, false), Kind::Q);
-        assert_eq!(classify("model.layers.78.enorm.weight", 78, false, false), Kind::F32);
-        assert_eq!(classify("model.layers.78.hnorm.weight", 78, false, false), Kind::F32);
+        assert_eq!(
+            classify("model.layers.78.eh_proj.weight", 78, false, false),
+            Kind::Q
+        );
+        assert_eq!(
+            classify("model.layers.78.enorm.weight", 78, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify("model.layers.78.hnorm.weight", 78, false, false),
+            Kind::F32
+        );
         assert_eq!(
             classify("model.layers.78.shared_head.norm.weight", 78, false, false),
             Kind::F32
@@ -2408,17 +2654,35 @@ mod tests {
             classify("model.layers.78.input_layernorm.weight", 78, false, false),
             Kind::F32
         );
-        assert_eq!(classify("model.layers.78.mlp.gate.weight", 78, false, false), Kind::F32);
         assert_eq!(
-            classify("model.layers.78.self_attn.kv_b_proj.weight", 78, false, false),
+            classify("model.layers.78.mlp.gate.weight", 78, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify(
+                "model.layers.78.self_attn.kv_b_proj.weight",
+                78,
+                false,
+                false
+            ),
             Kind::Q
         );
         assert_eq!(
-            classify("model.layers.78.mlp.shared_experts.gate_proj.weight", 78, false, false),
+            classify(
+                "model.layers.78.mlp.shared_experts.gate_proj.weight",
+                78,
+                false,
+                false
+            ),
             Kind::Q
         );
         assert_eq!(
-            classify("model.layers.78.mlp.experts.0.gate_proj.weight", 78, false, false),
+            classify(
+                "model.layers.78.mlp.experts.0.gate_proj.weight",
+                78,
+                false,
+                false
+            ),
             Kind::X // routed expert, streamed (NVFP4 by default)
         );
         // The duplicate lm_head inside the head is still dropped (we reuse lm_head).
@@ -2427,7 +2691,10 @@ mod tests {
             Kind::Skip
         );
         // Anything above the single nextn head is not part of the architecture.
-        assert_eq!(classify("model.layers.79.eh_proj.weight", 78, false, false), Kind::Skip);
+        assert_eq!(
+            classify("model.layers.79.eh_proj.weight", 78, false, false),
+            Kind::Skip
+        );
     }
 
     /// The COMPLETE tensor inventory of `unsloth/Kimi-K3`, swept from the safetensors
@@ -2442,111 +2709,262 @@ mod tests {
         // (source name, expected container name or "" to drop, expected Kind)
         let cases: &[(&str, &str, Kind)] = &[
             // --- routed experts: MXFP4 nibbles kept, E8M0 sidecar consumed -----------
-            ("language_model.model.layers.1.block_sparse_moe.experts.5.w1.weight_packed",
-             "model.layers.1.mlp.experts.5.gate_proj.weight", Kind::X),
-            ("language_model.model.layers.1.block_sparse_moe.experts.5.w2.weight_packed",
-             "model.layers.1.mlp.experts.5.down_proj.weight", Kind::X),
-            ("language_model.model.layers.1.block_sparse_moe.experts.5.w3.weight_packed",
-             "model.layers.1.mlp.experts.5.up_proj.weight", Kind::X),
-            ("language_model.model.layers.1.block_sparse_moe.experts.5.w1.weight_scale",
-             "model.layers.1.mlp.experts.5.gate_proj.weight_scale", Kind::Skip),
-            ("language_model.model.layers.1.block_sparse_moe.experts.5.w2.weight_scale",
-             "model.layers.1.mlp.experts.5.down_proj.weight_scale", Kind::Skip),
-            ("language_model.model.layers.1.block_sparse_moe.experts.5.w3.weight_scale",
-             "model.layers.1.mlp.experts.5.up_proj.weight_scale", Kind::Skip),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.5.w1.weight_packed",
+                "model.layers.1.mlp.experts.5.gate_proj.weight",
+                Kind::X,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.5.w2.weight_packed",
+                "model.layers.1.mlp.experts.5.down_proj.weight",
+                Kind::X,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.5.w3.weight_packed",
+                "model.layers.1.mlp.experts.5.up_proj.weight",
+                Kind::X,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.5.w1.weight_scale",
+                "model.layers.1.mlp.experts.5.gate_proj.weight_scale",
+                Kind::Skip,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.5.w2.weight_scale",
+                "model.layers.1.mlp.experts.5.down_proj.weight_scale",
+                Kind::Skip,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.5.w3.weight_scale",
+                "model.layers.1.mlp.experts.5.up_proj.weight_scale",
+                Kind::Skip,
+            ),
             // --- MoE block: latent projections, router, shared expert ---------------
-            ("language_model.model.layers.1.block_sparse_moe.routed_expert_down_proj.weight",
-             "model.layers.1.mlp.fc1_latent_proj.weight", Kind::Q),
-            ("language_model.model.layers.1.block_sparse_moe.routed_expert_up_proj.weight",
-             "model.layers.1.mlp.fc2_latent_proj.weight", Kind::Q),
-            ("language_model.model.layers.1.block_sparse_moe.routed_expert_norm.weight",
-             "model.layers.1.mlp.routed_expert_norm.weight", Kind::F32),
-            ("language_model.model.layers.1.block_sparse_moe.gate.weight",
-             "model.layers.1.mlp.gate.weight", Kind::F32),
-            ("language_model.model.layers.1.block_sparse_moe.gate.e_score_correction_bias",
-             "model.layers.1.mlp.gate.e_score_correction_bias", Kind::F32),
-            ("language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj.weight",
-             "model.layers.1.mlp.shared_experts.gate_proj.weight", Kind::Q),
-            ("language_model.model.layers.1.block_sparse_moe.shared_experts.up_proj.weight",
-             "model.layers.1.mlp.shared_experts.up_proj.weight", Kind::Q),
-            ("language_model.model.layers.1.block_sparse_moe.shared_experts.down_proj.weight",
-             "model.layers.1.mlp.shared_experts.down_proj.weight", Kind::Q),
+            (
+                "language_model.model.layers.1.block_sparse_moe.routed_expert_down_proj.weight",
+                "model.layers.1.mlp.fc1_latent_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.routed_expert_up_proj.weight",
+                "model.layers.1.mlp.fc2_latent_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.routed_expert_norm.weight",
+                "model.layers.1.mlp.routed_expert_norm.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.gate.weight",
+                "model.layers.1.mlp.gate.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.gate.e_score_correction_bias",
+                "model.layers.1.mlp.gate.e_score_correction_bias",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj.weight",
+                "model.layers.1.mlp.shared_experts.gate_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.shared_experts.up_proj.weight",
+                "model.layers.1.mlp.shared_experts.up_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.1.block_sparse_moe.shared_experts.down_proj.weight",
+                "model.layers.1.mlp.shared_experts.down_proj.weight",
+                Kind::Q,
+            ),
             // --- KDA mixer (69 layers) ----------------------------------------------
-            ("language_model.model.layers.0.self_attn.q_proj.weight",
-             "model.layers.0.self_attn.q_proj.weight", Kind::Q),
-            ("language_model.model.layers.0.self_attn.k_proj.weight",
-             "model.layers.0.self_attn.k_proj.weight", Kind::Q),
-            ("language_model.model.layers.0.self_attn.v_proj.weight",
-             "model.layers.0.self_attn.v_proj.weight", Kind::Q),
-            ("language_model.model.layers.0.self_attn.b_proj.weight",
-             "model.layers.0.self_attn.b_proj.weight", Kind::Q),
-            ("language_model.model.layers.0.self_attn.f_a_proj.weight",
-             "model.layers.0.self_attn.f_a_proj.weight", Kind::Q),
-            ("language_model.model.layers.0.self_attn.f_b_proj.weight",
-             "model.layers.0.self_attn.f_b_proj.weight", Kind::Q),
-            ("language_model.model.layers.0.self_attn.q_conv1d.weight",
-             "model.layers.0.self_attn.q_conv1d.weight", Kind::F32),
-            ("language_model.model.layers.0.self_attn.k_conv1d.weight",
-             "model.layers.0.self_attn.k_conv1d.weight", Kind::F32),
-            ("language_model.model.layers.0.self_attn.v_conv1d.weight",
-             "model.layers.0.self_attn.v_conv1d.weight", Kind::F32),
-            ("language_model.model.layers.0.self_attn.A_log",
-             "model.layers.0.self_attn.A_log", Kind::F32),
-            ("language_model.model.layers.0.self_attn.dt_bias",
-             "model.layers.0.self_attn.dt_bias", Kind::F32),
-            ("language_model.model.layers.0.self_attn.o_norm.weight",
-             "model.layers.0.self_attn.o_norm.weight", Kind::F32),
+            (
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.v_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.b_proj.weight",
+                "model.layers.0.self_attn.b_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.f_a_proj.weight",
+                "model.layers.0.self_attn.f_a_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.f_b_proj.weight",
+                "model.layers.0.self_attn.f_b_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.q_conv1d.weight",
+                "model.layers.0.self_attn.q_conv1d.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.k_conv1d.weight",
+                "model.layers.0.self_attn.k_conv1d.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.v_conv1d.weight",
+                "model.layers.0.self_attn.v_conv1d.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.A_log",
+                "model.layers.0.self_attn.A_log",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.dt_bias",
+                "model.layers.0.self_attn.dt_bias",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.self_attn.o_norm.weight",
+                "model.layers.0.self_attn.o_norm.weight",
+                Kind::F32,
+            ),
             // --- gated MLA mixer (24 layers) ----------------------------------------
-            ("language_model.model.layers.3.self_attn.q_a_proj.weight",
-             "model.layers.3.self_attn.q_a_proj.weight", Kind::Q),
-            ("language_model.model.layers.3.self_attn.q_b_proj.weight",
-             "model.layers.3.self_attn.q_b_proj.weight", Kind::Q),
-            ("language_model.model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
-             "model.layers.3.self_attn.kv_a_proj_with_mqa.weight", Kind::Q),
-            ("language_model.model.layers.3.self_attn.kv_b_proj.weight",
-             "model.layers.3.self_attn.kv_b_proj.weight", Kind::Q),
-            ("language_model.model.layers.3.self_attn.q_a_layernorm.weight",
-             "model.layers.3.self_attn.q_a_layernorm.weight", Kind::F32),
-            ("language_model.model.layers.3.self_attn.kv_a_layernorm.weight",
-             "model.layers.3.self_attn.kv_a_layernorm.weight", Kind::F32),
+            (
+                "language_model.model.layers.3.self_attn.q_a_proj.weight",
+                "model.layers.3.self_attn.q_a_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.3.self_attn.q_b_proj.weight",
+                "model.layers.3.self_attn.q_b_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
+                "model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.3.self_attn.kv_b_proj.weight",
+                "model.layers.3.self_attn.kv_b_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.3.self_attn.q_a_layernorm.weight",
+                "model.layers.3.self_attn.q_a_layernorm.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.3.self_attn.kv_a_layernorm.weight",
+                "model.layers.3.self_attn.kv_a_layernorm.weight",
+                Kind::F32,
+            ),
             // shared by BOTH mixers — g_proj and o_proj appear on all 93 layers.
-            ("language_model.model.layers.3.self_attn.g_proj.weight",
-             "model.layers.3.self_attn.g_proj.weight", Kind::Q),
-            ("language_model.model.layers.3.self_attn.o_proj.weight",
-             "model.layers.3.self_attn.o_proj.weight", Kind::Q),
+            (
+                "language_model.model.layers.3.self_attn.g_proj.weight",
+                "model.layers.3.self_attn.g_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.3.self_attn.o_proj.weight",
+                "model.layers.3.self_attn.o_proj.weight",
+                Kind::Q,
+            ),
             // --- dense MLP (layer 0 only) -------------------------------------------
-            ("language_model.model.layers.0.mlp.gate_proj.weight",
-             "model.layers.0.mlp.gate_proj.weight", Kind::Q),
-            ("language_model.model.layers.0.mlp.up_proj.weight",
-             "model.layers.0.mlp.up_proj.weight", Kind::Q),
-            ("language_model.model.layers.0.mlp.down_proj.weight",
-             "model.layers.0.mlp.down_proj.weight", Kind::Q),
+            (
+                "language_model.model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                Kind::Q,
+            ),
+            (
+                "language_model.model.layers.0.mlp.down_proj.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                Kind::Q,
+            ),
             // --- per-layer norms + attention residuals ------------------------------
-            ("language_model.model.layers.0.input_layernorm.weight",
-             "model.layers.0.input_layernorm.weight", Kind::F32),
-            ("language_model.model.layers.0.post_attention_layernorm.weight",
-             "model.layers.0.post_attention_layernorm.weight", Kind::F32),
-            ("language_model.model.layers.0.self_attention_res_norm.weight",
-             "model.layers.0.self_attention_res_norm.weight", Kind::F32),
-            ("language_model.model.layers.0.self_attention_res_proj.weight",
-             "model.layers.0.self_attention_res_proj.weight", Kind::F32),
-            ("language_model.model.layers.0.mlp_res_norm.weight",
-             "model.layers.0.mlp_res_norm.weight", Kind::F32),
-            ("language_model.model.layers.0.mlp_res_proj.weight",
-             "model.layers.0.mlp_res_proj.weight", Kind::F32),
+            (
+                "language_model.model.layers.0.input_layernorm.weight",
+                "model.layers.0.input_layernorm.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.post_attention_layernorm.weight",
+                "model.layers.0.post_attention_layernorm.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.self_attention_res_norm.weight",
+                "model.layers.0.self_attention_res_norm.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.self_attention_res_proj.weight",
+                "model.layers.0.self_attention_res_proj.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.mlp_res_norm.weight",
+                "model.layers.0.mlp_res_norm.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.layers.0.mlp_res_proj.weight",
+                "model.layers.0.mlp_res_proj.weight",
+                Kind::F32,
+            ),
             // --- model level ---------------------------------------------------------
-            ("language_model.model.embed_tokens.weight", "model.embed_tokens.weight", Kind::Io),
+            (
+                "language_model.model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+                Kind::Io,
+            ),
             ("language_model.lm_head.weight", "lm_head.weight", Kind::Io),
-            ("language_model.model.norm.weight", "model.norm.weight", Kind::F32),
-            ("language_model.model.output_attn_res_norm.weight",
-             "model.output_attn_res_norm.weight", Kind::F32),
-            ("language_model.model.output_attn_res_proj.weight",
-             "model.output_attn_res_proj.weight", Kind::F32),
+            (
+                "language_model.model.norm.weight",
+                "model.norm.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.output_attn_res_norm.weight",
+                "model.output_attn_res_norm.weight",
+                Kind::F32,
+            ),
+            (
+                "language_model.model.output_attn_res_proj.weight",
+                "model.output_attn_res_proj.weight",
+                Kind::F32,
+            ),
             // --- vision tower + projector: dropped (text-only MVP) -------------------
             ("vision_tower.encoder.blocks.0.wqkv.weight", "", Kind::Skip),
-            ("vision_tower.encoder.blocks.0.mlp.fc0.weight", "", Kind::Skip),
+            (
+                "vision_tower.encoder.blocks.0.mlp.fc0.weight",
+                "",
+                Kind::Skip,
+            ),
             ("vision_tower.encoder.blocks.0.norm0.weight", "", Kind::Skip),
-            ("vision_tower.encoder.final_layernorm.weight", "", Kind::Skip),
+            (
+                "vision_tower.encoder.final_layernorm.weight",
+                "",
+                Kind::Skip,
+            ),
             ("vision_tower.patch_embed.pos_emb.weight", "", Kind::Skip),
             ("vision_tower.patch_embed.proj.weight", "", Kind::Skip),
             ("mm_projector.post_norm.weight", "", Kind::Skip),
@@ -2557,9 +2975,16 @@ mod tests {
             match kimi_container_name(src) {
                 None => assert!(want_out.is_empty(), "{src} was dropped but should map"),
                 Some(got) => {
-                    assert!(!want_out.is_empty(), "{src} mapped to {got} but should be dropped");
+                    assert!(
+                        !want_out.is_empty(),
+                        "{src} mapped to {got} but should be dropped"
+                    );
                     assert_eq!(&got, want_out, "container name for {src}");
-                    assert_eq!(classify(&got, 93, false, false), *want_kind, "kind for {src}");
+                    assert_eq!(
+                        classify(&got, 93, false, false),
+                        *want_kind,
+                        "kind for {src}"
+                    );
                 }
             }
         }
@@ -2567,7 +2992,10 @@ mod tests {
         // No text-model tensor may be silently dropped: only the vision patterns map to
         // None. A K3 tensor reaching the container as `None` would vanish without error.
         let dropped = cases.iter().filter(|(_, o, _)| o.is_empty()).count();
-        assert_eq!(dropped, 8, "exactly the vision tower + projector patterns are dropped");
+        assert_eq!(
+            dropped, 8,
+            "exactly the vision tower + projector patterns are dropped"
+        );
     }
 
     /// Every K3 tensor must land in the right `Kind`. The three that do not follow from
@@ -2580,34 +3008,60 @@ mod tests {
 
         // Routed experts: `weight_packed`, not `.weight`. Without the explicit rule this
         // reaches the final `Kind::F32` and gets dequantized to f32 experts.
-        assert_eq!(c(&format!("{l}mlp.experts.7.gate_proj.weight_packed")), Kind::X);
-        assert_eq!(c(&format!("{l}mlp.experts.7.down_proj.weight_packed")), Kind::X);
+        assert_eq!(
+            c(&format!("{l}mlp.experts.7.gate_proj.weight_packed")),
+            Kind::X
+        );
+        assert_eq!(
+            c(&format!("{l}mlp.experts.7.down_proj.weight_packed")),
+            Kind::X
+        );
         // Its E8M0 sidecar is consumed alongside the weight, never emitted on its own.
-        assert_eq!(c(&format!("{l}mlp.experts.7.gate_proj.weight_scale")), Kind::Skip);
+        assert_eq!(
+            c(&format!("{l}mlp.experts.7.gate_proj.weight_scale")),
+            Kind::Skip
+        );
 
         // KDA vectors and kernels stay f32.
-        for t in ["self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight",
-                  "self_attn.A_log", "self_attn.dt_bias", "self_attn.o_norm.weight"] {
+        for t in [
+            "self_attn.q_conv1d.weight",
+            "self_attn.k_conv1d.weight",
+            "self_attn.A_log",
+            "self_attn.dt_bias",
+            "self_attn.o_norm.weight",
+        ] {
             assert_eq!(c(&format!("{l}{t}")), Kind::F32, "{t}");
         }
         // Residual projections are single rows -> f32, not per-row-scaled int8.
-        for t in ["self_attention_res_proj.weight", "mlp_res_proj.weight",
-                  "self_attention_res_norm.weight", "mlp_res_norm.weight"] {
+        for t in [
+            "self_attention_res_proj.weight",
+            "mlp_res_proj.weight",
+            "self_attention_res_norm.weight",
+            "mlp_res_norm.weight",
+        ] {
             assert_eq!(c(&format!("{l}{t}")), Kind::F32, "{t}");
         }
 
         // Resident matrices quantize: both mixers' projections, the latent projections,
         // and the shared expert.
-        for t in ["self_attn.q_proj.weight", "self_attn.g_proj.weight",
-                  "self_attn.f_b_proj.weight", "self_attn.kv_b_proj.weight",
-                  "mlp.fc1_latent_proj.weight", "mlp.fc2_latent_proj.weight",
-                  "mlp.shared_experts.down_proj.weight"] {
+        for t in [
+            "self_attn.q_proj.weight",
+            "self_attn.g_proj.weight",
+            "self_attn.f_b_proj.weight",
+            "self_attn.kv_b_proj.weight",
+            "mlp.fc1_latent_proj.weight",
+            "mlp.fc2_latent_proj.weight",
+            "mlp.shared_experts.down_proj.weight",
+        ] {
             assert_eq!(c(&format!("{l}{t}")), Kind::Q, "{t}");
         }
 
         // Router and the latent norm stay f32; embeddings take io_bits.
         assert_eq!(c(&format!("{l}mlp.gate.weight")), Kind::F32);
-        assert_eq!(c(&format!("{l}mlp.gate.e_score_correction_bias")), Kind::F32);
+        assert_eq!(
+            c(&format!("{l}mlp.gate.e_score_correction_bias")),
+            Kind::F32
+        );
         assert_eq!(c(&format!("{l}mlp.routed_expert_norm.weight")), Kind::F32);
         assert_eq!(c("model.embed_tokens.weight"), Kind::Io);
         assert_eq!(c("lm_head.weight"), Kind::Io);
@@ -2623,20 +3077,34 @@ mod tests {
     #[test]
     fn kimi_k3_name_mapping() {
         let m = |s: &str| kimi_container_name(s);
-        assert_eq!(m("language_model.model.embed_tokens.weight").as_deref(),
-                   Some("model.embed_tokens.weight"));
-        assert_eq!(m("language_model.lm_head.weight").as_deref(), Some("lm_head.weight"));
-        assert_eq!(m("language_model.model.norm.weight").as_deref(), Some("model.norm.weight"));
+        assert_eq!(
+            m("language_model.model.embed_tokens.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        assert_eq!(
+            m("language_model.lm_head.weight").as_deref(),
+            Some("lm_head.weight")
+        );
+        assert_eq!(
+            m("language_model.model.norm.weight").as_deref(),
+            Some("model.norm.weight")
+        );
 
         // Routed experts: w1 = gate, w3 = up, w2 = down — inside the latent space.
         // Both the packed nibbles and their E8M0 scale sidecar get the same rewrite.
         let e = "language_model.model.layers.1.block_sparse_moe.experts.7.";
-        assert_eq!(m(&format!("{e}w1.weight_packed")).as_deref(),
-                   Some("model.layers.1.mlp.experts.7.gate_proj.weight"));
-        assert_eq!(m(&format!("{e}w3.weight_packed")).as_deref(),
-                   Some("model.layers.1.mlp.experts.7.up_proj.weight"));
-        assert_eq!(m(&format!("{e}w2.weight_scale")).as_deref(),
-                   Some("model.layers.1.mlp.experts.7.down_proj.weight_scale"));
+        assert_eq!(
+            m(&format!("{e}w1.weight_packed")).as_deref(),
+            Some("model.layers.1.mlp.experts.7.gate_proj.weight")
+        );
+        assert_eq!(
+            m(&format!("{e}w3.weight_packed")).as_deref(),
+            Some("model.layers.1.mlp.experts.7.up_proj.weight")
+        );
+        assert_eq!(
+            m(&format!("{e}w2.weight_scale")).as_deref(),
+            Some("model.layers.1.mlp.experts.7.down_proj.weight_scale")
+        );
 
         // CONTRACT: what convert WRITES must be exactly what the loader LOOKS UP. These
         // two sides were written independently and drifted — convert kept the source's
@@ -2663,46 +3131,85 @@ mod tests {
         // `up` is latent->hidden (fc2_latent) — dimension direction, not gate/up/down.
         // Swapping these transposes the whole MoE block, so pin them explicitly.
         let b = "language_model.model.layers.1.block_sparse_moe.";
-        assert_eq!(m(&format!("{b}routed_expert_down_proj.weight")).as_deref(),
-                   Some("model.layers.1.mlp.fc1_latent_proj.weight"));
-        assert_eq!(m(&format!("{b}routed_expert_up_proj.weight")).as_deref(),
-                   Some("model.layers.1.mlp.fc2_latent_proj.weight"));
+        assert_eq!(
+            m(&format!("{b}routed_expert_down_proj.weight")).as_deref(),
+            Some("model.layers.1.mlp.fc1_latent_proj.weight")
+        );
+        assert_eq!(
+            m(&format!("{b}routed_expert_up_proj.weight")).as_deref(),
+            Some("model.layers.1.mlp.fc2_latent_proj.weight")
+        );
         // ...and they must NOT be caught by the expert down/up rewrite.
-        assert!(!m(&format!("{b}routed_expert_down_proj.weight")).unwrap().contains("routed_expert"));
+        assert!(!m(&format!("{b}routed_expert_down_proj.weight"))
+            .unwrap()
+            .contains("routed_expert"));
 
         // Router, shared experts, latent norm.
-        assert_eq!(m(&format!("{b}gate.e_score_correction_bias")).as_deref(),
-                   Some("model.layers.1.mlp.gate.e_score_correction_bias"));
-        assert_eq!(m(&format!("{b}shared_experts.down_proj.weight")).as_deref(),
-                   Some("model.layers.1.mlp.shared_experts.down_proj.weight"));
-        assert_eq!(m(&format!("{b}routed_expert_norm.weight")).as_deref(),
-                   Some("model.layers.1.mlp.routed_expert_norm.weight"));
+        assert_eq!(
+            m(&format!("{b}gate.e_score_correction_bias")).as_deref(),
+            Some("model.layers.1.mlp.gate.e_score_correction_bias")
+        );
+        assert_eq!(
+            m(&format!("{b}shared_experts.down_proj.weight")).as_deref(),
+            Some("model.layers.1.mlp.shared_experts.down_proj.weight")
+        );
+        assert_eq!(
+            m(&format!("{b}routed_expert_norm.weight")).as_deref(),
+            Some("model.layers.1.mlp.routed_expert_norm.weight")
+        );
 
         // Both mixers pass through untouched — KDA...
         let a = "language_model.model.layers.0.self_attn.";
-        for t in ["q_proj.weight", "g_proj.weight", "b_proj.weight", "f_a_proj.weight",
-                  "f_b_proj.weight", "q_conv1d.weight", "A_log", "dt_bias", "o_norm.weight"] {
-            assert_eq!(m(&format!("{a}{t}")).as_deref(),
-                       Some(format!("model.layers.0.self_attn.{t}").as_str()));
+        for t in [
+            "q_proj.weight",
+            "g_proj.weight",
+            "b_proj.weight",
+            "f_a_proj.weight",
+            "f_b_proj.weight",
+            "q_conv1d.weight",
+            "A_log",
+            "dt_bias",
+            "o_norm.weight",
+        ] {
+            assert_eq!(
+                m(&format!("{a}{t}")).as_deref(),
+                Some(format!("model.layers.0.self_attn.{t}").as_str())
+            );
         }
         // ...and gated MLA.
         let a3 = "language_model.model.layers.3.self_attn.";
-        for t in ["q_a_proj.weight", "q_b_proj.weight", "kv_a_proj_with_mqa.weight",
-                  "kv_b_proj.weight", "kv_a_layernorm.weight", "o_proj.weight"] {
-            assert_eq!(m(&format!("{a3}{t}")).as_deref(),
-                       Some(format!("model.layers.3.self_attn.{t}").as_str()));
+        for t in [
+            "q_a_proj.weight",
+            "q_b_proj.weight",
+            "kv_a_proj_with_mqa.weight",
+            "kv_b_proj.weight",
+            "kv_a_layernorm.weight",
+            "o_proj.weight",
+        ] {
+            assert_eq!(
+                m(&format!("{a3}{t}")).as_deref(),
+                Some(format!("model.layers.3.self_attn.{t}").as_str())
+            );
         }
 
         // Attention residuals (no analogue in any other arch) pass through.
-        for t in ["self_attention_res_norm.weight", "self_attention_res_proj.weight",
-                  "mlp_res_norm.weight", "mlp_res_proj.weight"] {
-            assert_eq!(m(&format!("language_model.model.layers.5.{t}")).as_deref(),
-                       Some(format!("model.layers.5.{t}").as_str()));
+        for t in [
+            "self_attention_res_norm.weight",
+            "self_attention_res_proj.weight",
+            "mlp_res_norm.weight",
+            "mlp_res_proj.weight",
+        ] {
+            assert_eq!(
+                m(&format!("language_model.model.layers.5.{t}")).as_deref(),
+                Some(format!("model.layers.5.{t}").as_str())
+            );
         }
 
         // The dense layer-0 MLP keeps its ordinary names.
-        assert_eq!(m("language_model.model.layers.0.mlp.gate_proj.weight").as_deref(),
-                   Some("model.layers.0.mlp.gate_proj.weight"));
+        assert_eq!(
+            m("language_model.model.layers.0.mlp.gate_proj.weight").as_deref(),
+            Some("model.layers.0.mlp.gate_proj.weight")
+        );
 
         // Vision tower and projector are dropped (text-only MVP, as with M3).
         assert!(m("vision_tower.encoder.blocks.0.wqkv.weight").is_none());
@@ -2712,7 +3219,10 @@ mod tests {
     #[test]
     fn nemotron_name_mapping() {
         let m = |s: &str| nemotron_container_name(s, 88);
-        assert_eq!(m("backbone.embeddings.weight").as_deref(), Some("model.embed_tokens.weight"));
+        assert_eq!(
+            m("backbone.embeddings.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
         assert_eq!(
             m("backbone.layers.5.mixer.in_proj.weight").as_deref(),
             Some("model.layers.5.mixer.in_proj.weight")
@@ -2727,7 +3237,10 @@ mod tests {
             Some("model.layers.7.mixer.norm.weight")
         );
         // Final norm norm_f -> the canonical model.norm.weight.
-        assert_eq!(m("backbone.norm_f.weight").as_deref(), Some("model.norm.weight"));
+        assert_eq!(
+            m("backbone.norm_f.weight").as_deref(),
+            Some("model.norm.weight")
+        );
         assert_eq!(m("lm_head.weight").as_deref(), Some("lm_head.weight"));
     }
 
@@ -2752,9 +3265,18 @@ mod tests {
             Some("model.layers.88.input_layernorm.weight")
         );
         // The three fusion tensors sit at the head's base index, unprefixed (GLM naming).
-        assert_eq!(m("mtp.layers.0.eh_proj.weight").as_deref(), Some("model.layers.88.eh_proj.weight"));
-        assert_eq!(m("mtp.layers.0.enorm.weight").as_deref(), Some("model.layers.88.enorm.weight"));
-        assert_eq!(m("mtp.layers.0.hnorm.weight").as_deref(), Some("model.layers.88.hnorm.weight"));
+        assert_eq!(
+            m("mtp.layers.0.eh_proj.weight").as_deref(),
+            Some("model.layers.88.eh_proj.weight")
+        );
+        assert_eq!(
+            m("mtp.layers.0.enorm.weight").as_deref(),
+            Some("model.layers.88.enorm.weight")
+        );
+        assert_eq!(
+            m("mtp.layers.0.hnorm.weight").as_deref(),
+            Some("model.layers.88.hnorm.weight")
+        );
 
         // --- sublayer 1: the latent-MoE block, at index n_layers + 1 --------------
         assert_eq!(
@@ -2799,44 +3321,121 @@ mod tests {
     fn nemotron_classify_rules() {
         // Routed experts (latent-space) → streamed X.
         assert_eq!(
-            classify("model.layers.1.mixer.experts.3.up_proj.weight", 88, false, false),
+            classify(
+                "model.layers.1.mixer.experts.3.up_proj.weight",
+                88,
+                false,
+                false
+            ),
             Kind::X
         );
         assert_eq!(
-            classify("model.layers.1.mixer.experts.3.down_proj.weight", 88, false, false),
+            classify(
+                "model.layers.1.mixer.experts.3.down_proj.weight",
+                88,
+                false,
+                false
+            ),
             Kind::X
         );
         // Shared expert stays resident (contains "experts" but not `.mixer.experts.<n>.`).
         assert_eq!(
-            classify("model.layers.1.mixer.shared_experts.up_proj.weight", 88, false, false),
+            classify(
+                "model.layers.1.mixer.shared_experts.up_proj.weight",
+                88,
+                false,
+                false
+            ),
             Kind::Q
         );
         // Router + correction bias → F32.
-        assert_eq!(classify("model.layers.1.mixer.gate.weight", 88, false, false), Kind::F32);
         assert_eq!(
-            classify("model.layers.1.mixer.gate.e_score_correction_bias", 88, false, false),
+            classify("model.layers.1.mixer.gate.weight", 88, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify(
+                "model.layers.1.mixer.gate.e_score_correction_bias",
+                88,
+                false,
+                false
+            ),
             Kind::F32
         );
         // Latent projections + Mamba2 big matmuls → resident Q.
-        assert_eq!(classify("model.layers.1.mixer.fc1_latent_proj.weight", 88, false, false), Kind::Q);
-        assert_eq!(classify("model.layers.1.mixer.fc2_latent_proj.weight", 88, false, false), Kind::Q);
-        assert_eq!(classify("model.layers.0.mixer.in_proj.weight", 88, false, false), Kind::Q);
-        assert_eq!(classify("model.layers.0.mixer.out_proj.weight", 88, false, false), Kind::Q);
+        assert_eq!(
+            classify(
+                "model.layers.1.mixer.fc1_latent_proj.weight",
+                88,
+                false,
+                false
+            ),
+            Kind::Q
+        );
+        assert_eq!(
+            classify(
+                "model.layers.1.mixer.fc2_latent_proj.weight",
+                88,
+                false,
+                false
+            ),
+            Kind::Q
+        );
+        assert_eq!(
+            classify("model.layers.0.mixer.in_proj.weight", 88, false, false),
+            Kind::Q
+        );
+        assert_eq!(
+            classify("model.layers.0.mixer.out_proj.weight", 88, false, false),
+            Kind::Q
+        );
         // Tiny Mamba2 params → F32 (exact).
-        assert_eq!(classify("model.layers.0.mixer.conv1d.weight", 88, false, false), Kind::F32);
-        assert_eq!(classify("model.layers.0.mixer.conv1d.bias", 88, false, false), Kind::F32);
-        assert_eq!(classify("model.layers.0.mixer.A_log", 88, false, false), Kind::F32);
-        assert_eq!(classify("model.layers.0.mixer.D", 88, false, false), Kind::F32);
-        assert_eq!(classify("model.layers.0.mixer.dt_bias", 88, false, false), Kind::F32);
+        assert_eq!(
+            classify("model.layers.0.mixer.conv1d.weight", 88, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify("model.layers.0.mixer.conv1d.bias", 88, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify("model.layers.0.mixer.A_log", 88, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify("model.layers.0.mixer.D", 88, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify("model.layers.0.mixer.dt_bias", 88, false, false),
+            Kind::F32
+        );
         // Gated Mamba norm + block norm → F32.
-        assert_eq!(classify("model.layers.0.mixer.norm.weight", 88, false, false), Kind::F32);
-        assert_eq!(classify("model.layers.0.norm.weight", 88, false, false), Kind::F32);
+        assert_eq!(
+            classify("model.layers.0.mixer.norm.weight", 88, false, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify("model.layers.0.norm.weight", 88, false, false),
+            Kind::F32
+        );
         // Attention proj (the 8 * layers) → resident Q.
-        assert_eq!(classify("model.layers.7.mixer.q_proj.weight", 88, false, false), Kind::Q);
-        assert_eq!(classify("model.layers.7.mixer.o_proj.weight", 88, false, false), Kind::Q);
+        assert_eq!(
+            classify("model.layers.7.mixer.q_proj.weight", 88, false, false),
+            Kind::Q
+        );
+        assert_eq!(
+            classify("model.layers.7.mixer.o_proj.weight", 88, false, false),
+            Kind::Q
+        );
         // Sidecar scales still dropped (handled before the .mixer. branch).
         assert_eq!(
-            classify("model.layers.1.mixer.experts.3.up_proj.weight_scale", 88, false, false),
+            classify(
+                "model.layers.1.mixer.experts.3.up_proj.weight_scale",
+                88,
+                false,
+                false
+            ),
             Kind::Skip
         );
     }
@@ -2858,23 +3457,47 @@ mod tests {
         // sublayer 1 — latent MoE
         assert_eq!(c2("model.layers.89.input_layernorm.weight"), Kind::F32);
         assert_eq!(c2("model.layers.89.mixer.gate.weight"), Kind::F32);
-        assert_eq!(c2("model.layers.89.mixer.gate.e_score_correction_bias"), Kind::F32);
+        assert_eq!(
+            c2("model.layers.89.mixer.gate.e_score_correction_bias"),
+            Kind::F32
+        );
         assert_eq!(c2("model.layers.89.mixer.fc1_latent_proj.weight"), Kind::Q);
         assert_eq!(c2("model.layers.89.mixer.fc2_latent_proj.weight"), Kind::Q);
-        assert_eq!(c2("model.layers.89.mixer.shared_experts.up_proj.weight"), Kind::Q);
-        assert_eq!(c2("model.layers.89.mixer.experts.0.up_proj.weight"), Kind::X);
-        assert_eq!(c2("model.layers.89.mixer.experts.511.down_proj.weight"), Kind::X);
+        assert_eq!(
+            c2("model.layers.89.mixer.shared_experts.up_proj.weight"),
+            Kind::Q
+        );
+        assert_eq!(
+            c2("model.layers.89.mixer.experts.0.up_proj.weight"),
+            Kind::X
+        );
+        assert_eq!(
+            c2("model.layers.89.mixer.experts.511.down_proj.weight"),
+            Kind::X
+        );
         // above the head: not part of the architecture
         assert_eq!(c2("model.layers.90.mixer.q_proj.weight"), Kind::Skip);
         assert_eq!(c2("model.layers.90.input_layernorm.weight"), Kind::Skip);
 
         // The single-block default (GLM/M3) still stops at index 88.
-        assert_eq!(classify("model.layers.89.mixer.gate.weight", 88, false, false), Kind::Skip);
+        assert_eq!(
+            classify("model.layers.89.mixer.gate.weight", 88, false, false),
+            Kind::Skip
+        );
 
         // `COLI_MTP_ONLY` keeps BOTH sublayers and nothing else.
-        assert_eq!(classify_head("model.layers.88.eh_proj.weight", 88, false, true, 2), Kind::Q);
         assert_eq!(
-            classify_head("model.layers.89.mixer.experts.7.up_proj.weight", 88, false, true, 2),
+            classify_head("model.layers.88.eh_proj.weight", 88, false, true, 2),
+            Kind::Q
+        );
+        assert_eq!(
+            classify_head(
+                "model.layers.89.mixer.experts.7.up_proj.weight",
+                88,
+                false,
+                true,
+                2
+            ),
             Kind::X
         );
         assert_eq!(
@@ -2886,15 +3509,29 @@ mod tests {
     #[test]
     fn mtp_only_emits_just_the_head() {
         // The augment pass keeps ONLY layer n_layers; every base tensor is skipped.
-        assert_eq!(classify("model.layers.78.eh_proj.weight", 78, false, true), Kind::Q);
         assert_eq!(
-            classify("model.layers.78.mlp.experts.5.up_proj.weight", 78, false, true),
+            classify("model.layers.78.eh_proj.weight", 78, false, true),
+            Kind::Q
+        );
+        assert_eq!(
+            classify(
+                "model.layers.78.mlp.experts.5.up_proj.weight",
+                78,
+                false,
+                true
+            ),
             Kind::X
         );
-        assert_eq!(classify("model.layers.78.mlp.gate.weight", 78, false, true), Kind::F32);
+        assert_eq!(
+            classify("model.layers.78.mlp.gate.weight", 78, false, true),
+            Kind::F32
+        );
         // Base-model tensors dropped on the augment pass (they already live in the container).
         assert_eq!(classify("lm_head.weight", 78, false, true), Kind::Skip);
-        assert_eq!(classify("model.embed_tokens.weight", 78, false, true), Kind::Skip);
+        assert_eq!(
+            classify("model.embed_tokens.weight", 78, false, true),
+            Kind::Skip
+        );
         assert_eq!(
             classify("model.layers.3.self_attn.kv_b_proj.weight", 78, false, true),
             Kind::Skip
@@ -2906,16 +3543,40 @@ mod tests {
         // With keep_idx: wk/wq_b/weights_proj quantize (Q), k_norm stays f32; and the
         // FP8 scale sidecar is still consumed. Default (false) drops them all.
         let n = "model.layers.0.self_attn.indexer";
-        assert_eq!(classify(&format!("{n}.wk.weight"), 78, true, false), Kind::Q);
-        assert_eq!(classify(&format!("{n}.wq_b.weight"), 78, true, false), Kind::Q);
-        assert_eq!(classify(&format!("{n}.weights_proj.weight"), 78, true, false), Kind::Q);
-        assert_eq!(classify(&format!("{n}.k_norm.weight"), 78, true, false), Kind::F32);
-        assert_eq!(classify(&format!("{n}.k_norm.bias"), 78, true, false), Kind::F32);
-        assert_eq!(classify(&format!("{n}.wk.weight_scale_inv"), 78, true, false), Kind::Skip);
+        assert_eq!(
+            classify(&format!("{n}.wk.weight"), 78, true, false),
+            Kind::Q
+        );
+        assert_eq!(
+            classify(&format!("{n}.wq_b.weight"), 78, true, false),
+            Kind::Q
+        );
+        assert_eq!(
+            classify(&format!("{n}.weights_proj.weight"), 78, true, false),
+            Kind::Q
+        );
+        assert_eq!(
+            classify(&format!("{n}.k_norm.weight"), 78, true, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify(&format!("{n}.k_norm.bias"), 78, true, false),
+            Kind::F32
+        );
+        assert_eq!(
+            classify(&format!("{n}.wk.weight_scale_inv"), 78, true, false),
+            Kind::Skip
+        );
         // Default path still drops them.
-        assert_eq!(classify(&format!("{n}.wk.weight"), 78, false, false), Kind::Skip);
+        assert_eq!(
+            classify(&format!("{n}.wk.weight"), 78, false, false),
+            Kind::Skip
+        );
         // keep_idx does NOT resurrect MTP-head tensors.
-        assert_eq!(classify("model.layers.3.eh_proj.weight", 78, true, false), Kind::Skip);
+        assert_eq!(
+            classify("model.layers.3.eh_proj.weight", 78, true, false),
+            Kind::Skip
+        );
     }
 
     /// Write a minimal FP8 shard: one `[2,2]` F8_E4M3 weight + its `[1,1]`
@@ -2963,7 +3624,12 @@ mod tests {
         drop(f);
 
         let outdir = tmp();
-        let opts = ConvertOpts { ebits: 8, io_bits: 8, n_layers: 78, ..Default::default() };
+        let opts = ConvertOpts {
+            ebits: 8,
+            io_bits: 8,
+            n_layers: 78,
+            ..Default::default()
+        };
         let stats = convert_snapshot(&indir, &outdir, opts, |_, _, _| {}).unwrap();
         assert_eq!(stats.tensors_quantized, 1); // o_proj
         assert_eq!(stats.tensors_f32, 1); // norm

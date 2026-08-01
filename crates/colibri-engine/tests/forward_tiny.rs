@@ -85,9 +85,15 @@ fn push_mtp_head(t: &mut Vec<(String, usize)>) {
     t.push((p("self_attn.q_a_proj.weight"), Q_LORA * D));
     t.push((p("self_attn.q_a_layernorm.weight"), Q_LORA));
     t.push((p("self_attn.q_b_proj.weight"), H * QK_HEAD * Q_LORA));
-    t.push((p("self_attn.kv_a_proj_with_mqa.weight"), (KV_LORA + QK_ROPE) * D));
+    t.push((
+        p("self_attn.kv_a_proj_with_mqa.weight"),
+        (KV_LORA + QK_ROPE) * D,
+    ));
     t.push((p("self_attn.kv_a_layernorm.weight"), KV_LORA));
-    t.push((p("self_attn.kv_b_proj.weight"), H * (QK_NOPE + V_HEAD) * KV_LORA));
+    t.push((
+        p("self_attn.kv_b_proj.weight"),
+        H * (QK_NOPE + V_HEAD) * KV_LORA,
+    ));
     t.push((p("self_attn.o_proj.weight"), D * H * V_HEAD));
     t.push((p("mlp.gate.weight"), E * D));
     t.push((p("mlp.gate.e_score_correction_bias"), E));
@@ -119,9 +125,15 @@ fn tensor_list() -> Vec<(String, usize)> {
         t.push((p("self_attn.q_a_proj.weight"), Q_LORA * D));
         t.push((p("self_attn.q_a_layernorm.weight"), Q_LORA));
         t.push((p("self_attn.q_b_proj.weight"), H * QK_HEAD * Q_LORA));
-        t.push((p("self_attn.kv_a_proj_with_mqa.weight"), (KV_LORA + QK_ROPE) * D));
+        t.push((
+            p("self_attn.kv_a_proj_with_mqa.weight"),
+            (KV_LORA + QK_ROPE) * D,
+        ));
         t.push((p("self_attn.kv_a_layernorm.weight"), KV_LORA));
-        t.push((p("self_attn.kv_b_proj.weight"), H * (QK_NOPE + V_HEAD) * KV_LORA));
+        t.push((
+            p("self_attn.kv_b_proj.weight"),
+            H * (QK_NOPE + V_HEAD) * KV_LORA,
+        ));
         t.push((p("self_attn.o_proj.weight"), D * H * V_HEAD));
         if i < FIRST_DENSE {
             t.push((p("mlp.gate_proj.weight"), DENSE_INTER * D));
@@ -222,9 +234,16 @@ fn mtp_head_drafts_and_absorbs() {
         colibri_engine::mtp_draft(&model, &mut kv, &provider, next, kv_idx, g, last_hidden)
             .expect("draft");
 
-    assert_eq!(drafts.len(), g, "should propose g tokens with room to spare");
+    assert_eq!(
+        drafts.len(),
+        g,
+        "should propose g tokens with room to spare"
+    );
     for &t in &drafts {
-        assert!((0..VOCAB as i32).contains(&t), "draft {t} out of vocab range");
+        assert!(
+            (0..VOCAB as i32).contains(&t),
+            "draft {t} out of vocab range"
+        );
     }
     // the head established its KV start at p = kv_idx - 1 (a PARTIAL cache:
     // it begins mid-sequence, unlike the main stack's 0)
@@ -248,8 +267,15 @@ fn mtp_head_drafts_and_absorbs() {
     assert_eq!(drafts, d2, "drafting must be deterministic");
 
     // absorb the verified tokens: runs the head over them for its KV only
-    colibri_engine::mtp_absorb(&model, &mut kv, &provider, &drafts[..1], last_hidden, kv_idx)
-        .expect("absorb");
+    colibri_engine::mtp_absorb(
+        &model,
+        &mut kv,
+        &provider,
+        &drafts[..1],
+        last_hidden,
+        kv_idx,
+    )
+    .expect("absorb");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -294,15 +320,29 @@ fn speculation_does_not_change_output() {
     };
 
     let (baseline, st0) = run(0); // speculation off
-    assert_eq!(baseline.len(), n_new, "sanity: produced the requested tokens");
+    assert_eq!(
+        baseline.len(),
+        n_new,
+        "sanity: produced the requested tokens"
+    );
     assert_eq!(st0.drafts_proposed, 0, "budget 0 must not draft");
-    assert_eq!(st0.forwards, n_new as u64 - 1, "one forward per token, less the last");
+    assert_eq!(
+        st0.forwards,
+        n_new as u64 - 1,
+        "one forward per token, less the last"
+    );
 
     let mut any_accepted = false;
     for budget in [1usize, 2, 3, 5] {
         let (toks, st) = run(budget);
-        assert_eq!(baseline, toks, "DRAFT={budget} must emit exactly the tokens DRAFT=0 does");
-        assert!(st.drafts_proposed > 0, "DRAFT={budget} should propose drafts");
+        assert_eq!(
+            baseline, toks,
+            "DRAFT={budget} must emit exactly the tokens DRAFT=0 does"
+        );
+        assert!(
+            st.drafts_proposed > 0,
+            "DRAFT={budget} should propose drafts"
+        );
         assert!(st.drafts_accepted <= st.drafts_proposed);
         if st.drafts_accepted > 0 {
             any_accepted = true;
@@ -338,9 +378,11 @@ fn mtp_paths_are_noops_without_a_head() {
     let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 8);
     let mut kv = KvCache::for_model(&model, 16);
     let h = vec![0f32; D];
-    assert!(colibri_engine::mtp_draft(&model, &mut kv, &provider, 1, 1, 4, &h)
-        .expect("draft")
-        .is_empty());
+    assert!(
+        colibri_engine::mtp_draft(&model, &mut kv, &provider, 1, 1, 4, &h)
+            .expect("draft")
+            .is_empty()
+    );
     colibri_engine::mtp_absorb(&model, &mut kv, &provider, &[1], &h, 0).expect("absorb");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -370,7 +412,10 @@ fn full_forward_and_greedy_decode() {
     let seq = generate_greedy(&model, &mut kv2, &provider, &prompt, 5).unwrap();
     assert_eq!(&seq[..3], &prompt); // prompt preserved
     assert!(seq.len() > 3 && seq.len() <= 8);
-    assert!(seq.iter().all(|&t| (0..VOCAB as i32).contains(&t)), "token out of range: {seq:?}");
+    assert!(
+        seq.iter().all(|&t| (0..VOCAB as i32).contains(&t)),
+        "token out of range: {seq:?}"
+    );
 
     // determinism: same prompt -> same continuation
     let mut kv3 = KvCache::new(NL, KV_LORA, QK_ROPE, 32);
@@ -444,7 +489,10 @@ fn direct_parallel_preload_matches_disk() {
     let from_disk = generate_greedy(&model, &mut kv1, &shards, &prompt, 6).unwrap();
     let mut kv2 = KvCache::new(NL, KV_LORA, QK_ROPE, 16);
     let from_preload = generate_greedy(&model, &mut kv2, &store, &prompt, 6).unwrap();
-    assert_eq!(from_disk, from_preload, "direct preload output must match disk");
+    assert_eq!(
+        from_disk, from_preload,
+        "direct preload output must match disk"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

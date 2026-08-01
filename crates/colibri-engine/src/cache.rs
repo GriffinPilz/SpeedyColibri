@@ -38,7 +38,12 @@ struct Predictor {
 
 impl Predictor {
     fn new(topn: usize) -> Predictor {
-        Predictor { topn, freq: HashMap::new(), trans: HashMap::new(), last: None }
+        Predictor {
+            topn,
+            freq: HashMap::new(),
+            trans: HashMap::new(),
+            last: None,
+        }
     }
 
     /// Record this layer's experts and return the predicted top-N for the *next*
@@ -214,7 +219,9 @@ impl<P: ExpertProvider> ExpertCache<P> {
     /// cumulative selection count) until `pin_budget_bytes` is reached. Returns
     /// how many were pinned. Warm-up loads do not count as session usage.
     pub fn warm_pin(&self, history: &UsageHistory, pin_budget_bytes: u64) -> io::Result<usize> {
-        Ok(self.pin_ranked(&history.ranked(), pin_budget_bytes, usize::MAX)?.0)
+        Ok(self
+            .pin_ranked(&history.ranked(), pin_budget_bytes, usize::MAX)?
+            .0)
     }
 
     /// Auto-sized AUTOPIN: pin the hot **head** of the usage curve — as many of the
@@ -602,9 +609,7 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
         // otherwise surfaces when the compute loop calls `expert`).
         let t = std::time::Instant::now();
         let loaded: Vec<(usize, Arc<Expert>)> = match self.inner.experts_batch(layer, &missing) {
-            Ok(exps) if exps.len() == missing.len() => {
-                missing.iter().copied().zip(exps).collect()
-            }
+            Ok(exps) if exps.len() == missing.len() => missing.iter().copied().zip(exps).collect(),
             _ => {
                 let mut v = Vec::with_capacity(missing.len());
                 for &e in &missing {
@@ -630,7 +635,15 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
                 continue;
             }
             let bytes = ex.bytes();
-            s.entries.insert(key, Entry { expert: ex, bytes, heat: 1, last: clock });
+            s.entries.insert(
+                key,
+                Entry {
+                    expert: ex,
+                    bytes,
+                    heat: 1,
+                    last: clock,
+                },
+            );
             s.bytes += bytes;
             s.misses += 1;
         }
@@ -707,14 +720,19 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
     /// The insert path also enforces `budget`, so between ticks the cache never grows past
     /// the last value we set. Fast `TICK_MS` keeps the reaction window small. Off-Linux
     /// (no `/proc/meminfo`) it no-ops after setting the standing budget.
-    pub fn spawn_adaptive_budget(self: &Arc<Self>, fill_target: u64, danger_floor: u64, hard_floor: u64) {
+    pub fn spawn_adaptive_budget(
+        self: &Arc<Self>,
+        fill_target: u64,
+        danger_floor: u64,
+        hard_floor: u64,
+    ) {
         const TICK_MS: u64 = 100; // poll ~2.5× faster than before — react before OOM, not after
         const SUSTAIN: u32 = 6; // ~600 ms below the danger floor before we cede memory
         const HARD_SLACK: u64 = 3 << 30; // when the OOM guard fires, evict back to this much headroom
         const FLOOR_MIN: u64 = 2 << 30; // never target < 2 GiB resident
-        // Slack above the startup swap level before the guard fires: absorbs the kernel
-        // paging out genuinely cold pages (a long-idle allocation) without treating it as
-        // expert-cache pressure. Anything beyond this is us.
+                                        // Slack above the startup swap level before the guard fires: absorbs the kernel
+                                        // paging out genuinely cold pages (a long-idle allocation) without treating it as
+                                        // expert-cache pressure. Anything beyond this is us.
         const SWAP_TOLERANCE: u64 = 256 << 20;
         let fill_target = fill_target.max(FLOOR_MIN);
         // hard_floor is the emergency line; danger_floor the softer one above it.
@@ -1003,7 +1021,12 @@ mod tests {
         // Distinct scores throughout: ties were always broken by HashMap iteration order,
         // which is arbitrary, so equality there is neither expected nor meaningful.
         // `bytes` is tracked on the Entry, so an empty Expert is enough here.
-        let mk = |bytes: u64| Entry { expert: Arc::new(Expert::default()), bytes, heat: 1, last: 0 };
+        let mk = |bytes: u64| Entry {
+            expert: Arc::new(Expert::default()),
+            bytes,
+            heat: 1,
+            last: 0,
+        };
         let build = || {
             let mut m: HashMap<(usize, usize), Entry> = HashMap::new();
             let mut total = 0u64;
@@ -1025,8 +1048,14 @@ mod tests {
         for budget_frac in [0u64, 1, 2, 3] {
             let (mut a_entries, mut a_bytes) = build();
             let budget = a_bytes * budget_frac / 4;
-            let expected =
-                evict_by_repeated_min(&mut a_entries, &mut a_bytes, &pinned, clock, budget, &protect);
+            let expected = evict_by_repeated_min(
+                &mut a_entries,
+                &mut a_bytes,
+                &pinned,
+                clock,
+                budget,
+                &protect,
+            );
 
             let (b_entries, b_bytes) = build();
             let mut s = State {
@@ -1057,7 +1086,10 @@ mod tests {
             let mut oracle: Vec<_> = a_entries.keys().copied().collect();
             survivors.sort_unstable();
             oracle.sort_unstable();
-            assert_eq!(survivors, oracle, "budget={budget}: different victims chosen");
+            assert_eq!(
+                survivors, oracle,
+                "budget={budget}: different victims chosen"
+            );
             // Whatever else happened, the invariants the caller relies on must hold.
             for k in &pinned {
                 assert!(s.entries.contains_key(k), "evicted a pinned entry {k:?}");
@@ -1093,7 +1125,11 @@ mod tests {
             q.observe_and_predict(2, &[20]);
         }
         let qp = q.observe_and_predict(1, &[10]);
-        assert_eq!(qp.first(), Some(&20), "topn=4 should still predict, got {qp:?}");
+        assert_eq!(
+            qp.first(),
+            Some(&20),
+            "topn=4 should still predict, got {qp:?}"
+        );
         assert!(qp.len() <= 4, "bound must be exact, got {qp:?}");
     }
 
@@ -1101,8 +1137,14 @@ mod tests {
     fn prefetch_ahead_gate_tracks_fraction_not_absolute_count() {
         // The two measured anchors. GLM @4096: 160 experts, a layer routes to ~all →
         // prefetch-ahead is a 1.58× win and must stay on.
-        assert!(ahead_predicts_next_layer(160, 160), "GLM full-union prefill must prefetch");
-        assert!(ahead_predicts_next_layer(120, 160), "75% of experts still predicts well");
+        assert!(
+            ahead_predicts_next_layer(160, 160),
+            "GLM full-union prefill must prefetch"
+        );
+        assert!(
+            ahead_predicts_next_layer(120, 160),
+            "75% of experts still predicts well"
+        );
 
         // Kimi-K3 @5 tokens: 896 experts, union ~78. This CLEARS the old absolute gate
         // (78 ≥ 64) but predicts almost nothing — measured 2293 wasted loads (~50 GiB)
@@ -1113,15 +1155,27 @@ mod tests {
         );
 
         // Same model at long context routes to ~all experts; the gate reopens on its own.
-        assert!(ahead_predicts_next_layer(896, 896), "K3 at full union should prefetch again");
+        assert!(
+            ahead_predicts_next_layer(896, 896),
+            "K3 at full union should prefetch again"
+        );
 
         // Decode is excluded on the absolute floor regardless of fraction: a tiny model
         // where top-k IS most of the experts must still not speculate per token.
-        assert!(!ahead_predicts_next_layer(8, 8), "decode-sized unions never prefetch ahead");
+        assert!(
+            !ahead_predicts_next_layer(8, 8),
+            "decode-sized unions never prefetch ahead"
+        );
 
         // Unsupplied expert count keeps the historical absolute-gate behaviour.
-        assert!(ahead_predicts_next_layer(78, 0), "n_experts=0 falls back to the old gate");
-        assert!(!ahead_predicts_next_layer(63, 0), "the absolute floor still applies");
+        assert!(
+            ahead_predicts_next_layer(78, 0),
+            "n_experts=0 falls back to the old gate"
+        );
+        assert!(
+            !ahead_predicts_next_layer(63, 0),
+            "the absolute floor still applies"
+        );
     }
 
     #[test]
@@ -1229,7 +1283,11 @@ mod tests {
         // expert 0 still resident (a hit, no new load)
         let before = cache.inner.loads.load(Ordering::Relaxed);
         cache.expert(0, 0).unwrap();
-        assert_eq!(cache.inner.loads.load(Ordering::Relaxed), before, "pinned reloaded");
+        assert_eq!(
+            cache.inner.loads.load(Ordering::Relaxed),
+            before,
+            "pinned reloaded"
+        );
     }
 
     #[test]
@@ -1261,7 +1319,11 @@ mod tests {
         let before = cache.inner.loads.load(Ordering::Relaxed);
         cache.expert(0, 2).unwrap();
         cache.expert(0, 1).unwrap();
-        assert_eq!(cache.inner.loads.load(Ordering::Relaxed), before, "pinned reloaded");
+        assert_eq!(
+            cache.inner.loads.load(Ordering::Relaxed),
+            before,
+            "pinned reloaded"
+        );
     }
 
     #[test]
@@ -1278,10 +1340,20 @@ mod tests {
         let cache = ExpertCache::new(counting(), u64::MAX);
         let (n, bytes, cov) = cache.warm_pin_auto(&h, u64::MAX).unwrap();
         assert_eq!(cache.pinned_count(), n);
-        assert!((4..=12).contains(&n), "auto pinned {n}, expected the ~4 hot head");
+        assert!(
+            (4..=12).contains(&n),
+            "auto pinned {n}, expected the ~4 hot head"
+        );
         assert!(bytes > 0);
-        assert!(cov > 0.8, "coverage {cov} should capture the hot head's traffic");
-        assert_eq!(cache.usage_snapshot().total(), 0, "warm-up isn't session usage");
+        assert!(
+            cov > 0.8,
+            "coverage {cov} should capture the hot head's traffic"
+        );
+        assert_eq!(
+            cache.usage_snapshot().total(),
+            0,
+            "warm-up isn't session usage"
+        );
     }
 
     #[test]
@@ -1298,7 +1370,10 @@ mod tests {
         };
         let cache = ExpertCache::new(counting(), one * 5);
         let (n, bytes, _cov) = cache.warm_pin_auto(&h, one * 5).unwrap();
-        assert!(n <= 4, "pinned {n}, must leave headroom below the 5-expert budget");
+        assert!(
+            n <= 4,
+            "pinned {n}, must leave headroom below the 5-expert budget"
+        );
         assert!(bytes <= one * 4);
     }
 

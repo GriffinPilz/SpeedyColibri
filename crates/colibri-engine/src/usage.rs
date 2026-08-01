@@ -68,8 +68,7 @@ impl UsageHistory {
     /// ascending for determinism. This is the pin order (global, all layers
     /// pooled — matching the C `pin_load` ranking).
     pub fn ranked(&self) -> Vec<(usize, usize)> {
-        let mut v: Vec<((usize, usize), u64)> =
-            self.counts.iter().map(|(&k, &c)| (k, c)).collect();
+        let mut v: Vec<((usize, usize), u64)> = self.counts.iter().map(|(&k, &c)| (k, c)).collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.into_iter().map(|(k, _)| k).collect()
     }
@@ -211,7 +210,8 @@ mod tests {
     #[test]
     fn save_load_roundtrip_c_format() {
         let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-        let path = std::path::Path::new(&dir).join(format!("coli-usage-{}.txt", std::process::id()));
+        let path =
+            std::path::Path::new(&dir).join(format!("coli-usage-{}.txt", std::process::id()));
         let mut h = UsageHistory::new();
         h.add(3, 1, 7);
         h.add(5, 200, 3);
@@ -258,9 +258,16 @@ mod tests {
             h.add(0, e, 1);
         }
         let k = h.knee();
-        assert!((5..=15).contains(&k), "knee {k} should sit near the 5-expert head");
+        assert!(
+            (5..=15).contains(&k),
+            "knee {k} should sit near the 5-expert head"
+        );
         // Pinning the knee captures the bulk of the traffic.
-        assert!(h.coverage_of_top(k) > 0.7, "knee coverage {}", h.coverage_of_top(k));
+        assert!(
+            h.coverage_of_top(k) > 0.7,
+            "knee coverage {}",
+            h.coverage_of_top(k)
+        );
     }
 
     #[test]

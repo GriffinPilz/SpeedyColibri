@@ -81,9 +81,15 @@ fn layer_tensors(i: usize, sparse: bool, t: &mut Vec<(String, usize)>) {
     t.push((p("self_attn.q_a_proj.weight"), Q_LORA * D));
     t.push((p("self_attn.q_a_layernorm.weight"), Q_LORA));
     t.push((p("self_attn.q_b_proj.weight"), H * QK_HEAD * Q_LORA));
-    t.push((p("self_attn.kv_a_proj_with_mqa.weight"), (KV_LORA + QK_ROPE) * D));
+    t.push((
+        p("self_attn.kv_a_proj_with_mqa.weight"),
+        (KV_LORA + QK_ROPE) * D,
+    ));
     t.push((p("self_attn.kv_a_layernorm.weight"), KV_LORA));
-    t.push((p("self_attn.kv_b_proj.weight"), H * (QK_NOPE + V_HEAD) * KV_LORA));
+    t.push((
+        p("self_attn.kv_b_proj.weight"),
+        H * (QK_NOPE + V_HEAD) * KV_LORA,
+    ));
     t.push((p("self_attn.o_proj.weight"), D * H * V_HEAD));
     if !sparse {
         t.push((p("mlp.gate_proj.weight"), DENSE_INTER * D));
@@ -122,9 +128,15 @@ fn tensor_list(with_mtp: bool) -> Vec<(String, usize)> {
         t.push((p("shared_head.norm.weight"), D));
         // routed experts of the MTP block (streamed; the gate probes 0 and E-1)
         for e in 0..E {
-            t.push((p(&format!("mlp.experts.{e}.gate_proj.weight")), MOE_INTER * D));
+            t.push((
+                p(&format!("mlp.experts.{e}.gate_proj.weight")),
+                MOE_INTER * D,
+            ));
             t.push((p(&format!("mlp.experts.{e}.up_proj.weight")), MOE_INTER * D));
-            t.push((p(&format!("mlp.experts.{e}.down_proj.weight")), D * MOE_INTER));
+            t.push((
+                p(&format!("mlp.experts.{e}.down_proj.weight")),
+                D * MOE_INTER,
+            ));
         }
     }
     t
@@ -197,12 +209,24 @@ fn tiny_model_loads_end_to_end() {
     let l0 = &m.layers[0];
     assert_eq!((l0.q_a.o, l0.q_a.i), (Q_LORA as i32, D as i32));
     assert_eq!((l0.q_b.o, l0.q_b.i), ((H * QK_HEAD) as i32, Q_LORA as i32));
-    assert_eq!((l0.kv_a.o, l0.kv_a.i), ((KV_LORA + QK_ROPE) as i32, D as i32));
-    assert_eq!((l0.kv_b.o, l0.kv_b.i), ((H * (QK_NOPE + V_HEAD)) as i32, KV_LORA as i32));
+    assert_eq!(
+        (l0.kv_a.o, l0.kv_a.i),
+        ((KV_LORA + QK_ROPE) as i32, D as i32)
+    );
+    assert_eq!(
+        (l0.kv_b.o, l0.kv_b.i),
+        ((H * (QK_NOPE + V_HEAD)) as i32, KV_LORA as i32)
+    );
     assert_eq!((l0.o.o, l0.o.i), (D as i32, (H * V_HEAD) as i32));
     // dense MLP on layer 0
-    assert_eq!((l0.gate_proj.o, l0.gate_proj.i), (DENSE_INTER as i32, D as i32));
-    assert_eq!((l0.down_proj.o, l0.down_proj.i), (D as i32, DENSE_INTER as i32));
+    assert_eq!(
+        (l0.gate_proj.o, l0.gate_proj.i),
+        (DENSE_INTER as i32, D as i32)
+    );
+    assert_eq!(
+        (l0.down_proj.o, l0.down_proj.i),
+        (D as i32, DENSE_INTER as i32)
+    );
 
     // MoE bits on layer 1
     let l1 = &m.layers[1];
@@ -258,8 +282,10 @@ fn incomplete_mtp_head_is_ignored() {
     // Write the full MTP set, then drop one required tensor (the last expert,
     // which is exactly what a shard-truncated conversion loses).
     let dropped = format!("model.layers.{NL}.mlp.experts.{}.down_proj.weight", E - 1);
-    let tensors: Vec<(String, usize)> =
-        tensor_list(true).into_iter().filter(|(n, _)| *n != dropped).collect();
+    let tensors: Vec<(String, usize)> = tensor_list(true)
+        .into_iter()
+        .filter(|(n, _)| *n != dropped)
+        .collect();
     write_tensors(&dir, &tensors);
 
     let m = load_model_with(&dir, LoadOptions::default()).expect("load_model");
@@ -309,7 +335,10 @@ fn kv_cache_sizes_for_mtp_head() {
     let m = load_model_with(&dir, LoadOptions::default()).unwrap();
     let mut kv = KvCache::for_model(&m, 16);
     assert_eq!(kv.kv_start.len(), NL + 1, "MTP head needs its own KV row");
-    assert!(kv.kv_start[..NL].iter().all(|&s| s == 0), "main stack starts at 0");
+    assert!(
+        kv.kv_start[..NL].iter().all(|&s| s == 0),
+        "main stack starts at 0"
+    );
     assert_eq!(kv.kv_start[NL], KV_UNSET, "MTP row starts unset");
 
     // start_at: the sentinel is > any real position, so the first call wins...

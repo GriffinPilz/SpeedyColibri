@@ -100,7 +100,12 @@ pub struct SsmState {
 
 impl SsmState {
     pub fn zeros(n_heads: usize, head_dim: usize, d_state: usize) -> Self {
-        SsmState { data: vec![0.0f32; n_heads * head_dim * d_state], n_heads, head_dim, d_state }
+        SsmState {
+            data: vec![0.0f32; n_heads * head_dim * d_state],
+            n_heads,
+            head_dim,
+            d_state,
+        }
     }
 }
 
@@ -332,7 +337,10 @@ mod tests {
             }
         }
         // dt_min clamping actually exercised (else the test proves less than it looks).
-        assert!(sdt.iter().any(|&v| v == dims.dt_min), "no dt clamped to dt_min");
+        assert!(
+            sdt.iter().any(|&v| v == dims.dt_min),
+            "no dt clamped to dt_min"
+        );
     }
 
     /// Hand-computed selective-scan recurrence (n_heads=1, head_dim=1, d_state=2,
@@ -342,7 +350,13 @@ mod tests {
     ///   t1: x=1, B=[0,1], C=[1,1]  → ssm=[0.34657, 0.6931], y = 1.03972 + 0.5 = 1.53972
     #[test]
     fn scan_matches_hand_computed() {
-        let dims = MambaDims { n_heads: 1, head_dim: 1, d_state: 2, n_groups: 1, dt_min: 0.0 };
+        let dims = MambaDims {
+            n_heads: 1,
+            head_dim: 1,
+            d_state: 2,
+            n_groups: 1,
+            dt_min: 0.0,
+        };
         let mut st = SsmState::zeros(1, 1, 2);
         let hidden = vec![1.0, 1.0]; // [seq=2, d_inner=1]
         let b = vec![1.0, 0.0, 0.0, 1.0]; // [2, g*n=2]
@@ -362,7 +376,13 @@ mod tests {
     /// Prefill (seq=2 in one call) must equal decode (two seq=1 calls carrying state).
     #[test]
     fn prefill_equals_stepwise_decode() {
-        let dims = MambaDims { n_heads: 2, head_dim: 3, d_state: 4, n_groups: 1, dt_min: 0.001 };
+        let dims = MambaDims {
+            n_heads: 2,
+            head_dim: 3,
+            d_state: 4,
+            n_groups: 1,
+            dt_min: 0.001,
+        };
         let d_inner = 6;
         let (g, n, nh) = (1, 4, 2);
         // deterministic pseudo-random-ish inputs
@@ -376,20 +396,51 @@ mod tests {
         let dt_bias: Vec<f32> = (0..nh).map(|i| f(i + 51)).collect();
 
         let mut st_full = SsmState::zeros(nh, 3, n);
-        let y_full =
-            selective_scan(dims, &mut st_full, &hidden, &b, &c, &dt, &a_log, &d, &dt_bias, 2);
+        let y_full = selective_scan(
+            dims,
+            &mut st_full,
+            &hidden,
+            &b,
+            &c,
+            &dt,
+            &a_log,
+            &d,
+            &dt_bias,
+            2,
+        );
 
         let mut st_step = SsmState::zeros(nh, 3, n);
         let y0 = selective_scan(
-            dims, &mut st_step, &hidden[..d_inner], &b[..g * n], &c[..g * n], &dt[..nh],
-            &a_log, &d, &dt_bias, 1,
+            dims,
+            &mut st_step,
+            &hidden[..d_inner],
+            &b[..g * n],
+            &c[..g * n],
+            &dt[..nh],
+            &a_log,
+            &d,
+            &dt_bias,
+            1,
         );
         let y1 = selective_scan(
-            dims, &mut st_step, &hidden[d_inner..], &b[g * n..], &c[g * n..], &dt[nh..],
-            &a_log, &d, &dt_bias, 1,
+            dims,
+            &mut st_step,
+            &hidden[d_inner..],
+            &b[g * n..],
+            &c[g * n..],
+            &dt[nh..],
+            &a_log,
+            &d,
+            &dt_bias,
+            1,
         );
         for i in 0..d_inner {
-            assert!((y_full[i] - y0[i]).abs() < 1e-6, "t0[{i}] {} vs {}", y_full[i], y0[i]);
+            assert!(
+                (y_full[i] - y0[i]).abs() < 1e-6,
+                "t0[{i}] {} vs {}",
+                y_full[i],
+                y0[i]
+            );
             assert!(
                 (y_full[d_inner + i] - y1[i]).abs() < 1e-6,
                 "t1[{i}] {} vs {}",
@@ -406,7 +457,13 @@ mod tests {
     #[test]
     fn groups_route_b_c_by_head() {
         // 2 heads, 1 group → both heads see the same B/C slice; result symmetric.
-        let dims = MambaDims { n_heads: 2, head_dim: 1, d_state: 1, n_groups: 1, dt_min: 0.0 };
+        let dims = MambaDims {
+            n_heads: 2,
+            head_dim: 1,
+            d_state: 1,
+            n_groups: 1,
+            dt_min: 0.0,
+        };
         let mut st = SsmState::zeros(2, 1, 1);
         let hidden = vec![1.0, 1.0]; // [seq1, d_inner=2] head0=1, head1=1
         let b = vec![2.0]; // [1, g*n=1]

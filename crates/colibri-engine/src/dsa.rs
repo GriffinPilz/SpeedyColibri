@@ -139,8 +139,8 @@ pub struct IndexerWeights<'a> {
 #[allow(clippy::too_many_arguments)]
 pub fn indexer_forward(
     w: &IndexerWeights,
-    x: &[f32],       // [s_len, hidden]
-    q_lora: &[f32],  // [s_len, q_lora_dim]  (the q_a-normed query, `QR` in the C)
+    x: &[f32],      // [s_len, hidden]
+    q_lora: &[f32], // [s_len, q_lora_dim]  (the q_a-normed query, `QR` in the C)
     s_len: usize,
     nh: usize,
     index_hd: usize,
@@ -201,7 +201,16 @@ pub fn indexer_forward(
     if nsp > 0 {
         scores_all = vec![0f32; nsp * s_len];
         gpu_scores = crate::gpu::try_dsa_indexer_scores(
-            &mut scores_all, &qi_all, &hw_all, &keys, nsp, s0, nh, index_hd, s_len, pos_base,
+            &mut scores_all,
+            &qi_all,
+            &hw_all,
+            &keys,
+            nsp,
+            s0,
+            nh,
+            index_hd,
+            s_len,
+            pos_base,
         );
         if !gpu_scores {
             scores_all = Vec::new();
@@ -277,7 +286,11 @@ mod tests {
         // nk <= index_topk → dense no-op: every position, in order. THE invariant.
         let scores = [0.9, 0.1, 0.5, 0.3];
         let sel = select_topk(&scores, 8);
-        assert_eq!(sel, vec![0, 1, 2, 3], "must select all when nk <= index_topk");
+        assert_eq!(
+            sel,
+            vec![0, 1, 2, 3],
+            "must select all when nk <= index_topk"
+        );
         assert!(is_dense(scores.len(), 8));
         assert!(!is_dense(scores.len(), 2));
     }
@@ -314,7 +327,9 @@ mod tests {
         // deterministic pseudo-random in [-1, 1), no rng dependency
         (0..n)
             .map(|i| {
-                let z = (i as u64).wrapping_mul(2654435761).wrapping_add(seed.wrapping_mul(40503));
+                let z = (i as u64)
+                    .wrapping_mul(2654435761)
+                    .wrapping_add(seed.wrapping_mul(40503));
                 ((z % 2000) as f32 / 1000.0) - 1.0
             })
             .collect()
@@ -327,26 +342,48 @@ mod tests {
         let (index_topk, qk_rope, s_len) = (2usize, 2usize, 4usize);
         // f32 (bits=16) synthetic weights → exact matmul.
         let wk = qtensor_from_f32(&vecf(index_hd * hidden, 1), index_hd, hidden, 16);
-        let wq = qtensor_from_f32(&vecf(nh * index_hd * q_lora_dim, 2), nh * index_hd, q_lora_dim, 16);
+        let wq = qtensor_from_f32(
+            &vecf(nh * index_hd * q_lora_dim, 2),
+            nh * index_hd,
+            q_lora_dim,
+            16,
+        );
         let wp = qtensor_from_f32(&vecf(nh * hidden, 3), nh, hidden, 16);
         let knw = vec![1.0f32; index_hd];
         let knb = vec![0.0f32; index_hd];
-        let w = IndexerWeights { wk: &wk, knorm_w: &knw, knorm_b: &knb, wq: &wq, wp: &wp };
+        let w = IndexerWeights {
+            wk: &wk,
+            knorm_w: &knw,
+            knorm_b: &knb,
+            wq: &wq,
+            wp: &wp,
+        };
         let x = vecf(s_len * hidden, 7);
         let ql = vecf(s_len * q_lora_dim, 8);
 
-        let sel = indexer_forward(&w, &x, &ql, s_len, nh, index_hd, index_topk, qk_rope, 10000.0, 0);
+        let sel = indexer_forward(
+            &w, &x, &ql, s_len, nh, index_hd, index_topk, qk_rope, 10000.0, 0,
+        );
 
         // queries 0,1 have nk=1,2 <= index_topk=2 → dense no-op (empty selection).
-        assert!(sel[0].is_empty() && sel[1].is_empty(), "context <= index_topk must be dense");
+        assert!(
+            sel[0].is_empty() && sel[1].is_empty(),
+            "context <= index_topk must be dense"
+        );
         // queries 2,3 have nk=3,4 > 2 → keep = min(nk, index_topk) = 2 positions.
         assert_eq!(sel[2].len(), 2);
         assert_eq!(sel[3].len(), 2);
         // every selected position is a valid causal index, ascending.
         for (s, sl) in sel.iter().enumerate() {
-            assert!(sl.windows(2).all(|w| w[0] < w[1]), "selection must be ascending");
+            assert!(
+                sl.windows(2).all(|w| w[0] < w[1]),
+                "selection must be ascending"
+            );
             for &t in sl {
-                assert!((t as usize) <= s, "selected pos {t} not causal for query {s}");
+                assert!(
+                    (t as usize) <= s,
+                    "selected pos {t} not causal for query {s}"
+                );
             }
         }
     }

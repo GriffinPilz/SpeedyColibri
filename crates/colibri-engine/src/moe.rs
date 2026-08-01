@@ -278,8 +278,14 @@ impl ExpertLayout {
     /// every other arch is 3-tensor SwiGLU under `.mlp.experts.`.
     pub fn for_arch(arch: Arch) -> ExpertLayout {
         match arch {
-            Arch::NemotronH => ExpertLayout { prefix: "mixer", gateless: true },
-            _ => ExpertLayout { prefix: "mlp", gateless: false },
+            Arch::NemotronH => ExpertLayout {
+                prefix: "mixer",
+                gateless: true,
+            },
+            _ => ExpertLayout {
+                prefix: "mlp",
+                gateless: false,
+            },
         }
     }
 
@@ -299,7 +305,10 @@ impl ExpertLayout {
     /// what the loader LOOKS UP — the two drifted once (`weight_packed` vs `weight`) and
     /// produced an unloadable container with every test on both sides passing.
     pub(crate) fn weight_name(&self, layer: usize, eid: usize, suf: &str) -> String {
-        format!("model.layers.{layer}.{}.experts.{eid}.{suf}.weight", self.prefix)
+        format!(
+            "model.layers.{layer}.{}.experts.{eid}.{suf}.weight",
+            self.prefix
+        )
     }
 }
 
@@ -469,12 +478,17 @@ pub(crate) fn default_read_threads() -> usize {
     static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     static WIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     if let Some(n) = *ENV.get_or_init(|| {
-        std::env::var("COLI_LOAD_THREADS").ok().and_then(|s| s.parse().ok())
+        std::env::var("COLI_LOAD_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
     }) {
         return n;
     }
-    let wide =
-        *WIDE.get_or_init(|| crate::preload::default_num_files().saturating_mul(2).clamp(8, 64));
+    let wide = *WIDE.get_or_init(|| {
+        crate::preload::default_num_files()
+            .saturating_mul(2)
+            .clamp(8, 64)
+    });
     match disk_bound_read_threads() {
         Some(n) => n.min(wide),
         None => wide,
@@ -485,8 +499,7 @@ pub(crate) fn default_read_threads() -> usize {
 ///
 /// Set by the launcher once coverage is known (see `wire_adaptive_cache`); unset means
 /// "not classified", which keeps today's behaviour.
-static DISK_BOUND_THREADS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static DISK_BOUND_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn disk_bound_read_threads() -> Option<usize> {
     match DISK_BOUND_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -637,7 +650,10 @@ pub fn load_expert(
         // allocation per projection (the streaming bottleneck). The read is chunked across
         // `read_threads` cores so a single miss saturates the disk. Scales are tiny and
         // elsewhere; keep them as small per-tensor reads.
-        let names: Vec<String> = projs.iter().map(|s| layout.weight_name(layer, eid, s)).collect();
+        let names: Vec<String> = projs
+            .iter()
+            .map(|s| layout.weight_name(layer, eid, s))
+            .collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let ws = shards.read_raw_shared(&name_refs, read_threads)?;
         expert_from_views(shards, layout, hidden, moe_inter, layer, eid, &ws)?
@@ -759,8 +775,16 @@ fn expert_from_views(
                 fmt_code: fmt,
                 o: o as i32,
                 i: i as i32,
-                q4: Bytes::Shared { buf: buf.clone(), off: *off, len: nib_bytes },
-                bs: Bytes::Shared { buf: buf.clone(), off: *off + nib_bytes, len: bs_bytes },
+                q4: Bytes::Shared {
+                    buf: buf.clone(),
+                    off: *off,
+                    len: nib_bytes,
+                },
+                bs: Bytes::Shared {
+                    buf: buf.clone(),
+                    off: *off + nib_bytes,
+                    len: bs_bytes,
+                },
                 g: g[0],
                 ..Default::default()
             });
@@ -771,7 +795,13 @@ fn expert_from_views(
         let fmt = if *len == o * i { 1 } else { 3 };
         let mut s = vec![0f32; o];
         shards.read_f32(&sname, &mut s)?;
-        let mut t = QTensor { fmt_code: fmt, o: o as i32, i: i as i32, s, ..Default::default() };
+        let mut t = QTensor {
+            fmt_code: fmt,
+            o: o as i32,
+            i: i as i32,
+            s,
+            ..Default::default()
+        };
         let fp8 = expert_fp8_enabled();
         if fmt == 1 {
             // int8 goes in q8 (signed) — a copy. Skipped under `fp8`, where `fmt == 1`
@@ -784,7 +814,11 @@ fn expert_from_views(
                 t.q8 = buf[*off..*off + *len].iter().map(|&b| b as i8).collect();
             }
         } else {
-            t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+            t.q4 = Bytes::Shared {
+                buf: buf.clone(),
+                off: *off,
+                len: *len,
+            };
         }
         if fp8 {
             if fmt == 1 {
@@ -799,7 +833,11 @@ fn expert_from_views(
                     t.s = ns;
                     t.q4 = Bytes::Owned(nc);
                 } else {
-                    t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+                    t.q4 = Bytes::Shared {
+                        buf: buf.clone(),
+                        off: *off,
+                        len: *len,
+                    };
                 }
                 t.fmt_code = 4;
             }
@@ -862,17 +900,35 @@ pub fn load_experts_batch(
     if !has_prequant_marker(shards, &first) {
         return eids
             .iter()
-            .map(|&e| load_expert(shards, layout, hidden, moe_inter, ebits, layer, e, read_threads))
+            .map(|&e| {
+                load_expert(
+                    shards,
+                    layout,
+                    hidden,
+                    moe_inter,
+                    ebits,
+                    layer,
+                    e,
+                    read_threads,
+                )
+            })
             .collect();
     }
     // One projection-name group per expert (2 gateless / 3 SwiGLU); keep the owned
     // strings alive so the borrowed &str slices handed to the reader stay valid.
     let names: Vec<Vec<String>> = eids
         .iter()
-        .map(|&eid| projs.iter().map(|s| layout.weight_name(layer, eid, s)).collect())
+        .map(|&eid| {
+            projs
+                .iter()
+                .map(|s| layout.weight_name(layer, eid, s))
+                .collect()
+        })
         .collect();
-    let groups: Vec<Vec<&str>> =
-        names.iter().map(|g| g.iter().map(String::as_str).collect()).collect();
+    let groups: Vec<Vec<&str>> = names
+        .iter()
+        .map(|g| g.iter().map(String::as_str).collect())
+        .collect();
     let group_refs: Vec<&[&str]> = groups.iter().map(|g| g.as_slice()).collect();
     let views = shards.read_raw_shared_batched(&group_refs, read_threads)?;
 
@@ -1021,7 +1077,14 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
             // anything that is not MXFP4-on-a-zero-copy-device, so a situ model with other
             // expert formats still lands on the CPU reference below.
             if crate::gpu::try_expert_ffn_mxfp4_situ(
-                gate, up, down, x, nr, out, a.situ_beta, a.situ_linear_beta,
+                gate,
+                up,
+                down,
+                x,
+                nr,
+                out,
+                a.situ_beta,
+                a.situ_linear_beta,
             ) {
                 return;
             }
@@ -1140,8 +1203,10 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     if crate::forward::profile_on() {
         let t = std::time::Instant::now();
         provider.prefetch(layer, &eids)?;
-        crate::forward::LOAD_US
-            .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::LOAD_US.fetch_add(
+            t.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     } else {
         provider.prefetch(layer, &eids)?;
     }
@@ -1208,15 +1273,19 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             xg[r * d..(r + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
         }
         if prof {
-            crate::forward::GATHER_US
-                .fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::forward::GATHER_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let mut hh = vec![0f32; nr * d];
         let t1 = std::time::Instant::now();
         ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
         if prof {
-            crate::forward::GPUFFN_US
-                .fetch_add(t1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::forward::GPUFFN_US.fetch_add(
+                t1.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let t2 = std::time::Instant::now();
         for (r, &t) in rows.iter().enumerate() {
@@ -1226,8 +1295,10 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             }
         }
         if prof {
-            crate::forward::SCATTER_US
-                .fetch_add(t2.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::forward::SCATTER_US.fetch_add(
+                t2.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
     Ok(out)
@@ -1256,7 +1327,14 @@ fn subcols(w_mat: &[f32], s_len: usize, n_uniq: usize, cols: &[usize]) -> Vec<f3
 /// f32, no quality change) when CUDA is available — a single-threaded CPU `matmul_f32`
 /// here was ~40% of moe-compute at long context — falling back to CPU otherwise.
 #[inline]
-fn router_matmul(logits: &mut [f32], x: &[f32], router: &[f32], s_len: usize, d: usize, e_n: usize) {
+fn router_matmul(
+    logits: &mut [f32],
+    x: &[f32],
+    router: &[f32],
+    s_len: usize,
+    d: usize,
+    e_n: usize,
+) {
     #[cfg(feature = "cuda")]
     {
         if crate::gpu::try_matmul_f32(logits, x, router, s_len, d, e_n) {
@@ -1295,9 +1373,13 @@ fn sharded_experts_partial<P: ExpertProvider, T: Transport + ?Sized>(
     let me = transport.this_node();
 
     // Partition the unique experts by owning node (columns into w_mat).
-    let mut by_node: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+    let mut by_node: std::collections::BTreeMap<u32, Vec<usize>> =
+        std::collections::BTreeMap::new();
     for (ui, &e) in uniq.iter().enumerate() {
-        by_node.entry(sharding.owner(e as u32).0).or_default().push(ui);
+        by_node
+            .entry(sharding.owner(e as u32).0)
+            .or_default()
+            .push(ui);
     }
 
     // Split the routed experts into this node's own shard and each peer's shard.
@@ -1460,7 +1542,16 @@ pub fn moe<P: ExpertProvider>(
     if let Some(ctx) = cluster_ctx() {
         if ctx.sharding.num_nodes() > 1 {
             return moe_sharded(
-                cfg, l, layer, x, s_len, out, with_shared, provider, &ctx.sharding, &*ctx.transport,
+                cfg,
+                l,
+                layer,
+                x,
+                s_len,
+                out,
+                with_shared,
+                provider,
+                &ctx.sharding,
+                &*ctx.transport,
             );
         }
     }
@@ -1474,8 +1565,10 @@ pub fn moe<P: ExpertProvider>(
     let _rt = std::time::Instant::now();
     router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
     if crate::forward::profile_on() {
-        crate::forward::ROUTER_US
-            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::ROUTER_US.fetch_add(
+            _rt.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     let mut idxs = vec![0usize; s_len * k];
@@ -1508,8 +1601,10 @@ pub fn moe<P: ExpertProvider>(
             *o += s;
         }
         if crate::forward::profile_on() {
-            crate::forward::SHARED_US
-                .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::forward::SHARED_US.fetch_add(
+                _st.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -1557,8 +1652,10 @@ pub fn nemotron_moe<P: ExpertProvider>(
     let _rt = std::time::Instant::now();
     router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
     if crate::forward::profile_on() {
-        crate::forward::ROUTER_US
-            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::ROUTER_US.fetch_add(
+            _rt.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     let mut idxs = vec![0usize; s_len * k];
     let mut ws = vec![0f32; s_len * k];
@@ -1570,8 +1667,14 @@ pub fn nemotron_moe<P: ExpertProvider>(
     log_routing(layer, s_len, k, &idxs);
 
     // ---- fc1: hidden -> latent --------------------------------------------
-    let fc1 = l.fc1_latent.as_ref().expect("nemotron MoE layer missing fc1_latent");
-    let fc2 = l.fc2_latent.as_ref().expect("nemotron MoE layer missing fc2_latent");
+    let fc1 = l
+        .fc1_latent
+        .as_ref()
+        .expect("nemotron MoE layer missing fc1_latent");
+    let fc2 = l
+        .fc2_latent
+        .as_ref()
+        .expect("nemotron MoE layer missing fc2_latent");
     let mut h_lat = vec![0f32; s_len * dl];
     matmul_qt(&mut h_lat, x, fc1, s_len);
 
@@ -1622,8 +1725,10 @@ pub fn nemotron_moe<P: ExpertProvider>(
         add_shared(&mut vec![0f32; s_len * d]);
     }
     if crate::forward::profile_on() {
-        crate::forward::SHARED_US
-            .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::SHARED_US.fetch_add(
+            _st.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     Ok(())
 }
@@ -1664,8 +1769,10 @@ pub fn kimi_moe<P: ExpertProvider>(
     let _rt = std::time::Instant::now();
     router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
     if crate::forward::profile_on() {
-        crate::forward::ROUTER_US
-            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::ROUTER_US.fetch_add(
+            _rt.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     let mut idxs = vec![0usize; s_len * k];
     let mut ws = vec![0f32; s_len * k];
@@ -1677,8 +1784,14 @@ pub fn kimi_moe<P: ExpertProvider>(
     log_routing(layer, s_len, k, &idxs);
 
     // ---- down-project into the latent space -------------------------------
-    let fc1 = l.fc1_latent.as_ref().expect("kimi MoE layer missing fc1_latent");
-    let fc2 = l.fc2_latent.as_ref().expect("kimi MoE layer missing fc2_latent");
+    let fc1 = l
+        .fc1_latent
+        .as_ref()
+        .expect("kimi MoE layer missing fc1_latent");
+    let fc2 = l
+        .fc2_latent
+        .as_ref()
+        .expect("kimi MoE layer missing fc2_latent");
     let mut h_lat = vec![0f32; s_len * dl];
     matmul_qt(&mut h_lat, x, fc1, s_len);
 
@@ -1691,7 +1804,15 @@ pub fn kimi_moe<P: ExpertProvider>(
     let sharded = cluster_ctx().filter(|ctx| ctx.sharding.num_nodes() > 1);
     let mut moe_lat = match &sharded {
         Some(ctx) => sharded_experts_partial(
-            provider, layer, &uniq, &w_mat, &h_lat, s_len, dl, &ctx.sharding, &*ctx.transport,
+            provider,
+            layer,
+            &uniq,
+            &w_mat,
+            &h_lat,
+            s_len,
+            dl,
+            &ctx.sharding,
+            &*ctx.transport,
         )?,
         None => {
             let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
@@ -1725,8 +1846,10 @@ pub fn kimi_moe<P: ExpertProvider>(
         add_shared(&mut vec![0f32; s_len * d]);
     }
     if crate::forward::profile_on() {
-        crate::forward::SHARED_US
-            .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::SHARED_US.fetch_add(
+            _st.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     Ok(())
 }
@@ -1764,8 +1887,15 @@ mod tests {
         let narrow = default_read_threads();
         set_disk_bound_read_threads(prev);
 
-        assert!(wide >= 8, "wide default {wide} should be the 2x-cores value (clamped >= 8)");
-        assert_eq!(narrow, 12.min(wide), "gate must lower the count, got {narrow}");
+        assert!(
+            wide >= 8,
+            "wide default {wide} should be the 2x-cores value (clamped >= 8)"
+        );
+        assert_eq!(
+            narrow,
+            12.min(wide),
+            "gate must lower the count, got {narrow}"
+        );
         assert!(
             narrow < wide || wide <= 12,
             "gate had no effect: wide={wide}, narrow={narrow} — this is exactly the no-op \
@@ -1881,15 +2011,21 @@ mod tests {
         // experts to `situ` — and landing between a test's two asserted-equal calls made
         // `moe_sharded_hot_aware_map_equals_single_node` fail ~1 run in 3.
         set_activation_for_test(ActCfg {
-            oai: false, alpha: 0.0, limit: 0.0, relu2: false,
-            situ: cfg.situ, situ_beta: cfg.situ_beta, situ_linear_beta: cfg.situ_linear_beta,
+            oai: false,
+            alpha: 0.0,
+            limit: 0.0,
+            relu2: false,
+            situ: cfg.situ,
+            situ_beta: cfg.situ_beta,
+            situ_linear_beta: cfg.situ_linear_beta,
         });
         let (d, dl, inter, e_n) = (4usize, 3usize, 2usize, 4usize);
         let s_len = 2usize;
 
         let mk = |o: usize, i: usize, seed: usize| {
-            let w: Vec<f32> =
-                (0..o * i).map(|k| (((k + seed) % 7) as f32 - 3.0) * 0.1).collect();
+            let w: Vec<f32> = (0..o * i)
+                .map(|k| (((k + seed) % 7) as f32 - 3.0) * 0.1)
+                .collect();
             qtensor_from_f32(&w, o, i, 8)
         };
         let mut l = Layer::default();
@@ -1917,7 +2053,9 @@ mod tests {
             );
         }
         let prov = MapProvider { experts };
-        let x: Vec<f32> = (0..s_len * d).map(|k| ((k % 5) as f32 - 2.0) * 0.3).collect();
+        let x: Vec<f32> = (0..s_len * d)
+            .map(|k| ((k % 5) as f32 - 2.0) * 0.3)
+            .collect();
 
         let mut got = vec![0f32; s_len * d];
         kimi_moe(&cfg, &l, 1, &x, s_len, &mut got, &prov).unwrap();
@@ -1969,13 +2107,29 @@ mod tests {
         let want_before = build(true); // the plausible wrong order
 
         for (i, (g, w)) in got.iter().zip(want_after.iter()).enumerate() {
-            assert!((g - w).abs() < 1e-5, "out[{i}]: {g} vs {w} (norm-after-experts)");
+            assert!(
+                (g - w).abs() < 1e-5,
+                "out[{i}]: {g} vs {w} (norm-after-experts)"
+            );
         }
-        let diff: f32 =
-            want_after.iter().zip(want_before.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 1e-3, "test is not discriminating: orderings agree ({diff})");
-        let wrong: f32 = got.iter().zip(want_before.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(wrong > 1e-3, "kimi_moe matched the WRONG ordering (norm on latent input)");
+        let diff: f32 = want_after
+            .iter()
+            .zip(want_before.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 1e-3,
+            "test is not discriminating: orderings agree ({diff})"
+        );
+        let wrong: f32 = got
+            .iter()
+            .zip(want_before.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            wrong > 1e-3,
+            "kimi_moe matched the WRONG ordering (norm on latent input)"
+        );
     }
 
     // Fused GPU expert FFN vs CPU at GLM expert sizes (hidden 6144, moe_inter 2048).
@@ -2029,7 +2183,7 @@ mod tests {
     #[test]
     fn route_selects_top_k_by_bias_augmented_score() {
         let c = cfg(); // topk=2, 4 experts
-        // logits chosen so sigmoid is monotonic; bias flips the order.
+                       // logits chosen so sigmoid is monotonic; bias flips the order.
         let logits = [0.0f32, 1.0, 2.0, 3.0]; // sigmoids ~ .5,.73,.88,.95
         let bias = [10.0f32, 0.0, 0.0, 0.0]; // huge bias on expert 0
         let (idx, w) = route(&c, &logits, &bias);
@@ -2136,7 +2290,10 @@ mod tests {
         // Two positions, k=2: one line per position, `step layer pos e0 e1`.
         let mut buf = Vec::new();
         write_routing_lines(&mut buf, 5, 3, 2, 2, &[10, 20, 30, 40]).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "5 3 0 10 20\n5 3 1 30 40\n");
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "5 3 0 10 20\n5 3 1 30 40\n"
+        );
     }
 
     #[test]
@@ -2167,7 +2324,7 @@ mod tests {
 
         let shards = Shards::open(&dir).unwrap();
         let c = cfg(); // 4 routed experts
-        // 2 nodes over 4 experts: node 0 owns {0,1}, node 1 owns {2,3}.
+                       // 2 nodes over 4 experts: node 0 owns {0,1}, node 1 owns {2,3}.
         let sharding = ExpertSharding::new(2, c.n_experts as u32);
         let p = ShardsExpertProvider::with_sharding(&shards, &c, 4, sharding, NodeId(0));
 
@@ -2178,19 +2335,29 @@ mod tests {
                 io::ErrorKind::Unsupported,
                 "expert {peer_expert} belongs to node 1 and must be refused"
             );
-            assert!(e.to_string().contains("owned by another node"), "unhelpful: {e}");
+            assert!(
+                e.to_string().contains("owned by another node"),
+                "unhelpful: {e}"
+            );
         }
 
         // A locally-owned expert gets *past* the gate and fails for an unrelated
         // reason (this fixture has no expert data) — proving the gate discriminates
         // by ownership rather than rejecting everything.
         let local = p.expert(0, 0).unwrap_err();
-        assert_ne!(local.kind(), io::ErrorKind::Unsupported, "local expert must pass the gate");
+        assert_ne!(
+            local.kind(),
+            io::ErrorKind::Unsupported,
+            "local expert must pass the gate"
+        );
 
         // A single-node provider owns everything: no expert is ever refused.
         let solo = ShardsExpertProvider::new(&shards, &c, 4);
         for e in 0..c.n_experts as usize {
-            assert_ne!(solo.expert(0, e).unwrap_err().kind(), io::ErrorKind::Unsupported);
+            assert_ne!(
+                solo.expert(0, e).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2201,7 +2368,10 @@ mod tests {
         // copy path's device cache is keyed by their address, so caching them there
         // would compute a *different* expert's weights. COLI_GPU_EXPERTS=1 must not be
         // able to force that — it may only opt in when zero-copy is available.
-        assert!(experts_gpu_decision(Some("1"), true), "=1 opts in when zero-copy is available");
+        assert!(
+            experts_gpu_decision(Some("1"), true),
+            "=1 opts in when zero-copy is available"
+        );
         assert!(
             !experts_gpu_decision(Some("1"), false),
             "=1 must NOT force streamed experts onto the address-keyed copy path"
@@ -2251,8 +2421,9 @@ mod tests {
         l.sh_down = sh.down.clone();
 
         // All four experts live in one provider (both "nodes" share it here).
-        let experts: HashMap<(usize, usize), Arc<Expert>> =
-            (0..4).map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d)))).collect();
+        let experts: HashMap<(usize, usize), Arc<Expert>> = (0..4)
+            .map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d))))
+            .collect();
         let provider = Arc::new(MapProvider { experts });
 
         let x = vec![0.3f32, 0.5, -0.2, 0.7];
@@ -2266,19 +2437,27 @@ mod tests {
 
         // Node 1's expert server (loopback TCP), handler = compute_experts_partial.
         let hp = provider.clone();
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
-            let outputs = compute_experts_partial(
-                &*hp,
-                req.layer as usize,
-                &req.experts,
-                &req.weights,
-                &req.activations,
-                req.n_tokens,
-                req.hidden,
-            )
-            .unwrap();
-            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
-        })
+        let addr = serve_experts(
+            "127.0.0.1:0".parse().unwrap(),
+            sharding.fingerprint(),
+            move |req| {
+                let outputs = compute_experts_partial(
+                    &*hp,
+                    req.layer as usize,
+                    &req.experts,
+                    &req.weights,
+                    &req.activations,
+                    req.n_tokens,
+                    req.hidden,
+                )
+                .unwrap();
+                ExpertResponse {
+                    outputs,
+                    n_tokens: req.n_tokens,
+                    hidden: req.hidden,
+                }
+            },
+        )
         .unwrap();
 
         let mut peers = HashMap::new();
@@ -2286,8 +2465,19 @@ mod tests {
         let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
 
         let mut out_sharded = vec![0f32; d];
-        moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
-            .unwrap();
+        moe_sharded(
+            &c,
+            &l,
+            0,
+            &x,
+            1,
+            &mut out_sharded,
+            true,
+            &*provider,
+            &sharding,
+            &transport,
+        )
+        .unwrap();
 
         for dd in 0..d {
             assert!(
@@ -2315,12 +2505,18 @@ mod tests {
 
         let (dl, inter, e_n, s_len) = (3usize, 2usize, 4usize, 2usize);
         let mk = |o: usize, i: usize, seed: usize| {
-            let w: Vec<f32> = (0..o * i).map(|k| (((k + seed) % 7) as f32 - 3.0) * 0.1).collect();
+            let w: Vec<f32> = (0..o * i)
+                .map(|k| (((k + seed) % 7) as f32 - 3.0) * 0.1)
+                .collect();
             qtensor_from_f32(&w, o, i, 8)
         };
         let experts: HashMap<(usize, usize), Arc<Expert>> = (0..e_n)
             .map(|e| {
-                let ex = Expert { gate: mk(inter, dl, 10 + e), up: mk(inter, dl, 20 + e), down: mk(dl, inter, 30 + e) };
+                let ex = Expert {
+                    gate: mk(inter, dl, 10 + e),
+                    up: mk(inter, dl, 20 + e),
+                    down: mk(dl, inter, 30 + e),
+                };
                 ((1usize, e), Arc::new(ex))
             })
             .collect();
@@ -2328,10 +2524,13 @@ mod tests {
 
         // Latent activations, and a weight matrix routing every token to every expert so
         // both the local and the remote branch carry real work.
-        let h_lat: Vec<f32> = (0..s_len * dl).map(|k| ((k % 5) as f32 - 2.0) * 0.3).collect();
+        let h_lat: Vec<f32> = (0..s_len * dl)
+            .map(|k| ((k % 5) as f32 - 2.0) * 0.3)
+            .collect();
         let uniq: Vec<usize> = (0..e_n).collect();
-        let w_mat: Vec<f32> =
-            (0..s_len * e_n).map(|k| 0.1 + (k % 3) as f32 * 0.25).collect();
+        let w_mat: Vec<f32> = (0..s_len * e_n)
+            .map(|k| 0.1 + (k % 3) as f32 * 0.25)
+            .collect();
 
         // Reference: every expert computed locally, in one call.
         let uniq32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
@@ -2341,20 +2540,28 @@ mod tests {
         // Node 0 owns {0,1}, node 1 owns {2,3}; node 1 answers over loopback TCP.
         let sharding = ExpertSharding::new(2, e_n as u32);
         let hp = provider.clone();
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
-            // `req.hidden` is `dl` here, not the model's hidden size.
-            let outputs = compute_experts_partial(
-                &*hp,
-                req.layer as usize,
-                &req.experts,
-                &req.weights,
-                &req.activations,
-                req.n_tokens,
-                req.hidden,
-            )
-            .unwrap();
-            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
-        })
+        let addr = serve_experts(
+            "127.0.0.1:0".parse().unwrap(),
+            sharding.fingerprint(),
+            move |req| {
+                // `req.hidden` is `dl` here, not the model's hidden size.
+                let outputs = compute_experts_partial(
+                    &*hp,
+                    req.layer as usize,
+                    &req.experts,
+                    &req.weights,
+                    &req.activations,
+                    req.n_tokens,
+                    req.hidden,
+                )
+                .unwrap();
+                ExpertResponse {
+                    outputs,
+                    n_tokens: req.n_tokens,
+                    hidden: req.hidden,
+                }
+            },
+        )
         .unwrap();
         let mut peers = HashMap::new();
         peers.insert(NodeId(1), addr);
@@ -2365,7 +2572,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(sharded.len(), s_len * dl, "sharded output must be [s_len, dl]");
+        assert_eq!(
+            sharded.len(),
+            s_len * dl,
+            "sharded output must be [s_len, dl]"
+        );
         for i in 0..s_len * dl {
             assert!(
                 (single[i] - sharded[i]).abs() < 1e-5,
@@ -2404,8 +2615,9 @@ mod tests {
         l.sh_up = sh.up.clone();
         l.sh_down = sh.down.clone();
 
-        let experts: HashMap<(usize, usize), Arc<Expert>> =
-            (0..4).map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d)))).collect();
+        let experts: HashMap<(usize, usize), Arc<Expert>> = (0..4)
+            .map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d))))
+            .collect();
         let provider = Arc::new(MapProvider { experts });
         let x = vec![0.3f32, 0.5, -0.2, 0.7];
 
@@ -2417,26 +2629,38 @@ mod tests {
         assert!(sharding.is_hot_aware());
 
         let hp = provider.clone();
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
-            let outputs = compute_experts_partial(
-                &*hp,
-                req.layer as usize,
-                &req.experts,
-                &req.weights,
-                &req.activations,
-                req.n_tokens,
-                req.hidden,
-            )
-            .unwrap();
-            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
-        })
+        let addr = serve_experts(
+            "127.0.0.1:0".parse().unwrap(),
+            sharding.fingerprint(),
+            move |req| {
+                let outputs = compute_experts_partial(
+                    &*hp,
+                    req.layer as usize,
+                    &req.experts,
+                    &req.weights,
+                    &req.activations,
+                    req.n_tokens,
+                    req.hidden,
+                )
+                .unwrap();
+                ExpertResponse {
+                    outputs,
+                    n_tokens: req.n_tokens,
+                    hidden: req.hidden,
+                }
+            },
+        )
         .unwrap();
 
         let mut peers = HashMap::new();
         peers.insert(NodeId(1), addr);
         let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
         // The hot pair is split across nodes, unlike the contiguous map.
-        assert_ne!(sharding.owner(0), sharding.owner(1), "hot experts must be spread");
+        assert_ne!(
+            sharding.owner(0),
+            sharding.owner(1),
+            "hot experts must be spread"
+        );
         let contig = ExpertSharding::new(2, c.n_experts as u32);
         assert_ne!(
             sharding.fingerprint(),
@@ -2445,8 +2669,19 @@ mod tests {
         );
 
         let mut out_sharded = vec![0f32; d];
-        moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
-            .unwrap();
+        moe_sharded(
+            &c,
+            &l,
+            0,
+            &x,
+            1,
+            &mut out_sharded,
+            true,
+            &*provider,
+            &sharding,
+            &transport,
+        )
+        .unwrap();
 
         for dd in 0..d {
             assert!(
@@ -2493,7 +2728,11 @@ mod tests {
                 if i > 0 {
                     hjson.push(',');
                 }
-                let numel = if *dtype == "F32" { b.len() / 4 } else { b.len() };
+                let numel = if *dtype == "F32" {
+                    b.len() / 4
+                } else {
+                    b.len()
+                };
                 hjson.push_str(&format!(
                     "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
                     name,
@@ -2528,13 +2767,23 @@ mod tests {
         let gate_q4: Vec<u8> = (0..moe_inter * rb_gu).map(|k| (k * 7 + 1) as u8).collect();
         let up_q4: Vec<u8> = (0..moe_inter * rb_gu).map(|k| (k * 5 + 2) as u8).collect();
         let down_q4: Vec<u8> = (0..hidden * rb_d).map(|k| (k * 3 + 9) as u8).collect();
-        let gate_s: Vec<f32> = (0..moe_inter).map(|o| 0.011 + 0.001 * (o % 13) as f32).collect();
-        let up_s: Vec<f32> = (0..moe_inter).map(|o| 0.007 + 0.002 * (o % 11) as f32).collect();
-        let down_s: Vec<f32> = (0..hidden).map(|o| 0.013 + 0.001 * (o % 7) as f32).collect();
+        let gate_s: Vec<f32> = (0..moe_inter)
+            .map(|o| 0.011 + 0.001 * (o % 13) as f32)
+            .collect();
+        let up_s: Vec<f32> = (0..moe_inter)
+            .map(|o| 0.007 + 0.002 * (o % 11) as f32)
+            .collect();
+        let down_s: Vec<f32> = (0..hidden)
+            .map(|o| 0.013 + 0.001 * (o % 7) as f32)
+            .collect();
 
         let dir = temp_dir();
         let p = |suf: &str| format!("model.layers.0.mlp.experts.0.{suf}");
-        let (gw, uw, dw) = (p("gate_proj.weight"), p("up_proj.weight"), p("down_proj.weight"));
+        let (gw, uw, dw) = (
+            p("gate_proj.weight"),
+            p("up_proj.weight"),
+            p("down_proj.weight"),
+        );
         let (gs, us, ds) = (
             p("gate_proj.weight.qs"),
             p("up_proj.weight.qs"),
@@ -2559,14 +2808,26 @@ mod tests {
         let ex = load_expert(&shards, glm, hidden, moe_inter, 4, 0, 0, 8).unwrap();
 
         // (a) each Bytes::Shared view holds exactly its on-disk bytes + scales + dims.
-        assert!(ex.gate.q4.as_slice() == gate_q4.as_slice(), "gate q4 mismatch");
+        assert!(
+            ex.gate.q4.as_slice() == gate_q4.as_slice(),
+            "gate q4 mismatch"
+        );
         assert!(ex.up.q4.as_slice() == up_q4.as_slice(), "up q4 mismatch");
-        assert!(ex.down.q4.as_slice() == down_q4.as_slice(), "down q4 mismatch");
+        assert!(
+            ex.down.q4.as_slice() == down_q4.as_slice(),
+            "down q4 mismatch"
+        );
         assert_eq!(ex.gate.s, gate_s);
         assert_eq!(ex.up.s, up_s);
         assert_eq!(ex.down.s, down_s);
-        assert_eq!((ex.gate.fmt_code, ex.gate.o, ex.gate.i), (3, moe_inter as i32, hidden as i32));
-        assert_eq!((ex.down.fmt_code, ex.down.o, ex.down.i), (3, hidden as i32, moe_inter as i32));
+        assert_eq!(
+            (ex.gate.fmt_code, ex.gate.o, ex.gate.i),
+            (3, moe_inter as i32, hidden as i32)
+        );
+        assert_eq!(
+            (ex.down.fmt_code, ex.down.o, ex.down.i),
+            (3, hidden as i32, moe_inter as i32)
+        );
 
         // (b) the shared views dequant identically to an owned reference through the
         // real matmul kernel (proves the QTensor is usable, not just byte-equal).
@@ -2646,7 +2907,9 @@ mod tests {
 
         // Deterministic smooth weights so the NVFP4 encoding is well-conditioned.
         let wv = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|k| ((k + seed) as f32 * 0.19).sin() * 0.5).collect()
+            (0..n)
+                .map(|k| ((k + seed) as f32 * 0.19).sin() * 0.5)
+                .collect()
         };
         let w_up = wv(MOE_INTER * LATENT, 3); // up:   [MOE_INTER, LATENT]
         let w_down = wv(LATENT * MOE_INTER, 7); // down: [LATENT, MOE_INTER]
@@ -2662,8 +2925,12 @@ mod tests {
         // order. NO gate_proj, NO `.qs`.
         let dir = temp_dir();
         let p = |suf: &str| format!("model.layers.0.mixer.experts.0.{suf}");
-        let (uw, dw, ug, dg) =
-            (p("up_proj.weight"), p("down_proj.weight"), p("up_proj.weight.g"), p("down_proj.weight.g"));
+        let (uw, dw, ug, dg) = (
+            p("up_proj.weight"),
+            p("down_proj.weight"),
+            p("up_proj.weight.g"),
+            p("down_proj.weight.g"),
+        );
         let entries: [(&str, &str, Vec<u8>); 4] = [
             (uw.as_str(), "U8", blob_u.clone()),
             (dw.as_str(), "U8", blob_d.clone()),
@@ -2676,7 +2943,11 @@ mod tests {
             if i > 0 {
                 hjson.push(',');
             }
-            let numel = if *dtype == "F32" { b.len() / 4 } else { b.len() };
+            let numel = if *dtype == "F32" {
+                b.len() / 4
+            } else {
+                b.len()
+            };
             hjson.push_str(&format!(
                 "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{numel}],\"data_offsets\":[{off},{}]}}",
                 off + b.len()
@@ -2708,13 +2979,22 @@ mod tests {
         .unwrap();
         let cfg = Config::from_json(&json).unwrap();
         assert_eq!(cfg.arch, Arch::NemotronH);
-        assert_eq!((cfg.moe_latent, cfg.moe_inter), (LATENT as i32, MOE_INTER as i32));
+        assert_eq!(
+            (cfg.moe_latent, cfg.moe_inter),
+            (LATENT as i32, MOE_INTER as i32)
+        );
 
         let shards = Shards::open(&dir).unwrap();
         let provider = ShardsExpertProvider::new(&shards, &cfg, 8);
         // The provider must have picked up the gateless/latent layout from the arch.
-        assert!(provider.layout.gateless, "Nemotron provider must use the gateless layout");
-        assert_eq!(provider.hidden, LATENT, "expert outer dim must be moe_latent");
+        assert!(
+            provider.layout.gateless,
+            "Nemotron provider must use the gateless layout"
+        );
+        assert_eq!(
+            provider.hidden, LATENT,
+            "expert outer dim must be moe_latent"
+        );
 
         // In-memory reference expert built straight from the same NVFP4 blobs.
         let ref_qt = |o: usize, i: usize, nib: &[u8], bsc: &[u8], g: f32| QTensor {
@@ -2743,15 +3023,23 @@ mod tests {
             matmul_qt(&mut y, &u, down, NR);
             y
         };
-        let x: Vec<f32> = (0..NR * LATENT).map(|k| 0.4 - 0.03 * (k % 9) as f32).collect();
+        let x: Vec<f32> = (0..NR * LATENT)
+            .map(|k| 0.4 - 0.03 * (k % 9) as f32)
+            .collect();
         let want = relu2(&up_ref, &down_ref, &x);
-        assert!(want.iter().any(|v| v.abs() > 1e-4), "reference relu2 output is all-zero");
+        assert!(
+            want.iter().any(|v| v.abs() > 1e-4),
+            "reference relu2 output is all-zero"
+        );
 
         // Both provider entry points: the single-expert load and the pooled batched read
         // (a 2-tensor group through `read_raw_shared_batched`).
         for (label, ex) in [
             ("expert", provider.expert(0, 0).unwrap()),
-            ("experts_batch", provider.experts_batch(0, &[0]).unwrap().remove(0)),
+            (
+                "experts_batch",
+                provider.experts_batch(0, &[0]).unwrap().remove(0),
+            ),
         ] {
             // Gateless: gate is empty; up/down are NVFP4 (fmt 5) with the latent-space dims.
             assert!(
@@ -2771,17 +3059,32 @@ mod tests {
             // The coalesced `.g` read materialized exactly the on-disk nibble + block-scale
             // halves and the global — byte-for-byte, at the right offsets.
             assert_eq!(ex.up.q4.as_slice(), nib_u.as_slice(), "{label}: up nibbles");
-            assert_eq!(ex.up.bs.as_slice(), bsc_u.as_slice(), "{label}: up block-scales");
+            assert_eq!(
+                ex.up.bs.as_slice(),
+                bsc_u.as_slice(),
+                "{label}: up block-scales"
+            );
             assert_eq!(ex.up.g, g_u, "{label}: up global");
-            assert_eq!(ex.down.q4.as_slice(), nib_d.as_slice(), "{label}: down nibbles");
-            assert_eq!(ex.down.bs.as_slice(), bsc_d.as_slice(), "{label}: down block-scales");
+            assert_eq!(
+                ex.down.q4.as_slice(),
+                nib_d.as_slice(),
+                "{label}: down nibbles"
+            );
+            assert_eq!(
+                ex.down.bs.as_slice(),
+                bsc_d.as_slice(),
+                "{label}: down block-scales"
+            );
             assert_eq!(ex.down.g, g_d, "{label}: down global");
 
             // Computes `down(relu(up·x)²)` identically to the in-memory reference.
             let got = relu2(&ex.up, &ex.down, &x);
             for (k, (&a, &b)) in got.iter().zip(&want).enumerate() {
                 let tol = 1e-5 * a.abs().max(b.abs()).max(1.0);
-                assert!((a - b).abs() <= tol, "{label} row {k}: loaded {a} vs reference {b}");
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{label} row {k}: loaded {a} vs reference {b}"
+                );
             }
         }
 
@@ -2813,8 +3116,12 @@ mod tests {
         const I: usize = 64;
 
         static N: AtomicU64 = AtomicU64::new(0);
-        let dir = PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()))
-            .join(format!("colibri-mx-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let dir =
+            PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into())).join(format!(
+                "colibri-mx-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
         std::fs::create_dir_all(&dir).unwrap();
 
         // nibbles ++ E8M0 block scales, the layout convert writes for a passthrough.
@@ -2829,7 +3136,11 @@ mod tests {
         }
 
         let p = |suf: &str| format!("model.layers.0.mlp.experts.0.{suf}");
-        let (gw, uw, dw) = (p("gate_proj.weight"), p("up_proj.weight"), p("down_proj.weight"));
+        let (gw, uw, dw) = (
+            p("gate_proj.weight"),
+            p("up_proj.weight"),
+            p("down_proj.weight"),
+        );
         let (gg, ug, dg) = (format!("{gw}.mx"), format!("{uw}.mx"), format!("{dw}.mx"));
         let one = 1.0f32.to_le_bytes().to_vec();
         let entries: [(&str, &str, Vec<u8>); 6] = [
@@ -2843,8 +3154,14 @@ mod tests {
         let mut hjson = String::from("{");
         let mut off = 0usize;
         for (i, (name, dtype, b)) in entries.iter().enumerate() {
-            if i > 0 { hjson.push(','); }
-            let numel = if *dtype == "F32" { b.len() / 4 } else { b.len() };
+            if i > 0 {
+                hjson.push(',');
+            }
+            let numel = if *dtype == "F32" {
+                b.len() / 4
+            } else {
+                b.len()
+            };
             hjson.push_str(&format!(
                 "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{numel}],\"data_offsets\":[{off},{}]}}",
                 off + b.len()));
@@ -2855,7 +3172,9 @@ mod tests {
         let mut f = File::create(dir.join("model.safetensors")).unwrap();
         f.write_all(&(hb.len() as u64).to_le_bytes()).unwrap();
         f.write_all(hb).unwrap();
-        for (_, _, b) in &entries { f.write_all(b).unwrap(); }
+        for (_, _, b) in &entries {
+            f.write_all(b).unwrap();
+        }
         drop(f);
 
         let shards = Shards::open(&dir).expect("open shards");
@@ -2863,10 +3182,18 @@ mod tests {
         let e = load_expert(&shards, layout, I, O, 8, 0, 0, 1).expect("load mxfp4 expert");
 
         for (name, t) in [("gate", &e.gate), ("up", &e.up), ("down", &e.down)] {
-            assert_eq!(t.fmt_code, 6, "{name} should be MXFP4 (fmt 6), got {}", t.fmt_code);
+            assert_eq!(
+                t.fmt_code, 6,
+                "{name} should be MXFP4 (fmt 6), got {}",
+                t.fmt_code
+            );
             assert_eq!(t.q4.len(), nib_bytes, "{name} nibble slice");
             // The stride is the whole point: NVFP4's 16 would give twice this.
-            assert_eq!(t.bs.len(), bs_bytes, "{name} block-scale slice (MXFP4 stride 32)");
+            assert_eq!(
+                t.bs.len(),
+                bs_bytes,
+                "{name} block-scale slice (MXFP4 stride 32)"
+            );
             assert_eq!(t.g, 1.0, "{name} MXFP4 global is the identity");
         }
     }
@@ -2893,7 +3220,9 @@ mod tests {
             let nb = i.div_ceil(32);
             let q4: Vec<u8> = (0..o * rb).map(|k| ((k * 7 + seed) % 256) as u8).collect();
             // Scales near 2^0 so the decoded weights stay in a sane range.
-            let bs: Vec<u8> = (0..o * nb).map(|k| (126 + ((k + seed) % 3)) as u8).collect();
+            let bs: Vec<u8> = (0..o * nb)
+                .map(|k| (126 + ((k + seed) % 3)) as u8)
+                .collect();
             QTensor {
                 fmt_code: 6,
                 q4: Bytes::Owned(q4),
@@ -2908,19 +3237,32 @@ mod tests {
         let (gate, up, down) = (mk(I, D, 1), mk(I, D, 5), mk(D, I, 9));
         let (beta, linear_beta) = (4.0f32, 25.0f32);
         let _ = ACTIVATION.set(ActCfg {
-            oai: false, alpha: 0.0, limit: 0.0, relu2: false,
-            situ: true, situ_beta: beta, situ_linear_beta: linear_beta,
+            oai: false,
+            alpha: 0.0,
+            limit: 0.0,
+            relu2: false,
+            situ: true,
+            situ_beta: beta,
+            situ_linear_beta: linear_beta,
         });
 
         for (nr, tol) in [(1usize, 2e-3f32), (8usize, 5e-2f32)] {
-            let x: Vec<f32> =
-                (0..nr * D).map(|k| ((k % 11) as f32 - 5.0) * 0.05).collect();
+            let x: Vec<f32> = (0..nr * D)
+                .map(|k| ((k % 11) as f32 - 5.0) * 0.05)
+                .collect();
             let mut want = vec![0f32; nr * D];
             ffn_cpu(&gate, &up, &down, &x, nr, &mut want);
 
             let mut got = vec![0f32; nr * D];
             let ran = crate::gpu::try_expert_ffn_mxfp4_situ(
-                &gate, &up, &down, &x, nr, &mut got, beta, linear_beta,
+                &gate,
+                &up,
+                &down,
+                &x,
+                nr,
+                &mut got,
+                beta,
+                linear_beta,
             );
             if !ran {
                 eprintln!("kernel declined at nr={nr} (no CUDA / no zero-copy) — skipping");
@@ -2936,5 +3278,4 @@ mod tests {
             }
         }
     }
-
 }

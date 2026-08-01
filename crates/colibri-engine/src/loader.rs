@@ -203,7 +203,6 @@ mod tests {
         }
     }
 
-
     /// A resident NVFP4 weight must load as fmt 5, with nibbles and block scales split at
     /// the right offset. The regression this pins: `qt_load` had no `.g` branch, so such a
     /// weight fell through to "no .qs → full tensor → read_f32" and reinterpreted packed
@@ -218,12 +217,18 @@ mod tests {
         blob.extend_from_slice(&bsc);
 
         let dir = temp_dir();
-        write_st(&dir, &[("w", "U8", blob.clone()), ("w.g", "F32", f32_bytes(&[g]))]);
+        write_st(
+            &dir,
+            &[("w", "U8", blob.clone()), ("w.g", "F32", f32_bytes(&[g]))],
+        );
         let shards = Shards::open(&dir).unwrap();
         let t = qt_load(&shards, "w", o, i, 8).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(t.fmt_code, 5, "must load as NVFP4, not fall through to f32/int8");
+        assert_eq!(
+            t.fmt_code, 5,
+            "must load as NVFP4, not fall through to f32/int8"
+        );
         assert_eq!(t.q4.len(), nib, "nibble section length");
         assert_eq!(t.bs.len(), bsc.len(), "block-scale section length");
         assert_eq!(t.g, g);
@@ -265,7 +270,7 @@ mod tests {
         let shards = Shards::open(&dir).unwrap();
         let qt = qt_load(&shards, "w", 2, 3, 8).unwrap();
         assert_eq!(qt.fmt_code, 1); // int8
-        // applying it should be close to the exact f32 matmul
+                                    // applying it should be close to the exact f32 matmul
         let x = vec![1.0f32, 1.0, 1.0];
         let mut y = vec![0f32; 2];
         matmul_qt(&mut y, &x, &qt, 1);

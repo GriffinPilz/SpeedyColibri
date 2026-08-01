@@ -629,7 +629,9 @@ pub fn try_dsa_indexer_scores(
     if !available() || nsp == 0 || nh == 0 || nh > 32 || hd == 0 || t_len == 0 {
         return false;
     }
-    if qi.len() < nsp * nh * hd || hw.len() < nsp * nh || keys.len() < t_len * hd
+    if qi.len() < nsp * nh * hd
+        || hw.len() < nsp * nh
+        || keys.len() < t_len * hd
         || scores.len() < nsp * t_len
     {
         return false;
@@ -844,13 +846,41 @@ pub fn try_expert_ffn(
         // download in expert_mlp_raw; out/x sized [nr, O]/[nr, I] by ffn().
         let ok = unsafe {
             if gate.fmt_code == 5 {
-                cuda::expert_mlp_nvfp4_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+                cuda::expert_mlp_nvfp4_raw(
+                    g.as_raw(),
+                    u.as_raw(),
+                    d.as_raw(),
+                    out.as_mut_ptr(),
+                    x.as_ptr(),
+                    nr as i32,
+                )
             } else if gate.fmt_code == 4 {
-                cuda::expert_mlp_fp8_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+                cuda::expert_mlp_fp8_raw(
+                    g.as_raw(),
+                    u.as_raw(),
+                    d.as_raw(),
+                    out.as_mut_ptr(),
+                    x.as_ptr(),
+                    nr as i32,
+                )
             } else if gate.fmt_code == 1 && tile_i8_enabled() {
-                cuda::expert_mlp_i8a16_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+                cuda::expert_mlp_i8a16_raw(
+                    g.as_raw(),
+                    u.as_raw(),
+                    d.as_raw(),
+                    out.as_mut_ptr(),
+                    x.as_ptr(),
+                    nr as i32,
+                )
             } else {
-                cuda::expert_mlp_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+                cuda::expert_mlp_raw(
+                    g.as_raw(),
+                    u.as_raw(),
+                    d.as_raw(),
+                    out.as_mut_ptr(),
+                    x.as_ptr(),
+                    nr as i32,
+                )
             }
         };
         if ok {
@@ -870,9 +900,11 @@ pub fn try_expert_ffn(
         weight_ptr(up) as usize,
         weight_ptr(down) as usize,
     ];
-    let (Some(g), Some(u), Some(d)) =
-        (upload_ffn(gate, &keys), upload_ffn(up, &keys), upload_ffn(down, &keys))
-    else {
+    let (Some(g), Some(u), Some(d)) = (
+        upload_ffn(gate, &keys),
+        upload_ffn(up, &keys),
+        upload_ffn(down, &keys),
+    ) else {
         return false;
     };
     // SAFETY: handles are resident on device 0; out/x sized [nr, O]/[nr, I] by ffn().
@@ -927,8 +959,14 @@ pub fn try_expert_ffn_mxfp4_situ(
     // x/out are sized [nr, gate.i] / [nr, down.o] by `ffn`.
     let ok = unsafe {
         cuda::expert_mlp_mxfp4_situ_raw(
-            g.as_raw(), u.as_raw(), d.as_raw(),
-            out.as_mut_ptr(), x.as_ptr(), nr as i32, beta, linear_beta,
+            g.as_raw(),
+            u.as_raw(),
+            d.as_raw(),
+            out.as_mut_ptr(),
+            x.as_ptr(),
+            nr as i32,
+            beta,
+            linear_beta,
         )
     };
     if ok {
@@ -962,7 +1000,12 @@ pub fn try_expert_ffn_relu2(
     // expert_mlp_nvfp4_relu2_raw; out/x sized [nr, up.I]/[nr, up.I] by ffn() (latent-space).
     let ok = unsafe {
         cuda::expert_mlp_nvfp4_relu2_raw(
-            u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32, exact_experts(),
+            u.as_raw(),
+            d.as_raw(),
+            out.as_mut_ptr(),
+            x.as_ptr(),
+            nr as i32,
+            exact_experts(),
         )
     };
     if ok {
@@ -1089,7 +1132,10 @@ pub fn try_expert_group(
         return true; // nothing routed — `out` unchanged
     }
     if !active.iter().all(|(ex, _, _)| {
-        ex.gate.gpu_eligible && ex.gate.fmt_code == 4 && ex.up.fmt_code == 4 && ex.down.fmt_code == 4
+        ex.gate.gpu_eligible
+            && ex.gate.fmt_code == 4
+            && ex.up.fmt_code == 4
+            && ex.down.fmt_code == 4
     }) {
         return false;
     }
@@ -1113,14 +1159,15 @@ pub fn try_expert_group(
     let mut ci = 0usize;
     while ci < active.len() {
         let c1 = (ci + 64).min(active.len());
-        let (mut gs, mut us, mut ds, mut rows_i) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut gs, mut us, mut ds, mut rows_i) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut keep = Vec::new(); // hold descriptors alive across the synchronous call
         let mut chunk_rows = 0usize;
         for (ex, rows, _) in &active[ci..c1] {
-            let (Some(gt), Some(ut), Some(dt)) =
-                (wrap_fresh(&ex.gate), wrap_fresh(&ex.up), wrap_fresh(&ex.down))
-            else {
+            let (Some(gt), Some(ut), Some(dt)) = (
+                wrap_fresh(&ex.gate),
+                wrap_fresh(&ex.up),
+                wrap_fresh(&ex.down),
+            ) else {
                 return false;
             };
             gs.push(gt.as_raw());
@@ -1244,8 +1291,11 @@ const GROUP_CHUNK_DEFAULT: usize = 32;
 fn group_chunk_experts() -> Option<usize> {
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        match std::env::var("COLI_GROUP_CHUNK").ok().and_then(|s| s.parse::<usize>().ok()) {
-            Some(0) => None,                 // explicit 0 = whole layer
+        match std::env::var("COLI_GROUP_CHUNK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(0) => None, // explicit 0 = whole layer
             Some(n) => Some(n),
             None => Some(GROUP_CHUNK_DEFAULT),
         }
@@ -1329,14 +1379,20 @@ pub fn try_expert_group_nvfp4(
     // of 32 (59 s vs 56 s), so a short-on-memory model gives up very little by staging
     // less at a time. If even one expert will not fit, decline and let the caller run the
     // per-expert path, which allocates nothing beyond one expert's scratch.
-    let per_expert: u64 = active.iter().map(|(ex, _, _)| ex.bytes()).max().unwrap_or(0);
+    let per_expert: u64 = active
+        .iter()
+        .map(|(ex, _, _)| ex.bytes())
+        .max()
+        .unwrap_or(0);
     let staging_per_expert = per_expert.saturating_mul(2); // pinned host + device arena
     let mut chunk = group_chunk_experts().unwrap_or(active.len()).max(1);
     if staging_per_expert > 0 {
         // Quarter of headroom: KV, activations and the read buffers draw on the same
         // remainder, and a staging buffer that consumed all of it would simply move the
         // kill to the next allocator.
-        let budget = crate::ram::manager().map(|m| m.headroom() / 4).unwrap_or(u64::MAX);
+        let budget = crate::ram::manager()
+            .map(|m| m.headroom() / 4)
+            .unwrap_or(u64::MAX);
         let fits = (budget / staging_per_expert) as usize;
         if fits == 0 {
             GROUP_SCRATCH.with(|c| c.set(gsc));
@@ -1349,7 +1405,7 @@ pub fn try_expert_group_nvfp4(
         );
     }
     let mut ok = true;
-    let mut done = 0usize;   // rows consumed so far, to slice x_all/y_all per chunk
+    let mut done = 0usize; // rows consumed so far, to slice x_all/y_all per chunk
     for part in active.chunks(chunk) {
         let part_rows: usize = part.iter().map(|(_, r, _)| r.len()).sum();
         let mut gs: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(part.len());
@@ -1359,9 +1415,11 @@ pub fn try_expert_group_nvfp4(
         let mut keep = Vec::with_capacity(part.len() * 3);
         let mut all_wrapped = true;
         for (ex, rows, _) in part {
-            let (Some(gt), Some(ut), Some(dt)) =
-                (wrap_fresh(&ex.gate), wrap_fresh(&ex.up), wrap_fresh(&ex.down))
-            else {
+            let (Some(gt), Some(ut), Some(dt)) = (
+                wrap_fresh(&ex.gate),
+                wrap_fresh(&ex.up),
+                wrap_fresh(&ex.down),
+            ) else {
                 all_wrapped = false;
                 break;
             };
@@ -1461,7 +1519,10 @@ pub fn try_expert_group_relu2(
     // ranges, so the weight stream gets real memory-level parallelism.
     //
     // `COLI_EXPERT_GROUP_PREFILL=1` lifts the restriction so this stays re-measurable.
-    if !group_prefill_enabled() && !expert_seg_enabled() && active.iter().any(|(_, rows, _)| rows.len() != 1) {
+    if !group_prefill_enabled()
+        && !expert_seg_enabled()
+        && active.iter().any(|(_, rows, _)| rows.len() != 1)
+    {
         return false;
     }
     // `d` is the expert input width (the MoE latent for Nemotron-H, not the model hidden);
@@ -1521,13 +1582,7 @@ pub fn try_expert_group_relu2(
             // SAFETY: us/ds stay resident until `keep` drops (after the synchronous call,
             // which includes the D2H); x_all/y_all hold `total * d` floats each.
             let ok = unsafe {
-                cuda::expert_seg_nvfp4_relu2_raw(
-                    &us,
-                    &ds,
-                    &rws,
-                    y_all.as_mut_ptr(),
-                    x_all.as_ptr(),
-                )
+                cuda::expert_seg_nvfp4_relu2_raw(&us, &ds, &rws, y_all.as_mut_ptr(), x_all.as_ptr())
             };
             drop(keep);
             if ok {

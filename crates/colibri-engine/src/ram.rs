@@ -147,7 +147,11 @@ impl RamManager {
     /// past a refusal is the exact path that exhausted swap on MiniMax-M3.
     pub fn commit(self: &Arc<Self>, class: Class, bytes: u64) -> Option<Commitment> {
         if bytes == 0 {
-            return Some(Commitment { mgr: Arc::clone(self), class, bytes: 0 });
+            return Some(Commitment {
+                mgr: Arc::clone(self),
+                class,
+                bytes: 0,
+            });
         }
         let mut cur = self.total.load(Ordering::Acquire);
         loop {
@@ -165,11 +169,14 @@ impl RamManager {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    let now = self.per_class[class as usize]
-                        .fetch_add(bytes, Ordering::Relaxed)
-                        + bytes;
+                    let now =
+                        self.per_class[class as usize].fetch_add(bytes, Ordering::Relaxed) + bytes;
                     self.note_peak(class, now);
-                    return Some(Commitment { mgr: Arc::clone(self), class, bytes });
+                    return Some(Commitment {
+                        mgr: Arc::clone(self),
+                        class,
+                        bytes,
+                    });
                 }
                 Err(observed) => cur = observed, // someone else moved it; re-test the fit
             }
@@ -204,12 +211,14 @@ impl RamManager {
         } else {
             self.total.fetch_sub(prev - bytes, Ordering::AcqRel);
         }
-        self.ceiling.saturating_sub(self.total.load(Ordering::Acquire))
+        self.ceiling
+            .saturating_sub(self.total.load(Ordering::Acquire))
     }
 
     /// Ledger headroom: what a new allocation of any class could still take.
     pub fn headroom(&self) -> u64 {
-        self.ceiling.saturating_sub(self.total.load(Ordering::Acquire))
+        self.ceiling
+            .saturating_sub(self.total.load(Ordering::Acquire))
     }
 }
 
@@ -273,7 +282,11 @@ pub fn manager() -> Option<Arc<RamManager>> {
 pub fn try_commit(class: Class, bytes: u64) -> Option<Commitment> {
     match manager() {
         Some(m) => m.commit(class, bytes),
-        None => Some(Commitment { mgr: unmanaged(), class, bytes: 0 }),
+        None => Some(Commitment {
+            mgr: unmanaged(),
+            class,
+            bytes: 0,
+        }),
     }
 }
 
@@ -377,13 +390,20 @@ mod tests {
 
         // Absolute, not additive — the cache reports its total, not a delta.
         assert_eq!(m.set_usage(Class::Experts, 50), 30, "20 + 50 = 70 of 100");
-        assert_eq!(m.set_usage(Class::Experts, 60), 20, "replaces 50, does not add to it");
+        assert_eq!(
+            m.set_usage(Class::Experts, 60),
+            20,
+            "replaces 50, does not add to it"
+        );
         assert_eq!(m.committed_in(Class::Experts), 60);
         assert_eq!(m.committed(), 80);
 
         // Shrinking on eviction gives the headroom back to *other* classes.
         assert_eq!(m.set_usage(Class::Experts, 10), 70);
-        assert!(m.commit(Class::Kv, 70).is_some(), "evicted expert bytes are now grantable");
+        assert!(
+            m.commit(Class::Kv, 70).is_some(),
+            "evicted expert bytes are now grantable"
+        );
     }
 
     #[test]
@@ -393,8 +413,16 @@ mod tests {
         // returned nonzero while over, the cache would keep growing past the ceiling.
         let m = mgr(100);
         assert_eq!(m.set_usage(Class::Experts, 140), 0);
-        assert_eq!(m.committed(), 140, "the overshoot is visible, not silently clamped");
-        assert_eq!(m.set_usage(Class::Experts, 90), 10, "and it recovers when evicted down");
+        assert_eq!(
+            m.committed(),
+            140,
+            "the overshoot is visible, not silently clamped"
+        );
+        assert_eq!(
+            m.set_usage(Class::Experts, 90),
+            10,
+            "and it recovers when evicted down"
+        );
     }
 
     #[test]
@@ -403,8 +431,15 @@ mod tests {
         let _a = m.commit(Class::Dense, 40).expect("fits");
         let _b = m.commit(Class::Kv, 40).expect("fits");
         assert_eq!(m.committed(), 80);
-        assert!(m.commit(Class::Scratch, 30).is_none(), "110 > 100 must be refused");
-        assert_eq!(m.committed(), 80, "a refused commit leaves the ledger untouched");
+        assert!(
+            m.commit(Class::Scratch, 30).is_none(),
+            "110 > 100 must be refused"
+        );
+        assert_eq!(
+            m.committed(),
+            80,
+            "a refused commit leaves the ledger untouched"
+        );
         let _c = m.commit(Class::Scratch, 20).expect("exact fit is allowed");
         assert_eq!(m.committed(), 100);
         assert!(m.commit(Class::Scratch, 1).is_none());
@@ -423,16 +458,25 @@ mod tests {
         m.commit(Class::Experts, grant).unwrap().hold_forever();
 
         // Requests now fit without touching the arena.
-        let kv = m.commit(Class::Kv, 20).expect("KV fits in the held-back room");
+        let kv = m
+            .commit(Class::Kv, 20)
+            .expect("KV fits in the held-back room");
         let scratch = m.commit(Class::Scratch, 5).expect("scratch fits too");
         assert_eq!(m.committed(), 100);
-        assert_eq!(m.committed_in(Class::Experts), 65, "the arena never gave anything up");
+        assert_eq!(
+            m.committed_in(Class::Experts),
+            65,
+            "the arena never gave anything up"
+        );
 
         // And the ceiling still binds beyond that.
         assert!(m.commit(Class::Kv, 1).is_none());
         drop(kv);
         drop(scratch);
-        assert!(m.commit(Class::Kv, 25).is_some(), "room returns when requests finish");
+        assert!(
+            m.commit(Class::Kv, 25).is_some(),
+            "room returns when requests finish"
+        );
     }
 
     /// A request that cannot fit is refused. It is NOT allocated anyway — that is the
@@ -441,12 +485,21 @@ mod tests {
     fn an_oversized_request_is_refused_not_squeezed_in() {
         let m = mgr(100);
         m.commit(Class::Dense, 10).unwrap().hold_forever();
-        m.commit(Class::Experts, m.arena_grant(20)).unwrap().hold_forever();
+        m.commit(Class::Experts, m.arena_grant(20))
+            .unwrap()
+            .hold_forever();
         assert_eq!(m.committed(), 80);
 
         assert!(m.commit(Class::Kv, 30).is_none(), "30 > the 20 held back");
-        assert_eq!(m.committed(), 80, "and nothing was committed on the way to refusing");
-        assert!(m.commit(Class::Kv, 20).is_some(), "exactly what was held back still fits");
+        assert_eq!(
+            m.committed(),
+            80,
+            "and nothing was committed on the way to refusing"
+        );
+        assert!(
+            m.commit(Class::Kv, 20).is_some(),
+            "exactly what was held back still fits"
+        );
     }
 
     #[test]
@@ -475,7 +528,10 @@ mod tests {
         );
         assert_eq!(verdict, Admission::TooLarge);
         assert!(c.is_none());
-        assert!(t0.elapsed() < std::time::Duration::from_secs(1), "it must not have waited");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "it must not have waited"
+        );
     }
 
     /// Contention waits and then succeeds when the other request finishes. Two requests
@@ -496,12 +552,8 @@ mod tests {
         });
         // With an unreachable ceiling this succeeds instantly; the assertion that matters
         // is that a Busy verdict is reserved for genuine timeout, never for "try again".
-        let (verdict, c) = commit_or_wait(
-            Class::Kv,
-            10,
-            u64::MAX,
-            std::time::Duration::from_secs(2),
-        );
+        let (verdict, c) =
+            commit_or_wait(Class::Kv, 10, u64::MAX, std::time::Duration::from_secs(2));
         assert_eq!(verdict, Admission::Ok);
         assert!(c.is_some());
         t.join().unwrap();

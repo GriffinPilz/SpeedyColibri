@@ -140,7 +140,9 @@ pub fn absorb<P: ExpertProvider>(
     }
     let mut nrm = vec![0f32; s * d];
     let mut tmp = vec![0f32; s * d];
-    head_forward(model, kv, provider, mtp, &mut hx, s, pos_base, &mut nrm, &mut tmp)
+    head_forward(
+        model, kv, provider, mtp, &mut hx, s, pos_base, &mut nrm, &mut tmp,
+    )
 }
 
 /// Propose up to `g_max` draft tokens by chaining the head. Port of `mtp_draft`.
@@ -193,7 +195,9 @@ pub fn draft<P: ExpertProvider>(
         // Only the first step's hidden is raw (it came from the main stack);
         // afterwards `h` is this block's own output.
         fuse(model, mtp, tok, &h, g == 0, &mut hx);
-        head_forward(model, kv, provider, mtp, &mut hx, 1, pos, &mut nrm, &mut tmp)?;
+        head_forward(
+            model, kv, provider, mtp, &mut hx, 1, pos, &mut nrm, &mut tmp,
+        )?;
 
         // the head's own final norm, then the SHARED lm_head
         rmsnorm(&mut row, &hx, &mtp.mtp_norm, model.cfg.eps);

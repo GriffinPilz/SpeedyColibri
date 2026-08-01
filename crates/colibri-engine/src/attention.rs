@@ -33,7 +33,10 @@ use std::io;
 #[inline]
 fn atime(acc: &std::sync::atomic::AtomicU64, t: std::time::Instant) {
     if crate::forward::profile_on() {
-        acc.fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        acc.fetch_add(
+            t.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -92,7 +95,18 @@ pub fn attention(
     pos_base: usize,
     out: &mut [f32],
 ) {
-    attention_with(cfg, l, layer, kv, x, s_len, pos_base, out, AttnCore::Reconstruct, None);
+    attention_with(
+        cfg,
+        l,
+        layer,
+        kv,
+        x,
+        s_len,
+        pos_base,
+        out,
+        AttnCore::Reconstruct,
+        None,
+    );
 }
 
 /// `COLI_M3_SPARSE=1` enables the MiniMax-M3 block-sparse Lightning Indexer (off by
@@ -123,7 +137,10 @@ fn topk_blocks(scores: &[f32], keep: usize) -> Vec<u32> {
     let keep = keep.min(n);
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&a, &b| {
-        scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
     });
     let mut sel: Vec<u32> = idx[..keep].iter().map(|&i| i as u32).collect();
     sel.sort_unstable();
@@ -254,7 +271,10 @@ pub fn attention_gqa(
             v[s * kv_dim..(s + 1) * kv_dim].copy_from_slice(&qkv_out[b + qsz + kv_dim..b + width]);
         }
     } else {
-        let q_proj = l.q_proj.as_ref().expect("GQA layer missing qkv_proj and q_proj");
+        let q_proj = l
+            .q_proj
+            .as_ref()
+            .expect("GQA layer missing qkv_proj and q_proj");
         let k_proj = l.k_proj.as_ref().expect("GQA layer missing k_proj");
         let v_proj = l.v_proj.as_ref().expect("GQA layer missing v_proj");
         matmul_qt(&mut q, x, q_proj, s_len);
@@ -347,44 +367,44 @@ pub fn attention_gqa(
         let mut scores: Vec<f32> = Vec::new();
         let mut skeys: Vec<usize> = Vec::new();
         for s in 0..s_len {
-        let pos = pos_base + s;
-        let tk = pos + 1; // attend to cached positions [st0, pos]
-        let krows = kv.k_full_rows(layer, st0, tk);
-        let vrows = kv.v_full_rows(layer, st0, tk);
-        for hh in 0..h {
-            let kvhh = hh / group;
-            let qvec = &q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
-            // Key set: dense = the contiguous causal range [st0, tk); block-sparse =
-            // the keys in this query/GQA-group's indexer-selected blocks (gathered once).
-            let sparse = block_sel.is_some();
-            if sparse {
-                skeys.clear();
-                for &b in &block_sel.as_ref().unwrap()[kvhh * s_len + s] {
-                    let lo = ((b as usize) * bsize).max(st0);
-                    let hi = ((b as usize + 1) * bsize).min(tk);
-                    skeys.extend(lo..hi);
+            let pos = pos_base + s;
+            let tk = pos + 1; // attend to cached positions [st0, pos]
+            let krows = kv.k_full_rows(layer, st0, tk);
+            let vrows = kv.v_full_rows(layer, st0, tk);
+            for hh in 0..h {
+                let kvhh = hh / group;
+                let qvec = &q[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
+                // Key set: dense = the contiguous causal range [st0, tk); block-sparse =
+                // the keys in this query/GQA-group's indexer-selected blocks (gathered once).
+                let sparse = block_sel.is_some();
+                if sparse {
+                    skeys.clear();
+                    for &b in &block_sel.as_ref().unwrap()[kvhh * s_len + s] {
+                        let lo = ((b as usize) * bsize).max(st0);
+                        let hi = ((b as usize + 1) * bsize).min(tk);
+                        skeys.extend(lo..hi);
+                    }
+                }
+                let nk = if sparse { skeys.len() } else { tk - st0 };
+                let key = |i: usize| if sparse { skeys[i] } else { st0 + i };
+                scores.clear();
+                scores.resize(nk, 0.0);
+                for (i, sc) in scores.iter_mut().enumerate() {
+                    let base = (key(i) - st0) * kv_dim + kvhh * hd;
+                    let krow = &krows[base..base + hd];
+                    *sc = qvec.iter().zip(krow).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                }
+                softmax(&mut scores);
+                let cvec = &mut ctx[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
+                for i in 0..nk {
+                    let base = (key(i) - st0) * kv_dim + kvhh * hd;
+                    let vrow = &vrows[base..base + hd];
+                    let sc = scores[i];
+                    for (c, &vv) in cvec.iter_mut().zip(vrow) {
+                        *c += sc * vv;
+                    }
                 }
             }
-            let nk = if sparse { skeys.len() } else { tk - st0 };
-            let key = |i: usize| if sparse { skeys[i] } else { st0 + i };
-            scores.clear();
-            scores.resize(nk, 0.0);
-            for (i, sc) in scores.iter_mut().enumerate() {
-                let base = (key(i) - st0) * kv_dim + kvhh * hd;
-                let krow = &krows[base..base + hd];
-                *sc = qvec.iter().zip(krow).map(|(&a, &b)| a * b).sum::<f32>() * scale;
-            }
-            softmax(&mut scores);
-            let cvec = &mut ctx[s * h * hd + hh * hd..s * h * hd + hh * hd + hd];
-            for i in 0..nk {
-                let base = (key(i) - st0) * kv_dim + kvhh * hd;
-                let vrow = &vrows[base..base + hd];
-                let sc = scores[i];
-                for (c, &vv) in cvec.iter_mut().zip(vrow) {
-                    *c += sc * vv;
-                }
-            }
-        }
         }
     }
     atime(&crate::forward::ATTN_CORE_US, _tc);
@@ -415,7 +435,19 @@ pub fn attention_with(
     core: AttnCore,
     sel: Option<&[Vec<u32>]>,
 ) -> Option<Vec<Vec<u32>>> {
-    attention_with_heads(cfg, l, layer, kv, x, s_len, pos_base, out, core, sel, (0, cfg.n_heads as usize))
+    attention_with_heads(
+        cfg,
+        l,
+        layer,
+        kv,
+        x,
+        s_len,
+        pos_base,
+        out,
+        core,
+        sel,
+        (0, cfg.n_heads as usize),
+    )
 }
 
 /// As [`attention_with`], but computing only the head slice `heads = (h_start,
@@ -445,7 +477,10 @@ pub fn attention_with_heads(
 ) -> Option<Vec<Vec<u32>>> {
     let h = cfg.n_heads as usize;
     let (h0, hc) = heads;
-    debug_assert!(h0 + hc <= h && hc > 0, "head slice ({h0},{hc}) out of range for {h} heads");
+    debug_assert!(
+        h0 + hc <= h && hc > 0,
+        "head slice ({h0},{hc}) out of range for {h} heads"
+    );
     // A partial head slice is only honored by the DSA-sparse GPU core and the CPU
     // reconstruct core; the dense GPU/absorb paths compute all H heads, so a partial
     // slice must not take them (guarded below with `full_heads`).
@@ -564,7 +599,18 @@ pub fn attention_with_heads(
                 // Decode: persistent device KV — append the new row, read on device.
                 match kv.sync_device(layer, pos_base, tk) {
                     Some((lat_dev, rope_dev)) => crate::gpu::try_attention_absorb_kvdev(
-                        &l.kv_b, &mut ctx, &q, lat_dev, rope_dev, h, qk_nope, r, vh, kvl, tk, cfg.attn_scale,
+                        &l.kv_b,
+                        &mut ctx,
+                        &q,
+                        lat_dev,
+                        rope_dev,
+                        h,
+                        qk_nope,
+                        r,
+                        vh,
+                        kvl,
+                        tk,
+                        cfg.attn_scale,
                     ),
                     None => false,
                 }
@@ -596,14 +642,19 @@ pub fn attention_with_heads(
     if !ran_gpu {
         match core {
             AttnCore::Reconstruct => {
-                reconstruct_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx, sel, h0, hc);
+                reconstruct_core(
+                    cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx, sel, h0, hc,
+                );
             }
             // Absorb is the S==1 decode core; DSA sparsifies the long-context prefill
             // (reconstruct), so a selection is not applied here. It has no head-slice
             // form (decode isn't tensor-parallel here) — a partial slice must use
             // Reconstruct.
             AttnCore::Absorb => {
-                debug_assert!(full_heads, "Absorb core has no head-slice form; use Reconstruct");
+                debug_assert!(
+                    full_heads,
+                    "Absorb core has no head-slice form; use Reconstruct"
+                );
                 absorb_core(cfg, l, layer, kv, &q, s_len, pos_base, st0, &mut ctx);
             }
         }
@@ -807,8 +858,17 @@ pub fn attention_sharded<T: Transport + ?Sized>(
         // the peers.
         let mut local = vec![0f32; s_len * d];
         attention_with_heads(
-            cfg, l, layer, kv, x, s_len, pos_base, &mut local, AttnCore::Reconstruct,
-            Some(&sel_full), (h0, hc),
+            cfg,
+            l,
+            layer,
+            kv,
+            x,
+            s_len,
+            pos_base,
+            &mut local,
+            AttnCore::Reconstruct,
+            Some(&sel_full),
+            (h0, hc),
         );
         partials.push((me.0, local));
 
@@ -887,7 +947,17 @@ pub fn compute_attention_partial(
         &dense
     };
     attention_with_heads(
-        cfg, l, 0, &mut kv, x, s_len, pos_base, out, AttnCore::Reconstruct, Some(sel_ref), (h0, hc),
+        cfg,
+        l,
+        0,
+        &mut kv,
+        x,
+        s_len,
+        pos_base,
+        out,
+        AttnCore::Reconstruct,
+        Some(sel_ref),
+        (h0, hc),
     );
 }
 
@@ -1124,7 +1194,7 @@ mod tests {
         assert_eq!(topk_blocks(&scores, 3), vec![1, 2, 3]);
         assert_eq!(topk_blocks(&scores, 1), vec![3]); // the local (+inf) block
         assert_eq!(topk_blocks(&scores, 10).len(), 5); // keep clamps to n
-        // ties resolve to the lower block id.
+                                                       // ties resolve to the lower block id.
         assert_eq!(topk_blocks(&[2.0f32, 2.0, 1.0], 1), vec![0]);
     }
 
@@ -1229,7 +1299,9 @@ mod tests {
         let cfg = Config::from_json(&json).unwrap();
         let (h, qk_nope, r, vh, kvl) = (64usize, 128usize, 64usize, 128usize, 512usize);
         let kvb_dim = h * (qk_nope + vh);
-        let wf: Vec<f32> = (0..kvb_dim * kvl).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
+        let wf: Vec<f32> = (0..kvb_dim * kvl)
+            .map(|k| ((k % 13) as f32 - 6.0) * 0.01)
+            .collect();
         let mut kv_b = qtensor_from_f32(&wf, kvb_dim, kvl, 8); // int8, like production
         kv_b.gpu_eligible = true;
         let mut l = Layer::default();
@@ -1248,8 +1320,9 @@ mod tests {
                 *x = (((pos * 5 + i) % 11) as f32 - 5.0) * 0.02;
             }
         }
-        let q: Vec<f32> =
-            (0..s_len * h * (qk_nope + r)).map(|k| ((k % 7) as f32 - 3.0) * 0.01).collect();
+        let q: Vec<f32> = (0..s_len * h * (qk_nope + r))
+            .map(|k| ((k % 7) as f32 - 3.0) * 0.01)
+            .collect();
         let latent = kv.latent_rows(0, 0, t).to_vec();
         let rope = kv.krot_rows(0, 0, t).to_vec();
         let scale = cfg.attn_scale;
@@ -1269,13 +1342,41 @@ mod tests {
 
         let mut ctx_gpu = vec![0f32; s_len * h * vh];
         let ok = crate::gpu::try_attention_absorb_sparse(
-            &l.kv_b, &mut ctx_gpu, &q, &latent, &rope, &sel, index_topk, 0, h, s_len, h, qk_nope, r,
-            vh, kvl, t, scale,
+            &l.kv_b,
+            &mut ctx_gpu,
+            &q,
+            &latent,
+            &rope,
+            &sel,
+            index_topk,
+            0,
+            h,
+            s_len,
+            h,
+            qk_nope,
+            r,
+            vh,
+            kvl,
+            t,
+            scale,
         );
         assert!(ok, "GPU sparse kernel must run when a device is present");
 
         let mut ctx_cpu = vec![0f32; s_len * h * vh];
-        reconstruct_core(&cfg, &l, 0, &kv, &q, s_len, 0, 0, &mut ctx_cpu, Some(&sel), 0, h);
+        reconstruct_core(
+            &cfg,
+            &l,
+            0,
+            &kv,
+            &q,
+            s_len,
+            0,
+            0,
+            &mut ctx_cpu,
+            Some(&sel),
+            0,
+            h,
+        );
 
         // Tensor-parallel invariant: the GPU sparse kernel over two disjoint head
         // slices [0,h/2) + [h/2,h) must reproduce the full-head kernel exactly (each
@@ -1285,12 +1386,42 @@ mod tests {
         let mut ctx_lo = vec![0f32; s_len * h * vh];
         let mut ctx_hi = vec![0f32; s_len * h * vh];
         assert!(crate::gpu::try_attention_absorb_sparse(
-            &l.kv_b, &mut ctx_lo, &q, &latent, &rope, &sel, index_topk, 0, half, s_len, h, qk_nope,
-            r, vh, kvl, t, scale,
+            &l.kv_b,
+            &mut ctx_lo,
+            &q,
+            &latent,
+            &rope,
+            &sel,
+            index_topk,
+            0,
+            half,
+            s_len,
+            h,
+            qk_nope,
+            r,
+            vh,
+            kvl,
+            t,
+            scale,
         ));
         assert!(crate::gpu::try_attention_absorb_sparse(
-            &l.kv_b, &mut ctx_hi, &q, &latent, &rope, &sel, index_topk, half, h - half, s_len, h,
-            qk_nope, r, vh, kvl, t, scale,
+            &l.kv_b,
+            &mut ctx_hi,
+            &q,
+            &latent,
+            &rope,
+            &sel,
+            index_topk,
+            half,
+            h - half,
+            s_len,
+            h,
+            qk_nope,
+            r,
+            vh,
+            kvl,
+            t,
+            scale,
         ));
         let split_err = (0..ctx_gpu.len())
             .map(|i| (ctx_gpu[i] - (ctx_lo[i] + ctx_hi[i])).abs())
@@ -1298,13 +1429,25 @@ mod tests {
         eprintln!("head-split GPU sparse vs full: maxerr = {split_err:.2e}");
         // Exact: if either slice wrote outside its heads, the sum would double-count and
         // this would be non-zero.
-        assert!(split_err == 0.0, "head-slice sum must equal full attention exactly; err={split_err:.3e}");
+        assert!(
+            split_err == 0.0,
+            "head-slice sum must equal full attention exactly; err={split_err:.3e}"
+        );
 
-        let maxerr =
-            ctx_gpu.iter().zip(&ctx_cpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let maxerr = ctx_gpu
+            .iter()
+            .zip(&ctx_cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         eprintln!("dsa sparse GPU vs CPU reconstruct: maxerr = {maxerr:.2e}");
-        assert!(ctx_cpu.iter().any(|v| v.abs() > 1e-6), "output must be non-trivial");
-        assert!(maxerr < 5e-3, "GPU sparse must match CPU reconstruct; maxerr={maxerr:.3e}");
+        assert!(
+            ctx_cpu.iter().any(|v| v.abs() > 1e-6),
+            "output must be non-trivial"
+        );
+        assert!(
+            maxerr < 5e-3,
+            "GPU sparse must match CPU reconstruct; maxerr={maxerr:.3e}"
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -1329,7 +1472,9 @@ mod tests {
         let cfg = Config::from_json(&json).unwrap();
         let (h, qk_nope, r, vh, kvl) = (64usize, 128usize, 64usize, 128usize, 512usize);
         let kvb_dim = h * (qk_nope + vh);
-        let wf: Vec<f32> = (0..kvb_dim * kvl).map(|k| ((k % 13) as f32 - 6.0) * 0.01).collect();
+        let wf: Vec<f32> = (0..kvb_dim * kvl)
+            .map(|k| ((k % 13) as f32 - 6.0) * 0.01)
+            .collect();
         let mut kv_b = qtensor_from_f32(&wf, kvb_dim, kvl, 4);
         kv_b.gpu_eligible = true;
         let mut l = Layer::default();
@@ -1345,7 +1490,9 @@ mod tests {
                 *x = 0.01;
             }
         }
-        let q: Vec<f32> = (0..h * (qk_nope + r)).map(|k| ((k % 7) as f32 - 3.0) * 0.01).collect();
+        let q: Vec<f32> = (0..h * (qk_nope + r))
+            .map(|k| ((k % 7) as f32 - 3.0) * 0.01)
+            .collect();
         let latent = kv.latent_rows(0, 0, t).to_vec();
         let rope = kv.krot_rows(0, 0, t).to_vec();
         let scale = cfg.attn_scale;
@@ -1353,9 +1500,15 @@ mod tests {
         let mut cc = vec![0f32; h * vh];
 
         // correctness + warm
-        crate::gpu::try_attention_absorb(&l.kv_b, &mut cg, &q, &latent, &rope, 1, h, qk_nope, r, vh, kvl, t, scale);
+        crate::gpu::try_attention_absorb(
+            &l.kv_b, &mut cg, &q, &latent, &rope, 1, h, qk_nope, r, vh, kvl, t, scale,
+        );
         absorb_core(&cfg, &l, 0, &kv, &q, 1, t - 1, 0, &mut cc);
-        let maxerr = cg.iter().zip(&cc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let maxerr = cg
+            .iter()
+            .zip(&cc)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
 
         // persistent device KV: sync once, then the kernel reads device memory
         let mut dev = crate::gpu::DeviceKv::new(1, t);
@@ -1367,12 +1520,16 @@ mod tests {
             .unwrap_or(500);
         let tm = std::time::Instant::now();
         for _ in 0..iters {
-            crate::gpu::try_attention_absorb(&l.kv_b, &mut cg, &q, &latent, &rope, 1, h, qk_nope, r, vh, kvl, t, scale);
+            crate::gpu::try_attention_absorb(
+                &l.kv_b, &mut cg, &q, &latent, &rope, 1, h, qk_nope, r, vh, kvl, t, scale,
+            );
         }
         let gpu_host = tm.elapsed().as_secs_f64();
         let tm = std::time::Instant::now();
         for _ in 0..iters {
-            crate::gpu::try_attention_absorb_kvdev(&l.kv_b, &mut cg, &q, lat_dev, rope_dev, h, qk_nope, r, vh, kvl, t, scale);
+            crate::gpu::try_attention_absorb_kvdev(
+                &l.kv_b, &mut cg, &q, lat_dev, rope_dev, h, qk_nope, r, vh, kvl, t, scale,
+            );
         }
         let gpu_dev = tm.elapsed().as_secs_f64();
         let tm = std::time::Instant::now();
@@ -1413,14 +1570,22 @@ mod tests {
             .ok()
             .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
             .unwrap_or_else(|| vec![512, 1024, 2048, 4096]);
-        let iters: u64 =
-            std::env::var("COLI_BENCH_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+        let iters: u64 = std::env::var("COLI_BENCH_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
 
         for &t in &ts {
             let s = t; // single-shot prefill: every position is new, context == S
-            let q: Vec<f32> = (0..s * h * d).map(|k| (((k * 7) % 13) as f32 - 6.0) * 0.02).collect();
-            let kk: Vec<f32> = (0..t * hkv * d).map(|k| (((k * 5) % 11) as f32 - 5.0) * 0.02).collect();
-            let vv: Vec<f32> = (0..t * hkv * d).map(|k| (((k * 3) % 7) as f32 - 3.0) * 0.02).collect();
+            let q: Vec<f32> = (0..s * h * d)
+                .map(|k| (((k * 7) % 13) as f32 - 6.0) * 0.02)
+                .collect();
+            let kk: Vec<f32> = (0..t * hkv * d)
+                .map(|k| (((k * 5) % 11) as f32 - 5.0) * 0.02)
+                .collect();
+            let vv: Vec<f32> = (0..t * hkv * d)
+                .map(|k| (((k * 3) % 7) as f32 - 3.0) * 0.02)
+                .collect();
 
             // CPU reference: causal grouped-query attention core.
             let mut cref = vec![0f32; s * h * d];
@@ -1457,9 +1622,16 @@ mod tests {
             let ok0 = crate::gpu::try_gqa_attn(&mut c0, &q, &kk, &vv, s, h, hkv, d, t, scale, 0);
             let ok1 = crate::gpu::try_gqa_attn(&mut c1, &q, &kk, &vv, s, h, hkv, d, t, scale, 1);
             assert!(ok0, "scalar GQA kernel must run when a device is present");
-            let e0 = c0.iter().zip(&cref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let e0 = c0
+                .iter()
+                .zip(&cref)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             let e1 = if ok1 {
-                c1.iter().zip(&cref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+                c1.iter()
+                    .zip(&cref)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max)
             } else {
                 f32::NAN
             };
@@ -1499,8 +1671,30 @@ mod tests {
         let mut out_recon = vec![0f32; s_len * d];
         let mut out_absorb = vec![0f32; s_len * d];
 
-        attention_with(&c, &l, 0, &mut kv_a, &x, s_len, 0, &mut out_recon, AttnCore::Reconstruct, None);
-        attention_with(&c, &l, 0, &mut kv_b, &x, s_len, 0, &mut out_absorb, AttnCore::Absorb, None);
+        attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv_a,
+            &x,
+            s_len,
+            0,
+            &mut out_recon,
+            AttnCore::Reconstruct,
+            None,
+        );
+        attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv_b,
+            &x,
+            s_len,
+            0,
+            &mut out_absorb,
+            AttnCore::Absorb,
+            None,
+        );
 
         for (a, b) in out_recon.iter().zip(&out_absorb) {
             assert!((a - b).abs() < 1e-4, "reconstruct {a} vs absorb {b}");
@@ -1528,8 +1722,30 @@ mod tests {
         // sel[s] = every causal position 0..=s (pos_base=0): exactly the dense set.
         let sel: Vec<Vec<u32>> = (0..s_len).map(|s| (0..=s as u32).collect()).collect();
 
-        attention_with(&c, &l, 0, &mut kv_dense, &x, s_len, 0, &mut out_dense, AttnCore::Reconstruct, None);
-        attention_with(&c, &l, 0, &mut kv_sparse, &x, s_len, 0, &mut out_sparse, AttnCore::Reconstruct, Some(&sel));
+        attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv_dense,
+            &x,
+            s_len,
+            0,
+            &mut out_dense,
+            AttnCore::Reconstruct,
+            None,
+        );
+        attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv_sparse,
+            &x,
+            s_len,
+            0,
+            &mut out_sparse,
+            AttnCore::Reconstruct,
+            Some(&sel),
+        );
 
         for (a, b) in out_dense.iter().zip(&out_sparse) {
             assert!((a - b).abs() < 1e-6, "dense {a} vs select-all {b}");
@@ -1555,11 +1771,36 @@ mod tests {
 
         let sel: Vec<Vec<u32>> = (0..s_len).map(|_| vec![0u32]).collect(); // attend only to pos 0
 
-        attention_with(&c, &l, 0, &mut kv_d, &x, s_len, 0, &mut out_d, AttnCore::Reconstruct, None);
-        attention_with(&c, &l, 0, &mut kv_s, &x, s_len, 0, &mut out_s, AttnCore::Reconstruct, Some(&sel));
+        attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv_d,
+            &x,
+            s_len,
+            0,
+            &mut out_d,
+            AttnCore::Reconstruct,
+            None,
+        );
+        attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv_s,
+            &x,
+            s_len,
+            0,
+            &mut out_s,
+            AttnCore::Reconstruct,
+            Some(&sel),
+        );
 
         let differ = out_d.iter().zip(&out_s).any(|(a, b)| (a - b).abs() > 1e-5);
-        assert!(differ, "a strict subset selection must change the attention output");
+        assert!(
+            differ,
+            "a strict subset selection must change the attention output"
+        );
     }
 
     #[test]
@@ -1595,8 +1836,12 @@ mod tests {
         assert_eq!(c.idx_type, vec![true], "one FULL indexer layer");
 
         let mut l = make_layer(&c);
-        let (hidden, ihd, nh, ql) =
-            (c.hidden as usize, c.index_hd as usize, c.index_nh as usize, c.q_lora as usize);
+        let (hidden, ihd, nh, ql) = (
+            c.hidden as usize,
+            c.index_hd as usize,
+            c.index_nh as usize,
+            c.q_lora as usize,
+        );
         l.ix_wk = Some(qtensor_from_f32(&vecf(ihd * hidden, 1), ihd, hidden, 16));
         l.ix_wq = Some(qtensor_from_f32(&vecf(nh * ihd * ql, 2), nh * ihd, ql, 16));
         l.ix_wp = Some(qtensor_from_f32(&vecf(nh * hidden, 3), nh, hidden, 16));
@@ -1610,8 +1855,19 @@ mod tests {
         // FULL layer: no incoming selection → it computes one and returns it.
         let mut kv1 = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
         let mut o1 = vec![0f32; s_len * d];
-        let sel = attention_with(&c, &l, 0, &mut kv1, &x, s_len, 0, &mut o1, AttnCore::Reconstruct, None)
-            .expect("a FULL indexer layer must compute+return a selection past index_topk");
+        let sel = attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv1,
+            &x,
+            s_len,
+            0,
+            &mut o1,
+            AttnCore::Reconstruct,
+            None,
+        )
+        .expect("a FULL indexer layer must compute+return a selection past index_topk");
         // It is a genuine sparse restriction: the last query keeps at most index_topk keys.
         assert!(sel[s_len - 1].len() <= c.index_topk as usize && !sel[s_len - 1].is_empty());
 
@@ -1619,11 +1875,27 @@ mod tests {
         // reproduce the full layer's sparse output byte-for-byte.
         let mut kv2 = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
         let mut o2 = vec![0f32; s_len * d];
-        let reused =
-            attention_with(&c, &l, 0, &mut kv2, &x, s_len, 0, &mut o2, AttnCore::Reconstruct, Some(&sel));
-        assert!(reused.is_none(), "a supplied selection must not be recomputed");
+        let reused = attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv2,
+            &x,
+            s_len,
+            0,
+            &mut o2,
+            AttnCore::Reconstruct,
+            Some(&sel),
+        );
+        assert!(
+            reused.is_none(),
+            "a supplied selection must not be recomputed"
+        );
         for (a, b) in o1.iter().zip(&o2) {
-            assert!((a - b).abs() < 1e-6, "reused selection must reproduce the sparse output: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "reused selection must reproduce the sparse output: {a} vs {b}"
+            );
         }
     }
 
@@ -1644,7 +1916,16 @@ mod tests {
         let mut kv_full = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
         let mut out_full = vec![0f32; s_len * d];
         attention_with_heads(
-            &c, &l, 0, &mut kv_full, &x, s_len, 0, &mut out_full, AttnCore::Reconstruct, None,
+            &c,
+            &l,
+            0,
+            &mut kv_full,
+            &x,
+            s_len,
+            0,
+            &mut out_full,
+            AttnCore::Reconstruct,
+            None,
             (0, hh),
         );
 
@@ -1654,14 +1935,27 @@ mod tests {
             let mut kv = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
             let mut part = vec![0f32; s_len * d];
             attention_with_heads(
-                &c, &l, 0, &mut kv, &x, s_len, 0, &mut part, AttnCore::Reconstruct, None, (h0, hc),
+                &c,
+                &l,
+                0,
+                &mut kv,
+                &x,
+                s_len,
+                0,
+                &mut part,
+                AttnCore::Reconstruct,
+                None,
+                (h0, hc),
             );
             for (o, &p) in out_sum.iter_mut().zip(part.iter()) {
                 *o += p;
             }
         }
         for (a, b) in out_full.iter().zip(&out_sum) {
-            assert!((a - b).abs() < 1e-5, "head-slice partial sum {b} != full {a}");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "head-slice partial sum {b} != full {a}"
+            );
         }
         assert!(out_full.iter().any(|v| v.abs() > 1e-6));
     }
@@ -1673,7 +1967,9 @@ mod tests {
         // handler runs `compute_attention_partial`), and the driver sums the o-projected
         // partials. Exercises the head split, the AttnRequest/Response wire path, the
         // shipped (dense here — this fixture has no indexer) selection, and the fold.
-        use colibri_cluster::{serve_cluster, AttnResponse, ExpertRequest, ExpertResponse, TcpTransport};
+        use colibri_cluster::{
+            serve_cluster, AttnResponse, ExpertRequest, ExpertResponse, TcpTransport,
+        };
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -1687,7 +1983,16 @@ mod tests {
         let mut kv_ref = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
         let mut out_single = vec![0f32; s_len * d];
         attention_with(
-            &c, &l, 0, &mut kv_ref, &x, s_len, 0, &mut out_single, AttnCore::Reconstruct, None,
+            &c,
+            &l,
+            0,
+            &mut kv_ref,
+            &x,
+            s_len,
+            0,
+            &mut out_single,
+            AttnCore::Reconstruct,
+            None,
         );
 
         let sharding = ExpertSharding::new(2, c.n_experts as u32);
@@ -1716,7 +2021,11 @@ mod tests {
                     &req.sel,
                     &mut outputs,
                 );
-                AttnResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
+                AttnResponse {
+                    outputs,
+                    n_tokens: req.n_tokens,
+                    hidden: req.hidden,
+                }
             },
         )
         .unwrap();
@@ -1728,7 +2037,17 @@ mod tests {
         let mut kv_shard = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 16);
         let mut out_sharded = vec![0f32; s_len * d];
         attention_sharded(
-            &c, &l, 0, &mut kv_shard, &x, s_len, 0, &mut out_sharded, None, &sharding, &transport,
+            &c,
+            &l,
+            0,
+            &mut kv_shard,
+            &x,
+            s_len,
+            0,
+            &mut out_sharded,
+            None,
+            &sharding,
+            &transport,
         )
         .unwrap();
 
@@ -1756,8 +2075,30 @@ mod tests {
         let mut kv2 = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 4);
         let mut o1 = vec![0f32; d];
         let mut o2 = vec![0f32; d];
-        attention_with(&c, &l, 0, &mut kv1, &x, 1, 0, &mut o1, AttnCore::Reconstruct, None);
-        attention_with(&c, &l, 0, &mut kv2, &x, 1, 0, &mut o2, AttnCore::Absorb, None);
+        attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv1,
+            &x,
+            1,
+            0,
+            &mut o1,
+            AttnCore::Reconstruct,
+            None,
+        );
+        attention_with(
+            &c,
+            &l,
+            0,
+            &mut kv2,
+            &x,
+            1,
+            0,
+            &mut o2,
+            AttnCore::Absorb,
+            None,
+        );
         for (a, b) in o1.iter().zip(&o2) {
             assert!((a - b).abs() < 1e-4);
         }
@@ -1780,7 +2121,16 @@ mod tests {
         let mut out_step = vec![0f32; 3 * d];
         for s in 0..3 {
             let mut o = vec![0f32; d];
-            attention(&c, &l, 0, &mut kv_step, &x[s * d..(s + 1) * d], 1, s, &mut o);
+            attention(
+                &c,
+                &l,
+                0,
+                &mut kv_step,
+                &x[s * d..(s + 1) * d],
+                1,
+                s,
+                &mut o,
+            );
             out_step[s * d..(s + 1) * d].copy_from_slice(&o);
         }
         for (a, b) in out_batch.iter().zip(&out_step) {

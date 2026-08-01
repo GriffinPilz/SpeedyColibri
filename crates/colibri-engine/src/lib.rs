@@ -38,12 +38,11 @@ pub use attention::{
     dsa_selection_for, head_slice, AttnCore,
 };
 pub use cache::{available_ram_bytes, capacity, total_ram_bytes, CacheStats, ExpertCache};
-pub use convert::{
-    convert_snapshot, detect_format, quant_error, requant_experts_nvfp4, ConvertOpts,
-    ConvertStats, Scheme, SourceFormat, TensorErr,
-};
-pub use usage::UsageHistory;
 pub use colibri_core::{Config, QTensor};
+pub use convert::{
+    convert_snapshot, detect_format, quant_error, requant_experts_nvfp4, ConvertOpts, ConvertStats,
+    Scheme, SourceFormat, TensorErr,
+};
 pub use forward::{
     forward, forward_batched, generate_greedy, generate_stream, generate_stream_drafting,
     kimi_forward, layer_forward, layer_forward_kind, logits, mamba2_mixer, DecodeStats,
@@ -54,14 +53,14 @@ pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
 pub use model::{KvCache, Layer, Model, MtpBlock, MtpHead, KV_UNSET};
 pub use moe::{
     cluster_ctx, compute_experts_partial, dense_mlp, kimi_moe, moe, moe_sharded, nemotron_moe,
-    route,
-    set_activation, set_cluster, ClusterCtx, Expert, ExpertLayout, ExpertProvider,
+    route, set_activation, set_cluster, ClusterCtx, Expert, ExpertLayout, ExpertProvider,
     ShardsExpertProvider,
 };
 pub use mtp::{absorb as mtp_absorb, draft as mtp_draft};
 pub use preload::{default_num_files, preload_parallel, repack, Manifest, PreloadStore};
 pub use quantize::qtensor_from_f32;
 pub use sampling::{argmax, sample_top_p, SampleConfig};
+pub use usage::UsageHistory;
 
 use colibri_core::{Arch, LayerKind};
 use std::path::Path;
@@ -155,7 +154,13 @@ fn load_layer(
     l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
     l.post_ln = ld(shards, &p("post_attention_layernorm.weight"))?;
     // Output projection is shared by both attention flavours (`[hidden, n_heads*head_dim]`).
-    l.o = qt_load(shards, &p("self_attn.o_proj.weight"), d, h * cfg.v_head as usize, dbits)?;
+    l.o = qt_load(
+        shards,
+        &p("self_attn.o_proj.weight"),
+        d,
+        h * cfg.v_head as usize,
+        dbits,
+    )?;
 
     if cfg.arch.is_gqa() {
         // GQA attention (MiniMax M3/M2): q/k/v projections + QK-norm. `qk_head` is the
@@ -163,9 +168,27 @@ fn load_layer(
         // only on M3's sparse layers (idx_type all-false for M2 → dense everywhere).
         let hd = cfg.qk_head as usize;
         let kvh = cfg.n_kv_heads as usize;
-        l.q_proj = Some(qt_load(shards, &p("self_attn.q_proj.weight"), h * hd, d, dbits)?);
-        l.k_proj = Some(qt_load(shards, &p("self_attn.k_proj.weight"), kvh * hd, d, dbits)?);
-        l.v_proj = Some(qt_load(shards, &p("self_attn.v_proj.weight"), kvh * hd, d, dbits)?);
+        l.q_proj = Some(qt_load(
+            shards,
+            &p("self_attn.q_proj.weight"),
+            h * hd,
+            d,
+            dbits,
+        )?);
+        l.k_proj = Some(qt_load(
+            shards,
+            &p("self_attn.k_proj.weight"),
+            kvh * hd,
+            d,
+            dbits,
+        )?);
+        l.v_proj = Some(qt_load(
+            shards,
+            &p("self_attn.v_proj.weight"),
+            kvh * hd,
+            d,
+            dbits,
+        )?);
         // Fuse q/k/v (they share the input x) into ONE matmul per layer: at S=1 decode
         // each was a separate synchronized GPU dispatch, ~25% of decode across the
         // projections. Drop the separate three — `attention_gqa` uses the fused tensor.
@@ -188,14 +211,32 @@ fn load_layer(
             && shards.has(&p("self_attn.index_q_proj.weight"))
         {
             let (inh, ihd) = (cfg.index_nh as usize, cfg.index_hd as usize);
-            l.idx_q_proj = Some(qt_load(shards, &p("self_attn.index_q_proj.weight"), inh * ihd, d, dbits)?);
-            l.idx_k_proj = Some(qt_load(shards, &p("self_attn.index_k_proj.weight"), ihd, d, dbits)?);
+            l.idx_q_proj = Some(qt_load(
+                shards,
+                &p("self_attn.index_q_proj.weight"),
+                inh * ihd,
+                d,
+                dbits,
+            )?);
+            l.idx_k_proj = Some(qt_load(
+                shards,
+                &p("self_attn.index_k_proj.weight"),
+                ihd,
+                d,
+                dbits,
+            )?);
             l.idx_q_norm = ld(shards, &p("self_attn.index_q_norm.weight"))?;
             l.idx_k_norm = ld(shards, &p("self_attn.index_k_norm.weight"))?;
         }
     } else {
         // MLA attention projections (GLM)
-        l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), cfg.q_lora as usize, d, dbits)?;
+        l.q_a = qt_load(
+            shards,
+            &p("self_attn.q_a_proj.weight"),
+            cfg.q_lora as usize,
+            d,
+            dbits,
+        )?;
         l.q_a_ln = ld(shards, &p("self_attn.q_a_layernorm.weight"))?;
         l.q_b = qt_load(
             shards,
@@ -226,9 +267,27 @@ fn load_layer(
         // the C loader (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`).
         if cfg.index_hd > 0 && cfg.index_nh > 0 && shards.has(&p("self_attn.indexer.wq_b.weight")) {
             let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
-            l.ix_wq = Some(qt_load(shards, &p("self_attn.indexer.wq_b.weight"), nh * hd, cfg.q_lora as usize, dbits)?);
-            l.ix_wk = Some(qt_load(shards, &p("self_attn.indexer.wk.weight"), hd, d, dbits)?);
-            l.ix_wp = Some(qt_load(shards, &p("self_attn.indexer.weights_proj.weight"), nh, d, dbits)?);
+            l.ix_wq = Some(qt_load(
+                shards,
+                &p("self_attn.indexer.wq_b.weight"),
+                nh * hd,
+                cfg.q_lora as usize,
+                dbits,
+            )?);
+            l.ix_wk = Some(qt_load(
+                shards,
+                &p("self_attn.indexer.wk.weight"),
+                hd,
+                d,
+                dbits,
+            )?);
+            l.ix_wp = Some(qt_load(
+                shards,
+                &p("self_attn.indexer.weights_proj.weight"),
+                nh,
+                d,
+                dbits,
+            )?);
             l.ix_knorm_w = ld(shards, &p("self_attn.indexer.k_norm.weight"))?;
             l.ix_knorm_b = ld(shards, &p("self_attn.indexer.k_norm.bias"))?;
         }
@@ -254,9 +313,27 @@ fn load_layer(
         // container and the fields stay at their empty default.
         let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
         if s_i > 0 {
-            l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?;
-            l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?;
-            l.sh_down = qt_load(shards, &p("mlp.shared_experts.down_proj.weight"), d, s_i, dbits)?;
+            l.sh_gate = qt_load(
+                shards,
+                &p("mlp.shared_experts.gate_proj.weight"),
+                s_i,
+                d,
+                dbits,
+            )?;
+            l.sh_up = qt_load(
+                shards,
+                &p("mlp.shared_experts.up_proj.weight"),
+                s_i,
+                d,
+                dbits,
+            )?;
+            l.sh_down = qt_load(
+                shards,
+                &p("mlp.shared_experts.down_proj.weight"),
+                d,
+                s_i,
+                dbits,
+            )?;
         }
     }
     Ok(l)
@@ -308,9 +385,20 @@ fn load_layer_nemotron_kind(
             let d_inner = cfg.mamba_inter as usize;
             let conv_dim = d_inner + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
             let proj_out = d_inner + conv_dim + nh;
-            l.mamba_in_proj = Some(qt_load(shards, &p("mixer.in_proj.weight"), proj_out, d, dbits)?);
-            l.mamba_out_proj =
-                Some(qt_load(shards, &p("mixer.out_proj.weight"), d, d_inner, dbits)?);
+            l.mamba_in_proj = Some(qt_load(
+                shards,
+                &p("mixer.in_proj.weight"),
+                proj_out,
+                d,
+                dbits,
+            )?);
+            l.mamba_out_proj = Some(qt_load(
+                shards,
+                &p("mixer.out_proj.weight"),
+                d,
+                d_inner,
+                dbits,
+            )?);
             // `[conv_dim, 1, k]` read flat == `[conv_dim, k]`; bias present iff use_conv_bias
             // (empty is tolerated by `causal_conv1d_silu`).
             l.mamba_conv_w = ld(shards, &p("mixer.conv1d.weight"))?;
@@ -345,13 +433,36 @@ fn load_layer_nemotron_kind(
             l.router = ld(shards, &p("mixer.gate.weight"))?;
             l.router_bias = ld(shards, &p("mixer.gate.e_score_correction_bias"))?;
             let dl = cfg.moe_latent as usize;
-            l.fc1_latent = Some(qt_load(shards, &p("mixer.fc1_latent_proj.weight"), dl, d, dbits)?);
-            l.fc2_latent = Some(qt_load(shards, &p("mixer.fc2_latent_proj.weight"), d, dl, dbits)?);
+            l.fc1_latent = Some(qt_load(
+                shards,
+                &p("mixer.fc1_latent_proj.weight"),
+                dl,
+                d,
+                dbits,
+            )?);
+            l.fc2_latent = Some(qt_load(
+                shards,
+                &p("mixer.fc2_latent_proj.weight"),
+                d,
+                dl,
+                dbits,
+            )?);
             // Shared expert (gateless ReLU²) reuses `up_proj`/`down_proj`.
             let si = cfg.shared_inter as usize;
-            l.up_proj = qt_load(shards, &p("mixer.shared_experts.up_proj.weight"), si, d, dbits)?;
-            l.down_proj =
-                qt_load(shards, &p("mixer.shared_experts.down_proj.weight"), d, si, dbits)?;
+            l.up_proj = qt_load(
+                shards,
+                &p("mixer.shared_experts.up_proj.weight"),
+                si,
+                d,
+                dbits,
+            )?;
+            l.down_proj = qt_load(
+                shards,
+                &p("mixer.shared_experts.down_proj.weight"),
+                d,
+                si,
+                dbits,
+            )?;
             // Routed experts (latent-space, gateless ReLU²) stream via the ExpertProvider.
         }
         // Kimi-K3's KDA layers carry a different tensor set entirely (q/k/v + separate
@@ -427,7 +538,13 @@ fn load_layer_kimi(
             l.q_proj = Some(qt_load(shards, &p("self_attn.q_proj.weight"), c, d, dbits)?);
             l.k_proj = Some(qt_load(shards, &p("self_attn.k_proj.weight"), c, d, dbits)?);
             l.v_proj = Some(qt_load(shards, &p("self_attn.v_proj.weight"), c, d, dbits)?);
-            l.kda_b_proj = Some(qt_load(shards, &p("self_attn.b_proj.weight"), nh, d, dbits)?);
+            l.kda_b_proj = Some(qt_load(
+                shards,
+                &p("self_attn.b_proj.weight"),
+                nh,
+                d,
+                dbits,
+            )?);
             // Factored forget gate: hidden -> r -> n_heads*head_dim. `r` is derived from
             // the checkpoint rather than assumed — it is not any other config field.
             //
@@ -446,11 +563,26 @@ fn load_layer_kimi(
                 .find(&format!("{f_a}.qs"))
                 .and_then(|t| t.shape.first().copied())
                 .or_else(|| {
-                    shards.find(&f_a).and_then(|t| t.shape.first().copied()).map(|n| n / d as i64)
+                    shards
+                        .find(&f_a)
+                        .and_then(|t| t.shape.first().copied())
+                        .map(|n| n / d as i64)
                 })
                 .unwrap_or(hd as i64) as usize;
-            l.kda_f_a = Some(qt_load(shards, &p("self_attn.f_a_proj.weight"), r, d, dbits)?);
-            l.kda_f_b = Some(qt_load(shards, &p("self_attn.f_b_proj.weight"), c, r, dbits)?);
+            l.kda_f_a = Some(qt_load(
+                shards,
+                &p("self_attn.f_a_proj.weight"),
+                r,
+                d,
+                dbits,
+            )?);
+            l.kda_f_b = Some(qt_load(
+                shards,
+                &p("self_attn.f_b_proj.weight"),
+                c,
+                r,
+                dbits,
+            )?);
             // `[C, 1, k]` on disk; read flat it is exactly the `[C, k]` the mixer wants
             // (same trick as Nemotron's `conv1d.weight`).
             l.kda_conv_q = ld(shards, &p("self_attn.q_conv1d.weight"))?;
@@ -462,7 +594,11 @@ fn load_layer_kimi(
         }
         _ => {
             // Gated MLA — the GLM latent projections verbatim, plus `attn_gate` above.
-            let (nh, ql, kl) = (cfg.n_heads as usize, cfg.q_lora as usize, cfg.kv_lora as usize);
+            let (nh, ql, kl) = (
+                cfg.n_heads as usize,
+                cfg.q_lora as usize,
+                cfg.kv_lora as usize,
+            );
             l.q_a = qt_load(shards, &p("self_attn.q_a_proj.weight"), ql, d, dbits)?;
             l.q_b = qt_load(
                 shards,
@@ -503,13 +639,43 @@ fn load_layer_kimi(
         let (dl, si) = (cfg.moe_latent as usize, cfg.shared_inter as usize);
         l.router = ld(shards, &p("mlp.gate.weight"))?;
         l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))?;
-        l.fc1_latent = Some(qt_load(shards, &p("mlp.fc1_latent_proj.weight"), dl, d, dbits)?);
-        l.fc2_latent = Some(qt_load(shards, &p("mlp.fc2_latent_proj.weight"), d, dl, dbits)?);
+        l.fc1_latent = Some(qt_load(
+            shards,
+            &p("mlp.fc1_latent_proj.weight"),
+            dl,
+            d,
+            dbits,
+        )?);
+        l.fc2_latent = Some(qt_load(
+            shards,
+            &p("mlp.fc2_latent_proj.weight"),
+            d,
+            dl,
+            dbits,
+        )?);
         l.routed_expert_norm = ld(shards, &p("mlp.routed_expert_norm.weight"))?;
         // Shared experts: ONE fused pair, `shared_inter = n_shared * moe_inter` wide.
-        l.sh_gate = qt_load(shards, &p("mlp.shared_experts.gate_proj.weight"), si, d, dbits)?;
-        l.sh_up = qt_load(shards, &p("mlp.shared_experts.up_proj.weight"), si, d, dbits)?;
-        l.sh_down = qt_load(shards, &p("mlp.shared_experts.down_proj.weight"), d, si, dbits)?;
+        l.sh_gate = qt_load(
+            shards,
+            &p("mlp.shared_experts.gate_proj.weight"),
+            si,
+            d,
+            dbits,
+        )?;
+        l.sh_up = qt_load(
+            shards,
+            &p("mlp.shared_experts.up_proj.weight"),
+            si,
+            d,
+            dbits,
+        )?;
+        l.sh_down = qt_load(
+            shards,
+            &p("mlp.shared_experts.down_proj.weight"),
+            d,
+            si,
+            dbits,
+        )?;
         // Routed experts stream through the ExpertProvider.
     }
     Ok(l)
@@ -558,7 +724,10 @@ fn load_mtp(
         "mlp.experts.0.gate_proj.weight".to_string(),
         format!("mlp.experts.{last_e}.down_proj.weight"),
     ];
-    if !required.iter().all(|s| shards.has(&format!("model.layers.{i}.{s}"))) {
+    if !required
+        .iter()
+        .all(|s| shards.has(&format!("model.layers.{i}.{s}")))
+    {
         return Ok(None);
     }
 
@@ -669,7 +838,10 @@ fn load_mtp_nemotron(
         // which iterates `model.layers` only — the head is not in that vector, so mark it
         // here or every draft step runs its projections on one core.
         mark_gpu_eligible(&mut layer);
-        blocks.push(MtpBlock { layer, kind: Some(kind) });
+        blocks.push(MtpBlock {
+            layer,
+            kind: Some(kind),
+        });
     }
     Ok(Some(MtpHead {
         blocks,
@@ -723,7 +895,14 @@ fn mark_gpu_eligible(l: &mut Layer) {
     // projections at 197 s of a 236 s / 512-tok prefill (84%!) — dwarfing both the
     // attention core (5.6 s) and expert I/O (31 s). `l.o` (o_proj) is already marked
     // above via the GLM list, which is why it was fast; these were simply omitted.
-    for t in [&mut l.qkv_proj, &mut l.q_proj, &mut l.k_proj, &mut l.v_proj, &mut l.idx_q_proj, &mut l.idx_k_proj] {
+    for t in [
+        &mut l.qkv_proj,
+        &mut l.q_proj,
+        &mut l.k_proj,
+        &mut l.v_proj,
+        &mut l.idx_q_proj,
+        &mut l.idx_k_proj,
+    ] {
         if let Some(t) = t {
             t.gpu_eligible = true;
         }
@@ -765,7 +944,12 @@ fn mark_gpu_eligible(l: &mut Layer) {
     // output gate) and is the same order as `q_b`/`kv_b`. Leaving it off is the same
     // omission that cost 84% of an M3 prefill and 94% of Nemotron's mamba time — the
     // tell is a phase total far exceeding the sum of its GPU sub-timers.
-    for t in [&mut l.attn_gate, &mut l.kda_b_proj, &mut l.kda_f_a, &mut l.kda_f_b] {
+    for t in [
+        &mut l.attn_gate,
+        &mut l.kda_b_proj,
+        &mut l.kda_f_a,
+        &mut l.kda_f_b,
+    ] {
         if let Some(t) = t {
             t.gpu_eligible = true;
         }
@@ -780,10 +964,7 @@ fn mark_gpu_eligible(l: &mut Layer) {
 /// on demand during the forward pass (the whole point of the engine). DSA-indexer
 /// and MTP-head weights are detected (`has_dsa`/`has_mtp`) but their extra tensors
 /// are loaded lazily by those subsystems (still being ported).
-pub fn load_model_with(
-    snap: impl AsRef<Path>,
-    opts: LoadOptions,
-) -> Result<Model, EngineError> {
+pub fn load_model_with(snap: impl AsRef<Path>, opts: LoadOptions) -> Result<Model, EngineError> {
     let snap = snap.as_ref();
     let cfg = Config::load(snap)?;
     // Record the SwiGLU variant for the FFN choke point (SiLU for GLM, clamped
@@ -803,8 +984,11 @@ pub fn load_model_with(
             "model.norm.weight".to_string(),
             format!("model.layers.{last}.input_layernorm.weight"),
         ];
-        let missing: Vec<&str> =
-            sentinels.iter().map(String::as_str).filter(|t| !shards.has(t)).collect();
+        let missing: Vec<&str> = sentinels
+            .iter()
+            .map(String::as_str)
+            .filter(|t| !shards.has(t))
+            .collect();
         if !missing.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -829,7 +1013,13 @@ pub fn load_model_with(
     // dbits >= 8, else dbits), matching the C `io_bits`.
     let io_bits = if dbits >= 8 { 16 } else { dbits };
 
-    let embed = qt_load(&shards, "model.embed_tokens.weight", cfg.vocab as usize, d, io_bits)?;
+    let embed = qt_load(
+        &shards,
+        "model.embed_tokens.weight",
+        cfg.vocab as usize,
+        d,
+        io_bits,
+    )?;
     let lm_head = qt_load(&shards, "lm_head.weight", cfg.vocab as usize, d, io_bits)?;
     let final_norm = ld(&shards, "model.norm.weight")?;
 
@@ -838,7 +1028,10 @@ pub fn load_model_with(
     // run (the stack's final mix would silently become "just the accumulator"), so a
     // missing-tensor error here is the right failure.
     let (output_attn_res_norm, output_attn_res_proj) = if cfg.arch == Arch::KimiK3 {
-        (ld(&shards, "model.output_attn_res_norm.weight")?, ld(&shards, "model.output_attn_res_proj.weight")?)
+        (
+            ld(&shards, "model.output_attn_res_norm.weight")?,
+            ld(&shards, "model.output_attn_res_proj.weight")?,
+        )
     } else {
         (Vec::new(), Vec::new())
     };
@@ -852,9 +1045,8 @@ pub fn load_model_with(
     // MTP head lives at the extra layer index n_layers; DSA indexer weights are
     // per-layer `self_attn.indexer.*`.
     let mtp = load_mtp(&shards, &cfg, dbits)?;
-    let has_dsa = (0..cfg.n_layers as usize).any(|i| {
-        shards.has(&format!("model.layers.{i}.self_attn.indexer.wq_b.weight"))
-    });
+    let has_dsa = (0..cfg.n_layers as usize)
+        .any(|i| shards.has(&format!("model.layers.{i}.self_attn.indexer.wq_b.weight")));
 
     let mut model = Model {
         cfg,
@@ -886,8 +1078,7 @@ pub fn load_model_with(
     // tens of GB — so cache coverage is the scarce resource, not matmul latency.
     // `COLI_DEVICE_WEIGHTS=0` disables it for every arch — the A/B handle for "does this
     // buy speed, or just cost the expert cache RAM it could have used?"
-    let device_cache_weights =
-        std::env::var("COLI_DEVICE_WEIGHTS").ok().as_deref() != Some("0");
+    let device_cache_weights = std::env::var("COLI_DEVICE_WEIGHTS").ok().as_deref() != Some("0");
 
     // HOW the eligible weights reach the GPU, decided from this model's own footprint.
     //
@@ -979,25 +1170,51 @@ mod gpu_eligible_tests {
     /// for whenever a device-cache budget makes K3 eligible again.
     #[test]
     fn mark_gpu_eligible_covers_every_optional_projection() {
-        let q = || Some(colibri_core::QTensor { o: 2, i: 2, ..Default::default() });
+        let q = || {
+            Some(colibri_core::QTensor {
+                o: 2,
+                i: 2,
+                ..Default::default()
+            })
+        };
         let mut l = Layer {
-            q_proj: q(), k_proj: q(), v_proj: q(), qkv_proj: q(),
-            idx_q_proj: q(), idx_k_proj: q(),
-            mamba_in_proj: q(), mamba_out_proj: q(),
-            fc1_latent: q(), fc2_latent: q(),
-            attn_gate: q(), kda_b_proj: q(), kda_f_a: q(), kda_f_b: q(),
-            ix_wk: q(), ix_wq: q(), ix_wp: q(),
+            q_proj: q(),
+            k_proj: q(),
+            v_proj: q(),
+            qkv_proj: q(),
+            idx_q_proj: q(),
+            idx_k_proj: q(),
+            mamba_in_proj: q(),
+            mamba_out_proj: q(),
+            fc1_latent: q(),
+            fc2_latent: q(),
+            attn_gate: q(),
+            kda_b_proj: q(),
+            kda_f_a: q(),
+            kda_f_b: q(),
+            ix_wk: q(),
+            ix_wq: q(),
+            ix_wp: q(),
             ..Default::default()
         };
         mark_gpu_eligible(&mut l);
         let opts: [(&str, &Option<colibri_core::QTensor>); 17] = [
-            ("q_proj", &l.q_proj), ("k_proj", &l.k_proj), ("v_proj", &l.v_proj),
-            ("qkv_proj", &l.qkv_proj), ("idx_q_proj", &l.idx_q_proj),
-            ("idx_k_proj", &l.idx_k_proj), ("mamba_in_proj", &l.mamba_in_proj),
-            ("mamba_out_proj", &l.mamba_out_proj), ("fc1_latent", &l.fc1_latent),
-            ("fc2_latent", &l.fc2_latent), ("attn_gate", &l.attn_gate),
-            ("kda_b_proj", &l.kda_b_proj), ("kda_f_a", &l.kda_f_a),
-            ("kda_f_b", &l.kda_f_b), ("ix_wk", &l.ix_wk), ("ix_wq", &l.ix_wq),
+            ("q_proj", &l.q_proj),
+            ("k_proj", &l.k_proj),
+            ("v_proj", &l.v_proj),
+            ("qkv_proj", &l.qkv_proj),
+            ("idx_q_proj", &l.idx_q_proj),
+            ("idx_k_proj", &l.idx_k_proj),
+            ("mamba_in_proj", &l.mamba_in_proj),
+            ("mamba_out_proj", &l.mamba_out_proj),
+            ("fc1_latent", &l.fc1_latent),
+            ("fc2_latent", &l.fc2_latent),
+            ("attn_gate", &l.attn_gate),
+            ("kda_b_proj", &l.kda_b_proj),
+            ("kda_f_a", &l.kda_f_a),
+            ("kda_f_b", &l.kda_f_b),
+            ("ix_wk", &l.ix_wk),
+            ("ix_wq", &l.ix_wq),
             ("ix_wp", &l.ix_wp),
         ];
         for (name, t) in opts {
@@ -1046,13 +1263,20 @@ mod kimi_container_tests {
 
             // Shared by both mixers.
             assert_eq!((l.o.o as usize, l.o.i as usize), (d, c), "L{li} o_proj");
-            let g = l.attn_gate.as_ref().unwrap_or_else(|| panic!("L{li} has no g_proj"));
+            let g = l
+                .attn_gate
+                .as_ref()
+                .unwrap_or_else(|| panic!("L{li} has no g_proj"));
             assert_eq!((g.o as usize, g.i as usize), (c, d), "L{li} g_proj");
             assert_eq!(l.in_ln.len(), d, "L{li} in_ln");
             assert_eq!(l.post_ln.len(), d, "L{li} post_ln");
             // The attention-residual pair: a norm plus a single-row projection.
             assert_eq!(l.attn_res_norm.len(), d, "L{li} attn_res_norm");
-            assert_eq!(l.attn_res_proj.len(), d, "L{li} attn_res_proj is [1, hidden]");
+            assert_eq!(
+                l.attn_res_proj.len(),
+                d,
+                "L{li} attn_res_proj is [1, hidden]"
+            );
             assert_eq!(l.mlp_res_norm.len(), d, "L{li} mlp_res_norm");
             assert_eq!(l.mlp_res_proj.len(), d, "L{li} mlp_res_proj is [1, hidden]");
 
@@ -1089,18 +1313,27 @@ mod kimi_container_tests {
                     }
                     // `[C, 1, k]` read flat is `[C, k]`.
                     let k = cfg.kda_d_conv as usize;
-                    for (nm, v) in [("q", &l.kda_conv_q), ("k", &l.kda_conv_k), ("v", &l.kda_conv_v)]
-                    {
+                    for (nm, v) in [
+                        ("q", &l.kda_conv_q),
+                        ("k", &l.kda_conv_k),
+                        ("v", &l.kda_conv_v),
+                    ] {
                         assert_eq!(v.len(), c * k, "L{li} {nm}_conv1d");
                     }
                     assert_eq!(l.kda_a_log.len(), hd, "L{li} A_log");
                     assert_eq!(l.kda_dt_bias.len(), c, "L{li} dt_bias");
                     assert_eq!(l.kda_o_norm.len(), hd, "L{li} o_norm");
-                    assert!(l.q_a.qf.is_empty() && l.q_a.q8.is_empty(), "L{li} KDA has no MLA q_a");
+                    assert!(
+                        l.q_a.qf.is_empty() && l.q_a.q8.is_empty(),
+                        "L{li} KDA has no MLA q_a"
+                    );
                 }
                 _ => {
-                    let (nh, ql, kl) =
-                        (cfg.n_heads as usize, cfg.q_lora as usize, cfg.kv_lora as usize);
+                    let (nh, ql, kl) = (
+                        cfg.n_heads as usize,
+                        cfg.q_lora as usize,
+                        cfg.kv_lora as usize,
+                    );
                     assert_eq!((l.q_a.o as usize, l.q_a.i as usize), (ql, d), "L{li} q_a");
                     assert_eq!(
                         (l.q_b.o as usize, l.q_b.i as usize),
@@ -1119,7 +1352,10 @@ mod kimi_container_tests {
                     );
                     assert_eq!(l.q_a_ln.len(), ql, "L{li} q_a_layernorm");
                     assert_eq!(l.kv_a_ln.len(), kl, "L{li} kv_a_layernorm");
-                    assert!(l.kda_a_log.is_empty(), "L{li} MLA must not load KDA vectors");
+                    assert!(
+                        l.kda_a_log.is_empty(),
+                        "L{li} MLA must not load KDA vectors"
+                    );
                 }
             }
 
@@ -1133,7 +1369,11 @@ mod kimi_container_tests {
                 assert!(l.sparse, "L{li} should be MoE");
                 let (dl, si) = (cfg.moe_latent as usize, cfg.shared_inter as usize);
                 assert_eq!(l.router.len(), cfg.n_experts as usize * d, "L{li} router");
-                assert_eq!(l.router_bias.len(), cfg.n_experts as usize, "L{li} router bias");
+                assert_eq!(
+                    l.router_bias.len(),
+                    cfg.n_experts as usize,
+                    "L{li} router bias"
+                );
                 let f1 = l.fc1_latent.as_ref().expect("fc1_latent");
                 let f2 = l.fc2_latent.as_ref().expect("fc2_latent");
                 assert_eq!((f1.o as usize, f1.i as usize), (dl, d), "L{li} fc1_latent");
@@ -1141,8 +1381,16 @@ mod kimi_container_tests {
                 assert_eq!(l.routed_expert_norm.len(), dl, "L{li} routed_expert_norm");
                 // Shared experts ship as ONE fused pair, `n_shared * moe_inter` wide.
                 assert_eq!(si, cfg.n_shared as usize * cfg.moe_inter as usize);
-                assert_eq!((l.sh_gate.o as usize, l.sh_gate.i as usize), (si, d), "L{li} sh_gate");
-                assert_eq!((l.sh_down.o as usize, l.sh_down.i as usize), (d, si), "L{li} sh_down");
+                assert_eq!(
+                    (l.sh_gate.o as usize, l.sh_gate.i as usize),
+                    (si, d),
+                    "L{li} sh_gate"
+                );
+                assert_eq!(
+                    (l.sh_down.o as usize, l.sh_down.i as usize),
+                    (d, si),
+                    "L{li} sh_down"
+                );
             }
             eprintln!("layer {li:>2} ({:?}) loaded OK", cfg.layer_kind[li]);
         }

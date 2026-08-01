@@ -69,7 +69,11 @@ fn temp_dir() -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let mut p = PathBuf::from(base);
-    p.push(format!("colibri-k3-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    p.push(format!(
+        "colibri-k3-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -143,9 +147,15 @@ fn tensor_list() -> Vec<(String, usize)> {
             t.push((p("self_attn.q_a_proj.weight"), Q_LORA * D));
             t.push((p("self_attn.q_a_layernorm.weight"), Q_LORA));
             t.push((p("self_attn.q_b_proj.weight"), H * QK_HEAD * Q_LORA));
-            t.push((p("self_attn.kv_a_proj_with_mqa.weight"), (KV_LORA + QK_ROPE) * D));
+            t.push((
+                p("self_attn.kv_a_proj_with_mqa.weight"),
+                (KV_LORA + QK_ROPE) * D,
+            ));
             t.push((p("self_attn.kv_a_layernorm.weight"), KV_LORA));
-            t.push((p("self_attn.kv_b_proj.weight"), H * (QK_NOPE + V_HEAD) * KV_LORA));
+            t.push((
+                p("self_attn.kv_b_proj.weight"),
+                H * (QK_NOPE + V_HEAD) * KV_LORA,
+            ));
         }
 
         if i < FIRST_DENSE {
@@ -218,7 +228,11 @@ fn kimi_stack_runs_end_to_end() {
     let dir = temp_dir();
     let model = tiny_model(&dir);
     assert_eq!(model.cfg.attn_res_block_size as usize, BLOCK);
-    assert_eq!(model.output_attn_res_norm.len(), D, "model-level attn-res must load");
+    assert_eq!(
+        model.output_attn_res_norm.len(),
+        D,
+        "model-level attn-res must load"
+    );
     assert_eq!(model.output_attn_res_proj.len(), D);
 
     let provider = ShardsExpertProvider::new(&model.shards, &model.cfg, 8);
@@ -227,8 +241,14 @@ fn kimi_stack_runs_end_to_end() {
     let mut hidden = vec![0f32; prompt.len() * D];
     forward(&model, &mut kv, &provider, &prompt, 0, &mut hidden).expect("K3 forward");
 
-    assert!(hidden.iter().all(|v| v.is_finite()), "K3 forward produced non-finite hidden state");
-    assert!(hidden.iter().any(|&v| v != 0.0), "K3 forward produced an all-zero hidden state");
+    assert!(
+        hidden.iter().all(|v| v.is_finite()),
+        "K3 forward produced non-finite hidden state"
+    );
+    assert!(
+        hidden.iter().any(|&v| v != 0.0),
+        "K3 forward produced an all-zero hidden state"
+    );
 
     // Deterministic.
     let mut kv2 = KvCache::for_model(&model, 32);
@@ -261,7 +281,10 @@ fn kimi_prefill_matches_incremental_decode() {
     // constant, matching decode row-for-row would prove nothing. Token 0 and token 2
     // carry different ids AND different histories, so they must differ.
     assert!(
-        prefill[..D].iter().zip(&prefill[2 * D..3 * D]).any(|(a, b)| (a - b).abs() > 1e-4),
+        prefill[..D]
+            .iter()
+            .zip(&prefill[2 * D..3 * D])
+            .any(|(a, b)| (a - b).abs() > 1e-4),
         "hidden states are position-independent; the equivalence check would be vacuous"
     );
 
@@ -335,8 +358,14 @@ fn kimi_routed_experts_load_in_latent_space() {
     // Layer FIRST_DENSE is the first sparse layer.
     let e = provider.expert(FIRST_DENSE, 0).expect("expert load");
     assert_eq!(e.gate.o as usize, MOE_INTER);
-    assert_eq!(e.gate.i as usize, DL, "expert input width must be moe_latent");
-    assert_eq!(e.down.o as usize, DL, "expert output width must be moe_latent");
+    assert_eq!(
+        e.gate.i as usize, DL,
+        "expert input width must be moe_latent"
+    );
+    assert_eq!(
+        e.down.o as usize, DL,
+        "expert output width must be moe_latent"
+    );
     assert_eq!(e.down.i as usize, MOE_INTER);
 }
 
@@ -358,7 +387,11 @@ fn kimi_resident_weights_are_gpu_eligible() {
     let model = tiny_model(&dir);
     let mut checked = 0usize;
     for (li, l) in model.layers.iter().enumerate() {
-        for (name, t) in [("o", &l.o), ("gate_proj", &l.gate_proj), ("sh_gate", &l.sh_gate)] {
+        for (name, t) in [
+            ("o", &l.o),
+            ("gate_proj", &l.gate_proj),
+            ("sh_gate", &l.sh_gate),
+        ] {
             if t.o > 0 && t.i > 0 {
                 assert!(t.gpu_eligible, "L{li} {name} should be GPU-eligible");
                 checked += 1;
@@ -373,5 +406,8 @@ fn kimi_resident_weights_are_gpu_eligible() {
     }
     assert!(model.embed.gpu_eligible, "embed should be GPU-eligible");
     assert!(model.lm_head.gpu_eligible, "lm_head should be GPU-eligible");
-    assert!(checked >= 10, "expected many weights to check, saw {checked}");
+    assert!(
+        checked >= 10,
+        "expected many weights to check, saw {checked}"
+    );
 }

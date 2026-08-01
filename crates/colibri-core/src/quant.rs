@@ -412,6 +412,15 @@ pub static ARENA_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// Times the wait gave up and allocated anyway — always a bug, never contention.
 pub static ARENA_STARVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Bytes the pool is holding right now — retained buffers only, not lent-out ones.
+///
+/// Exists so the engine can charge `Class::ReadBuf`, which was committed NOWHERE: the
+/// ledger reported `readbuf 0.0 GB` on every model while the pool was really holding GB, and
+/// `RUNTIME_RESERVE` is a flat 10 GB standing in partly for exactly this.
+pub fn pool_live_bytes() -> u64 {
+    BUF_POOL.lock().unwrap().bytes
+}
+
 /// `(hits, misses, pushes, drops, drop_bytes)`.
 pub fn pool_profile() -> (u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;

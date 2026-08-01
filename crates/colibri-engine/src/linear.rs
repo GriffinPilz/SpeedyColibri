@@ -444,7 +444,11 @@ mod tests {
             for k in 0..i {
                 let nib = ((k + r * 3) % 16) as u8;
                 let idx = r * (i / 2) + (k >> 1);
-                if k & 1 == 1 { q4[idx] |= nib << 4 } else { q4[idx] |= nib }
+                if k & 1 == 1 {
+                    q4[idx] |= nib << 4
+                } else {
+                    q4[idx] |= nib
+                }
             }
             for b in 0..nb {
                 bs[r * nb + b] = (127 + (b as i32) - (r as i32)) as u8; // 2^0, 2^1, ...
@@ -471,7 +475,11 @@ mod tests {
                 want += E2M1[nib] * f8e8m0_to_f32(bs[r * nb + k / 32]) * x[k];
             }
             want *= g;
-            assert!((y[r] - want).abs() < 1e-4, "row {r}: got {} want {want}", y[r]);
+            assert!(
+                (y[r] - want).abs() < 1e-4,
+                "row {r}: got {} want {want}",
+                y[r]
+            );
         }
     }
 }

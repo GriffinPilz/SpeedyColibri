@@ -102,16 +102,31 @@ pub fn plan_expert_chunks(
     target_bytes: usize,
 ) -> Vec<ChunkDesc> {
     let mut v = plan_matrix_chunks(
-        layer, eid, ExpertMatrix::Gate,
-        ex.gate.o as usize, ex.gate.i as usize, ex.gate.fmt_code, target_bytes,
+        layer,
+        eid,
+        ExpertMatrix::Gate,
+        ex.gate.o as usize,
+        ex.gate.i as usize,
+        ex.gate.fmt_code,
+        target_bytes,
     );
     v.extend(plan_matrix_chunks(
-        layer, eid, ExpertMatrix::Up,
-        ex.up.o as usize, ex.up.i as usize, ex.up.fmt_code, target_bytes,
+        layer,
+        eid,
+        ExpertMatrix::Up,
+        ex.up.o as usize,
+        ex.up.i as usize,
+        ex.up.fmt_code,
+        target_bytes,
     ));
     v.extend(plan_matrix_chunks(
-        layer, eid, ExpertMatrix::Down,
-        ex.down.o as usize, ex.down.i as usize, ex.down.fmt_code, target_bytes,
+        layer,
+        eid,
+        ExpertMatrix::Down,
+        ex.down.o as usize,
+        ex.down.i as usize,
+        ex.down.fmt_code,
+        target_bytes,
     ));
     v
 }
@@ -151,7 +166,10 @@ impl ChunkSource for LocalChunkSource<'_> {
         let src = matrix_weight_bytes(self.expert, d.matrix)?;
         let end = d.byte_off + d.byte_len;
         if end > src.len() || dst.len() != d.byte_len {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "chunk out of range"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk out of range",
+            ));
         }
         dst.copy_from_slice(&src[d.byte_off..end]);
         Ok(())
@@ -198,7 +216,11 @@ mod tests {
 
     fn mk_expert() -> Expert {
         // e4m3-shaped (fmt=4, 1 B/weight): gate/up [8,16], down [16,8]
-        Expert { gate: qt(4, 8, 16), up: qt(4, 8, 16), down: qt(4, 16, 8) }
+        Expert {
+            gate: qt(4, 8, 16),
+            up: qt(4, 8, 16),
+            down: qt(4, 16, 8),
+        }
     }
 
     #[test]
@@ -253,10 +275,17 @@ mod tests {
     fn fetch_rejects_out_of_range() {
         let ex = mk_expert();
         let bad = ChunkDesc {
-            layer: 0, eid: 0, matrix: ExpertMatrix::Gate,
-            o_start: 0, o_count: 1, byte_off: 10_000, byte_len: 16,
+            layer: 0,
+            eid: 0,
+            matrix: ExpertMatrix::Gate,
+            o_start: 0,
+            o_count: 1,
+            byte_off: 10_000,
+            byte_len: 16,
         };
         let mut buf = vec![0u8; 16];
-        assert!(LocalChunkSource { expert: &ex }.fetch_into(&bad, &mut buf).is_err());
+        assert!(LocalChunkSource { expert: &ex }
+            .fetch_into(&bad, &mut buf)
+            .is_err());
     }
 }

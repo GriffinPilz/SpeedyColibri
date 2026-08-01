@@ -37,8 +37,8 @@ pub struct Layer {
     /// built at load time so `attention_gqa` runs ONE fused matmul per layer instead of
     /// three (q/k/v share the same input). When set, `q_proj`/`k_proj`/`v_proj` are dropped.
     pub qkv_proj: Option<QTensor>,
-    pub q_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
-    pub k_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
+    pub q_norm: Vec<f32>, // per-head RMSNorm weight [head_dim] (gemma-folded)
+    pub k_norm: Vec<f32>, // per-head RMSNorm weight [head_dim] (gemma-folded)
 
     // MiniMax-M3 block-sparse Lightning Indexer (present only on sparse attention
     // layers; see `Config::idx_type` for M3). Empty/None on GLM and on M3 dense layers.
@@ -64,22 +64,22 @@ pub struct Layer {
     // DSA lightning indexer (present only on FULL indexer layers, i.e. when the
     // checkpoint was converted with the indexer weights). `None`/empty → no DSA on
     // this layer, so attention runs the dense path. See `crate::dsa`.
-    pub ix_wk: Option<QTensor>,     // key proj: hidden -> index_hd
-    pub ix_wq: Option<QTensor>,     // query proj: q_lora -> index_nh*index_hd
-    pub ix_wp: Option<QTensor>,     // per-head weight proj: hidden -> index_nh
-    pub ix_knorm_w: Vec<f32>,       // key LayerNorm weight (eps 1e-6)
-    pub ix_knorm_b: Vec<f32>,       // key LayerNorm bias
+    pub ix_wk: Option<QTensor>, // key proj: hidden -> index_hd
+    pub ix_wq: Option<QTensor>, // query proj: q_lora -> index_nh*index_hd
+    pub ix_wp: Option<QTensor>, // per-head weight proj: hidden -> index_nh
+    pub ix_knorm_w: Vec<f32>,   // key LayerNorm weight (eps 1e-6)
+    pub ix_knorm_b: Vec<f32>,   // key LayerNorm bias
 
     // ---- Nemotron-H Mamba2 mixer (present on `LayerKind::Mamba` layers) ----
     // `in_ln` above is the single block-input RMSNorm; Nemotron has no `post_ln`.
     pub mamba_in_proj: Option<QTensor>, // hidden -> d_inner + conv_dim + n_heads (18560)
     pub mamba_out_proj: Option<QTensor>, // d_inner -> hidden
-    pub mamba_conv_w: Vec<f32>,     // depthwise conv [conv_dim, k] (from [conv_dim,1,k])
-    pub mamba_conv_b: Vec<f32>,     // conv bias [conv_dim]
-    pub mamba_a_log: Vec<f32>,      // [n_heads]; A = -exp(a_log)
-    pub mamba_d: Vec<f32>,          // skip connection [n_heads]
-    pub mamba_dt_bias: Vec<f32>,    // step bias [n_heads]
-    pub mamba_norm: Vec<f32>,       // gated RMSNorm weight [d_inner]
+    pub mamba_conv_w: Vec<f32>,         // depthwise conv [conv_dim, k] (from [conv_dim,1,k])
+    pub mamba_conv_b: Vec<f32>,         // conv bias [conv_dim]
+    pub mamba_a_log: Vec<f32>,          // [n_heads]; A = -exp(a_log)
+    pub mamba_d: Vec<f32>,              // skip connection [n_heads]
+    pub mamba_dt_bias: Vec<f32>,        // step bias [n_heads]
+    pub mamba_norm: Vec<f32>,           // gated RMSNorm weight [d_inner]
 
     // ---- Nemotron-H latent-MoE projections (present on `LayerKind::Moe` layers) ----
     // Routed experts (`sh_*` unused here; routed via the expert provider) run in the
@@ -325,8 +325,8 @@ impl KvCache {
     /// rows (attention/MoE) keep empty buffers. These are O(1) in context length, unlike
     /// the `max_t`-scaled KV rows, so they are allocated eagerly (small + always resident).
     pub(crate) fn enable_mamba2(&mut self, cfg: &Config) {
-        let conv_dim = cfg.mamba_inter as usize
-            + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
+        let conv_dim =
+            cfg.mamba_inter as usize + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
         let k = cfg.mamba_d_conv as usize;
         let (nh, hd, ds) = (
             cfg.mamba_n_heads as usize,
@@ -361,7 +361,9 @@ impl KvCache {
     /// Replace this layer's KDA conv history. `carries` is what
     /// [`KvCache::kda_conv_take`] returns, advanced by one step.
     pub(crate) fn kda_conv_store(&mut self, layer: usize, carries: &[f32]) {
-        let Some(slot) = self.kda_conv.get_mut(layer) else { return };
+        let Some(slot) = self.kda_conv.get_mut(layer) else {
+            return;
+        };
         if slot.len() < carries.len() {
             slot.resize(carries.len(), 0.0);
         }
@@ -479,7 +481,10 @@ impl KvCache {
         if cfg.layer_kind.is_empty() {
             cfg.n_layers as usize
         } else {
-            cfg.layer_kind.iter().filter(|k| **k == LayerKind::Attn).count()
+            cfg.layer_kind
+                .iter()
+                .filter(|k| **k == LayerKind::Attn)
+                .count()
         }
     }
 
@@ -533,8 +538,8 @@ impl KvCache {
         let conv_dim =
             cfg.mamba_inter as usize + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
         let conv = cfg.mamba_d_conv as usize * conv_dim;
-        let ssm = cfg.mamba_n_heads as usize * cfg.mamba_head_dim as usize
-            * cfg.mamba_d_state as usize;
+        let ssm =
+            cfg.mamba_n_heads as usize * cfg.mamba_head_dim as usize * cfg.mamba_d_state as usize;
         // KDA (Kimi-K3). Same: zero unless the stack actually has `Kda` layers.
         let n_kda = count(LayerKind::Kda);
         let (kda_conv, kda_state) = Self::kda_state_lens(cfg);
@@ -573,7 +578,15 @@ impl KvCache {
         let dev = self
             .dev
             .get_or_insert_with(|| crate::gpu::DeviceKv::new(n_layers, max_t));
-        dev.sync(layer, &self.latent[layer], &self.k_rot[layer], kvl, r, pos_base, tk)
+        dev.sync(
+            layer,
+            &self.latent[layer],
+            &self.k_rot[layer],
+            kvl,
+            r,
+            pos_base,
+            tk,
+        )
     }
 
     pub fn kv_lora(&self) -> usize {
@@ -744,8 +757,7 @@ impl Layer {
         let q = |t: &QTensor| t.bytes().max(0) as u64;
         let oq = |t: &Option<QTensor>| t.as_ref().map(&q).unwrap_or(0);
         let v = |x: &Vec<f32>| (x.len() * 4) as u64;
-        0
-            + q(&self.q_a)
+        0 + q(&self.q_a)
             + q(&self.q_b)
             + q(&self.kv_a)
             + q(&self.kv_b)
@@ -853,10 +865,11 @@ mod resident_bytes_tests {
             + body.matches(": Option<QTensor>").count()
             + body.matches(": Vec<f32>").count();
 
-        let fstart = src.find("pub fn resident_bytes(&self) -> u64 {").expect("fn");
+        let fstart = src
+            .find("pub fn resident_bytes(&self) -> u64 {")
+            .expect("fn");
         let fbody = &src[fstart..fstart + src[fstart..].find("\n    }").expect("fn end")];
-        let n_summed =
-            fbody.matches("q(&self.").count() + fbody.matches("v(&self.").count();
+        let n_summed = fbody.matches("q(&self.").count() + fbody.matches("v(&self.").count();
 
         assert_eq!(
             n_summed, n_fields,
@@ -873,7 +886,12 @@ mod resident_bytes_tests {
 
         let mut l = Layer::default();
         l.in_ln = vec![0.0; 16]; // 64 bytes
-        l.attn_gate = Some(QTensor { fmt_code: 1, o: 4, i: 8, ..Default::default() });
+        l.attn_gate = Some(QTensor {
+            fmt_code: 1,
+            o: 4,
+            i: 8,
+            ..Default::default()
+        });
         // int8: o*i codes + o f32 scales = 32 + 16 = 48
         assert_eq!(l.resident_bytes(), 64 + 48);
     }
@@ -908,8 +926,15 @@ mod kv_accounting_tests {
                 "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
                 "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
         );
-        assert_eq!(KvCache::kv_layers(&cfg), 1, "only the single '*' layer holds KV");
-        assert!(KvCache::allocates_gqa_kv(&cfg), "for_model calls enable_gqa for NemotronH");
+        assert_eq!(
+            KvCache::kv_layers(&cfg),
+            1,
+            "only the single '*' layer holds KV"
+        );
+        assert!(
+            KvCache::allocates_gqa_kv(&cfg),
+            "for_model calls enable_gqa for NemotronH"
+        );
 
         // per attn layer: mla(kv_lora 0 + qk_rope 4) + k_full/v_full(2*2*4=16) + shadow(mla)
         let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
@@ -964,10 +989,20 @@ mod kv_accounting_tests {
                 "scoring_func":"sigmoid","use_routing_bias":true,"hidden_act":"silu",
                 "rms_norm_eps":1e-5,"eos_token_id":2}"#,
         );
-        assert!(cfg.layer_kind.is_empty(), "uniform archs carry no layer_kind");
-        assert_eq!(KvCache::kv_layers(&cfg), cfg.n_layers as usize, "every layer holds KV");
+        assert!(
+            cfg.layer_kind.is_empty(),
+            "uniform archs carry no layer_kind"
+        );
+        assert_eq!(
+            KvCache::kv_layers(&cfg),
+            cfg.n_layers as usize,
+            "every layer holds KV"
+        );
         assert_eq!(KvCache::fixed_bytes(&cfg), 0, "no recurrent state");
-        assert_eq!(KvCache::bytes_for(&cfg, 7), KvCache::bytes_per_token(&cfg) * 7);
+        assert_eq!(
+            KvCache::bytes_for(&cfg, 7),
+            KvCache::bytes_per_token(&cfg) * 7
+        );
 
         // Matches the long-standing formula for a GQA transformer.
         let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
@@ -1015,8 +1050,15 @@ mod kv_accounting_tests {
     fn kimi_k3_charges_mla_per_token_and_kda_per_sequence() {
         let cfg = kimi_k3_cfg();
         assert_eq!(cfg.n_layers, 93);
-        assert_eq!(KvCache::kv_layers(&cfg), 24, "only the gated-MLA layers hold KV");
-        assert!(!KvCache::allocates_gqa_kv(&cfg), "K3 is MLA: no k_full/v_full");
+        assert_eq!(
+            KvCache::kv_layers(&cfg),
+            24,
+            "only the gated-MLA layers hold KV"
+        );
+        assert!(
+            !KvCache::allocates_gqa_kv(&cfg),
+            "K3 is MLA: no k_full/v_full"
+        );
 
         // Per token: 24 layers x (kv_lora 512 + qk_rope 64) x f32, doubled by the device
         // shadow under cuda. 108 KiB/token there, 54 KiB on the host-only build.
@@ -1028,7 +1070,11 @@ mod kv_accounting_tests {
         let conv = 4 * 3 * 96 * 128; // d_conv x (q,k,v) x n_heads*head_dim
         let state = 96 * 128 * 128; // [n_heads, head_dim, head_dim]
         assert_eq!(KvCache::fixed_bytes(&cfg), 69 * (conv + state) * 4);
-        assert_eq!(KvCache::fixed_bytes(&cfg), 474_808_320, "~475 MB per sequence");
+        assert_eq!(
+            KvCache::fixed_bytes(&cfg),
+            474_808_320,
+            "~475 MB per sequence"
+        );
 
         // The fixed term must not scale with context — that is the whole point of it
         // being separate, and the reason short requests are where it bites.
@@ -1043,8 +1089,12 @@ mod kv_accounting_tests {
     #[test]
     fn kimi_k3_fixed_bytes_equals_what_enable_kda_allocates() {
         let cfg = kimi_k3_cfg();
-        let mut kv =
-            KvCache::new(cfg.n_layers as usize, cfg.kv_lora as usize, cfg.qk_rope as usize, 1);
+        let mut kv = KvCache::new(
+            cfg.n_layers as usize,
+            cfg.kv_lora as usize,
+            cfg.qk_rope as usize,
+            1,
+        );
         kv.enable_kda(&cfg);
 
         let allocated: usize = kv.kda_conv.iter().map(Vec::len).sum::<usize>()
@@ -1056,7 +1106,11 @@ mod kv_accounting_tests {
         assert_eq!(populated, 69, "only KDA layers carry recurrent state");
         for (li, k) in cfg.layer_kind.iter().enumerate() {
             let has_state = !kv.kda_state[li].is_empty();
-            assert_eq!(has_state, *k == LayerKind::Kda, "layer {li} state/kind mismatch");
+            assert_eq!(
+                has_state,
+                *k == LayerKind::Kda,
+                "layer {li} state/kind mismatch"
+            );
         }
     }
 
@@ -1082,6 +1136,9 @@ mod kv_accounting_tests {
         assert!(!nemo.layer_kind.contains(&LayerKind::Kda));
         // Nemotron's figure is unchanged by the KDA term existing.
         let conv_dim = nemo.mamba_inter as usize + 2 * 2;
-        assert_eq!(KvCache::fixed_bytes(&nemo), 2 * (2 * conv_dim + 2 * 2 * 2) * 4);
+        assert_eq!(
+            KvCache::fixed_bytes(&nemo),
+            2 * (2 * conv_dim + 2 * 2 * 2) * 4
+        );
     }
 }

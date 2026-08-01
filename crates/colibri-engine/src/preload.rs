@@ -192,7 +192,15 @@ fn expert_blob(ex: &Expert) -> Vec<u8> {
     b
 }
 
-fn read_qt(blob: &[u8], off: &mut usize, qlen: usize, slen: usize, o: usize, i: usize, fmt: i32) -> QTensor {
+fn read_qt(
+    blob: &[u8],
+    off: &mut usize,
+    qlen: usize,
+    slen: usize,
+    o: usize,
+    i: usize,
+    fmt: i32,
+) -> QTensor {
     let q = &blob[*off..*off + qlen];
     *off += qlen;
     let sb = &blob[*off..*off + slen];
@@ -227,7 +235,9 @@ fn expert_from_blob(blob: &[u8], hidden: usize, moe_inter: usize, fmt: i32) -> E
 
 /// Default shard count: one per CPU core.
 pub fn default_num_files() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 /// Repack every routed expert (sparse layers) from `provider` into `num_files`
@@ -278,8 +288,10 @@ pub fn repack<P: ExpertProvider>(
         f.flush()?;
     }
 
-    let mut layers: Vec<(usize, i32, u64)> =
-        layer_meta.into_iter().map(|(l, (f, b))| (l, f, b)).collect();
+    let mut layers: Vec<(usize, i32, u64)> = layer_meta
+        .into_iter()
+        .map(|(l, (f, b))| (l, f, b))
+        .collect();
     layers.sort();
     let manifest = Manifest {
         num_files,
@@ -334,23 +346,27 @@ pub fn preload_parallel(
             let handles: Vec<_> = experts
                 .chunks(per_thread)
                 .map(|chunk| {
-                    scope.spawn(move || -> io::Result<HashMap<(usize, usize), Arc<Expert>>> {
-                        let mut map = HashMap::new();
-                        let mut used = 0u64;
-                        for &(layer, eid) in chunk {
-                            if used > per_thread_budget && !map.is_empty() {
-                                break;
+                    scope.spawn(
+                        move || -> io::Result<HashMap<(usize, usize), Arc<Expert>>> {
+                            let mut map = HashMap::new();
+                            let mut used = 0u64;
+                            for &(layer, eid) in chunk {
+                                if used > per_thread_budget && !map.is_empty() {
+                                    break;
+                                }
+                                // Bulk preload is already ~20-way parallel across experts,
+                                // so each expert's read stays a single stream (chunking it
+                                // too would only oversubscribe the drive).
+                                let mut ex = load_expert(
+                                    shards, layout, hidden, moe_inter, ebits, layer, eid, 1,
+                                )?;
+                                ex.mark_gpu_eligible(); // preloaded == resident/stable
+                                used += ex.bytes();
+                                map.insert((layer, eid), Arc::new(ex));
                             }
-                            // Bulk preload is already ~20-way parallel across experts,
-                            // so each expert's read stays a single stream (chunking it
-                            // too would only oversubscribe the drive).
-                            let mut ex = load_expert(shards, layout, hidden, moe_inter, ebits, layer, eid, 1)?;
-                            ex.mark_gpu_eligible(); // preloaded == resident/stable
-                            used += ex.bytes();
-                            map.insert((layer, eid), Arc::new(ex));
-                        }
-                        Ok(map)
-                    })
+                            Ok(map)
+                        },
+                    )
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -398,25 +414,27 @@ impl PreloadStore {
                     .enumerate()
                     .map(|(fi, locs)| {
                         let layer_meta = &layer_meta;
-                        scope.spawn(move || -> io::Result<HashMap<(usize, usize), Arc<Expert>>> {
-                            let file = File::open(Manifest::shard_path(dir, fi))?;
-                            let mut map = HashMap::new();
-                            let mut buf: Vec<u8> = Vec::new();
-                            let mut used = 0u64;
-                            for loc in locs {
-                                let (fmt, ebytes) = layer_meta[&loc.layer];
-                                if used + ebytes > per_file_budget_bytes && !map.is_empty() {
-                                    break; // budget reached for this shard
+                        scope.spawn(
+                            move || -> io::Result<HashMap<(usize, usize), Arc<Expert>>> {
+                                let file = File::open(Manifest::shard_path(dir, fi))?;
+                                let mut map = HashMap::new();
+                                let mut buf: Vec<u8> = Vec::new();
+                                let mut used = 0u64;
+                                for loc in locs {
+                                    let (fmt, ebytes) = layer_meta[&loc.layer];
+                                    if used + ebytes > per_file_budget_bytes && !map.is_empty() {
+                                        break; // budget reached for this shard
+                                    }
+                                    buf.resize(ebytes as usize, 0);
+                                    read_exact_at(&file, loc.offset, &mut buf)?;
+                                    let mut ex = expert_from_blob(&buf, hidden, moe_inter, fmt);
+                                    ex.mark_gpu_eligible(); // preloaded == resident/stable
+                                    map.insert((loc.layer, loc.eid), Arc::new(ex));
+                                    used += ebytes;
                                 }
-                                buf.resize(ebytes as usize, 0);
-                                read_exact_at(&file, loc.offset, &mut buf)?;
-                                let mut ex = expert_from_blob(&buf, hidden, moe_inter, fmt);
-                                ex.mark_gpu_eligible(); // preloaded == resident/stable
-                                map.insert((loc.layer, loc.eid), Arc::new(ex));
-                                used += ebytes;
-                            }
-                            Ok(map)
-                        })
+                                Ok(map)
+                            },
+                        )
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -470,7 +488,9 @@ mod tests {
 
     fn tiny_expert(seed: usize) -> Expert {
         let mk = |o: usize, i: usize, s: usize| {
-            let w: Vec<f32> = (0..o * i).map(|k| (((k + s) % 9) as f32 - 4.0) * 0.1).collect();
+            let w: Vec<f32> = (0..o * i)
+                .map(|k| (((k + s) % 9) as f32 - 4.0) * 0.1)
+                .collect();
             qtensor_from_f32(&w, o, i, 8) // int8
         };
         Expert {
@@ -503,12 +523,23 @@ mod tests {
             moe_inter: 4,
             layers: vec![(1, 1, 128)],
             experts: vec![
-                ExpertLoc { layer: 1, eid: 0, file: 0, offset: 0 },
-                ExpertLoc { layer: 1, eid: 1, file: 1, offset: 128 },
+                ExpertLoc {
+                    layer: 1,
+                    eid: 0,
+                    file: 0,
+                    offset: 0,
+                },
+                ExpertLoc {
+                    layer: 1,
+                    eid: 1,
+                    file: 1,
+                    offset: 128,
+                },
             ],
         };
         let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-        let path = std::path::Path::new(&dir).join(format!("coli-manifest-{}.json", std::process::id()));
+        let path =
+            std::path::Path::new(&dir).join(format!("coli-manifest-{}.json", std::process::id()));
         m.save(&path).unwrap();
         let m2 = Manifest::load(&path).unwrap();
         assert_eq!(m2.num_files, 3);

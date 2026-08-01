@@ -86,21 +86,31 @@ def main():
     prompts = PROMPTS * repeat
     print(f"benchmark: {len(prompts)} distinct-prompt requests x {n_tokens} tok -> {url}")
     print(f"{'#':>3}  {'tok/s':>7}  {'tok':>4}  {'sec':>7}  prompt")
-    rates = []
+    rates, toks = [], []
     for i, p in enumerate(prompts, 1):
         r = one(url, p, n_tokens)
         if r is None:
             continue
         rate, tokens, dt = r
         rates.append(rate)
+        toks.append(tokens)
         print(f"{i:>3}  {rate:>7.2f}  {tokens:>4}  {dt:>7.1f}  {p[:38]!r}")
 
+    # TOKEN GATE. `rate` is tokens/second, so a request returning FEWER tokens than asked
+    # for still produces a perfectly plausible number — the rate just drops, and the run
+    # reads as "slow model" rather than "broken model". Not hypothetical: a Kimi-K3 serve
+    # run reported a clean 0.28 tok/s on the same day that model was being SIGTERMed at
+    # 512-token prefill, and nothing in the summary could tell those apart.
+    short = [(i, t) for i, t in enumerate(toks, 1) if t < n_tokens]
     if not rates:
         print("no successful requests")
         sys.exit(1)
     rates_sorted = sorted(rates)
     print()
-    print(f"requests   : {len(rates)}")
+    if short:
+        print(f"SHORT COMPLETIONS: {len(short)}/{len(toks)} returned < {n_tokens} tokens "
+              f"-> {short[:5]}", file=sys.stderr)
+    print(f"requests   : {len(rates)}  (tokens {min(toks)}-{max(toks)} of {n_tokens} asked)")
     print(f"median     : {statistics.median(rates):.2f} tok/s   <- compare this")
     print(f"mean       : {statistics.fmean(rates):.2f} tok/s")
     print(f"min / max  : {rates_sorted[0]:.2f} / {rates_sorted[-1]:.2f} tok/s")

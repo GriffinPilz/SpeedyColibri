@@ -2486,11 +2486,94 @@ fn fill_within_headroom(requested: u64, dense_ram: u64, total: u64) -> u64 {
 /// other tenant, since the reserve absorbs our own runtime) does the monitor cede gradually.
 const ADAPTIVE_DANGER_FLOOR: u64 = 4 << 30;
 
-/// Hard OOM-guard line: the monitor evicts LRU experts *immediately* (no hysteresis) whenever
-/// `MemAvailable` falls below this — whatever consumed the memory, including the GPU on GB10's
+/// Floor of the hard OOM-guard line. The *effective* floor is [`oom_guard_floor`], which
+/// raises this to clear whatever will actually kill us.
+///
+/// The monitor evicts LRU experts immediately (no hysteresis) whenever `MemAvailable` falls
+/// below the effective floor — whatever consumed the memory, including the GPU on GB10's
 /// unified pool. This is the guarantee that filling RAM can never OOM the box; it sits below
 /// [`ADAPTIVE_DANGER_FLOOR`] (the softer, external-tenant line).
 const ADAPTIVE_HARD_FLOOR: u64 = 3 << 30;
+
+/// earlyoom's SIGTERM threshold as a percent of `MemTotal`, discovered from the running
+/// process, or `None` if earlyoom is not running.
+///
+/// Read from `/proc/*/cmdline` rather than by shelling out to `ps`: this runs during
+/// startup on a box we are about to fill, and forking is exactly what a nearly-full box
+/// handles worst.
+///
+/// **A running earlyoom whose flags cannot be parsed yields its documented default of
+/// 10%, not `None`.** Guessing low here means the guard sits under the kill line and never
+/// fires, which is the failure this whole function exists to prevent; guessing high only
+/// costs residency.
+#[cfg(target_os = "linux")]
+fn earlyoom_sigterm_pct() -> Option<u64> {
+    const DEFAULT_PCT: u64 = 10; // `earlyoom --help`: "default 10 %"
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for e in entries.flatten() {
+        let raw = match std::fs::read(e.path().join("cmdline")) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        // cmdline is NUL-separated argv.
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if args.is_empty() || !args[0].contains("earlyoom") {
+            continue;
+        }
+        // `-m PERCENT` or `-m PERCENT,KILL_PERCENT`; the SIGTERM line is the first field.
+        let pct = args
+            .iter()
+            .position(|a| a == "-m")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.split(',').next())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        return Some(pct.unwrap_or(DEFAULT_PCT).clamp(1, 99));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn earlyoom_sigterm_pct() -> Option<u64> {
+    None
+}
+
+/// The OOM guard's floor, derived from what will actually kill this process.
+///
+/// **[`ADAPTIVE_HARD_FLOOR`] alone is only safe because this one box was hand-tuned.**
+/// earlyoom's threshold is a *percentage of MemTotal*; ours was an absolute 3 GiB. Those
+/// cross:
+///
+/// | config | earlyoom SIGTERMs at | old 3 GiB floor | result |
+/// |---|---|---|---|
+/// | gx10-42b2, `-m 2` (tuned by `sparkrun`) | 2.61 GB | 3.22 GB | safe by 0.61 GB |
+/// | **stock earlyoom, `-m 10` (the default)** | **13.07 GB** | 3.22 GB | **killed; guard idle** |
+/// | 256 GB host at `-m 2` | 5.12 GB | 3.22 GB | **killed; guard idle** |
+///
+/// It is fatal rather than merely suboptimal because [`TARGET_RAM_PCT`] deliberately drives
+/// toward leaving only ~4% free. On a stock-earlyoom host that means crossing the kill line
+/// on essentially every model, every run, while `MemAvailable` is still nowhere near the
+/// guard's own 3.22 GB — so the entire adaptive OOM guard is decorative on any untuned host.
+/// Even at `-m 2` it breaks above ~161 GB of RAM.
+///
+/// The margin above the trigger is a quarter of it, floored at 1 GiB: the *rate*-dependent
+/// part of the stopping distance is already handled by `braking_floor` in the monitor, so
+/// this only has to cover the gap between "we noticed" and "earlyoom noticed".
+fn oom_guard_floor(total: u64, earlyoom_pct: Option<u64>) -> u64 {
+    match earlyoom_pct {
+        // No earlyoom: the kernel OOM killer is the backstop. It is far less eager (it
+        // fires on allocation failure, not on a percentage), so the static floor stands.
+        None => ADAPTIVE_HARD_FLOOR,
+        Some(pct) => {
+            let trigger = total / 100 * pct;
+            let margin = (trigger / 4).max(1 << 30);
+            ADAPTIVE_HARD_FLOOR.max(trigger.saturating_add(margin))
+        }
+    }
+}
 
 /// The expert cache is capped at `MemTotal / CACHE_CAP_DIVISOR`.
 ///
@@ -3028,7 +3111,27 @@ where
     if near_fit {
         colibri_safetensors::set_fadvise(true);
     }
-    provider.spawn_adaptive_budget(fill_target, ADAPTIVE_DANGER_FLOOR, ADAPTIVE_HARD_FLOOR);
+    // Derive the guard's floor from what will actually kill us, not from a constant that
+    // happens to suit this host's tuned earlyoom. Say so when it moves: on a stock-earlyoom
+    // box this costs real residency, and the operator's better fix is to tune earlyoom down
+    // rather than let us hold back 10+ GB.
+    let eo_pct = earlyoom_sigterm_pct();
+    let hard_floor = oom_guard_floor(total, eo_pct);
+    if hard_floor > ADAPTIVE_HARD_FLOOR {
+        eprintln!(
+            "[ram] OOM-guard floor raised {} -> {} GiB: earlyoom SIGTERMs at -m {}% = {} GiB \
+             of this host's {} GiB, which is above the built-in floor. Holding back that \
+             much less for experts. `earlyoom -m 2` (see /etc/default/earlyoom) would \
+             return it.",
+            ADAPTIVE_HARD_FLOOR >> 30,
+            hard_floor >> 30,
+            eo_pct.unwrap_or(0),
+            (total / 100 * eo_pct.unwrap_or(0)) >> 30,
+            total >> 30,
+        );
+    }
+    let danger_floor = ADAPTIVE_DANGER_FLOOR.max(hard_floor);
+    provider.spawn_adaptive_budget(fill_target, danger_floor, hard_floor);
     // Both regimes now fill to the SAME max-residency target; they differ only in what
     // happens to the page cache. A model whose set fits drops it (`fadvise`) because it is
     // a pure duplicate of what we already hold; a model that still streams a tail keeps it
@@ -3742,6 +3845,49 @@ mod tests {
             uploaded + resident * 2 + RUNTIME_RESERVE <= ram_target(total),
             "fill + both weight copies + reserve must fit the 96% ceiling"
         );
+    }
+
+    /// The guard's floor must clear whatever will actually SIGTERM us, on every host —
+    /// not just the one whose earlyoom someone tuned down to 2%.
+    ///
+    /// This cannot be verified end-to-end on gx10-42b2 without rewriting its
+    /// /etc/default/earlyoom (root, and the operator's call), so the arithmetic is the
+    /// deliverable. Each row is a real configuration.
+    #[test]
+    fn oom_guard_floor_clears_earlyoom_on_every_host() {
+        let gb = |n: f64| (n * 1e9) as u64;
+        let cases = [
+            // (MemTotal, earlyoom -m pct, label)
+            (gb(130.66), 2u64, "gx10-42b2 as tuned by sparkrun"),
+            (gb(130.66), 10, "same box with STOCK earlyoom"),
+            (gb(256.0), 2, "a 256 GB host at -m 2"),
+            (gb(512.0), 10, "a large host, stock"),
+        ];
+        for (total, pct, label) in cases {
+            let trigger = total / 100 * pct;
+            let floor = oom_guard_floor(total, Some(pct));
+            assert!(
+                floor > trigger,
+                "{label}: floor {floor} must sit ABOVE earlyoom's {trigger}, or the guard \
+                 never fires before the kill"
+            );
+            assert!(
+                floor >= ADAPTIVE_HARD_FLOOR,
+                "{label}: never drop below the built-in minimum"
+            );
+        }
+
+        // The old absolute constant fails exactly where this function was written to help:
+        // stock earlyoom on this very box would SIGTERM at 13 GB with the guard idle at 3.
+        let stock_trigger = gb(130.66) / 100 * 10;
+        assert!(
+            ADAPTIVE_HARD_FLOOR < stock_trigger,
+            "the bug this replaces: a 3 GiB absolute floor is below a stock 10% kill line"
+        );
+
+        // No earlyoom => the kernel OOM killer is the backstop; keep the static floor
+        // rather than inventing headroom nobody needs.
+        assert_eq!(oom_guard_floor(gb(130.66), None), ADAPTIVE_HARD_FLOOR);
     }
 
     #[test]

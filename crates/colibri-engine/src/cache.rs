@@ -748,13 +748,35 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
         let swap_baseline = swap_used_bytes().unwrap_or(0);
         std::thread::spawn(move || {
             let mut low_ticks: u32 = 0;
+            // Last tick's `MemAvailable`, so the guard can see how fast memory is going.
+            // Seeded with the current value: the first tick then measures a drop of 0 and
+            // the floor starts at `hard_floor`, which is what a still cache deserves.
+            let mut prev_avail = available_ram_bytes().unwrap_or(u64::MAX);
+            // Wall-clock of the previous tick. The monitor competes with ~20 reader threads
+            // and the prefill for 20 cores, so "the guard did not brake" has two very
+            // different causes — it decided not to, or it never ran. `COLI_GUARD_TRACE=1`
+            // prints both, with the actual gap between ticks, so they can be told apart.
+            let trace = std::env::var("COLI_GUARD_TRACE").map(|v| v != "0").unwrap_or(false);
+            let mut prev_tick = std::time::Instant::now();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
                 let avail = match available_ram_bytes() {
                     Some(a) => a,
                     None => return, // non-Linux: no live signal, keep the standing budget
                 };
+                let gap_ms = prev_tick.elapsed().as_millis() as u64;
+                prev_tick = std::time::Instant::now();
                 let resident = cache.state.lock().unwrap().bytes;
+                if trace {
+                    eprintln!(
+                        "[guard] gap={gap_ms}ms avail={:.2} GB drop={:.2} GB cache={:.2} GB \
+                         budget={:.2} GB",
+                        avail as f64 / 1e9,
+                        prev_avail.saturating_sub(avail) as f64 / 1e9,
+                        resident as f64 / 1e9,
+                        cache.budget.load(Ordering::Relaxed) as f64 / 1e9,
+                    );
+                }
 
                 // SWAP GUARD — checked before the MemAvailable floors, because it fires
                 // first. Measured on 42b2: a 110 GB fill put 3 GB into swap while
@@ -777,13 +799,39 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                     }
                 }
 
-                // OOM guard (immediate, no hysteresis): never let avail cross hard_floor,
+                // OOM guard (immediate, no hysteresis): never let avail cross the floor,
                 // whatever ate the memory. Evict back to a few GB of slack above it.
-                if avail < hard_floor {
-                    let reclaim = (hard_floor - avail).saturating_add(HARD_SLACK);
+                //
+                // The floor is *rate-aware* — see `braking_floor`. A static `hard_floor`
+                // is only safe if the guard can stop within the margin between it and
+                // whatever kills us; on Kimi-K3 one tick of fill was larger than that
+                // entire margin, so the guard lost every time.
+                let drop_per_tick = prev_avail.saturating_sub(avail);
+                prev_avail = avail;
+                let floor_now = braking_floor(hard_floor, drop_per_tick);
+                if avail < floor_now {
+                    let reclaim = (floor_now - avail).saturating_add(HARD_SLACK);
                     let new_budget = resident.saturating_sub(reclaim).max(FLOOR_MIN);
                     cache.budget.store(new_budget, Ordering::Relaxed);
-                    cache.state.lock().unwrap().evict_to(new_budget);
+                    let after = {
+                        let mut s = cache.state.lock().unwrap();
+                        s.evict_to(new_budget);
+                        s.bytes
+                    };
+                    if trace {
+                        eprintln!(
+                            "[guard] FIRE avail={:.2} floor={:.2} (base {:.2} + brake {:.2}) \
+                             cache {:.2} -> {:.2} GB (budget {:.2}, freed {:.2})",
+                            avail as f64 / 1e9,
+                            floor_now as f64 / 1e9,
+                            hard_floor as f64 / 1e9,
+                            (floor_now - hard_floor) as f64 / 1e9,
+                            resident as f64 / 1e9,
+                            after as f64 / 1e9,
+                            new_budget as f64 / 1e9,
+                            resident.saturating_sub(after) as f64 / 1e9,
+                        );
+                    }
                     low_ticks = 0;
                     continue;
                 }
@@ -931,6 +979,50 @@ pub mod capacity {
     }
 }
 
+/// Ticks of stopping distance the OOM guard keeps in hand. The guard can brake at most
+/// once per `TICK_MS`, so it needs the floor to cover the fill it cannot yet see, plus
+/// slack for a poll that lands late — the monitor thread competes with 20 reader threads
+/// and the prefill on 20 cores, so ticks are not evenly spaced.
+const BRAKE_TICKS: u64 = 4;
+
+/// Cap on the brake term. A single pathological tick (an external tenant taking tens of GB
+/// at once) must not translate into "evict the entire cache" — the reclaim arithmetic below
+/// the floor already handles a genuine emergency, and this term is only the *anticipatory*
+/// part.
+const MAX_BRAKE: u64 = 8 << 30;
+
+/// The floor the OOM guard must actually defend, given how fast memory is disappearing.
+///
+/// **A static floor is a bug when the fill is fast.** The guard is a control loop: it
+/// samples `MemAvailable` every `TICK_MS` and can only evict at a tick. So it is safe only
+/// while
+///
+/// ```text
+///     consumption_per_tick  <  hard_floor − (whatever kills us)
+/// ```
+///
+/// Measured on Kimi-K3 (2026-07-31, 512-token prefill, `/tmp/k3_trace2.rss`): the expert
+/// cache fills at **8.24 GB/s** — 0.82 GB per 100 ms tick — because K3's set is 1347 GiB
+/// against 3% coverage, so it streams at full read bandwidth and never reaches its fill
+/// target. The margin from `ADAPTIVE_HARD_FLOOR` (3 GiB = 3.22 GB) down to earlyoom's
+/// `-m 2` line (2% of MemTotal = 2.61 GB) is **0.61 GB — 0.74 of one tick**. The trace
+/// caught exactly that: the last sample read `avail=3.19 GB`, already under the floor, and
+/// the process was SIGTERMed before the next poll could evict anything.
+///
+/// So the stopping distance has to scale with the speed. This adds `BRAKE_TICKS` worth of
+/// the observed per-tick drop to the floor, which is a no-op for a cache in steady state
+/// (drop ≈ 0 ⇒ floor unchanged) and only bites while something is consuming fast — i.e. it
+/// cannot regress the four models that were already passing.
+///
+/// This was *not* an accounting shortfall. Two earlier hypotheses were wrong: that the
+/// buffer-pool byte cap killed K3 (it dies with the cap reverted), and that
+/// `RUNTIME_RESERVE` was simply too small (the plan does fit — dense 62.06 GB observed plus
+/// a 55.8 GB fill target leaves 8.6 GB, comfortably above a 3.22 GB floor). The plan was
+/// fine; the guard could not hold it.
+fn braking_floor(hard_floor: u64, drop_per_tick: u64) -> u64 {
+    hard_floor.saturating_add(drop_per_tick.saturating_mul(BRAKE_TICKS).min(MAX_BRAKE))
+}
+
 /// Available RAM in bytes, best-effort. Reads `/proc/meminfo` `MemAvailable` on
 /// Linux (the DGX Spark target); returns `None` elsewhere (e.g. macOS dev boxes),
 /// where the caller should fall back to an explicit budget.
@@ -981,6 +1073,55 @@ mod tests {
     use super::*;
     use crate::quantize::qtensor_from_f32;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A still cache must not pay for a brake it does not need: with nothing consuming,
+    /// the guard's floor is exactly `hard_floor`. This is what keeps the rate-aware floor
+    /// from regressing the four models that already passed the ceiling check.
+    #[test]
+    fn braking_floor_is_inert_in_steady_state() {
+        let hard = 3u64 << 30;
+        assert_eq!(braking_floor(hard, 0), hard);
+    }
+
+    /// The Kimi-K3 case, in the units it was measured in.
+    ///
+    /// Fill 8.24 GB/s at `TICK_MS` = 100 ⇒ 0.82 GB per tick. earlyoom runs `-m 2` on a
+    /// 130.66 GB box ⇒ it SIGTERMs at 2.61 GB. The floor the guard defends has to leave
+    /// more than one tick of fill above that line, or it brakes into a process that is
+    /// already dead — which is exactly what the trace caught (`avail=3.19 GB` at the last
+    /// sample, under the old static 3.22 GB floor, killed before the next poll).
+    #[test]
+    fn braking_floor_clears_earlyoom_at_the_measured_k3_fill_rate() {
+        let hard = 3u64 << 30; // ADAPTIVE_HARD_FLOOR = 3.22 GB
+        let earlyoom = 2_613_000_000u64; // 2% of 130.66 GB MemTotal
+        let per_tick = 824_000_000u64; // 8.24 GB/s x 100 ms
+
+        // The old static floor: less than one tick of margin. This is the bug.
+        assert!(
+            hard - earlyoom < per_tick,
+            "a static floor only failed because one tick of fill ({per_tick}) exceeded its \
+             whole margin ({}); if that stops being true, re-derive BRAKE_TICKS",
+            hard - earlyoom
+        );
+
+        // The rate-aware floor: strictly more than one tick of stopping distance.
+        let floor = braking_floor(hard, per_tick);
+        assert!(
+            floor - earlyoom > per_tick,
+            "guard must be able to brake before earlyoom: floor {floor} leaves {} above the \
+             kill line, which is less than the {per_tick} consumed per tick",
+            floor - earlyoom
+        );
+    }
+
+    /// One pathological tick must not demand evicting the world; the brake term is only
+    /// the anticipatory part and the reclaim below the floor handles a real emergency.
+    #[test]
+    fn braking_floor_is_capped() {
+        let hard = 3u64 << 30;
+        assert_eq!(braking_floor(hard, 40 << 30), hard + MAX_BRAKE);
+        assert_eq!(braking_floor(u64::MAX, 1 << 30), u64::MAX, "must not overflow");
+    }
 
     /// The pre-rewrite eviction loop, kept verbatim as the oracle.
     fn evict_by_repeated_min(

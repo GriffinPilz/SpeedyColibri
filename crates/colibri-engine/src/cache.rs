@@ -774,11 +774,7 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
             // genuinely free right now, less room to brake in, is the honest ceiling; the
             // plan remains the upper bound, so a model with real headroom is unaffected.
             let mut learned_cap = match available_ram_bytes() {
-                Some(a) => fill_target.min(
-                    a.saturating_sub(danger_floor)
-                        .saturating_sub(MAX_BRAKE)
-                        .max(FLOOR_MIN),
-                ),
+                Some(a) => fill_target.min(supported_cap(0, a, danger_floor).max(FLOOR_MIN)),
                 None => fill_target,
             };
             loop {
@@ -881,7 +877,20 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 // again approach the floor faster than `CAP_RECOVER_PER_TICK`, which is
                 // ~0.64 GB/s against the 8.24 GB/s an unbounded refill managed. A 461 ms
                 // scheduling gap then costs ~0.3 GB instead of 3.12 GB.
-                if avail > danger_floor && resident >= learned_cap {
+                // Never promise more than the memory that exists right now supports. Applied
+                // every tick, so the approach is bounded by observation rather than by a
+                // one-shot estimate made before the runtime revealed its own footprint.
+                learned_cap = learned_cap
+                    .min(supported_cap(resident, avail, danger_floor))
+                    .max(FLOOR_MIN);
+                // "Binding" needs a tolerance. The insert path stops *just under* the
+                // budget, so the cache is never exactly at the cap and a `>=` test is
+                // essentially never true: measured on K3 as cache=25.44 against cap=25.46,
+                // pinned there with 38.92 GB free and a supported cap of ~51 GB. Within one
+                // recovery step counts as binding.
+                if avail > danger_floor
+                    && resident.saturating_add(CAP_RECOVER_PER_TICK) >= learned_cap
+                {
                     learned_cap = recover_cap(learned_cap, fill_target);
                 }
                 // Hold the learned cap minus whatever callers have reserved (e.g. live KV
@@ -1094,6 +1103,34 @@ const CAP_RECOVER_PER_TICK: u64 = 64 << 20;
 /// in progress (~7 s). The measurement was erased before it could take effect and the run
 /// died at the same 122 GB as with no seed at all. Additive increase has to be conditioned
 /// on the constraint being active, or it is just a slow way back to the number that failed.
+/// Free bytes the cap must always leave unspoken-for: the soft danger line plus a full
+/// brake's worth of stopping distance.
+fn cap_margin(danger_floor: u64) -> u64 {
+    danger_floor.saturating_add(MAX_BRAKE)
+}
+
+/// The largest cap the memory that exists *right now* can support.
+///
+/// The seeded cap fixed t=0 only, and t=0 is not where the danger is. K3's first approach
+/// ran at full read bandwidth into a cap that was correct when it was chosen and stale a
+/// second later, because the cache is not the only thing consuming: read buffers, GPU
+/// staging and the CUDA context draw on the same pool, so `MemAvailable` falls *faster*
+/// than the cache grows. The guard still caught it — but only at avail 6.59 GB, and the
+/// dip that followed reached **2.45 GB, under earlyoom's 2.61 GB trigger**. It lived.
+///
+/// So the seed becomes a per-tick invariant: whatever the cache already holds, plus what
+/// is free, less the margin we refuse to spend. That is self-correcting in the one way the
+/// seed was not — as runtime overhead reveals itself, the ceiling comes down with it,
+/// without waiting for an eviction to teach it.
+///
+/// This only ever *lowers* the cap. Earning it back stays the job of the deliberately slow
+/// [`recover_cap`], so a transient dip cannot be converted into an instant refill.
+fn supported_cap(resident: u64, avail: u64, danger_floor: u64) -> u64 {
+    resident
+        .saturating_add(avail)
+        .saturating_sub(cap_margin(danger_floor))
+}
+
 fn recover_cap(learned_cap: u64, fill_target: u64) -> u64 {
     learned_cap
         .saturating_add(CAP_RECOVER_PER_TICK)
@@ -1214,6 +1251,28 @@ mod tests {
         assert!(
             lost < 1 << 30,
             "a {worst_gap_ms} ms blind window may cost at most ~1 GB, got {lost}"
+        );
+    }
+
+    /// The per-tick ceiling must bind exactly when free memory is about to run out, and be
+    /// inert while there is real room. Numbers are the two measured K3 states.
+    #[test]
+    fn supported_cap_binds_on_approach_and_not_in_steady_state() {
+        let danger = 4u64 << 30;
+        // Converged steady state: cache 33.32 GB with 29.12 GB free. Nothing to clamp —
+        // the cap it earned (33.33) is comfortably under what memory supports.
+        let steady = supported_cap(33_320_000_000, 29_120_000_000, danger);
+        assert!(
+            steady > 33_330_000_000,
+            "must not claw back a converged cache: {steady}"
+        );
+        // The approach, at the moment the guard first fired: cache 53.62 GB, 6.59 GB free.
+        // Here the ceiling has to bite, because the next second took it to 2.45 GB — under
+        // earlyoom's 2.61 GB line.
+        let approach = supported_cap(53_620_000_000, 6_590_000_000, danger);
+        assert!(
+            approach < 53_620_000_000,
+            "must cut the cap below the cache during the approach: {approach}"
         );
     }
 

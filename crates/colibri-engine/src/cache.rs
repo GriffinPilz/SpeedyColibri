@@ -789,12 +789,17 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 if trace {
                     eprintln!(
                         "[guard] gap={gap_ms}ms avail={:.2} GB drop={:.2} GB cache={:.2} GB \
-                         budget={:.2} GB cap={:.2} GB",
+                         budget={:.2} GB cap={:.2} GB reserved={:.2} GB supported={:.2} GB",
                         avail as f64 / 1e9,
                         prev_avail.saturating_sub(avail) as f64 / 1e9,
                         resident as f64 / 1e9,
                         cache.budget.load(Ordering::Relaxed) as f64 / 1e9,
                         learned_cap as f64 / 1e9,
+                        // `reserved` and `supported` are the two terms the serve regression
+                        // hypothesis is about: if the same KV is subtracted twice, `cap`
+                        // sits ~`reserved` below `supported` while memory is not tight.
+                        cache.reserved.load(Ordering::Relaxed) as f64 / 1e9,
+                        supported_cap(resident, avail, danger_floor) as f64 / 1e9,
                     );
                 }
 

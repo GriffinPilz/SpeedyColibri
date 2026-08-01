@@ -347,7 +347,12 @@ pub fn arena_cfg() -> Option<(usize, usize)> {
 
 /// Max **bytes** retained (`COLI_BUF_POOL_MB`, default 2048).
 ///
-/// **REVERTED from 16384: it put Kimi-K3 over the memory ceiling and the process was killed.**
+/// **REVERTED from 16384 — but NOT because it killed Kimi-K3.** That attribution was wrong:
+/// K3 is still SIGTERMed at 512-token prefill with this back at 2048, so its ceiling
+/// violation is PRE-EXISTING (54 GB dense + 52 GB fill = 106 GB before activations and KV).
+/// The raise added 14 GB on top of an already-failing configuration, which made it look
+/// causal. The revert stands on its own terms: 16 GB of retention the RAM ledger does not
+/// govern is unsafe on a 106 GB plan regardless of what else is wrong.
 /// K3 plans 54 GB dense + 52 GB fill = 106 GB, and this cap is retention the RAM ledger does
 /// NOT govern, so 16 GB on top took peak RSS to 114.6 GiB against a 108.0 GiB ceiling —
 /// earlyoom SIGTERM (rc=143), zero tokens. The 4-6% below is real but it is not worth a

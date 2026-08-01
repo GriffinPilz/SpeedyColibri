@@ -881,7 +881,7 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 // again approach the floor faster than `CAP_RECOVER_PER_TICK`, which is
                 // ~0.64 GB/s against the 8.24 GB/s an unbounded refill managed. A 461 ms
                 // scheduling gap then costs ~0.3 GB instead of 3.12 GB.
-                if avail > danger_floor {
+                if avail > danger_floor && resident >= learned_cap {
                     learned_cap = recover_cap(learned_cap, fill_target);
                 }
                 // Hold the learned cap minus whatever callers have reserved (e.g. live KV
@@ -1086,6 +1086,14 @@ const CAP_RECOVER_PER_TICK: u64 = 64 << 20;
 ///
 /// The cap never exceeds the load-time plan, so a model that never trips the guard — every
 /// model that already passed the ceiling check — behaves exactly as before.
+///
+/// **Only called while the cap is actually binding** (`resident >= learned_cap`). Raising a
+/// cap the cache has not yet reached buys nothing and actively destroys information: the
+/// first version recovered on every comfortable tick, so on K3 the seeded 53.66 GB cap
+/// climbed back to the planned 56.10 GB in 38 ticks (3.8 s) while the initial fill was still
+/// in progress (~7 s). The measurement was erased before it could take effect and the run
+/// died at the same 122 GB as with no seed at all. Additive increase has to be conditioned
+/// on the constraint being active, or it is just a slow way back to the number that failed.
 fn recover_cap(learned_cap: u64, fill_target: u64) -> u64 {
     learned_cap
         .saturating_add(CAP_RECOVER_PER_TICK)

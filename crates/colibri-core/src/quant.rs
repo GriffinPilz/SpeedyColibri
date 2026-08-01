@@ -345,7 +345,19 @@ pub fn arena_cfg() -> Option<(usize, usize)> {
     ARENA.lock().unwrap().map(|a| (a.slot_bytes, a.slots))
 }
 
-/// Max **bytes** retained (`COLI_BUF_POOL_MB`, default 16384).
+/// Max **bytes** retained (`COLI_BUF_POOL_MB`, default 2048).
+///
+/// **REVERTED from 16384: it put Kimi-K3 over the memory ceiling and the process was killed.**
+/// K3 plans 54 GB dense + 52 GB fill = 106 GB, and this cap is retention the RAM ledger does
+/// NOT govern, so 16 GB on top took peak RSS to 114.6 GiB against a 108.0 GiB ceiling —
+/// earlyoom SIGTERM (rc=143), zero tokens. The 4-6% below is real but it is not worth a
+/// killed process, and it was measured on K3 alone without a ceiling check because
+/// `ceiling_verify.sh` covers four models and K3 is not one of them.
+///
+/// The right fix is not a bigger constant, it is to bound retention by the ledger: the pool
+/// is now charged to `Class::ReadBuf`, so `pool_max_bytes` can be headroom-derived instead of
+/// flat, and K3 would then get what is actually free rather than a fixed 16 GB. Until that
+/// lands, 2048 is the value the fleet is verified at.
 ///
 /// This is the LIVE bound — the count cap above is off by default — so it is the one that
 /// has to fit every model, and at 2048 it did not.
@@ -375,7 +387,7 @@ fn pool_max_bytes() -> u64 {
         std::env::var("COLI_BUF_POOL_MB")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(16384u64)
+            .unwrap_or(2048u64)
             << 20
     })
 }

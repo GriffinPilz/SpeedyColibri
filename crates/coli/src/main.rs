@@ -2420,12 +2420,26 @@ const TARGET_RAM_PCT: u64 = 96;
 /// activations, GPU host staging, expert read buffers, the CUDA context and allocator
 /// slack.
 ///
-/// This was 20 GB and conflated two different things. KV is *not* a constant — it scales
-/// with context and with live request count, and it is already handled dynamically:
-/// `ExpertCache::reserve_ram` has callers subtract a request's KV from the standing budget
-/// for its duration, so the monitor holds `fill_target − reserved` and never refills into
-/// space a live request needs. Reserving a flat 20 GB *on top* of that charged for KV
-/// twice and cost ~15 GB of expert residency on every model.
+/// This was 20 GB and conflated two different things: KV is not a constant — it scales
+/// with context and with live request count — so a flat allowance for it double-charged
+/// against the dynamic handling and cost ~15 GB of expert residency on every model.
+///
+/// **The original justification named the wrong mechanism, and that matters if you are
+/// thinking of shrinking this further.** It cited `ExpertCache::reserve_ram` "having
+/// callers subtract a request's KV from the standing budget". `reserve_ram` has **no
+/// callers** — every reference to it in the tree is a doc comment or its own rollback
+/// path, and `COLI_GUARD_TRACE=1` on a serve run shows `reserved=0.00 GB` on every tick.
+///
+/// What actually admits KV is the ledger, in `serve::handle_completion`:
+/// `commit_or_wait(Class::Kv, kv_bytes, rigid, …)` against
+/// `rigid = ceiling − Dense − Experts`, with a real 507 and a queue path. So KV *is*
+/// bounded and cannot OOM the box — but it is bounded *after* experts rather than by
+/// evicting them, which is a separate gap (experts win over KV at long context).
+///
+/// The 20 → 10 GB cut may still be right; it is the *reasoning* that was unfounded. Since
+/// the per-tick `supported_cap` ceiling landed, the monitor also corrects a too-small
+/// reserve dynamically by capping the cache against real free memory — which is arguably
+/// the better mechanism and an argument for this constant mattering less, not more.
 const RUNTIME_RESERVE: u64 = 10 << 30;
 
 /// Ceiling on total process footprint: [`TARGET_RAM_PCT`] of RAM.

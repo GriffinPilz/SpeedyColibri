@@ -2970,14 +2970,18 @@ where
     // committed budget below is the honest one: the ledger tracks the dense tier and
     // admits requests against it, without claiming an arena that does not exist.
     eprintln!(
-        "[ram] ceiling {} GB = {}% of {} GB | dense {} GB{} | {} GB for experts + KV + \
+        // GiB, not GB. These are `>> 30` and were labelled "GB", which reads as a
+        // disagreement with the ledger's `[profile] ram peak` line (that one divides by
+        // 1e9 and is genuinely GB). Same bytes, two units, one label — it cost an hour of
+        // chasing a planner-vs-ledger accounting bug that did not exist.
+        "[ram] ceiling {} GiB = {}% of {} GiB | dense {} GiB{} | {} GiB for experts + KV + \
          activations (arena not yet wired: expert memory is still pooled, not pre-granted)",
         mgr.ceiling() >> 30,
         TARGET_RAM_PCT,
         total >> 30,
         dense_ram >> 30,
         if colibri_engine::ram::device_duplicate_bytes() > 0 {
-            format!(" (incl. {} GB device duplicate)", resident >> 30)
+            format!(" (incl. {} GiB device duplicate)", resident >> 30)
         } else {
             String::new()
         },
@@ -3028,8 +3032,9 @@ where
         String::new()
     };
     eprintln!(
-        "[cache] {regime}: ~{} GB experts{scope} / {} GB RAM ({covers_pct}% coverage), {} GB \
-         resident weights → fill to ~{} GB, LRU-evict under pressure (hard floor {} GB) — never OOM",
+        // GiB throughout — see the `[ram]` line above for why the label matters.
+        "[cache] {regime}: ~{} GiB experts{scope} / {} GiB RAM ({covers_pct}% coverage), {} GiB \
+         resident weights → fill to ~{} GiB, LRU-evict under pressure (hard floor {} GiB) — never OOM",
         total_expert_bytes >> 30,
         total >> 30,
         resident >> 30,

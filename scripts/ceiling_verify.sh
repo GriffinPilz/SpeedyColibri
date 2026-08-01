@@ -67,16 +67,19 @@ for m in "${MODELS[@]}"; do
   rc=$?; t1=$(date +%s); s1=$(sw)
   R=$(grep -oE 'MAXRSS_KB=[0-9]+' "/tmp/ceil_$m.log" | grep -oE '[0-9]+' | tail -1)
   rss=$(awk -v k="${R:-0}" 'BEGIN{printf "%.1f", k/1048576}')
-  dense=$(grep -oE 'dense [0-9]+ GB' "/tmp/ceil_$m.log" | grep -oE '[0-9]+' | head -1)
-  fill=$(grep -oE 'fill to ~[0-9]+ GB' "/tmp/ceil_$m.log" | grep -oE '[0-9]+' | head -1)
+  # Accept GiB or GB: these were labelled "GB" while carrying `>> 30` values, and the
+  # label was corrected to GiB. Matching both means this script keeps working against an
+  # older binary — which matters, since A/B sweeps deliberately run pre-change builds.
+  dense=$(grep -oE 'dense [0-9]+ Gi?B' "/tmp/ceil_$m.log" | grep -oE '[0-9]+' | head -1)
+  fill=$(grep -oE 'fill to ~[0-9]+ Gi?B' "/tmp/ceil_$m.log" | grep -oE '[0-9]+' | head -1)
   tok=$(grep -oE 'generated \([0-9]+ tok\): \[[^]]*\]' "/tmp/ceil_$m.log" | head -1)
   st="PASS"
   [[ "$rc" == 0 ]] || { st="FAIL-rc$rc"; fail=1; }
   [[ -n "$tok" ]]  || { st="FAIL-NO-TOKENS"; fail=1; }
   [[ "$s1" -le "$((s0+64))" ]] || { st="FAIL-SWAP"; fail=1; }
   awk -v r="$rss" -v c="$CEIL_GIB" 'BEGIN{exit !(r < c)}' || { st="FAIL-RSS"; fail=1; }
-  # The plan itself must fit, not just this run's peak. These are printed with `>> 30`,
-  # i.e. GiB despite the "GB" label, so compare them against the GiB ceiling.
+  # The plan itself must fit, not just this run's peak. Both values are GiB, matching
+  # CEIL_GIB.
   if [[ -n "$dense" && -n "$fill" ]]; then
     awk -v d="$dense" -v f="$fill" -v c="$CEIL_GIB" 'BEGIN{exit !(d+f <= c)}' \
       || { st="FAIL-PLAN"; fail=1; }

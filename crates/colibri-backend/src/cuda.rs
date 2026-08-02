@@ -312,6 +312,7 @@ extern "C" {
     fn coli_cuda_pipe_upload(device: c_int, dst: *mut c_void, src: *const c_void, bytes: usize) -> c_int;
     fn coli_cuda_tensor_free(tensor: *mut ColiCudaTensor);
     fn coli_cuda_tensor_bytes(tensor: *const ColiCudaTensor) -> usize;
+    fn coli_cuda_scratch_bytes(device: c_int) -> usize;
     fn coli_cuda_tensor_device(tensor: *const ColiCudaTensor) -> c_int;
 }
 
@@ -320,6 +321,21 @@ extern "C" {
 /// Number of usable CUDA devices (0 if none / driver missing).
 pub fn device_count() -> i32 {
     unsafe { coli_cuda_device_count() }
+}
+
+/// Live CUDA scratch across every device: activation/GEMM buffers, expert staging, the
+/// Mamba2 scan arenas, attention scratch, and the pinned host staging — but NOT the device
+/// weight cache.
+///
+/// This exists because on GB10 that memory is invisible to the RAM ledger and yet entirely
+/// real: "VRAM" is the same LPDDR5X the ledger is trying to budget. `Class::Scratch` is
+/// charged in one place, as a prediction, on the grouped NVFP4 path only — so an MXFP4
+/// model charges ~nothing while allocating all of it.
+///
+/// Reports capacities, which is what is actually held: the C `reserve` helper keeps a
+/// buffer whenever its capacity already covers the request.
+pub fn scratch_bytes() -> u64 {
+    unsafe { coli_cuda_scratch_bytes(-1) as u64 }
 }
 
 /// Initialize the given CUDA device ordinals. Returns whether init succeeded.

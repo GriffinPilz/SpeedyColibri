@@ -1546,6 +1546,18 @@ where
                     m.ceiling() as f64 / 1e9,
                 );
             }
+            // The CUDA context is the third term in that reserve and the only one still
+            // invisible to the ledger. On GB10 "VRAM" is the same LPDDR5X pool as the heap,
+            // so every byte here is real RAM the budget never counted — and `scratch` above
+            // does not cover it: Class::Scratch is charged in one place, as a prediction,
+            // on the grouped NVFP4 path only, so an MXFP4 model reports ~0 while allocating
+            // all of this. OBSERVATION ONLY — do not let it move a budget until the number
+            // has been read on all five models (see task #48).
+            #[cfg(feature = "cuda")]
+            eprintln!(
+                "[profile] cuda scratch: {:.2} GB — real LPDDR5X, NOT in the ram ledger",
+                colibri_backend::cuda::scratch_bytes() as f64 / 1e9,
+            );
             let (pok, pfail, pbytes, pcap) = colibri_core::quant::pin_profile();
             eprintln!(
                 "[profile] page-lock: {pok} ok / {pfail} failed / {pcap} capped | {:.1} GB locked",

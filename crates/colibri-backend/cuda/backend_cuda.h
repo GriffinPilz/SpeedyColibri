@@ -34,6 +34,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
 /* device < 0 returns aggregate statistics for all configured devices. */
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
+/* Live DeviceContext scratch (device + pinned host), EXCLUDING the weight cache that
+ * coli_cuda_stats reports. On GB10 both draw on the same LPDDR5X pool, and none of it is
+ * visible to the Rust RAM ledger today. */
+COLI_CUDA_DLLEXPORT size_t coli_cuda_scratch_bytes(int device);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
 

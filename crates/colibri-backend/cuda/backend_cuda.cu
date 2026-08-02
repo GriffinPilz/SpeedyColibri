@@ -1811,6 +1811,44 @@ extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor
     if (tensor_bytes) *tensor_bytes = bytes;
 }
 
+/* Every live DeviceContext scratch allocation, device and pinned-host alike.
+ *
+ * On GB10 that distinction does not matter for the RAM ledger: "VRAM" and host memory are
+ * the SAME 121 GiB LPDDR5X pool, so a cudaMalloc here is exactly as real as a heap
+ * allocation in Rust. None of it was visible to the ledger — `Class::Scratch` is charged
+ * in exactly one place (gpu.rs), as a PREDICTION, and only on the grouped NVFP4 path, so
+ * an MXFP4 model like Kimi-K3 charges ~nothing while allocating all of the below.
+ *
+ * `tensor_bytes` is deliberately EXCLUDED: that is the device weight cache, a different
+ * class, already exposed by coli_cuda_stats.
+ *
+ * Sums capacities, not requested sizes. `reserve` keeps a buffer when cap >= bytes, so the
+ * capacity is what is actually held. */
+extern "C" size_t coli_cuda_scratch_bytes(int device) {
+    size_t t = 0;
+    for (int i = 0; i < g_nctx; i++) if (device < 0 || g_ctx[i].device == device) {
+        const DeviceContext *c = &g_ctx[i];
+        t += c->x_cap + c->y_cap + c->gate_cap + c->up_cap;
+        t += c->qx_cap + c->qscale_cap;
+        t += c->host_x_cap + c->host_y_cap;                       /* pinned */
+        t += c->sg_tile_e_cap + c->sg_tile_r0_cap + c->sg_off_cap + c->sg_rows_cap;
+        t += c->sg_ug_cap + c->sg_dg_cap + c->sg_uw_cap + c->sg_ubs_cap + c->sg_dw_cap + c->sg_dbs_cap;
+        t += c->ewg_cap + c->ewu_cap + c->ewd_cap;
+        t += c->esg_cap + c->esu_cap + c->esd_cap;
+        t += c->ebsg_cap + c->ebsu_cap + c->ebsd_cap;
+        t += c->lres_cap + c->host_lres_cap;                      /* host_lres is pinned */
+        t += c->aq_cap + c->al_cap + c->ar_cap + c->ac_cap;
+        t += c->ms_state_cap + c->ms_x_cap + c->ms_y_cap + c->ms_b_cap + c->ms_c_cap;
+        t += c->ms_dth_cap + c->ms_dah_cap + c->ms_d_cap;
+        t += c->ms_pin_x_cap + c->ms_pin_y_cap + c->ms_pin_state_cap;   /* pinned */
+        t += c->asel_cap + c->acnt_cap;
+        t += c->aqa_cap + c->akb_cap + c->amsk_cap;
+        t += c->group_desc_cap;
+        for (int b = 0; b < 24; b++) t += c->pipe_cap[b];
+    }
+    return t;
+}
+
 extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                         double *h2d_ms, double *kernel_ms, double *d2h_ms) {
     if(calls) *calls=g_group_calls; if(experts) *experts=g_group_experts; if(rows) *rows=g_group_rows;

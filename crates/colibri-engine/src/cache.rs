@@ -785,6 +785,16 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 };
                 let gap_ms = prev_tick.elapsed().as_millis() as u64;
                 prev_tick = std::time::Instant::now();
+                // Sample the consumption rate HERE, before any early `continue`. The swap
+                // guard below returns to the top of the loop without reaching the bottom,
+                // so updating `prev_avail` down there left it stale across every
+                // swap-guard tick: the next `drop_per_tick` then spanned two or more ticks
+                // and overstated the rate, inflating `braking_floor` — and with the swap
+                // guard firing repeatedly it would pin the brake at MAX_BRAKE and evict far
+                // more than needed. Conservative direction, so it could never have caused
+                // an OOM, which is exactly why it would have gone unnoticed.
+                let drop_per_tick = prev_avail.saturating_sub(avail);
+                prev_avail = avail;
                 // Keep the ledger's read-buffer figure current. It was charged in exactly
                 // one place — inside forward.rs's `[profile]` print — i.e. once, at the end
                 // of a run, so for the whole run the ledger believed ReadBuf was 0 while it
@@ -799,7 +809,11 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                         "[guard] gap={gap_ms}ms avail={:.2} GB drop={:.2} GB cache={:.2} GB \
                          budget={:.2} GB cap={:.2} GB reserved={:.2} GB supported={:.2} GB",
                         avail as f64 / 1e9,
-                        prev_avail.saturating_sub(avail) as f64 / 1e9,
+                        // `drop_per_tick`, not `prev_avail - avail` — `prev_avail` is
+                        // updated above this point now, so recomputing it here would print
+                        // 0.00 every tick and quietly blind the one instrument that showed
+                        // the fill rate in the first place.
+                        drop_per_tick as f64 / 1e9,
                         resident as f64 / 1e9,
                         cache.budget.load(Ordering::Relaxed) as f64 / 1e9,
                         learned_cap as f64 / 1e9,
@@ -839,8 +853,6 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 // is only safe if the guard can stop within the margin between it and
                 // whatever kills us; on Kimi-K3 one tick of fill was larger than that
                 // entire margin, so the guard lost every time.
-                let drop_per_tick = prev_avail.saturating_sub(avail);
-                prev_avail = avail;
                 let floor_now = braking_floor(hard_floor, drop_per_tick);
                 if avail < floor_now {
                     let reclaim = (floor_now - avail).saturating_add(HARD_SLACK);

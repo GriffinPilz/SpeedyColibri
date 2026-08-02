@@ -803,6 +803,26 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 // `headroom() / 4`. This tick already runs every 100 ms and already has the
                 // dependency, so currency costs one atomic swap.
                 crate::ram::set_usage(crate::ram::Class::ReadBuf, colibri_core::pool_live_bytes());
+                // Same treatment for `Class::Scratch`, which was worse off: measured 0.0 GB
+                // on ALL FIVE models. Its only charge site (gpu.rs) is a *prediction* made
+                // on the grouped NVFP4 path, and that path does not fire on a plain `gen`,
+                // so the class was pure dead accounting while the CUDA context held
+                // 0.17-2.30 GB of real LPDDR5X (M3 largest). On GB10 "VRAM" is the same
+                // pool the ledger is budgeting, so this is not a bookkeeping nicety.
+                //
+                // NOTE this does NOT change the cache ceiling: `supported_cap` works off
+                // MemAvailable, which already reflects every cudaMalloc. What it fixes is
+                // `headroom()`, whose real consumer is gpu.rs sizing its staging chunk as
+                // `headroom() / 4` — that was optimistic by up to 2.30 GB.
+                //
+                // The gpu.rs prediction is left in place: `set_usage` is absolute, so this
+                // supersedes it within one tick, which is strictly better than a prediction
+                // that is never cleared.
+                #[cfg(feature = "cuda")]
+                crate::ram::set_usage(
+                    crate::ram::Class::Scratch,
+                    colibri_backend::cuda::scratch_bytes(),
+                );
                 let resident = cache.state.lock().unwrap().bytes;
                 if trace {
                     eprintln!(

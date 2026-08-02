@@ -1475,16 +1475,42 @@ where
         {
             let (setup, drain, post, bytes, njobs) = colibri_safetensors::batch_profile();
             let cache = ms(&LOAD_US) - (setup + drain + post) as f64 / 1e3;
-            eprintln!(
-                "[profile] expert-load breakdown: span-setup {:.0} ms | drain {:.0} ms ({:.2} GB in {} jobs, {:.2} GB/s) | post {:.0} ms | cache+other {:.0} ms",
-                setup as f64 / 1e3,
-                drain as f64 / 1e3,
-                bytes as f64 / 1e9,
-                njobs,
-                if drain > 0 { bytes as f64 / 1e3 / drain as f64 } else { 0.0 },
-                post as f64 / 1e3,
-                cache,
-            );
+            // `drain` accumulates from EVERY loader thread, and prefill runs a background
+            // prefetch-ahead loader concurrently with the foreground while `LOAD_US`
+            // brackets only the foreground call. So in prefill `drain` is summed THREAD
+            // time and routinely exceeds the phase that contains it — GLM has printed
+            // `drain 95754 ms` against `expert-load 41450 ms`, K3 `drain 171216 ms`
+            // against a 456 s whole run. When that happens these are not a partition and
+            // the derived GB/s is meaningless: K3 reported "7.57 GB/s" on a run the device
+            // counters put an order of magnitude lower. Printing a negative remainder and a
+            // fabricated rate has produced wrong conclusions more than once, so say which
+            // case this is instead. `bytes` and `njobs` stay valid either way — threads
+            // read disjoint bytes, and a count is a count.
+            if cache < 0.0 {
+                eprintln!(
+                    "[profile] expert-load breakdown: span-setup {:.0} ms | drain {:.0} ms SUMMED \
+                     ACROSS LOADER THREADS (exceeds expert-load {:.0} ms — not a partition, and no \
+                     wall-clock rate is derivable from it; use /proc/diskstats) | {:.2} GB in {} jobs \
+                     | post {:.0} ms",
+                    setup as f64 / 1e3,
+                    drain as f64 / 1e3,
+                    ms(&LOAD_US),
+                    bytes as f64 / 1e9,
+                    njobs,
+                    post as f64 / 1e3,
+                );
+            } else {
+                eprintln!(
+                    "[profile] expert-load breakdown: span-setup {:.0} ms | drain {:.0} ms ({:.2} GB in {} jobs, {:.2} GB/s) | post {:.0} ms | cache+other {:.0} ms",
+                    setup as f64 / 1e3,
+                    drain as f64 / 1e3,
+                    bytes as f64 / 1e9,
+                    njobs,
+                    if drain > 0 { bytes as f64 / 1e3 / drain as f64 } else { 0.0 },
+                    post as f64 / 1e3,
+                    cache,
+                );
+            }
             // Decompose the `cache+other` residual. `build` is what `experts_batch`
             // costs on top of the reader — per-expert construction from the bytes.
             eprintln!(

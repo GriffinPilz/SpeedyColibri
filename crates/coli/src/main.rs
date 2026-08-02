@@ -146,19 +146,30 @@ See PORTING.md for the C->Rust port status."#
 ///
 /// `M_TRIM_THRESHOLD` is set for the same reason in the other direction: it governs how
 /// much free top-of-heap is retained before `sbrk` gives it back.
+/// 2 MiB: above ordinary sub-huge-page allocations, below every expert span on the fleet
+/// (K3's MXFP4 spans are ~17.5 MB, the NVFP4 models' larger still).
+const MMAP_THRESHOLD: i32 = 2 * 1024 * 1024;
+
 #[cfg(target_os = "linux")]
 fn return_freed_memory_to_the_os() {
-    // Overridable because the right value is span-size dependent and a future model may
-    // want a different one — but it defaults ON, because the failure it prevents is a
-    // silent OOM kill rather than a slowdown.
-    let thr = std::env::var("COLI_MMAP_THRESHOLD_MB")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(2);
+    // NOT configurable, deliberately. This shipped with a `COLI_MMAP_THRESHOLD_MB` override
+    // on the theory that the right value is span-size dependent. Measured, raising it far
+    // enough to stop mmap-forcing costs **nemotron serve 8.40 -> 3.50 tok/s (2.4x)** and
+    // **m2.7 decode 3.50 -> 1.89 (1.85x)** — it is not a tuning knob, it is a way to break
+    // the engine quietly.
+    //
+    // Worse, it breaks a second thing implicitly: the per-tick `supported_cap` ceiling
+    // evicts *expecting* freed expert buffers to return to the OS. Without mmap-forcing
+    // they do not, so eviction becomes pure cost — which is why mallopt-off on the current
+    // binary (3.50) measured far worse than the pre-rework binary (8.60) even though
+    // neither has mallopt. The allocator setting and the cache ceiling are COUPLED and have
+    // to ship together.
+    //
+    // A future model wanting a different threshold should change this constant and A/B it,
+    // the same way the value was arrived at — not flip an env var in production.
     unsafe {
-        libc::mallopt(libc::M_MMAP_THRESHOLD, thr * 1024 * 1024);
-        libc::mallopt(libc::M_TRIM_THRESHOLD, thr * 1024 * 1024);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, MMAP_THRESHOLD);
     }
 }
 

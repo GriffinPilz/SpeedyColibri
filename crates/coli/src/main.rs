@@ -146,6 +146,29 @@ See PORTING.md for the C->Rust port status."#
 ///
 /// `M_TRIM_THRESHOLD` is set for the same reason in the other direction: it governs how
 /// much free top-of-heap is retained before `sbrk` gives it back.
+/// Tell the ledger about a `gen`-path KV cache.
+///
+/// `Class::Kv` was charged in exactly ONE place — `serve`'s admission check — so every
+/// `coli gen` ran with the ledger believing KV was zero. Small at benchmark sizes (~55 MB
+/// for K3's 108 KiB/token over 512 tokens) but it scales with context, and both
+/// `RUNTIME_RESERVE` and the cap margin are meant to be derived from what the ledger knows.
+/// A ledger that is silently wrong for a whole command is worse than one that is
+/// approximate.
+///
+/// `set_usage`, not `commit`: gen holds exactly one KV cache for the life of the process,
+/// so an absolute figure is right and needs no RAII to release.
+///
+/// **Serve deliberately does not use this.** It charges at admission via
+/// `commit_or_wait(Class::Kv, ..)`, which must *hold* the bytes between the fit check and
+/// the allocation — otherwise a second request slips into the space between them. Charging
+/// again at allocation would double-count. Unifying the two (admission converting its
+/// reservation instead of adding a second charge) is a real refactor of serve's admission
+/// path and is not attempted here.
+fn charge_gen_kv(model: &colibri_engine::Model, max_t: usize) {
+    let bytes = colibri_engine::KvCache::bytes_for(&model.cfg, max_t) as u64;
+    colibri_engine::ram::set_usage(colibri_engine::ram::Class::Kv, bytes);
+}
+
 /// 2 MiB: above ordinary sub-huge-page allocations, below every expert span on the fleet
 /// (K3's MXFP4 spans are ~17.5 MB, the NVFP4 models' larger still).
 const MMAP_THRESHOLD: i32 = 2 * 1024 * 1024;
@@ -744,6 +767,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     // 1 on GLM/M3, 2 on Nemotron-H's `"*E"` head); hand-rolling
     // `KvCache::new(n_layers, ..)` would under-allocate on an MTP model.
     let mut kv = colibri_engine::KvCache::for_model(model, prompt.len() + n_new);
+    charge_gen_kv(model, prompt.len() + n_new);
     match colibri_engine::generate_greedy(model, &mut kv, &*provider, &prompt, n_new) {
         Ok(seq) => {
             let cont: Vec<i32> = seq[prompt.len()..].to_vec();
@@ -1300,6 +1324,7 @@ fn finish_gen(
     n_new: usize,
 ) -> ExitCode {
     let mut kv = colibri_engine::KvCache::for_model(&model, prompt.len() + n_new);
+    charge_gen_kv(&model, prompt.len() + n_new);
     match colibri_engine::generate_greedy(model, &mut kv, provider, prompt, n_new) {
         Ok(seq) => {
             println!("prompt: {prompt:?}");

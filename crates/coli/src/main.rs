@@ -2413,7 +2413,16 @@ fn cmd_loadbench(args: &[String]) -> ExitCode {
 /// "don't take so much that the kernel pages you out", because `MemAvailable` counts
 /// the page cache as free: on a 121 GiB Spark it reads ~99 GiB once dense weights are
 /// resident, so any small constant still yields a budget far past the cliff.
-const WORKING_RESERVE: u64 = 10 << 30;
+///
+/// **This is [`RUNTIME_RESERVE`], not a second quantity.** They were declared separately,
+/// both at 10 GiB, with near-identical doc comments — "CUDA context, expert read buffers,
+/// activations, allocator slack" versus "prefill activations, GPU host staging, expert
+/// read buffers, the CUDA context and allocator slack" — and sat on two different live
+/// paths: this one under `ram_budget` → [`budget_from`], the other under
+/// [`clamp_fill_to_headroom`]. Anyone tuning "the reserve" would fix one and silently miss
+/// the other. Aliased rather than deleted so both names keep their (different, both
+/// accurate) explanations of what the reserve is for.
+const WORKING_RESERVE: u64 = RUNTIME_RESERVE;
 
 /// Share of `MemTotal` the process aims to occupy in total — experts, dense weights and
 /// its own runtime combined. Experts take whatever is left after the other two.

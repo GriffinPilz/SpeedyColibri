@@ -785,6 +785,14 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 };
                 let gap_ms = prev_tick.elapsed().as_millis() as u64;
                 prev_tick = std::time::Instant::now();
+                // Keep the ledger's read-buffer figure current. It was charged in exactly
+                // one place — inside forward.rs's `[profile]` print — i.e. once, at the end
+                // of a run, so for the whole run the ledger believed ReadBuf was 0 while it
+                // was really GBs (GLM 5.9, M2.7 1.7). Every consumer of `headroom()` was
+                // that much optimistic, notably gpu.rs sizing its staging chunk as
+                // `headroom() / 4`. This tick already runs every 100 ms and already has the
+                // dependency, so currency costs one atomic swap.
+                crate::ram::set_usage(crate::ram::Class::ReadBuf, colibri_core::pool_live_bytes());
                 let resident = cache.state.lock().unwrap().bytes;
                 if trace {
                     eprintln!(

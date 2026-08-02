@@ -774,7 +774,7 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
             // genuinely free right now, less room to brake in, is the honest ceiling; the
             // plan remains the upper bound, so a model with real headroom is unaffected.
             let mut learned_cap = match available_ram_bytes() {
-                Some(a) => fill_target.min(supported_cap(0, a, danger_floor).max(FLOOR_MIN)),
+                Some(a) => fill_target.min(supported_cap(0, a, hard_floor).max(FLOOR_MIN)),
                 None => fill_target,
             };
             loop {
@@ -807,7 +807,7 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                         // hypothesis is about: if the same KV is subtracted twice, `cap`
                         // sits ~`reserved` below `supported` while memory is not tight.
                         cache.reserved.load(Ordering::Relaxed) as f64 / 1e9,
-                        supported_cap(resident, avail, danger_floor) as f64 / 1e9,
+                        supported_cap(resident, avail, hard_floor) as f64 / 1e9,
                     );
                 }
 
@@ -894,7 +894,7 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 // every tick, so the approach is bounded by observation rather than by a
                 // one-shot estimate made before the runtime revealed its own footprint.
                 learned_cap = learned_cap
-                    .min(supported_cap(resident, avail, danger_floor))
+                    .min(supported_cap(resident, avail, hard_floor))
                     .max(FLOOR_MIN);
                 // "Binding" needs a tolerance. The insert path stops *just under* the
                 // budget, so the cache is never exactly at the cap and a `>=` test is
@@ -1116,10 +1116,30 @@ const CAP_RECOVER_PER_TICK: u64 = 64 << 20;
 /// in progress (~7 s). The measurement was erased before it could take effect and the run
 /// died at the same 122 GB as with no seed at all. Additive increase has to be conditioned
 /// on the constraint being active, or it is just a slow way back to the number that failed.
-/// Free bytes the cap must always leave unspoken-for: the soft danger line plus a full
-/// brake's worth of stopping distance.
-fn cap_margin(danger_floor: u64) -> u64 {
-    danger_floor.saturating_add(MAX_BRAKE)
+/// Free bytes the cap must leave unspoken-for once the cache is full.
+///
+/// Because `supported_cap` is a fixed point (the cache growing by D raises `resident` and
+/// lowers `avail` by the same D), **this margin IS the free memory at steady state** — not
+/// a transient allowance. It has to cover the line we must never cross, plus room for
+/// non-cache memory to grow after the cache has settled.
+///
+/// It was `danger_floor + MAX_BRAKE` = 12.88 GB, and neither term was chosen for this job.
+/// `danger_floor` is the *soft* line for a sustained external tenant, deliberately above
+/// the real one; `MAX_BRAKE` is a CAP on the *anticipatory* brake term in
+/// [`braking_floor`], which already scales with the observed consumption rate — reserving
+/// its maximum permanently pays for a worst case that the rate-aware floor handles when it
+/// actually happens. I reused both because they were to hand.
+///
+/// So: the real floor (now earlyoom-derived, see `oom_guard_floor`) plus half a brake for
+/// non-cache growth. On gx10-42b2 that is 3.69 + 4.29 = 7.98 GB rather than 12.88 GB,
+/// returning ~4.9 GB to the expert cache.
+///
+/// This matters more than its size suggests: the #41 sweep measured the margin moving
+/// prefill by up to 17% in EITHER direction, per model — M2.7 (near-fit, ~86% coverage)
+/// gained 17.1% on prefill from more free memory while losing 11.9% on decode from less
+/// cache, and M3/GLM went the other way. It is the largest single lever measured.
+fn cap_margin(hard_floor: u64) -> u64 {
+    hard_floor.saturating_add(MAX_BRAKE / 2)
 }
 
 /// The largest cap the memory that exists *right now* can support.
@@ -1138,10 +1158,10 @@ fn cap_margin(danger_floor: u64) -> u64 {
 ///
 /// This only ever *lowers* the cap. Earning it back stays the job of the deliberately slow
 /// [`recover_cap`], so a transient dip cannot be converted into an instant refill.
-fn supported_cap(resident: u64, avail: u64, danger_floor: u64) -> u64 {
+fn supported_cap(resident: u64, avail: u64, hard_floor: u64) -> u64 {
     resident
         .saturating_add(avail)
-        .saturating_sub(cap_margin(danger_floor))
+        .saturating_sub(cap_margin(hard_floor))
 }
 
 fn recover_cap(learned_cap: u64, fill_target: u64) -> u64 {
@@ -1271,10 +1291,10 @@ mod tests {
     /// inert while there is real room. Numbers are the two measured K3 states.
     #[test]
     fn supported_cap_binds_on_approach_and_not_in_steady_state() {
-        let danger = 4u64 << 30;
+        let hard = 3u64 << 30; // the real floor, not the soft danger line
         // Converged steady state: cache 33.32 GB with 29.12 GB free. Nothing to clamp —
         // the cap it earned (33.33) is comfortably under what memory supports.
-        let steady = supported_cap(33_320_000_000, 29_120_000_000, danger);
+        let steady = supported_cap(33_320_000_000, 29_120_000_000, hard);
         assert!(
             steady > 33_330_000_000,
             "must not claw back a converged cache: {steady}"
@@ -1282,7 +1302,7 @@ mod tests {
         // The approach, at the moment the guard first fired: cache 53.62 GB, 6.59 GB free.
         // Here the ceiling has to bite, because the next second took it to 2.45 GB — under
         // earlyoom's 2.61 GB line.
-        let approach = supported_cap(53_620_000_000, 6_590_000_000, danger);
+        let approach = supported_cap(53_620_000_000, 6_590_000_000, hard);
         assert!(
             approach < 53_620_000_000,
             "must cut the cap below the cache during the approach: {approach}"

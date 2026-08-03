@@ -1547,6 +1547,139 @@ mod tests {
         );
     }
 
+    /// #54 regression: the flash GQA kernel must ACCEPT a context past 8192.
+    ///
+    /// `coli_cuda_gqa_attn` had a single `T > 8192` guard covering both of its kernels. That
+    /// is a real hardware bound for the scalar one, whose shared memory is
+    /// `(D + T + ATTN_TPB)*4` and passes the 48 KB limit at T=16384 — but the flash kernel's
+    /// shared memory is `GQA_QT*8*D`, INDEPENDENT of T, because it tiles over keys with an
+    /// online softmax. The shared guard therefore refused the one path built for long
+    /// context, and `return 0` is indistinguishable from "no GPU": the caller silently fell
+    /// to the single-threaded CPU core. Measured on M2.7: 8192 tokens ran the GPU core in
+    /// 42 s, 16384 fell off a cliff, and a 113851-token prefill never finished at all.
+    ///
+    /// Both halves are asserted, because the fix is a SPLIT and not a raise — flash must now
+    /// run here, and scalar must still be refused. Testing only the first would pass just as
+    /// well if someone deleted the cap outright and left the scalar kernel to corrupt or
+    /// fail on a shared-memory overflow.
+    ///
+    /// The reference covers a few query rows rather than all S: a full S x T reference at
+    /// this T costs ~1e9 ops for no extra signal. The chosen rows include the last, which
+    /// attends to every one of the T keys and so exercises the full online-softmax
+    /// accumulation across all 544 key tiles — the part that is actually new above the cap.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gqa_flash_accepts_long_context() {
+        if !crate::gpu::available() {
+            eprintln!("skip: no CUDA device");
+            return;
+        }
+        let (s, t, h, hkv, d) = (64usize, 8704usize, 4usize, 2usize, 32usize);
+        assert!(t > 8192, "this test is pointless below the old cap");
+        let group = h / hkv;
+        let scale = 1.0 / (d as f32).sqrt();
+        // The data has to make the result POSITION-SENSITIVE, which the obvious choice does
+        // not. With small-magnitude patterned q/k the scores land within about +-0.02, every
+        // softmax weight is ~1/T, and the output collapses to the plain mean of `vv` — whose
+        // own pattern has the same mean over any long span. A kernel that dropped every key
+        // past the first tile would then agree to ~1e-9 and this test would pass it.
+        //
+        // So: q/k are scaled to give scores of order +-1, which makes the softmax actually
+        // discriminate between positions, and `vv` carries a term LINEAR IN t. The output
+        // then reads out the weighted mean key position, which moves under both truncation
+        // and mis-weighting. `reference_is_position_sensitive` below asserts this held.
+        let q: Vec<f32> = (0..s * h * d)
+            .map(|z| {
+                let (si, hh, j) = (z / (h * d), (z / d) % h, z % d);
+                (((si * 3 + hh * 5 + j * 7) % 17) as f32 - 8.0) * 0.05
+            })
+            .collect();
+        let kk: Vec<f32> = (0..t * hkv * d)
+            .map(|z| {
+                let (tt, kvh, j) = (z / (hkv * d), (z / d) % hkv, z % d);
+                (((tt * 11 + kvh * 3 + j * 13) % 19) as f32 - 9.0) * 0.05
+            })
+            .collect();
+        let vv: Vec<f32> = (0..t * hkv * d)
+            .map(|z| {
+                let (tt, j) = (z / (hkv * d), z % d);
+                tt as f32 * 1e-4 + j as f32 * 0.01
+            })
+            .collect();
+
+        let mut got = vec![0f32; s * h * d];
+        assert!(
+            crate::gpu::try_gqa_attn(&mut got, &q, &kk, &vv, s, h, hkv, d, t, scale, 1),
+            "flash GQA kernel must accept T={t}, above the old 8192 cap"
+        );
+        let mut scal = vec![0f32; s * h * d];
+        assert!(
+            !crate::gpu::try_gqa_attn(&mut scal, &q, &kk, &vv, s, h, hkv, d, t, scale, 0),
+            "scalar GQA kernel must STAY capped at T={t}: (D+T+ATTN_TPB)*4 shared memory \
+             does not fit"
+        );
+
+        // Causal CPU reference for selected rows. Query row `si` attends keys [0, base+si].
+        let base = t - s;
+        let mut worst = 0f32;
+        let mut far_probe = f32::NAN;
+        for &si in &[0usize, 1, s / 2, s - 1] {
+            let nt = base + si + 1;
+            for hh in 0..h {
+                let kvh = hh / group;
+                let qv = &q[(si * h + hh) * d..(si * h + hh) * d + d];
+                let mut sce = vec![0f32; nt];
+                for (tt, x) in sce.iter_mut().enumerate() {
+                    let kr = &kk[(tt * hkv + kvh) * d..(tt * hkv + kvh) * d + d];
+                    *x = qv.iter().zip(kr).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                }
+                let mx = sce.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut den = 0f32;
+                for x in sce.iter_mut() {
+                    *x = (*x - mx).exp();
+                    den += *x;
+                }
+                let mut cref = vec![0f32; d];
+                for (tt, &w) in sce.iter().enumerate() {
+                    let vr = &vv[(tt * hkv + kvh) * d..(tt * hkv + kvh) * d + d];
+                    let w = w / den;
+                    for (o, &x) in cref.iter_mut().zip(vr) {
+                        *o += w * x;
+                    }
+                }
+                if si == s - 1 && hh == 0 {
+                    far_probe = cref[0];
+                }
+                for (j, &r) in cref.iter().enumerate() {
+                    worst = worst.max((got[(si * h + hh) * d + j] - r).abs());
+                }
+            }
+        }
+
+        // The `vv` term linear in t makes component 0 read out 1e-4 * (weighted mean key
+        // position). The last row attends all T keys, so a correct reference lands near
+        // 1e-4 * T/2 ~= 0.44, while a kernel that stopped after the first 512-key tile would
+        // land near 0.026. Asserting the REFERENCE is up here is what stops this test from
+        // quietly reverting to the degenerate near-uniform-softmax version, in which every
+        // span has the same mean and truncation is invisible.
+        assert!(
+            far_probe > 0.2,
+            "test data stopped being position-sensitive (probe {far_probe}): a truncating \
+             kernel would pass this test — fix the data, not the bound"
+        );
+        // Q and K cross the kernel as fp16 with f32 accumulation, so exact equality is not
+        // available. Observed max|Δ| here is ~8e-5, so this bound sits ~25x above the fp16
+        // noise floor, while a kernel that truncated the key range or lost the running max
+        // would be off by ~0.4 — two orders of magnitude OUTSIDE it. (The bound is not the
+        // part doing the work: with the earlier near-uniform-softmax data the same kernel
+        // agreed to 7e-9 and a truncating one would have too.)
+        eprintln!("gqa flash T={t}: max|Δ| vs CPU = {worst:.2e}");
+        assert!(
+            worst < 2e-3,
+            "flash GQA disagrees with the CPU reference at T={t}: max|Δ| {worst:e}"
+        );
+    }
+
     // Isolated GQA attention microbench at real MiniMax-M3 dims (H=64, Hkv=4, D=128),
     // single-shot prefill (S == T). A/Bs the two GPU kernels (mode 0 scalar, mode 1
     // WMMA flash) against a CPU reference, reporting per-call ms, max|Δ| vs CPU, and

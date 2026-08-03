@@ -3273,11 +3273,27 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
 extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const float *k,
         const float *v, int S, int H, int Hkv, int D, int T, float scale, int mode) {
     if (!ctx || !q || !k || !v || S < 1 || H < 1 || Hkv < 1 || D < 1 || D > 1024 ||
-        H % Hkv || T < S || T > 8192)
+        H % Hkv || T < S)
         return 0;
     // mode 1 = WMMA flash (tc_gqa_attn); requires D a multiple of 16. Anything else,
     // or D not tile-aligned, falls back to the scalar gqa_attn_kernel (mode 0).
     int flash = (mode == 1 && D % 16 == 0);
+    // The T ceiling is PER-PATH, because only the scalar kernel pays for T in shared memory:
+    //   scalar: shared = (D + T + ATTN_TPB)*4 — 33 KB at T=8192, and past the 48 KB limit by
+    //           T=16384. For that kernel 8192 is a real hardware bound.
+    //   flash:  shared = GQA_QT*8*D — INDEPENDENT of T. It tiles over keys with an online
+    //           softmax (mrow/lrow/corr); handling long context is the entire point of it.
+    // These shared a single blanket `T > 8192`, so the guard written for the scalar kernel
+    // silently refused the one path built for long context — `return 0` is indistinguishable
+    // from "no GPU", and the caller drops to the single-threaded CPU core. Measured on M2.7
+    // (#54): 8192 tokens ran the GPU core, 16384 fell off a cliff, and 113851 never finished.
+    // Flash's real bound is the grid.y hardware limit — one block per GQA_QT queries.
+    // Past it, and on scratch-allocation failure below, the CPU fallback still stands.
+    if (flash) {
+        if ((S + GQA_QT - 1) / GQA_QT > 65535) return 0;
+    } else if (T > 8192) {
+        return 0;
+    }
     DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
     std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     size_t qb = (size_t)S * H * D * sizeof(float), kb = (size_t)T * Hkv * D * sizeof(float);

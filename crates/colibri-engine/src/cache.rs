@@ -984,16 +984,69 @@ impl<P: ExpertProvider> ExpertCache<P> {
         if avail >= need {
             return true; // already enough headroom
         }
-        let mut s = self.state.lock().unwrap();
-        let target = s.bytes.saturating_sub(need - avail).max(FLOOR_MIN);
-        if target < s.bytes {
+        // Evict, re-measure, evict the REMAINDER. A single pass structurally undershoots:
+        // it targets exactly the deficit, but freeing N bytes of cache does not raise
+        // `MemAvailable` by N. Measured 2026-08-02 on m2.7 — evicting 64.4 GB moved avail
+        // 40.1 -> 102.5 GB, returning 62.4 GB (~97%) and missing `need` by 2.0 GB. The
+        // request was refused for a 2 GB shortfall after correctly freeing 64 GB.
+        //
+        // A fixed slack constant would be the wrong fix: the shortfall is a ratio, not a
+        // size, and any constant is either too small for a big eviction or over-evicts a
+        // small one. Re-measuring costs one /proc/meminfo read per pass and is self-scaling.
+        // Bounded so a pathological case cannot spin; it stops early at the floor anyway.
+        const MAX_PASSES: usize = 4;
+        let before = self.state.lock().unwrap().bytes;
+        let mut after = before;
+        let mut avail_after = Some(avail);
+        let mut passes = 0usize;
+        for _ in 0..MAX_PASSES {
+            let now = match available_ram_bytes() {
+                Some(a) => a,
+                None => break, // no signal; the post-loop check treats this as OK
+            };
+            avail_after = Some(now);
+            if now >= need {
+                break;
+            }
+            let mut s = self.state.lock().unwrap();
+            let target = s.bytes.saturating_sub(need - now).max(FLOOR_MIN);
+            if target >= s.bytes {
+                after = s.bytes;
+                break; // already at the floor — evicting more is not possible
+            }
             s.evict_to(target);
             self.budget.store(target, Ordering::Relaxed);
+            after = s.bytes;
+            drop(s);
+            passes += 1;
         }
-        drop(s);
-        // Re-check: eviction returns mmap'd expert buffers to the OS, so `MemAvailable`
-        // should have risen. If it still can't cover the allocation, we're out of room.
-        let ok = available_ram_bytes().map(|a| a >= need).unwrap_or(true);
+        // Decide on a FRESH reading, not the one sampled at the top of the last pass — if the
+        // loop exits by exhausting MAX_PASSES that value predates its own eviction and would
+        // reject a request that now fits.
+        avail_after = available_ram_bytes().or(avail_after);
+        let ok = avail_after.map(|a| a >= need).unwrap_or(true);
+        // Always log this path. Evicting the expert cache to admit one request is a rare,
+        // operationally significant event, and its outcome was previously invisible: a
+        // rejection here and a rejection from the ledger downstream produced indistinguishable
+        // symptoms. `slack` is the number that matters — a small negative value means the
+        // eviction undershot rather than the request being genuinely too big, which is exactly
+        // the 2.0 GB miss that motivated the multi-pass loop above.
+        let g = |b: u64| b as f64 / 1e9;
+        eprintln!(
+            "[cache] reserve_ram {}: need {:.1} GB (kv {:.1} + floor {:.1}) | avail {:.1} -> \
+             {:.1} GB | experts {:.1} -> {:.1} GB (floor_min {:.1}) | {} pass(es) | slack {:.1} GB",
+            if ok { "OK" } else { "FAILED" },
+            g(need),
+            g(bytes),
+            g(hard),
+            g(avail),
+            avail_after.map(g).unwrap_or(f64::NAN),
+            g(before),
+            g(after),
+            g(FLOOR_MIN),
+            passes,
+            avail_after.map(|a| a as f64 - need as f64).unwrap_or(f64::NAN) / 1e9,
+        );
         if !ok {
             self.release_ram(bytes); // roll back — the caller will reject
         }

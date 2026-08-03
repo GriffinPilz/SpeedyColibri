@@ -77,6 +77,25 @@ fn kv_bytes_per_token(cfg: &colibri_core::Config) -> usize {
 
 type Provider<'a> = ExpertCache<ShardsExpertProvider<'a>>;
 
+/// RAII release for [`ExpertCache::reserve_ram`], held for the life of a request.
+///
+/// The reservation must come back on *every* exit path — the two rejection arms, the normal
+/// completion, and any early return added later. A leak is not transient: the adaptive
+/// monitor subtracts `reserved` from the expert-cache budget on every 100 ms tick, so a
+/// forgotten release shrinks the cache permanently for the life of the process. That failure
+/// would be invisible in a smoke test and show up as a slow, unexplained decay under load,
+/// which is precisely the kind of bug worth spending a Drop impl to make impossible.
+struct KvRoom<'p, 'a> {
+    provider: &'p Provider<'a>,
+    bytes: u64,
+}
+
+impl Drop for KvRoom<'_, '_> {
+    fn drop(&mut self) {
+        self.provider.release_ram(self.bytes);
+    }
+}
+
 /// `coli serve <snap> [port] [warm-up prompt...]`. `snap` is injected by the CLI
 /// dispatcher (position 2). An optional pure-integer next arg is the port; any
 /// remaining args are one warm-up prompt. `COLI_PORT` / `COLI_WARMUP` (the latter
@@ -656,16 +675,96 @@ fn complete(
     // state). That is O(1) in context, so counting only per-token bytes under-reserves worst
     // for SHORT prompts — where the per-token figure is far too small to cover it.
     let kv_bytes = KvCache::bytes_for(&model.cfg, ids.len()) as u64;
+
+    // MAKE ROOM BEFORE ASKING WHETHER IT FITS.
+    //
+    // `rigid` below subtracts the CURRENT expert cache — memory that is entirely
+    // reclaimable. Measured 2026-08-02 on m2.7: a 186828-token prompt needing 93.9 GB was
+    // refused against a 37.7 GB budget while 71.4 GB of evictable cache sat resident. It
+    // would have fit by 15.2 GB. `reserve_ram` evicts LRU experts down to a floor, holds the
+    // bytes against the monitor (which subtracts `reserved` from the cache budget every
+    // tick, so experts cannot refill into the space), and rolls back if even a full eviction
+    // cannot cover the request.
+    //
+    // This is the call a comment two hundred lines up claimed already existed. It did not:
+    // `reserve_ram` had ZERO callers, and `COLI_GUARD_TRACE=1` showed reserved=0.00 GB on
+    // every tick of a serve run.
+    //
+    // COST, stated plainly: admitting one very large prompt can evict most of the expert
+    // cache, and every concurrent request then streams from disk until the monitor refills.
+    // That is the right trade against the alternative — refusing outright a request the box
+    // can serve — but it is a real cost, not a free win.
+    let experts_before = colibri_engine::ram::manager()
+        .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
+        .unwrap_or(0);
+    if !provider.reserve_ram(kv_bytes) {
+        let gib = (1u64 << 30) as f64;
+        eprintln!(
+            "[serve] REFUSED 507: {} tokens need {:.1} GB KV — does not fit even after \
+             evicting the expert cache to its floor",
+            ids.len(),
+            kv_bytes as f64 / gib,
+        );
+        let msg = format!(
+            "Prompt too large for this node: {} tokens need ~{:.1} GB of KV cache, which \
+             does not fit even after evicting the expert cache. Use a shorter prompt.",
+            ids.len(),
+            kv_bytes as f64 / gib
+        );
+        send_json(
+            stream,
+            507,
+            &format!("{{\"error\":{{\"message\":{},\"type\":\"insufficient_memory\",\"code\":\"kv_cache_too_large\"}}}}", jstr(&msg)),
+        );
+        return;
+    }
+    // Release on EVERY exit path. A leaked reservation is permanent: the monitor subtracts
+    // `reserved` from the cache budget on every 100 ms tick, so the expert cache would stay
+    // that much smaller for the life of the process.
+    let _room = KvRoom {
+        provider,
+        bytes: kv_bytes,
+    };
+    // Say so when a request cost the cache something. Without this the fix is invisible:
+    // an admitted request looks the same as one that always fitted, and a client timeout
+    // cannot distinguish "admitted and prefilling" from "queued" — which is precisely how
+    // an earlier attempt to observe this mis-reported itself.
+    let experts_after = colibri_engine::ram::manager()
+        .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
+        .unwrap_or(0);
+    if experts_after < experts_before {
+        let gib = (1u64 << 30) as f64;
+        eprintln!(
+            "[serve] ADMITTED {} tokens ({:.1} GB KV) by evicting {:.1} GB of expert cache \
+             ({:.1} -> {:.1} GB) — concurrent requests will stream until the monitor refills",
+            ids.len(),
+            kv_bytes as f64 / gib,
+            (experts_before - experts_after) as f64 / gib,
+            experts_before as f64 / gib,
+            experts_after as f64 / gib,
+        );
+    }
+
     // Admit through the RAM ledger, which knows the dense tier and the expert arena.
     // A request that merely collides with another in flight WAITS — both may be
     // individually admissible, and rejecting the second would make capacity look far
     // smaller than it is. A request too large for the whole rigid budget is rejected at
     // once, because waiting cannot help it and it would block the queue behind it.
+    //
+    // Computed AFTER `reserve_ram`, so `Class::Experts` already reflects the eviction
+    // (`evict_to_protecting` publishes the ledger on both its exit paths).
+    //
+    // Scratch and ReadBuf are subtracted too. They were omitted, which made this budget
+    // optimistic by ~4.4 GB (measured: ReadBuf 0-2.1 GB, CUDA scratch 0.17-2.30 GB across
+    // the fleet). That error points the OPPOSITE way to the expert one and is far smaller,
+    // so it was masked — but with experts now evicted out of the way it is what remains.
     let rigid = colibri_engine::ram::manager()
         .map(|m| {
             m.ceiling()
                 .saturating_sub(m.committed_in(colibri_engine::ram::Class::Dense))
                 .saturating_sub(m.committed_in(colibri_engine::ram::Class::Experts))
+                .saturating_sub(m.committed_in(colibri_engine::ram::Class::Scratch))
+                .saturating_sub(m.committed_in(colibri_engine::ram::Class::ReadBuf))
         })
         .unwrap_or(u64::MAX);
     let (verdict, kv_commit) = colibri_engine::ram::commit_or_wait(
@@ -678,25 +777,26 @@ fn complete(
         colibri_engine::ram::Admission::Ok => kv_commit,
         colibri_engine::ram::Admission::TooLarge => {
             let gib = (1u64 << 30) as f64;
-            // Log it. Both refusal paths used to answer the client and record NOTHING, so a
-            // node refusing every long prompt looked identical to one nobody was calling —
-            // and a black-box probe cannot tell a rejection from a slow prefill, which is
-            // exactly how an attempt to observe this from outside failed.
+            // Both refusal paths used to answer the client and record NOTHING, so a node
+            // refusing every long prompt looked identical to one nobody was calling — and a
+            // black-box probe cannot tell a rejection from a slow prefill, which is exactly
+            // how an attempt to observe this from outside failed.
             //
-            // `evictable` is the point: `rigid` subtracts the CURRENT expert cache, but that
-            // memory is reclaimable. When this line shows a refusal alongside tens of GB of
-            // evictable cache, that is task #39 happening — the request could have been
-            // served by dropping cold experts, and nothing does that.
-            let evictable = colibri_engine::ram::manager()
+            // Reaching here now means the LEDGER refused after `reserve_ram` already evicted
+            // to fit — i.e. the accounting says no even though physical memory said yes.
+            // `still_resident` is what survived the eviction (pinned entries and the cache
+            // floor), so a large value here is a genuine signal, not the old #39 bug: it
+            // would mean eviction is not reaching what the ledger is counting.
+            let still_resident = colibri_engine::ram::manager()
                 .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
                 .unwrap_or(0);
             eprintln!(
-                "[serve] REFUSED 507: {} tokens need {:.1} GB KV, rigid budget {:.1} GB \
-                 ({:.1} GB of EVICTABLE expert cache is resident — see task #39)",
+                "[serve] REFUSED 507 (ledger): {} tokens need {:.1} GB KV, rigid budget \
+                 {:.1} GB after evicting to fit ({:.1} GB experts still resident)",
                 ids.len(),
                 kv_bytes as f64 / gib,
                 rigid as f64 / gib,
-                evictable as f64 / gib,
+                still_resident as f64 / gib,
             );
             let msg = format!(
                 "Prompt too large for this node: {} tokens need ~{:.1} GB of KV cache, \

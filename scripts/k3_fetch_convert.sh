@@ -2,9 +2,11 @@
 # Fetch and convert the full unsloth/Kimi-K3 checkpoint ONE SHARD AT A TIME.
 #
 # Why not just download it and run `coli convert`: the source is 1561 GB and the
-# container is ~1500 GB, so holding both needs ~3.0 TB and the box has ~2.36 TB free.
+# container is ~1505 GB (measured: 94 text shards, 16.0 GB each), so holding both needs
+# ~3.0 TB — more than a Spark's 3.6 TB root has spare once any other model is present.
 # Converting shard-by-shard and deleting each source as it lands keeps the peak at
-# `container-so-far + 2 shards` (~1.54 TB).
+# `container-so-far + 2 shards` (~1.54 TB). `preflight_space` below checks the real
+# figure at start-up rather than trusting a number written here, which goes stale.
 #
 # This is only sound because of three properties of the checkpoint, verified against
 # `model.safetensors.index.json` before the script was written:
@@ -35,7 +37,8 @@
 # rather than treating it as a failed conversion.
 #
 #   Usage: scripts/k3_fetch_convert.sh [first_shard] [last_shard]
-#   Env:   K3_SRC, K3_OUT, COLI_BIN, MIN_FREE_GB (default 150)
+#   Env:   K3_SRC, K3_OUT, COLI_BIN, MIN_FREE_GB (default 150),
+#          OUT_GB_PER_SHARD / SRC_GB_PER_SHARD (preflight sizing, measured defaults)
 set -euo pipefail
 
 SRC=${K3_SRC:-$HOME/models/Kimi-K3-src}
@@ -72,6 +75,65 @@ mkdir -p "$SRC" "$OUT"
 shard_name() { printf 'model-%05d-of-000096.safetensors' "$1"; }
 out_name()   { printf 'out-%05d.safetensors' "$1"; }
 free_gb()    { df -BG --output=avail "$SRC" | tail -1 | tr -dc '0-9'; }
+avail_gb()   { df -BG --output=avail "$1" | tail -1 | tr -dc '0-9'; }
+fs_of()      { df --output=source "$1" | tail -1 | tr -d '[:space:]'; }
+
+# ---- preflight: does the remaining work actually fit? --------------------------------
+# The `free_gb` check inside the loop is a FLOOR guard — it aborts once space is nearly
+# gone, which on this script means after hours of downloading at ~16 GB a shard. This
+# answers the other question, before anything is fetched: is there room for the shards
+# still to convert?
+#
+# Sizes are measured off the finished container rather than guessed: 94 text shards /
+# 1505 GB = 16.0 GB per output shard; source shards are ~16.3 GB each.
+#
+# Resume-aware on purpose. A finished container plus a re-run must NOT be refused — the
+# 1.5 TB is already spent, so `todo` is 0 and the requirement collapses to the staging
+# floor. Charging the whole range every time would make the script refuse to re-verify
+# its own completed work on the very box that produced it, which is precisely when you
+# re-run it.
+OUT_GB_PER_SHARD=${OUT_GB_PER_SHARD:-16}
+SRC_GB_PER_SHARD=${SRC_GB_PER_SHARD:-17}
+
+preflight_space() {
+  local n todo=0 total=$(( LAST - FIRST + 1 )) need_out need_src
+  for ((n=FIRST; n<=LAST; n++)); do
+    # Same predicate the loop uses to skip, so this estimate cannot disagree with it.
+    [[ -s "$OUT/$(out_name "$n")" ]] || todo=$(( todo + 1 ))
+  done
+  need_out=$(( todo * OUT_GB_PER_SHARD ))
+  # Staging peaks at PREFETCH_DEPTH downloads in flight plus the one being converted.
+  need_src=$(( (PREFETCH_DEPTH + 1) * SRC_GB_PER_SHARD ))
+  (( todo == 0 )) && need_src=0
+
+  local out_fs src_fs out_avail src_avail need
+  out_fs=$(fs_of "$OUT"); src_fs=$(fs_of "$SRC")
+  out_avail=$(avail_gb "$OUT"); src_avail=$(avail_gb "$SRC")
+  log "preflight: $todo of $total shard(s) still to convert (~${OUT_GB_PER_SHARD}GB each)"
+
+  local hint="Free the space, or do it in pieces — the range is resumable:
+    scripts/k3_fetch_convert.sh <first> <last>     # e.g. $FIRST $(( FIRST + 19 ))
+  Each converted shard costs ~${OUT_GB_PER_SHARD}GB and is kept, so progress is not lost."
+
+  if [[ "$out_fs" == "$src_fs" ]]; then
+    # One filesystem holds both, so the peak is additive — this is the default layout.
+    need=$(( need_out + need_src + MIN_FREE_GB ))
+    log "preflight: need ~${need}GB on $out_fs (output ${need_out} + staging ${need_src} + ${MIN_FREE_GB} floor), have ${out_avail}GB"
+    (( out_avail >= need )) || die "not enough disk: need ~${need}GB on $out_fs, have ${out_avail}GB (short ~$(( need - out_avail ))GB).
+  $hint"
+  else
+    log "preflight: \$K3_OUT on $out_fs needs ~$(( need_out + MIN_FREE_GB ))GB, have ${out_avail}GB"
+    log "preflight: \$K3_SRC on $src_fs needs ~$(( need_src + MIN_FREE_GB ))GB, have ${src_avail}GB"
+    (( out_avail >= need_out + MIN_FREE_GB )) || die "not enough disk for output on $out_fs: need ~$(( need_out + MIN_FREE_GB ))GB, have ${out_avail}GB.
+  $hint"
+    (( src_avail >= need_src + MIN_FREE_GB )) || die "not enough disk for staging on $src_fs: need ~$(( need_src + MIN_FREE_GB ))GB, have ${src_avail}GB."
+  fi
+}
+
+# Run before ANY network activity: the point of a preflight is that nothing has been
+# fetched yet when it refuses. It first sat below the metadata fetch, which already put
+# eight files on disk before the check ran.
+preflight_space
 
 # Content-Length for a remote file, so a truncated download is caught rather than
 # converted into garbage. A short safetensors file can still parse its header and yield

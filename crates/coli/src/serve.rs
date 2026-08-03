@@ -195,10 +195,21 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         );
     }
 
-    // Worst-case KV for the served window (a single full-context request). No longer
-    // reserved up front: each request reserves *its own* KV dynamically (evicting experts
-    // just-in-time — see `ExpertCache::reserve_ram`), so this is only the ceiling we quote.
-    // The initial expert budget leaves a modest base for it; the adaptive monitor takes over.
+    // Worst-case KV for the served window (a single full-context request). Not reserved up
+    // front — each request commits its own KV — so this is only the ceiling we quote.
+    //
+    // **This comment used to say requests evict experts just-in-time "see
+    // `ExpertCache::reserve_ram`". That is false and always was**: `reserve_ram` has no
+    // callers anywhere in the tree, and `COLI_GUARD_TRACE=1` on a serve run shows
+    // `reserved=0.00 GB` on all 998 ticks. It is the second comment found citing that dead
+    // function as a live mechanism (the first was `RUNTIME_RESERVE`, corrected earlier).
+    //
+    // What actually happens: `handle` commits through `commit_or_wait(Class::Kv, kv_bytes,
+    // rigid, …)` against `rigid = ceiling − Dense − Experts`. Nothing evicts experts for a
+    // specific pending request. `Experts` is the CURRENT cache — memory that is entirely
+    // evictable — so a prompt can be refused while tens of GB of reclaimable cache sits
+    // resident. The adaptive monitor does evict, but against *its own* ceiling on a 100 ms
+    // tick, not on behalf of a waiting request. See task #39.
     let kv_worst_case = KvCache::bytes_for(&model.cfg, ctx_len) as u64;
     let budget = crate::ram_budget_reserving(kv_worst_case.min(8 << 30));
     let gib = (1u64 << 30) as f64;
@@ -667,6 +678,26 @@ fn complete(
         colibri_engine::ram::Admission::Ok => kv_commit,
         colibri_engine::ram::Admission::TooLarge => {
             let gib = (1u64 << 30) as f64;
+            // Log it. Both refusal paths used to answer the client and record NOTHING, so a
+            // node refusing every long prompt looked identical to one nobody was calling —
+            // and a black-box probe cannot tell a rejection from a slow prefill, which is
+            // exactly how an attempt to observe this from outside failed.
+            //
+            // `evictable` is the point: `rigid` subtracts the CURRENT expert cache, but that
+            // memory is reclaimable. When this line shows a refusal alongside tens of GB of
+            // evictable cache, that is task #39 happening — the request could have been
+            // served by dropping cold experts, and nothing does that.
+            let evictable = colibri_engine::ram::manager()
+                .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
+                .unwrap_or(0);
+            eprintln!(
+                "[serve] REFUSED 507: {} tokens need {:.1} GB KV, rigid budget {:.1} GB \
+                 ({:.1} GB of EVICTABLE expert cache is resident — see task #39)",
+                ids.len(),
+                kv_bytes as f64 / gib,
+                rigid as f64 / gib,
+                evictable as f64 / gib,
+            );
             let msg = format!(
                 "Prompt too large for this node: {} tokens need ~{:.1} GB of KV cache, \
                  but only ~{:.1} GB is available for requests after the model's own \
@@ -683,6 +714,14 @@ fn complete(
             return;
         }
         colibri_engine::ram::Admission::Busy => {
+            let gib = (1u64 << 30) as f64;
+            eprintln!(
+                "[serve] REFUSED 503: {} tokens need {:.1} GB KV; waited {KV_QUEUE_SECS}s and \
+                 other requests did not free it (rigid budget {:.1} GB)",
+                ids.len(),
+                kv_bytes as f64 / gib,
+                rigid as f64 / gib,
+            );
             let msg = format!(
                 "Server busy: this prompt needs ~{:.1} GB of KV cache and other requests \
                  did not free it within {KV_QUEUE_SECS}s. Retry shortly.",

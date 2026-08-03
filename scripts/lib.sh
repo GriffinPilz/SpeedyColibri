@@ -92,7 +92,21 @@ bench_lock_acquire() {
     echo "harness: clearing stale lock from dead pid ${pid:-?}" >&2
   fi
   echo $$ > "$BENCH_LOCK"
-  trap 'rm -f "$BENCH_LOCK"' EXIT INT TERM
+  # EXIT does the cleanup; INT and TERM must additionally STOP.
+  #
+  # These were one handler — `trap 'rm -f "$BENCH_LOCK"' EXIT INT TERM` — which removed the
+  # lock and then RETURNED, so the script ignored the signal and kept measuring with its own
+  # guard gone. A TERM'd sweep silently continued to its next point, and the deleted lock
+  # file read as proof it had died. The next run's "is anything already measuring?" check
+  # then passed, which is precisely how two measurements end up contending (1.65x) while
+  # both look clean.
+  #
+  # `exit` from the INT/TERM handler re-triggers EXIT, which does the rm — so the cleanup is
+  # still in exactly one place. Note bash defers a trap until the current foreground command
+  # finishes, so a signal lands after the in-flight point completes, not mid-point.
+  trap 'rm -f "$BENCH_LOCK"' EXIT
+  trap 'echo "harness: interrupted (SIGINT) — stopping" >&2; exit 130' INT
+  trap 'echo "harness: terminated (SIGTERM) — stopping" >&2; exit 143' TERM
 }
 
 # True while a measurement holds the lock. For non-bench tooling (uploads, fetches) to test.

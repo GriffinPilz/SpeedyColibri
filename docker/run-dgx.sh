@@ -51,8 +51,24 @@ while [[ "${1:-}" == -[hpm] || "${1:-}" == --hf-token || "${1:-}" == --port || "
     -h|--hf-token) export HF_TOKEN="${2:?-h needs a token}"; shift 2 ;;
     -p|--port)     export COLI_PORT="${2:?-p needs a port}"; shift 2 ;;
     -m|--model)
+      # Kimi-K3 deliberately has no short name: it cannot use the download-then-convert
+      # path this script drives. The source is 1561 GB and `coli convert` needs the source
+      # AND the container on disk at once (~2.96 TB), which does not fit on a Spark's 3.6 TB
+      # root beside any other model. `scripts/k3_fetch_convert.sh` exists for exactly this —
+      # it fetches and converts ONE SHARD AT A TIME so the two never coexist in full.
+      # Say so instead of resolving to the raw repo and letting the user discover it after
+      # a 1.5 TB download.
+      case "${2:-}" in
+        k3|kimi|kimi-k3|Kimi-K3)
+          echo "[run-dgx] kimi-k3 cannot be converted through this path: the source is 1561 GB and" >&2
+          echo "[run-dgx] conversion needs source + container on disk together (~2.96 TB)." >&2
+          echo "[run-dgx] Use one of:" >&2
+          echo "[run-dgx]   scripts/k3_fetch_convert.sh        # streams shard-by-shard, no 3 TB peak" >&2
+          echo "[run-dgx]   -m Kanposer/Kimi-K3-speedy-colibri-mxfp4   # prebuilt container (see its card for status)" >&2
+          exit 2 ;;
+      esac
       repo="$(model_repo "${2:?-m needs a model}")"
-      [[ -n "$repo" ]] || { echo "[run-dgx] unknown model '$2' — try: nemotron, m2.7, m3, glm, or an org/repo" >&2; exit 2; }
+      [[ -n "$repo" ]] || { echo "[run-dgx] unknown model '$2' — try: nemotron, m2.7, m3, glm, or an org/repo (kimi-k3: see scripts/k3_fetch_convert.sh)" >&2; exit 2; }
       export COLI_MODEL_REPO="$repo"; shift 2 ;;
   esac
   used_flags=1

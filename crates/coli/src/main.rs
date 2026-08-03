@@ -631,6 +631,37 @@ fn cmd_load(args: &[String]) -> ExitCode {
     }
 }
 
+/// Warn when the last model loaded on this box was a DIFFERENT one, and say what to do.
+///
+/// `coli dropcache` fadvises only the containers it is given, so switching models leaves the
+/// outgoing model's pages resident and the incoming one evicts them while streaming.
+/// Measured 2026-08-02 on K3: 95 MB/s at the device and still unfinished at 69 minutes,
+/// against 456 s for the very next run once those pages were gone — **~30x**, from nothing
+/// but whose pages were resident.
+///
+/// `scripts/lib.sh`'s `mem_reset` now handles this automatically, so the harness is covered.
+/// This exists for the case that is not: a bare `coli gen ...` typed by hand. I wrote the
+/// warning about this trap and then walked into it an hour later with a one-liner, spent ten
+/// minutes misreading the result as a hang, and only then remembered. A line of output at
+/// load time would have ended it immediately.
+///
+/// Advisory only — it never evicts. Dropping another model's cache without being asked would
+/// be the wrong call on a shared box, and the state file is best-effort: a missing or
+/// unreadable one simply means no warning.
+fn note_model_switch(container: &str) {
+    const LAST: &str = "/tmp/colibri-last-container";
+    let prev = std::fs::read_to_string(LAST).unwrap_or_default();
+    let prev = prev.trim();
+    if !prev.is_empty() && prev != container && std::path::Path::new(prev).is_dir() {
+        eprintln!(
+            "[cache] NOTE: the previous model loaded here was {prev}, and its pages are \
+             probably still resident — this run may be far slower than steady state. \
+             `coli dropcache {container} {prev}` first, or use scripts/lib.sh's mem_reset."
+        );
+    }
+    let _ = std::fs::write(LAST, container);
+}
+
 /// `coli gen <snap> [id...]` — load a model and greedy-generate from the given
 /// token ids (default `[1]`), printing the continuation ids. Runs the full CPU
 /// forward pass; experts stream from the snapshot on demand.
@@ -642,6 +673,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    note_model_switch(snap);
     let prompt: Vec<i32> = args
         .get(3..)
         .map(|a| a.iter().filter_map(|s| s.parse().ok()).collect())

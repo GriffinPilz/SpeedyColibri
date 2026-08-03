@@ -108,6 +108,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    crate::note_model_switch(&snap);
 
     // Port: a leading bare integer arg, else COLI_PORT, else the default.
     let mut rest = &args[3.min(args.len())..];
@@ -700,13 +701,13 @@ fn complete(
     if !provider.reserve_ram(kv_bytes) {
         let gib = (1u64 << 30) as f64;
         eprintln!(
-            "[serve] REFUSED 507: {} tokens need {:.1} GB KV — does not fit even after \
+            "[serve] REFUSED 507: {} tokens need {:.1} GiB KV — does not fit even after \
              evicting the expert cache to its floor",
             ids.len(),
             kv_bytes as f64 / gib,
         );
         let msg = format!(
-            "Prompt too large for this node: {} tokens need ~{:.1} GB of KV cache, which \
+            "Prompt too large for this node: {} tokens need ~{:.1} GiB of KV cache, which \
              does not fit even after evicting the expert cache. Use a shorter prompt.",
             ids.len(),
             kv_bytes as f64 / gib
@@ -735,8 +736,8 @@ fn complete(
     if experts_after < experts_before {
         let gib = (1u64 << 30) as f64;
         eprintln!(
-            "[serve] ADMITTED {} tokens ({:.1} GB KV) by evicting {:.1} GB of expert cache \
-             ({:.1} -> {:.1} GB) — concurrent requests will stream until the monitor refills",
+            "[serve] ADMITTED {} tokens ({:.1} GiB KV) by evicting {:.1} GiB of expert cache \
+             ({:.1} -> {:.1} GiB) — concurrent requests will stream until the monitor refills",
             ids.len(),
             kv_bytes as f64 / gib,
             (experts_before - experts_after) as f64 / gib,
@@ -756,7 +757,9 @@ fn complete(
     //
     // Scratch and ReadBuf are subtracted too. They were omitted, which made this budget
     // optimistic by ~4.4 GB (measured: ReadBuf 0-2.1 GB, CUDA scratch 0.17-2.30 GB across
-    // the fleet). That error points the OPPOSITE way to the expert one and is far smaller,
+    // the fleet — decimal GB, as forward.rs's `[profile]` lines divide by 1e9, unlike the
+    // GiB used for the runtime figures below).
+    // That error points the OPPOSITE way to the expert one and is far smaller,
     // so it was masked — but with experts now evicted out of the way it is what remains.
     let rigid = colibri_engine::ram::manager()
         .map(|m| {
@@ -791,16 +794,16 @@ fn complete(
                 .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
                 .unwrap_or(0);
             eprintln!(
-                "[serve] REFUSED 507 (ledger): {} tokens need {:.1} GB KV, rigid budget \
-                 {:.1} GB after evicting to fit ({:.1} GB experts still resident)",
+                "[serve] REFUSED 507 (ledger): {} tokens need {:.1} GiB KV, rigid budget \
+                 {:.1} GiB after evicting to fit ({:.1} GiB experts still resident)",
                 ids.len(),
                 kv_bytes as f64 / gib,
                 rigid as f64 / gib,
                 still_resident as f64 / gib,
             );
             let msg = format!(
-                "Prompt too large for this node: {} tokens need ~{:.1} GB of KV cache, \
-                 but only ~{:.1} GB is available for requests after the model's own \
+                "Prompt too large for this node: {} tokens need ~{:.1} GiB of KV cache, \
+                 but only ~{:.1} GiB is available for requests after the model's own \
                  memory. Use a shorter prompt.",
                 ids.len(),
                 kv_bytes as f64 / gib,
@@ -816,14 +819,14 @@ fn complete(
         colibri_engine::ram::Admission::Busy => {
             let gib = (1u64 << 30) as f64;
             eprintln!(
-                "[serve] REFUSED 503: {} tokens need {:.1} GB KV; waited {KV_QUEUE_SECS}s and \
-                 other requests did not free it (rigid budget {:.1} GB)",
+                "[serve] REFUSED 503: {} tokens need {:.1} GiB KV; waited {KV_QUEUE_SECS}s and \
+                 other requests did not free it (rigid budget {:.1} GiB)",
                 ids.len(),
                 kv_bytes as f64 / gib,
                 rigid as f64 / gib,
             );
             let msg = format!(
-                "Server busy: this prompt needs ~{:.1} GB of KV cache and other requests \
+                "Server busy: this prompt needs ~{:.1} GiB of KV cache and other requests \
                  did not free it within {KV_QUEUE_SECS}s. Retry shortly.",
                 kv_bytes as f64 / (1u64 << 30) as f64
             );

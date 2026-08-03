@@ -1031,10 +1031,15 @@ impl<P: ExpertProvider> ExpertCache<P> {
         // symptoms. `slack` is the number that matters — a small negative value means the
         // eviction undershot rather than the request being genuinely too big, which is exactly
         // the 2.0 GB miss that motivated the multi-pass loop above.
-        let g = |b: u64| b as f64 / 1e9;
+        // GiB, matching serve.rs. These two lines print the SAME request microseconds apart
+        // and disagreed: `reserve_ram` divided by 1e9 while serve divided by 1<<30, and both
+        // said "GB" — so one call read as "kv 83.8" and the next as "78.0 GB KV". Same
+        // number, different unit, identical label. Anyone comparing them would hunt a
+        // nonexistent 5.8 GB discrepancy.
+        let g = |b: u64| b as f64 / (1u64 << 30) as f64;
         eprintln!(
-            "[cache] reserve_ram {}: need {:.1} GB (kv {:.1} + floor {:.1}) | avail {:.1} -> \
-             {:.1} GB | experts {:.1} -> {:.1} GB (floor_min {:.1}) | {} pass(es) | slack {:.1} GB",
+            "[cache] reserve_ram {}: need {:.1} GiB (kv {:.1} + floor {:.1}) | avail {:.1} -> \
+             {:.1} GiB | experts {:.1} -> {:.1} GiB (floor_min {:.1}) | {} pass(es) | slack {:.1} GiB",
             if ok { "OK" } else { "FAILED" },
             g(need),
             g(bytes),

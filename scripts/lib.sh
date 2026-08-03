@@ -37,13 +37,34 @@ need_source()    { [[ -d "$SOURCE" ]]    || die "source missing: $SOURCE (model 
 #
 # Call it BEFORE each arm (start from a known state) and AFTER (leave the box clean for
 # whatever runs next).
+#
+# It also drops the PREVIOUSLY-RESET model's pages, tracked in `$LAST_CONTAINER_FILE`.
+# `fadvise` only touches the containers named, so dropping just the incoming model leaves
+# the outgoing one resident and the new model must evict it while streaming. Measured
+# 2026-08-02 on K3: 95 MB/s at the device and still unfinished at 69 min, against 456 s for
+# the very next run once those pages were gone — ~30x, from nothing but whose pages were
+# resident.
+#
+# Doing it HERE rather than at each call site is the point: `scripts/bench.sh` worked around
+# this with a discarded warmup run (a whole extra model-load per model), and every ad-hoc
+# script has to remember. Anything that calls `mem_reset` now gets it for free — including
+# the one-liner I ran an hour after writing the warning, and walked straight into.
+LAST_CONTAINER_FILE="${LAST_CONTAINER_FILE:-/tmp/colibri-last-container}"
+
 mem_reset() {
   [[ -x "$COLI_BIN" && -d "$CONTAINER" ]] || return 0
+  local prev=""
+  [[ -f "$LAST_CONTAINER_FILE" ]] && prev=$(cat "$LAST_CONTAINER_FILE" 2>/dev/null)
   # `|| true` is load-bearing: callers run under `set -euo pipefail`, so a non-zero
   # dropcache takes the whole suite down between printing its header and its first result.
   # That is exactly what happened — an argv indexing bug made dropcache exit 1, and every
   # bench.sh run produced no output while looking like it had merely been slow.
-  "$COLI_BIN" dropcache "$CONTAINER" 2>/dev/null | sed 's/^/    /' || true
+  if [[ -n "$prev" && "$prev" != "$CONTAINER" && -d "$prev" ]]; then
+    "$COLI_BIN" dropcache "$CONTAINER" "$prev" 2>/dev/null | sed 's/^/    /' || true
+  else
+    "$COLI_BIN" dropcache "$CONTAINER" 2>/dev/null | sed 's/^/    /' || true
+  fi
+  printf '%s' "$CONTAINER" >"$LAST_CONTAINER_FILE" 2>/dev/null || true
   # Let the kernel actually complete the reclaim before the next arm starts timing.
   sleep "${MEM_RESET_SETTLE:-3}"
 }

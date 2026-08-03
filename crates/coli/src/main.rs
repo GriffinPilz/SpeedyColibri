@@ -1891,12 +1891,23 @@ fn cmd_repack(args: &[String]) -> ExitCode {
 ///   (B) io_uring with SQPOLL at depth `qd`, buffered (page-cache-served, like us),
 ///   (C) io_uring + O_DIRECT at depth `qd` — the drive's ceiling (bypasses cache).
 /// If (A) already ≈ (C), the read engine is not the bottleneck and io_uring can't help.
-/// `coli dropcache <container>` — drop the model's cached pages, and report memory state.
+/// `coli dropcache <container> [container ...]` — drop those models' cached pages, and
+/// report memory state.
 ///
 /// Run this **between benchmark arms**. Page-cache carry-over is the largest source of
 /// contamination in this repo's measurements: the same configuration has read 2.27 tok/s
 /// early in a sequence and 0.23 tok/s late, purely from what an earlier arm left warm. An
 /// A/B that does not reset between arms is measuring arm order as much as arm content.
+///
+/// **Pass the PREVIOUS model too when switching models.** `fadvise` only touches the
+/// containers named, so dropping just the incoming model leaves the outgoing one resident
+/// and the new model has to evict it while streaming. Measured 2026-08-02: the first K3 run
+/// after nine Nemotron runs (172% coverage, fills the cache) moved 95 MB/s and had not
+/// finished at 69 minutes; the very next K3 run, with those pages displaced, completed in
+/// 456 s. ~30x, from nothing but whose pages were resident.
+///
+/// `scripts/bench.sh` works around this with a discarded warmup run, which costs a full run
+/// per model. Naming both containers is the cheaper fix and is why this takes a list.
 ///
 /// Uses `posix_fadvise(DONTNEED)`, so it needs **no root** and only touches this model's
 /// pages. Two things it deliberately does not do, because they require privileges this
@@ -1916,10 +1927,11 @@ fn cmd_dropcache(args: &[String]) -> ExitCode {
     // every `scripts/bench.sh` suite aborted immediately after printing its header and
     // produced no output at all. A benchmark harness that silently measures nothing is
     // worse than one that crashes.
-    let Some(container) = args.get(2) else {
-        eprintln!("usage: coli dropcache <container-dir>");
+    let containers = &args[2.min(args.len())..];
+    if containers.is_empty() {
+        eprintln!("usage: coli dropcache <container-dir> [container-dir ...]");
         return ExitCode::from(2);
-    };
+    }
     let mem = |key: &str| -> u64 {
         std::fs::read_to_string("/proc/meminfo")
             .ok()
@@ -1934,20 +1946,26 @@ fn cmd_dropcache(args: &[String]) -> ExitCode {
             / 1024 // MiB
     };
     let cached_before = mem("Cached:");
-    let shards = match colibri_safetensors::Shards::open(container) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("dropcache: {container}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let dropped = shards.drop_page_cache();
+    let mut dropped = 0u64;
+    let mut nfiles = 0usize;
+    for container in containers {
+        let shards = match colibri_safetensors::Shards::open(container) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("dropcache: {container}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        dropped += shards.drop_page_cache();
+        nfiles += shards.num_files();
+    }
     let cached_after = mem("Cached:");
     let swap_used = mem("SwapTotal:").saturating_sub(mem("SwapFree:"));
     println!(
-        "dropcache: advised {} GB across {} shards | page cache {} -> {} MiB (freed {})",
+        "dropcache: advised {} GB across {} shards in {} container(s) | page cache {} -> {} MiB (freed {})",
         dropped >> 30,
-        shards.num_files(),
+        nfiles,
+        containers.len(),
         cached_before,
         cached_after,
         cached_before.saturating_sub(cached_after),

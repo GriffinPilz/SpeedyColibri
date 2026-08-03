@@ -1976,8 +1976,24 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
         else
             i8a16_matmul<<<tg, 128>>>(ctx->y, ctx->x, (const uint8_t *)t->weights, t->scales, S, I, O);
     } else {
-        dim3 grid((unsigned)O, (unsigned)S);
-        quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->wrapped);
+        // gridDim.y is capped at 65535 and this arm launches one block per (output, row), so
+        // a prefill with more rows than that does not merely run slowly — the launch fails
+        // outright with `invalid argument`, coli_cuda_matmul returns 0, and the caller drops
+        // to the single-threaded CPU `matmul_qt`. Measured on M2.7 at S=73728 (#56): the
+        // attention core stayed on the GPU while every projection fell to one CPU thread.
+        // (The tiled fmt 1/4 arm above is already safe — its grid.y is (S+15)/16.)
+        //
+        // quant_matmul takes its row from blockIdx.y alone and never reads `S`, so a chunk is
+        // just a pointer offset. Chunks share the default stream, so they serialise in order
+        // and the single completion check below still covers all of them.
+        const unsigned YMAX = 65535u;
+        for (int s0 = 0; s0 < S; s0 += (int)YMAX) {
+            int sc = S - s0;
+            if (sc > (int)YMAX) sc = (int)YMAX;
+            dim3 grid((unsigned)O, (unsigned)sc);
+            quant_matmul<<<grid, 256>>>(ctx->y + (size_t)s0 * O, ctx->x + (size_t)s0 * I,
+                                        t->weights, t->scales, fmt, sc, I, O, rb, t->wrapped);
+        }
     }
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;

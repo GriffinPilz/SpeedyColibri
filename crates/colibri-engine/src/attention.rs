@@ -1607,10 +1607,28 @@ mod tests {
             })
             .collect();
 
+        // Control FIRST, below the old cap. `try_gqa_attn` returns one bool for two very
+        // different refusals: "the T guard rejected this" and "reserve()'s cudaMalloc
+        // failed". Under `cargo test`'s default parallelism the other CUDA tests can exhaust
+        // device scratch, so asserting acceptance outright is flaky — it failed ~1 run in 3
+        // here while passing every single-threaded run. The control calibrates: below the old
+        // cap the guard cannot be the reason, so a refusal there means the device is simply
+        // unusable right now and there is nothing to test. Both sizes reserve within ~1 MB of
+        // each other, so a genuine memory failure hits both.
+        let mut ctrl = vec![0f32; s * h * d];
+        if !crate::gpu::try_gqa_attn(&mut ctrl, &q, &kk, &vv, s, h, hkv, d, 4096, scale, 1) {
+            eprintln!(
+                "skip: device declined flash GQA at T=4096 (below the old cap), so it is out \
+                 of scratch rather than capped — nothing to assert"
+            );
+            return;
+        }
+
         let mut got = vec![0f32; s * h * d];
         assert!(
             crate::gpu::try_gqa_attn(&mut got, &q, &kk, &vv, s, h, hkv, d, t, scale, 1),
-            "flash GQA kernel must accept T={t}, above the old 8192 cap"
+            "flash GQA kernel refused T={t} while accepting T=4096 on this same device — the \
+             T>8192 cap is back on the flash path (#54)"
         );
         let mut scal = vec![0f32; s * h * d];
         assert!(

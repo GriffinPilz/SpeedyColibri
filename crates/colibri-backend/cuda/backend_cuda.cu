@@ -2055,6 +2055,20 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
         gate->device != up->device || gate->device != down->device ||
         gate->I != up->I || gate->O != up->O ||
         down->I != gate->O || down->O != gate->I) return 0;
+    /* FORMAT GUARD. This path reads scales as a per-ROW f32 array (`quant_matmul` ->
+     * `weight_at`), which is only true for fmt 0/1/3/4. NVFP4 (5) and MXFP4 (6) keep
+     * BLOCK scales in a separate array this entry point does not even take a parameter
+     * for, so launching for them dereferences a pointer that is empty or wrongly strided.
+     *
+     * It did: DeepSeek-V4's MXFP4 experts reach here and the kernel takes an illegal
+     * memory access. CUDA errors are STICKY, so that one launch poisons the context and
+     * every later GPU op in the process fails — the model silently finished on the
+     * single-threaded CPU matmul at 0.19 tok/s. Declining instead makes the caller fall
+     * back cleanly for these experts and leaves the rest of the model on the GPU.
+     *
+     * Dims and device were checked; the format was not. That asymmetry is the bug — see
+     * the closed-set dispatch trap: most per-format enumerations here fail SILENTLY. */
+    if (gate->fmt > 4 || up->fmt > 4 || down->fmt > 4) return 0;
     DeviceContext *ctx = find_ctx(gate->device);
     if (!select_ctx(ctx)) return 0;
     std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));

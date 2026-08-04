@@ -786,3 +786,155 @@ mod pool_tests {
         assert!(out[0] < 20.0 && out[1] < 50.0, "masked slot leaked: {out:?}");
     }
 }
+
+/// Per-layer Compressor state carried between forward calls.
+///
+/// Holds the tokens that have not yet formed a complete window. With overlap the buffer is
+/// `2*ratio` slots wide: `[..ratio]` is the overlapping window's carry, `[ratio..]` the
+/// normal window's. Scores start at `-inf` so an unfilled slot contributes nothing.
+#[derive(Clone)]
+pub struct CompressorState {
+    pub kv: Vec<f32>,
+    pub score: Vec<f32>,
+    pub ratio: usize,
+    pub coff: usize,
+    pub d: usize,
+}
+
+impl CompressorState {
+    pub fn new(ratio: usize, d: usize) -> Self {
+        let coff = if ratio == 4 { 2 } else { 1 };
+        let slots = coff * ratio;
+        CompressorState {
+            kv: vec![0.0; slots * coff * d],
+            score: vec![f32::NEG_INFINITY; slots * coff * d],
+            ratio,
+            coff,
+            d,
+        }
+    }
+}
+
+/// Compressor prefill (`start_pos == 0`): pool `[s, hidden]` into `ceil`-many compressed
+/// KV rows of width `d`, and leave the unfinished tail in `st`.
+///
+/// `kvp`/`scorep` are the already-projected `wkv(x)`/`wgate(x)`, each `[s, coff*d]`.
+/// Returns the compressed rows `[s/ratio, d]`, **pre-norm and pre-rope** — the caller
+/// applies `comp_norm` and the Compressor's own rope (theta 160000, NOT the attention
+/// theta) before writing them to the cache.
+///
+/// Transcribed from `Compressor.forward`'s `start_pos == 0` branch. The parts that are
+/// easy to get wrong and silent if you do:
+///
+///   * The tail (`seqlen % ratio`) does NOT form a block — it goes to the state for the
+///     next call. Rounding it up into a short block would produce a compressed row that
+///     the reference never emits, shifting every later position.
+///   * With overlap, the state ALSO keeps the last full window (`kv[cutoff-ratio..cutoff]`)
+///     in slots `[..ratio]`, because the next block's overlap half comes from it.
+///   * `ape` is added to the SCORE only, indexed by position-within-window.
+pub fn compress_prefill(
+    kvp: &[f32],
+    scorep: &[f32],
+    ape: &[f32],
+    s: usize,
+    ratio: usize,
+    d: usize,
+    st: &mut CompressorState,
+) -> Vec<f32> {
+    let coff = if ratio == 4 { 2 } else { 1 };
+    let w = coff * d;
+    debug_assert_eq!(kvp.len(), s * w);
+    debug_assert_eq!(ape.len(), ratio * w);
+    let overlap = coff == 2;
+    let remainder = s % ratio;
+    let cutoff = s - remainder;
+    let offset = if overlap { ratio } else { 0 };
+
+    // Carry: with overlap, the last COMPLETE window feeds the next block's overlap half.
+    if overlap && cutoff >= ratio {
+        for r in 0..ratio {
+            let src = (cutoff - ratio + r) * w;
+            st.kv[r * w..r * w + w].copy_from_slice(&kvp[src..src + w]);
+            for k in 0..w {
+                st.score[r * w + k] = scorep[src + k] + ape[r * w + k];
+            }
+        }
+    }
+    // Carry: the tail that does not fill a window.
+    for r in 0..remainder {
+        let src = (cutoff + r) * w;
+        let dst = (offset + r) * w;
+        st.kv[dst..dst + w].copy_from_slice(&kvp[src..src + w]);
+        for k in 0..w {
+            st.score[dst + k] = scorep[src + k] + ape[r * w + k];
+        }
+    }
+
+    let nblk = cutoff / ratio;
+    if nblk == 0 {
+        return Vec::new();
+    }
+    // Blocks: [nblk, ratio, w], score gets `ape` per position-within-window.
+    let mut kvb = vec![0f32; nblk * ratio * w];
+    let mut scb = vec![0f32; nblk * ratio * w];
+    for b in 0..nblk {
+        for r in 0..ratio {
+            let src = (b * ratio + r) * w;
+            let dst = (b * ratio + r) * w;
+            kvb[dst..dst + w].copy_from_slice(&kvp[src..src + w]);
+            for k in 0..w {
+                scb[dst + k] = scorep[src + k] + ape[r * w + k];
+            }
+        }
+    }
+    let (kvb, scb, win) = if overlap {
+        (
+            overlap_transform(&kvb, nblk, ratio, d, 0.0),
+            overlap_transform(&scb, nblk, ratio, d, f32::NEG_INFINITY),
+            2 * ratio,
+        )
+    } else {
+        (kvb, scb, ratio)
+    };
+    let mut out = vec![0f32; nblk * d];
+    gated_pool(&kvb, &scb, nblk, win, d, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod prefill_tests {
+    use super::*;
+
+    // The tail must NOT become a block. With ratio 4 and s = 10, the reference emits 2
+    // compressed rows (8 tokens) and carries 2 — an implementation that rounds up emits 3
+    // and shifts every subsequent position, while still returning a well-shaped buffer.
+    #[test]
+    fn prefill_drops_the_tail_into_state_not_into_a_block() {
+        let (ratio, d, s) = (4usize, 3usize, 10usize);
+        let coff = 2;
+        let w = coff * d;
+        let kvp: Vec<f32> = (0..s * w).map(|k| (k as f32) * 0.01).collect();
+        let scorep = vec![0f32; s * w];
+        let ape = vec![0f32; ratio * w];
+        let mut st = CompressorState::new(ratio, d);
+        let out = compress_prefill(&kvp, &scorep, &ape, s, ratio, d, &mut st);
+        assert_eq!(out.len(), (s / ratio) * d, "10 tokens at ratio 4 must give 2 rows");
+        // the 2 carried tokens are in the state's NORMAL half (slots [ratio..])
+        let tail0 = &st.kv[ratio * w..ratio * w + w];
+        assert_eq!(tail0, &kvp[8 * w..9 * w], "first carried token must be token 8");
+        // and the last complete window is kept for the next block's overlap half
+        assert_eq!(&st.kv[0..w], &kvp[4 * w..5 * w], "overlap carry must be token 4");
+    }
+
+    // A sequence shorter than one window compresses to nothing at all.
+    #[test]
+    fn prefill_shorter_than_one_window_emits_no_blocks() {
+        let (ratio, d, s) = (4usize, 3usize, 3usize);
+        let w = 2 * d;
+        let mut st = CompressorState::new(ratio, d);
+        let out = compress_prefill(
+            &vec![1.0; s * w], &vec![0.0; s * w], &vec![0.0; ratio * w], s, ratio, d, &mut st,
+        );
+        assert!(out.is_empty(), "3 tokens at ratio 4 cannot form a block");
+    }
+}

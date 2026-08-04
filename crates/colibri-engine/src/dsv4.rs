@@ -1057,3 +1057,82 @@ mod decode_tests {
         }
     }
 }
+
+/// Walsh-Hadamard rotation over the trailing `n` elements, scaled by `n^-0.5`.
+///
+/// The reference's `rotate_activation`: `hadamard_transform(x, scale = x.size(-1) ** -0.5)`.
+/// Its purpose is QAT-matching — it spreads information across dimensions so the following
+/// fp4/fp8 quantisation sees a flatter distribution. Skipping it does not crash or look
+/// wrong; it just scores against activations the model was not trained on, which is
+/// precisely where the Indexer's top-k selection goes subtly bad.
+///
+/// Despite the docstring saying "randomized", the reference applies NO sign vector — it is
+/// the plain transform. Adding one would be a reasonable-looking guess and wrong.
+///
+/// `n` must be a power of two (V4 uses `index_head_dim` 128).
+pub fn hadamard_rotate(x: &mut [f32], n: usize) {
+    debug_assert!(n.is_power_of_two(), "WHT needs a power-of-two length, got {n}");
+    debug_assert_eq!(x.len() % n, 0);
+    for row in x.chunks_exact_mut(n) {
+        let mut h = 1;
+        while h < n {
+            let mut i = 0;
+            while i < n {
+                for j in i..i + h {
+                    let (a, b) = (row[j], row[j + h]);
+                    row[j] = a + b;
+                    row[j + h] = a - b;
+                }
+                i += h << 1;
+            }
+            h <<= 1;
+        }
+        let s = (n as f32).powf(-0.5);
+        for v in row.iter_mut() {
+            *v *= s;
+        }
+    }
+}
+
+#[cfg(test)]
+mod hadamard_tests {
+    use super::*;
+
+    // Involution alone is a WEAK check — the identity function is also its own inverse, so
+    // a no-op implementation passes it. Pin the actual 2-point values and require real
+    // mixing as well.
+    #[test]
+    fn hadamard_matches_known_values_and_actually_mixes() {
+        let r2 = 2f32.powf(-0.5);
+        // n = 2: [a, b] -> [(a+b)/sqrt2, (a-b)/sqrt2]
+        let mut x = vec![3.0f32, 1.0];
+        hadamard_rotate(&mut x, 2);
+        assert!((x[0] - 4.0 * r2).abs() < 1e-6, "got {x:?}");
+        assert!((x[1] - 2.0 * r2).abs() < 1e-6, "got {x:?}");
+
+        // n = 4, one-hot input: every output must be 1/2 in magnitude — a no-op leaves
+        // three zeros and fails, and a wrong scale fails on the magnitude.
+        let mut y = vec![1.0f32, 0.0, 0.0, 0.0];
+        hadamard_rotate(&mut y, 4);
+        for (i, &v) in y.iter().enumerate() {
+            assert!((v.abs() - 0.5).abs() < 1e-6, "element {i} = {v}, expected +-0.5");
+        }
+    }
+
+    // Orthogonality: applying it twice returns the original. Checked SECOND, and only
+    // after the value test above, because on its own it cannot distinguish the real
+    // transform from doing nothing.
+    #[test]
+    fn hadamard_is_its_own_inverse() {
+        let n = 128;
+        let orig: Vec<f32> = (0..n).map(|k| ((k as f32) * 0.37).sin() * 3.0).collect();
+        let mut x = orig.clone();
+        hadamard_rotate(&mut x, n);
+        // It must have CHANGED something first, or the round-trip proves nothing.
+        assert!(x.iter().zip(&orig).any(|(a, b)| (a - b).abs() > 1e-3), "transform was a no-op");
+        hadamard_rotate(&mut x, n);
+        for (i, (a, b)) in x.iter().zip(&orig).enumerate() {
+            assert!((a - b).abs() < 1e-4, "element {i}: {a} vs {b}");
+        }
+    }
+}

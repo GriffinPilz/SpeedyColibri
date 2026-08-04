@@ -137,6 +137,15 @@ pub struct Config {
     pub dense_inter: i32,
     pub first_dense: i32,
     pub q_lora: i32,
+    /// DeepSeek-V4 output LoRA: rank per group (`o_lora_rank`) and the number of groups
+    /// (`o_groups`). V4 replaces the plain o_proj with `o_a` [g*rank, n_heads*head_dim/g]
+    /// then `o_b` [hidden, g*rank]. 0 on every other arch.
+    ///
+    /// These are carried in Config rather than read back from the weights because the
+    /// container stores quantised tensors as FLAT blobs — `o_a` arrives as [33554432] with
+    /// no shape to recover, and 8192x4096 is not the only factorisation of it.
+    pub o_lora: i32,
+    pub o_groups: i32,
     pub kv_lora: i32,
     pub qk_nope: i32,
     pub qk_rope: i32,
@@ -446,6 +455,8 @@ impl Config {
             dense_inter: gi("intermediate_size"),
             first_dense: gi("first_k_dense_replace"),
             q_lora: gi("q_lora_rank"),
+            o_lora: 0,
+            o_groups: 0,
             kv_lora: gi("kv_lora_rank"),
             qk_nope: gi("qk_nope_head_dim"),
             qk_rope: gi("qk_rope_head_dim"),
@@ -627,6 +638,8 @@ impl Config {
             dense_inter: gt("dense_intermediate_size"),
             first_dense,
             q_lora: 0,  // GQA: no query LoRA
+            o_lora: 0,  // GQA: plain o_proj, no output LoRA
+            o_groups: 0,
             kv_lora: 0, // GQA: no latent KV
             qk_nope,
             qk_rope,
@@ -788,6 +801,8 @@ impl Config {
             dense_inter: 0,
             first_dense: 0,
             q_lora: g("q_lora_rank"),
+            o_lora: g("o_lora_rank"),
+            o_groups: g("o_groups").max(1),
             // Attention geometry, taken from the checkpoint's own `inference/model.py`
             // (class `Attention`) rather than inferred, and cross-checked against the
             // released tensor shapes:
@@ -929,6 +944,8 @@ impl Config {
             dense_inter: gt("intermediate_size"),
             first_dense: gt("first_k_dense_replace"),
             q_lora: gt("q_lora_rank"),
+            o_lora: 0,
+            o_groups: 0,
             kv_lora: gt("kv_lora_rank"),
             qk_nope: gt("qk_nope_head_dim"),
             qk_rope: gt("qk_rope_head_dim"),
@@ -1109,6 +1126,8 @@ impl Config {
             dense_inter: gi("moe_intermediate_size").max(1),
             first_dense: 0, // MoE layers are index-selected via layer_kind, not a prefix.
             q_lora: 0,
+            o_lora: 0,
+            o_groups: 0,
             kv_lora: 0,
             qk_nope,
             qk_rope,

@@ -16,6 +16,25 @@ use std::io;
 
 /// Load a `[O, I]` weight tensor as a [`QTensor`] at `bits`. Port of
 /// `qt_from_disk` + `qt_load`.
+/// The `[out, in]` shape of a tensor, read from the shard index.
+///
+/// DeepSeek-V4's O-LoRA dims (`o_groups`, `o_lora_rank`) are V4-only config fields the
+/// shared `Config` does not carry, so the loader takes them from the weights themselves.
+/// The shapes are the ground truth; deriving them again from config arithmetic would just
+/// create a second source that can drift.
+pub fn two_dims_of(shards: &Shards, name: &str) -> io::Result<(usize, usize)> {
+    let t = shards.find(name).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {name}"))
+    })?;
+    if t.shape.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name}: expected a 2-D tensor, got {:?}", t.shape),
+        ));
+    }
+    Ok((t.shape[0] as usize, t.shape[1] as usize))
+}
+
 pub fn qt_load(shards: &Shards, name: &str, o: usize, i: usize, bits: u32) -> io::Result<QTensor> {
     // NVFP4 resident weight (built by `COLI_RESIDENT_NVFP4`): a `.g` global scale sits
     // beside a blob of e2m1 nibbles CONCATENATED with ue4m3 per-16 block scales — the same

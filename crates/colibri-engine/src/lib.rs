@@ -50,7 +50,7 @@ pub use forward::{
     kimi_forward, layer_forward, layer_forward_kind, logits, mamba2_mixer, DecodeStats,
 };
 pub use linear::{embed_row, matmul_f32, matmul_qt};
-pub use loader::{ld, qt_load};
+pub use loader::{ld, qt_load, two_dims_of};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
 pub use model::{KvCache, Layer, Model, MtpBlock, MtpHead, KV_UNSET};
 pub use moe::{
@@ -155,14 +155,34 @@ fn load_layer(
     let mut l = Layer::default();
     l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
     l.post_ln = ld(shards, &p("post_attention_layernorm.weight"))?;
-    // Output projection is shared by both attention flavours (`[hidden, n_heads*head_dim]`).
-    l.o = qt_load(
-        shards,
-        &p("self_attn.o_proj.weight"),
-        d,
-        h * cfg.v_head as usize,
-        dbits,
-    )?;
+    // Output projection. Every arch here except DeepSeek-V4 has a single
+    // `[hidden, n_heads*head_dim]` o_proj shared by both attention flavours; V4 replaces
+    // it with a LoRA pair (`o_a` then `o_b`) and ships no `o_proj` at all, so asking for
+    // one there fails the load with "missing tensor" — which is exactly how this was found.
+    if cfg.arch == colibri_core::Arch::DeepseekV4 {
+        // o_a: [g*rank, n_heads*head_dim/g]   -> [8192, 4096] on the released checkpoint
+        // o_b: [hidden,  g*rank]               -> [4096, 8192]
+        //
+        // Dims come from Config, NOT from the tensor: the container stores quantised
+        // weights as flat blobs, so `o_a` arrives as [33554432] and 8192x4096 is only one
+        // of its factorisations. Reading the shape back would be guessing.
+        let g = cfg.o_groups.max(1) as usize;
+        let rank = cfg.o_lora as usize;
+        let (oa_o, oa_i) = (g * rank, h * cfg.qk_head as usize / g);
+        let (ob_o, ob_i) = (d, g * rank);
+        l.o_a = Some(qt_load(shards, &p("self_attn.o_a_proj.weight"), oa_o, oa_i, dbits)?);
+        l.o_b = Some(qt_load(shards, &p("self_attn.o_b_proj.weight"), ob_o, ob_i, dbits)?);
+        // Per-head sink, one f32 per attention head.
+        l.attn_sink = ld(shards, &p("self_attn.attn_sink"))?;
+    } else {
+        l.o = qt_load(
+            shards,
+            &p("self_attn.o_proj.weight"),
+            d,
+            h * cfg.v_head as usize,
+            dbits,
+        )?;
+    }
 
     if cfg.arch.is_gqa() {
         // GQA attention (MiniMax M3/M2): q/k/v projections + QK-norm. `qk_head` is the
@@ -247,27 +267,53 @@ fn load_layer(
             cfg.q_lora as usize,
             dbits,
         )?;
-        l.kv_a = qt_load(
-            shards,
-            &p("self_attn.kv_a_proj_with_mqa.weight"),
-            (cfg.kv_lora + cfg.qk_rope) as usize,
-            d,
-            dbits,
-        )?;
-        l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
-        l.kv_b = qt_load(
-            shards,
-            &p("self_attn.kv_b_proj.weight"),
-            h * (cfg.qk_nope + cfg.v_head) as usize,
-            cfg.kv_lora as usize,
-            dbits,
-        )?;
+        if cfg.arch == colibri_core::Arch::DeepseekV4 {
+            // V4's KV path is NOT V3's. `wkv` projects hidden -> head_dim and that latent
+            // is used directly as both K and V after `kv_norm` — there is no kv_b, and no
+            // `_with_mqa` suffix on the name. Loading it through the V3 arm would ask for
+            // two tensors this checkpoint does not contain.
+            l.kv_a = qt_load(
+                shards,
+                &p("self_attn.kv_a_proj.weight"),
+                cfg.kv_lora as usize,
+                d,
+                dbits,
+            )?;
+            l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
+        } else {
+            l.kv_a = qt_load(
+                shards,
+                &p("self_attn.kv_a_proj_with_mqa.weight"),
+                (cfg.kv_lora + cfg.qk_rope) as usize,
+                d,
+                dbits,
+            )?;
+            l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
+            l.kv_b = qt_load(
+                shards,
+                &p("self_attn.kv_b_proj.weight"),
+                h * (cfg.qk_nope + cfg.v_head) as usize,
+                cfg.kv_lora as usize,
+                dbits,
+            )?;
+        }
 
         // DSA lightning indexer — present only when the checkpoint was converted with the
         // indexer weights (`--indexer`). Load per layer that carries them; a model without
         // these tensors leaves the fields `None` and attention runs dense. Names/dims match
         // the C loader (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`).
-        if cfg.index_hd > 0 && cfg.index_nh > 0 && shards.has(&p("self_attn.indexer.wq_b.weight")) {
+        // DeepSeek-V4 also carries an `indexer.*` subtree and sets index_hd/index_nh, but
+        // its indexer is a DIFFERENT structure: compressor-based
+        // (`indexer.compressor.{ape,norm,wgate,wkv}` + `weights_proj` + `wq_b`) with no
+        // `wk` at all. Letting it open the GLM arm gets two tensors in before failing on
+        // `indexer.wk.weight`. Until the V4 indexer forward path exists, V4 runs DENSE
+        // attention — correct but not sparse, and skipping the load is what makes that
+        // explicit rather than half-loading a sparse path that cannot run (#59).
+        if cfg.arch != colibri_core::Arch::DeepseekV4
+            && cfg.index_hd > 0
+            && cfg.index_nh > 0
+            && shards.has(&p("self_attn.indexer.wq_b.weight"))
+        {
             let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
             l.ix_wq = Some(qt_load(
                 shards,
@@ -308,8 +354,22 @@ fn load_layer(
         // The router selection bias sits under `.gate.` on GLM but directly under the
         // MoE block on MiniMax-M3 (`block_sparse_moe.e_score_correction_bias` →
         // `mlp.e_score_correction_bias`); accept either.
+        // DeepSeek-V4 spells it `mlp.gate.bias`, and its three hash-routing layers
+        // (`num_hash_layers`) carry NO bias at all — they route by the `tid2eid` table
+        // instead, which is not converted yet (#59). Falling back to zeros there keeps the
+        // other 40 layers loadable; a zero bias is exactly "no selection preference", so it
+        // is the honest neutral value rather than a fudge. Those 3 layers will still route
+        // wrongly until tid2eid lands — they are wrong by omission, not by this default.
         l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))
-            .or_else(|_| ld(shards, &p("mlp.e_score_correction_bias")))?;
+            .or_else(|_| ld(shards, &p("mlp.e_score_correction_bias")))
+            .or_else(|_| ld(shards, &p("mlp.gate.bias")))
+            .or_else(|e| {
+                if cfg.arch == colibri_core::Arch::DeepseekV4 {
+                    Ok(vec![0f32; cfg.n_experts as usize])
+                } else {
+                    Err(e)
+                }
+            })?;
         // Shared expert — GLM/M3 have one; MiniMax-M2 has none (n_shared 0). Only load
         // (and later compute) it when present, else the tensors are absent from the
         // container and the fields stay at their empty default.

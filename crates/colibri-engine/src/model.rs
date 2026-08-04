@@ -27,6 +27,16 @@ pub struct Layer {
     pub q_a_ln: Vec<f32>,
     pub kv_a_ln: Vec<f32>,
 
+    // DeepSeek-V4 output projection: a LoRA PAIR replacing the single `o` above.
+    // `o_a` is [n_groups*o_lora_rank, n_heads*head_dim/n_groups] and `o_b` is
+    // [hidden, n_groups*o_lora_rank] (`o_groups` 8, `o_lora_rank` 1024). V3 and every
+    // other arch here have a plain `o_proj`, so these are None elsewhere and `o` is
+    // left empty on V4 — the two are mutually exclusive, never both populated.
+    pub o_a: Option<QTensor>,
+    pub o_b: Option<QTensor>,
+    // Per-head attention sink, f32 [n_heads] (DeepSeek-V4). Empty elsewhere.
+    pub attn_sink: Vec<f32>,
+
     // GQA (MiniMax-M3, arch == MinimaxM3): standard q/k/v projections with per-head
     // QK-norm; RoPE is partial (see Config::qk_rope). `None`/empty on GLM, which
     // uses the MLA fields above instead. `o` (above) is the shared output proj.
@@ -762,6 +772,9 @@ impl Layer {
             + q(&self.kv_a)
             + q(&self.kv_b)
             + q(&self.o)
+            + oq(&self.o_a)
+            + oq(&self.o_b)
+            + v(&self.attn_sink)
             + q(&self.gate_proj)
             + q(&self.up_proj)
             + q(&self.down_proj)

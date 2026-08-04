@@ -270,6 +270,12 @@ pub struct KvCache {
     k_rot: Vec<Vec<f32>>,
     /// GQA full-KV width (`n_kv_heads * head_dim`); 0 on the MLA (GLM) path.
     kv_dim: usize,
+    /// DeepSeek-V4 compressed KV: per-layer `[max_blocks * head_dim]`, empty on layers
+    /// without a Compressor and on every other arch. See `comp_init`.
+    comp: Vec<Vec<f32>>,
+    comp_len: Vec<usize>,
+    comp_state: Vec<Option<crate::dsv4::CompressorState>>,
+    comp_dim: usize,
     /// per-layer full key buffer, each `[max_t * kv_dim]` — GQA only (else empty).
     k_full: Vec<Vec<f32>>,
     /// per-layer full value buffer, each `[max_t * kv_dim]` — GQA only (else empty).
@@ -340,6 +346,12 @@ impl KvCache {
     /// not with `max_t` — one that stops early never pays for the unused tail.
     pub fn new(n_rows: usize, kv_lora: usize, qk_rope: usize, max_t: usize) -> KvCache {
         KvCache {
+            // DeepSeek-V4 compressed KV — empty until `comp_init`; every other arch
+            // leaves them empty for the cache's lifetime.
+            comp: Vec::new(),
+            comp_len: Vec::new(),
+            comp_state: Vec::new(),
+            comp_dim: 0,
             max_t,
             kv_lora,
             qk_rope,
@@ -653,6 +665,55 @@ impl KvCache {
     }
     pub fn latent_row_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
         &mut self.latent[layer][pos * self.kv_lora..(pos + 1) * self.kv_lora]
+    }
+
+    /// DeepSeek-V4 compressed-KV rows and the per-layer Compressor carry state.
+    ///
+    /// Lazily sized: only the 41 layers that HAVE a compressor get buffers, and a model
+    /// without one keeps these empty. `comp_len[layer]` is how many compressed rows exist
+    /// so far — it advances once every `compress_ratio` tokens, not once per token, which
+    /// is the whole point of the mechanism.
+    pub fn comp_init(&mut self, n_layers: usize, ratios: &[i32], head_dim: usize, max_blocks: usize) {
+        self.comp = (0..n_layers)
+            .map(|i| {
+                let r = ratios.get(i).copied().unwrap_or(0);
+                if r > 0 { vec![0f32; max_blocks * head_dim] } else { Vec::new() }
+            })
+            .collect();
+        self.comp_len = vec![0usize; n_layers];
+        self.comp_state = (0..n_layers)
+            .map(|i| {
+                let r = ratios.get(i).copied().unwrap_or(0);
+                (r > 0).then(|| crate::dsv4::CompressorState::new(r as usize, head_dim))
+            })
+            .collect();
+        self.comp_dim = head_dim;
+    }
+
+    /// Append one compressed row to `layer`. Silently drops past capacity rather than
+    /// panicking mid-generation — the caller sizes `max_blocks` from `max_t / min_ratio`.
+    pub fn comp_push(&mut self, layer: usize, row: &[f32]) {
+        let d = self.comp_dim;
+        let n = self.comp_len[layer];
+        if (n + 1) * d <= self.comp[layer].len() {
+            self.comp[layer][n * d..(n + 1) * d].copy_from_slice(row);
+            self.comp_len[layer] = n + 1;
+        }
+    }
+
+    /// The compressed rows written so far for `layer`.
+    pub fn comp_rows(&self, layer: usize) -> &[f32] {
+        &self.comp[layer][..self.comp_len[layer] * self.comp_dim]
+    }
+
+    /// Whether `comp_init` has run (buffers allocated).
+    pub fn comp_rows_len(&self) -> usize {
+        self.comp.len()
+    }
+
+    /// Mutable access to a layer's Compressor carry state.
+    pub fn comp_state_mut(&mut self, layer: usize) -> Option<&mut crate::dsv4::CompressorState> {
+        self.comp_state.get_mut(layer).and_then(|o| o.as_mut())
     }
 
     /// Roped k_rot row for `(layer, pos)`.

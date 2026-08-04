@@ -2177,6 +2177,12 @@ fn dsv4_attention(
         rmsnorm(&mut row[..hd], &kvt[i * hd..(i + 1) * hd], &l.kv_a_ln, cfg.eps);
         let (c, sn) = v4_rope_rows(cos, sin, pos_base + i, half);
         crate::dsv4::rope_interleaved(&mut row[..hd], c, sn, rd, false);
+        // QAT match: the reference FP8-simulates the NON-rope dims and deliberately leaves
+        // the rope dims alone — `act_quant(kv[..., :-rd], 64, ..., True)` — so the two
+        // halves carry different precision by design. Quantising the whole row (or none of
+        // it) is the natural simplification and loses that distinction; the rope dims are
+        // left in full precision because position is where it matters most.
+        crate::dsv4::act_quant_sim(&mut row[..hd - rd], 64);
         kv.latent_row_mut(li, pos_base + i).copy_from_slice(&row[..hd]);
     }
 

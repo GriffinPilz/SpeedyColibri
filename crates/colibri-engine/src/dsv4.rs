@@ -1136,3 +1136,78 @@ mod hadamard_tests {
         }
     }
 }
+
+/// Round to the nearest representable e4m3 value (FP8, 3 mantissa bits, max 448).
+#[inline]
+fn e4m3_round(v: f32) -> f32 {
+    if v == 0.0 || !v.is_finite() {
+        return v;
+    }
+    let a = v.abs();
+    if a >= 448.0 {
+        return 448.0f32.copysign(v);
+    }
+    // e4m3's smallest normal is 2^-6; below that it is subnormal with a fixed step.
+    let e = a.log2().floor().max(-6.0);
+    let step = (e - 3.0).exp2(); // 3 mantissa bits => 8 steps per binade
+    ((a / step).round() * step).min(448.0).copysign(v)
+}
+
+/// In-place FP8 activation simulation: block-wise quantise then immediately dequantise.
+///
+/// The reference's `act_quant(..., inplace=True)` — "fused quant+dequant back to BF16". It
+/// does NOT shrink anything; its whole purpose is to make inference see the same rounding
+/// the model saw during QAT. Omitting it leaves activations *more* precise than training,
+/// which sounds harmless and is not: V4 quantises the non-rope KV dims specifically, and
+/// the rope dims specifically NOT, so the two halves are meant to carry different
+/// precision.
+///
+/// `block` is the group size along the last dim (64 for V4's KV call). Scale is
+/// `amax / 448` per block, matching the kernel's `fp8_max`.
+pub fn act_quant_sim(x: &mut [f32], block: usize) {
+    for grp in x.chunks_mut(block) {
+        let amax = grp.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        if amax == 0.0 {
+            continue;
+        }
+        let s = amax / 448.0;
+        for v in grp.iter_mut() {
+            *v = e4m3_round(*v / s) * s;
+        }
+    }
+}
+
+#[cfg(test)]
+mod act_quant_tests {
+    use super::*;
+
+    // It must actually LOSE precision, and it must preserve the block maximum. A no-op
+    // passes any "output is close to input" check, so assert both directions: the max
+    // survives exactly, and a value needing more than 3 mantissa bits moves.
+    #[test]
+    fn act_quant_rounds_but_preserves_the_block_max() {
+        // 1 + 1/64 needs 6 mantissa bits, so e4m3 cannot represent it and it must move.
+        let mut x = vec![1.0 + 1.0 / 64.0, 100.0];
+        let before = x.clone();
+        act_quant_sim(&mut x, 2);
+        assert!((x[1] - 100.0).abs() < 1e-3, "block max must survive: {}", x[1]);
+        assert!((x[0] - before[0]).abs() > 1e-4, "value needing 6 mantissa bits must round");
+        // and it must stay CLOSE — a wrong scale would move it far.
+        assert!((x[0] - before[0]).abs() < 0.05, "moved too far: {} -> {}", before[0], x[0]);
+    }
+
+    // Blocks are independent: a huge value in one block must not degrade another.
+    #[test]
+    fn act_quant_scales_per_block() {
+        let mut x = vec![1.0, 1.0, 1000.0, 1000.0];
+        act_quant_sim(&mut x, 2);
+        assert!((x[0] - 1.0).abs() < 1e-3, "small block must keep its own scale: {}", x[0]);
+    }
+
+    #[test]
+    fn act_quant_leaves_zero_blocks_alone() {
+        let mut x = vec![0.0f32; 4];
+        act_quant_sim(&mut x, 2);
+        assert!(x.iter().all(|&v| v == 0.0), "an all-zero block must not produce NaN");
+    }
+}

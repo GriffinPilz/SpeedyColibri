@@ -1240,6 +1240,10 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     // earlier work chose on prefill evidence and which nothing here re-measured.
     #[allow(clippy::overly_complex_bool_expr)]
     if true {
+        // Timed as one block: on the archs that take a grouped path this IS the expert
+        // compute, and `GATHER_US`/`GPUFFN_US`/`SCATTER_US` below never run. Without
+        // this the whole grouped path lands in the residual.
+        let _grp = std::time::Instant::now();
         let mut active = Vec::with_capacity(per_expert.len());
         for (e, rows, rw) in &per_expert {
             active.push((provider.expert(layer, *e)?, rows.clone(), rw.clone()));
@@ -1258,6 +1262,12 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         } else {
             false
         };
+        if crate::forward::profile_on() {
+            crate::forward::MOE_GRP_US.fetch_add(
+                _grp.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if grouped {
             return Ok(out);
         }
@@ -1657,6 +1667,7 @@ pub fn nemotron_moe<P: ExpertProvider>(
             std::sync::atomic::Ordering::Relaxed,
         );
     }
+    let _sel = std::time::Instant::now();
     let mut idxs = vec![0usize; s_len * k];
     let mut ws = vec![0f32; s_len * k];
     for s in 0..s_len {
@@ -1665,6 +1676,7 @@ pub fn nemotron_moe<P: ExpertProvider>(
         ws[s * k..s * k + k].copy_from_slice(&w);
     }
     log_routing(layer, s_len, k, &idxs);
+    let mut sel_us = _sel.elapsed().as_micros() as u64;
 
     // ---- fc1: hidden -> latent --------------------------------------------
     let fc1 = l
@@ -1676,7 +1688,9 @@ pub fn nemotron_moe<P: ExpertProvider>(
         .as_ref()
         .expect("nemotron MoE layer missing fc2_latent");
     let mut h_lat = vec![0f32; s_len * dl];
+    let _fc = std::time::Instant::now();
     matmul_qt(&mut h_lat, x, fc1, s_len);
+    let mut fc_us = _fc.elapsed().as_micros() as u64;
 
     // ---- routed experts (weighted sum, in latent space) -------------------
     // Expert-parallel: when a multi-node cluster is installed, split the routed experts
@@ -1685,7 +1699,9 @@ pub fn nemotron_moe<P: ExpertProvider>(
     // wire carries `moe_latent` floats per token instead of `hidden`, so the latent MoE
     // is *cheaper* to shard than the standard one. fc2 and the shared expert stay local:
     // they're resident dense weights every node already has.
+    let _un = std::time::Instant::now();
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
+    sel_us += _un.elapsed().as_micros() as u64;
     let moe_lat = match cluster_ctx().filter(|c| c.sharding.num_nodes() > 1) {
         Some(ctx) => sharded_experts_partial(
             provider,
@@ -1705,7 +1721,14 @@ pub fn nemotron_moe<P: ExpertProvider>(
     };
 
     // ---- fc2: latent -> hidden --------------------------------------------
+    let _fc2 = std::time::Instant::now();
     matmul_qt(out, &moe_lat, fc2, s_len);
+    fc_us += _fc2.elapsed().as_micros() as u64;
+    if crate::forward::profile_on() {
+        let rel = std::sync::atomic::Ordering::Relaxed;
+        crate::forward::MOE_FC_US.fetch_add(fc_us, rel);
+        crate::forward::MOE_SEL_US.fetch_add(sel_us, rel);
+    }
 
     // ---- shared expert (gateless ReLU², on the original hidden) -----------
     // `l.gate_proj` is empty for a Nemotron MoE layer and ignored under ReLU²; the

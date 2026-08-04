@@ -239,6 +239,7 @@ fn main() -> ExitCode {
         "qerr" => cmd_qerr(&args),
         "iobench" => cmd_iobench(&args),
         "dropcache" => cmd_dropcache(&args),
+        "gpubench" => cmd_gpubench(&args),
         "bench" => {
             eprintln!("coli {cmd}: not yet ported. See PORTING.md for status.");
             ExitCode::from(2)
@@ -1913,6 +1914,31 @@ fn cmd_repack(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `coli gpubench [S=1] [reps=200]` — per-call cost of a GPU matmul, isolated from
+/// any model. Decode issues one of these per dense weight per layer, each paying a
+/// blocking HtoD copy, a launch, a DtoH copy and a stream sync. The sweep includes a
+/// deliberately tiny shape whose arithmetic is negligible, so its time IS the fixed
+/// per-call floor and every real shape can be reported against it.
+#[cfg(feature = "cuda")]
+fn cmd_gpubench(args: &[String]) -> ExitCode {
+    let s: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
+    let reps: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(200);
+    if !colibri_engine::gpu::available() {
+        eprintln!("coli gpubench: no CUDA backend — this measures GPU dispatch, so there is nothing to report");
+        return ExitCode::FAILURE;
+    }
+    colibri_engine::gpubench::report(s, reps);
+    ExitCode::SUCCESS
+}
+
+/// Without the `cuda` feature there is no dispatch to measure — say so rather than
+/// timing the CPU fallback, which would report a number for a different code path.
+#[cfg(not(feature = "cuda"))]
+fn cmd_gpubench(_args: &[String]) -> ExitCode {
+    eprintln!("coli gpubench: built without the `cuda` feature — nothing to measure");
+    ExitCode::FAILURE
 }
 
 /// `coli iobench <file> [total_mb=2048] [bs_kb=2048] [qd=20]` — the atlas io_uring

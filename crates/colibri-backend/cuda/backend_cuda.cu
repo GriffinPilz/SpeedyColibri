@@ -39,6 +39,10 @@ typedef struct {
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
+    /* Pinned staging for the segmented-GEMV descriptor array. It is only ~1 KB, but it
+     * is uploaded once per MoE layer per token, and a PAGEABLE async copy is not async:
+     * the driver bounces it through an internal buffer and synchronizes. */
+    float *host_seg; size_t host_seg_cap;
     /* Segmented-expert descriptors (see coli_cuda_expert_seg_nvfp4_relu2): per-row-tile
      * expert index + local row base, and per-expert offsets/rows/weight pointers/scales. */
     int *sg_tile_e,*sg_tile_r0,*sg_off,*sg_rows; float *sg_ug,*sg_dg; void *sg_uw,*sg_ubs,*sg_dw,*sg_dbs;
@@ -428,6 +432,189 @@ __global__ static void nvfp4_gemv_u4(float *y,const float *x,const uint8_t *w,
     #pragma unroll
     for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
     if(lane==0) y[n]=acc*g;
+}
+
+/* One expert's two projections, as the segmented GEMV kernels see them. Both are packed
+ * into a single descriptor so the whole layer's set is ONE pinned upload per call rather
+ * than six pageable ones. `which` selects up (0) or down (1) at launch. */
+struct NvSegDesc {
+    const uint8_t *uw,*ubs,*dw,*dbs;
+    float ug,dg;
+};
+
+/* The same expert set, but delivered in KERNEL PARAMETER space instead of through a
+ * device buffer.
+ *
+ * This distinction is worth 2.5x and is not obvious. Expert weights here are ZERO-COPY
+ * HOST pointers. Handed to a kernel as a parameter, the driver sees the address at launch
+ * and the access is a normal mapped read. Handed to it as opaque bytes inside a device
+ * buffer, the driver cannot know which host pages the kernel will touch, and the reads
+ * degrade to fault-driven mapping. Measured on Nemotron-H decode, everything else held
+ * identical (same grid, same inner loop, same host-side block, tokens bit-identical):
+ *
+ *     weight pointer as kernel parameter   11.31 tok/s
+ *     weight pointer read from a device buffer    4.02 tok/s
+ *
+ * This also CORRECTS the explanation recorded on `expert_seg_decode_enabled`, which
+ * attributed that path's 2.4x regression to `nvfp4_matmul_seg` wasting 15/16 of a 16-row
+ * MMA tile on a 1-row expert. That cannot be the cause: the GEMV here tiles nothing and
+ * reproduces the same penalty. What both paths share is reading weight pointers out of
+ * `sg_uw`/`sg_dw` device arrays.
+ *
+ * Sized for the largest routed top-k in the fleet with headroom; the caller declines
+ * above it rather than silently truncating the expert set. 640 B, far under the 4 KB
+ * parameter limit. */
+#define SEGP_MAX 32
+struct SegP {
+    const uint8_t *w[SEGP_MAX];
+    const uint8_t *bs[SEGP_MAX];
+    float g[SEGP_MAX];
+};
+
+/* ---- SEGMENTED decode GEMV: one warp per (expert, output row) -------------------
+ *
+ * The decode expert path issues a launch trio per expert — 22 experts x 40 MoE layers =
+ * 2640 launches per token on Nemotron-H — and each one is a GEMV over a single row. An
+ * nsys profile measured 26,400 `nvfp4_gemv` launches averaging 15.4 us, which was the
+ * whole of the routed-expert time. One expert's up-projection is only (2688+7)/8 = 337
+ * blocks, so each launch leaves the machine mostly idle and they serialize on the stream.
+ *
+ * These kernels add an EXPERT AXIS to the grid (`blockIdx.y`) so a whole layer's experts
+ * go out in one launch: same warps, same arithmetic, ~22x the blocks in flight and 3
+ * launches per layer instead of 66.
+ *
+ * This is the "true segmented GEMV" that `expert_seg_decode_enabled` asks for and does
+ * NOT provide: that path reuses `nvfp4_matmul_seg`, whose 16-row MMA tiles waste 15/16 of
+ * their work on a 1-row expert and measured a 2.4x REGRESSION. Nothing here tiles rows.
+ *
+ * Layout: at decode every expert owns exactly one row, so expert `e` reads `x + e*K` and
+ * writes `y + e*N` — which is already how the caller packs its pooled buffers.
+ *
+ * BIT-EXACTNESS: the inner loop, the per-lane `k` assignment and the shuffle reduction
+ * are copied unchanged from the per-expert kernels above, so each output is bit-identical
+ * to the unsegmented path. That makes the token-identity gate a real regression test for
+ * this change rather than a formality. (The wide and narrow variants still differ from
+ * *each other* in the last ULPs, exactly as they do unsegmented.)
+ *
+ * `w`/`bs` are device arrays of host (zero-copy) weight pointers, one per expert. */
+__global__ static void nvfp4_gemv_seg(float *y,const float *x,
+                                      const NvSegDesc *segs,int which,int K,int N){
+    extern __shared__ float xs[];
+    int e=blockIdx.y;
+    const float *xe=x+(size_t)e*K;
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=xe[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    const NvSegDesc s=segs[e];
+    const uint8_t *wb=which?s.dw:s.uw;
+    const uint8_t *bb=which?s.dbs:s.ubs;
+    float g=which?s.dg:s.ug;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=wb+(size_t)n*Kh;
+    const uint8_t *br=bb+(size_t)n*nb;
+    float acc=0.f;
+    for(int k=lane;k<K;k+=32){
+        uint8_t byte=wr[k>>1];
+        int nib=(k&1)?(byte>>4):(byte&0xF);
+        acc += xs[k]*e2m1f(nib)*e4m3f(br[k>>4]);
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[(size_t)e*N+n]=acc*g;
+}
+
+/* Wide (16 B/lane) twin of `nvfp4_gemv_seg`, mirroring `nvfp4_gemv_u4`. Every expert's
+ * weight must satisfy `nvfp4_u4_ok`, or the caller must use the narrow kernel above —
+ * a misaligned `uint4` load is UB, not merely slow. */
+__global__ static void nvfp4_gemv_u4_seg(float *y,const float *x,
+                                         const NvSegDesc *segs,int which,int K,int N){
+    extern __shared__ float xs[];
+    int e=blockIdx.y;
+    const float *xe=x+(size_t)e*K;
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=xe[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    const NvSegDesc s=segs[e];
+    const uint8_t *wb=which?s.dw:s.uw;
+    const uint8_t *bb=which?s.dbs:s.ubs;
+    float g=which?s.dg:s.ug;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=wb+(size_t)n*Kh;
+    const uint8_t *br=bb+(size_t)n*nb;
+    const uint4 *wq=(const uint4*)wr;
+    int Kq=Kh>>4;
+    float acc=0.f;
+    for(int i=lane;i<Kq;i+=32){
+        uint4 v=wq[i];
+        int k0=i<<5;
+        float s0=e4m3f(br[k0>>4]);
+        float s1=e4m3f(br[(k0+16)>>4]);
+        uint32_t word[4]={v.x,v.y,v.z,v.w};
+        #pragma unroll
+        for(int wi=0;wi<4;wi++){
+            float sc=(wi<2)?s0:s1;
+            int kb=k0+(wi<<3);
+            uint32_t wd=word[wi];
+            float part=0.f;
+            #pragma unroll
+            for(int bj=0;bj<4;bj++){
+                uint32_t byte=(wd>>(bj<<3))&0xFFu;
+                int kk=kb+(bj<<1);
+                part += xs[kk]*e2m1f(byte&0xF) + xs[kk+1]*e2m1f(byte>>4);
+            }
+            acc+=part*sc;
+        }
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[(size_t)e*N+n]=acc*g;
+}
+
+/* Parameter-space twin of `nvfp4_gemv_u4_seg` — see `SegP` for why this exists.
+ * Identical inner loop and lane->k mapping, so it is bit-identical to `nvfp4_gemv_u4`. */
+__global__ static void nvfp4_gemv_u4_segp(float *y,const float *x,SegP p,int K,int N){
+    extern __shared__ float xs[];
+    int e=blockIdx.y;
+    const float *xe=x+(size_t)e*K;
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=xe[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=p.w[e]+(size_t)n*Kh;
+    const uint8_t *br=p.bs[e]+(size_t)n*nb;
+    const uint4 *wq=(const uint4*)wr;
+    int Kq=Kh>>4;
+    float acc=0.f;
+    for(int i=lane;i<Kq;i+=32){
+        uint4 v=wq[i];
+        int k0=i<<5;
+        float s0=e4m3f(br[k0>>4]);
+        float s1=e4m3f(br[(k0+16)>>4]);
+        uint32_t word[4]={v.x,v.y,v.z,v.w};
+        #pragma unroll
+        for(int wi=0;wi<4;wi++){
+            float sc=(wi<2)?s0:s1;
+            int kb=k0+(wi<<3);
+            uint32_t wd=word[wi];
+            float part=0.f;
+            #pragma unroll
+            for(int bj=0;bj<4;bj++){
+                uint32_t byte=(wd>>(bj<<3))&0xFFu;
+                int kk=kb+(bj<<1);
+                part += xs[kk]*e2m1f(byte&0xF) + xs[kk+1]*e2m1f(byte>>4);
+            }
+            acc+=part*sc;
+        }
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[(size_t)e*N+n]=acc*p.g[e];
 }
 
 /* Can `nvfp4_gemv_u4` read this weight? Needs every row 16 B aligned.
@@ -2761,6 +2948,120 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     int tpb=256,wpb=tpb>>5,off=0;
+
+    /* ---- one launch trio for the WHOLE LAYER instead of one per expert ----------
+     * Only for the decode shape (every expert exactly one row) with more than one
+     * expert — below that there is nothing to batch. `COLI_NVFP4_SEG_GEMV=0` forces
+     * the per-expert loop so the two can be A/B'd in one binary.
+     *
+     * Bit-identical to the loop below by construction (same kernels' inner loops,
+     * same lane->k mapping), so a token-identity gate over this is meaningful. */
+    static int s_seg=-1;
+    if(s_seg<0){const char*e=getenv("COLI_NVFP4_SEG_GEMV");s_seg=e?atoi(e):1;}
+    int all_one=1; for(int c=0;c<count;c++) if(rows[c]!=1){all_one=0;break;}
+    if(s_seg&&all_one&&count>1&&!s_tiled){
+        /* The wide reader needs EVERY expert 16 B aligned — one ineligible expert
+         * makes the whole grid unusable, so this is all-or-nothing per launch. */
+        int uw_ok=1,dw_ok=1;
+        for(int c=0;c<count;c++){
+            if(!nvfp4_u4_ok((const uint8_t*)ups[c]->weights,D)) uw_ok=0;
+            if(!nvfp4_u4_ok((const uint8_t*)downs[c]->weights,I)) dw_ok=0;
+        }
+        /* ONE pinned upload for the whole descriptor set. The first version issued six
+         * separate pageable `cudaMemcpyAsync` calls here — 240 per token across 40 MoE
+         * layers — and a pageable async copy is not async: the driver stages it through
+         * an internal bounce buffer and synchronizes, so each one drained the stream. */
+        size_t segb=(size_t)count*sizeof(NvSegDesc);
+        if(reserve_pinned(&ctx->host_seg,&ctx->host_seg_cap,segb)&&
+           reserve_bytes((void**)&ctx->sg_uw,&ctx->sg_uw_cap,segb)){
+            NvSegDesc *hs=(NvSegDesc*)ctx->host_seg;
+            for(int c=0;c<count;c++){
+                hs[c].uw=(const uint8_t*)ups[c]->weights;   hs[c].ubs=(const uint8_t*)ups[c]->bscale;
+                hs[c].dw=(const uint8_t*)downs[c]->weights; hs[c].dbs=(const uint8_t*)downs[c]->bscale;
+                hs[c].ug=ups[c]->gscale; hs[c].dg=downs[c]->gscale;
+            }
+            const NvSegDesc *dsg=(const NvSegDesc*)ctx->sg_uw;
+            if(cuda_ok(cudaMemcpyAsync(ctx->sg_uw,hs,segb,cudaMemcpyHostToDevice,ctx->stream),"seg-gemv desc")){
+            /* How many experts share one launch. `COLI_NVFP4_SEG_CHUNK` exists because
+             * the whole-layer answer (chunk == count) turned out to be the WRONG end of
+             * a curve, and a single point could not show that. chunk=1 reproduces the
+             * per-expert launch structure through the segmented kernel, so the sweep
+             * isolates concurrency from every other difference between the two paths. */
+            static int s_chunk=-1;
+            if(s_chunk<0){const char*e=getenv("COLI_NVFP4_SEG_CHUNK");s_chunk=e?atoi(e):0;}
+            int chunk=(s_chunk>0&&s_chunk<count)?s_chunk:count;
+            /* `COLI_NVFP4_SEG_DIRECT=1` keeps this entire host-side block — the pinned
+             * descriptor upload, the chunk loop, the single D2H — but issues the ORIGINAL
+             * per-expert kernels, which take the weight pointer as a kernel PARAMETER
+             * instead of reading it from a descriptor. It is the control that separates
+             * "the new kernel is slow" from "the new surrounding code is slow"; without
+             * it the two are confounded and the measurement says nothing about which. */
+            static int s_direct=-1;
+            if(s_direct<0){const char*e=getenv("COLI_NVFP4_SEG_DIRECT");s_direct=e&&atoi(e);}
+            /* Parameter-space segmented launch: one grid for the whole layer with the
+             * expert pointers delivered as kernel arguments. `COLI_NVFP4_SEG_PARAM=0`
+             * falls back to the device-buffer form for A/B. */
+            static int s_param=-1;
+            if(s_param<0){const char*e=getenv("COLI_NVFP4_SEG_PARAM");s_param=e?atoi(e):1;}
+            if(s_param&&!s_direct&&uw_ok&&dw_ok){
+                /* Chunked at SEGP_MAX so a model routing more experts than fit in one
+                 * parameter block still gets parameter-space pointers. Falling back to
+                 * the device-buffer kernel instead would be a silent 2.5x cliff keyed on
+                 * top-k, which is exactly the kind of gate that hides for months. */
+                for(int c0=0;c0<count;c0+=SEGP_MAX){
+                    int nc=(c0+SEGP_MAX<count)?SEGP_MAX:(count-c0);
+                    SegP pu,pd;
+                    for(int c=0;c<nc;c++){
+                        ColiCudaTensor *u=ups[c0+c],*d=downs[c0+c];
+                        pu.w[c]=(const uint8_t*)u->weights; pu.bs[c]=(const uint8_t*)u->bscale; pu.g[c]=u->gscale;
+                        pd.w[c]=(const uint8_t*)d->weights; pd.bs[c]=(const uint8_t*)d->bscale; pd.g[c]=d->gscale;
+                    }
+                    dim3 gup((unsigned)((I+wpb-1)/wpb),(unsigned)nc);
+                    dim3 gdn((unsigned)((D+wpb-1)/wpb),(unsigned)nc);
+                    float *xc=ctx->x+(size_t)c0*D,*tc=ctx->up+(size_t)c0*I,*yc=ctx->y+(size_t)c0*D;
+                    nvfp4_gemv_u4_segp<<<gup,tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,pu,D,I);
+                    relu2_inplace<<<(unsigned)(((size_t)nc*I+255)/256),256,0,ctx->stream>>>(tc,(size_t)nc*I);
+                    nvfp4_gemv_u4_segp<<<gdn,tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,pd,I,D);
+                }
+            } else if(s_direct){
+                for(int c=0;c<count;c++){
+                    const uint8_t *uw=(const uint8_t*)ups[c]->weights,*dw=(const uint8_t*)downs[c]->weights;
+                    const uint8_t *ubs=(const uint8_t*)ups[c]->bscale,*dbs=(const uint8_t*)downs[c]->bscale;
+                    float *xc=ctx->x+(size_t)c*D,*tc=ctx->up+(size_t)c*I,*yc=ctx->y+(size_t)c*D;
+                    nvfp4_gemv_u4<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ups[c]->gscale,D,I);
+                    relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tc,(size_t)I);
+                    nvfp4_gemv_u4<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,downs[c]->gscale,I,D);
+                }
+            } else
+            for(int c0=0;c0<count;c0+=chunk){
+                int nc=(c0+chunk<count)?chunk:(count-c0);
+                dim3 gup((unsigned)((I+wpb-1)/wpb),(unsigned)nc);
+                dim3 gdn((unsigned)((D+wpb-1)/wpb),(unsigned)nc);
+                float *xc=ctx->x+(size_t)c0*D,*tc=ctx->up+(size_t)c0*I,*yc=ctx->y+(size_t)c0*D;
+                if(uw_ok)
+                    nvfp4_gemv_u4_seg<<<gup,tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,dsg+c0,0,D,I);
+                else
+                    nvfp4_gemv_seg<<<gup,tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,dsg+c0,0,D,I);
+                relu2_inplace<<<(unsigned)(((size_t)nc*I+255)/256),256,0,ctx->stream>>>(tc,(size_t)nc*I);
+                if(dw_ok)
+                    nvfp4_gemv_u4_seg<<<gdn,tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dsg+c0,1,I,D);
+                else
+                    nvfp4_gemv_seg<<<gdn,tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dsg+c0,1,I,D);
+            }
+            if(cuda_ok(cudaGetLastError(),"seg-gemv launch")&&
+               cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),"seg-gemv output download")&&
+               cuda_ok(cudaStreamSynchronize(ctx->stream),"seg-gemv synchronize")){
+                std::memcpy(y,ctx->host_y,xb);
+                { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+                  g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+                return 1;
+            }
+            return 0;  /* the launch/copy already failed — retrying per-expert would hide it */
+            }
+        }
+        /* descriptor staging failed: fall through to the per-expert loop below */
+    }
+
     for(int c=0;c<count;c++){
         int r=rows[c];
         const uint8_t *uw=(const uint8_t*)ups[c]->weights,*dw=(const uint8_t*)downs[c]->weights;

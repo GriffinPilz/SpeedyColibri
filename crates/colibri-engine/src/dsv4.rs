@@ -938,3 +938,122 @@ mod prefill_tests {
         assert!(out.is_empty(), "3 tokens at ratio 4 cannot form a block");
     }
 }
+
+/// Compressor decode step: absorb one token, and every `ratio`-th step emit one compressed
+/// row (pre-norm, pre-rope). Returns `None` on the steps that only accumulate.
+///
+/// Transcribed from `Compressor.forward`'s `start_pos > 0` branch. The overlap case is the
+/// subtle one — it does NOT pool the state buffer as stored. It builds the window from
+/// **different dim-halves of different state regions**:
+///
+/// ```text
+///   window[..ratio] = state[..ratio ][.. d]   # previous window, FIRST half of dims
+///   window[ratio..] = state[ratio.. ][d ..]   # current  window, SECOND half of dims
+/// ```
+///
+/// then rotates `state[..ratio] = state[ratio..]` so this window becomes the next step's
+/// predecessor. Pooling the buffer directly has the right shape and silently mixes the two
+/// halves' semantics.
+///
+/// `should_compress` is `(pos + 1) % ratio == 0`, so the emitted row corresponds to the
+/// window ENDING at `pos` — the caller ropes it at position `pos + 1 - ratio` and stores it
+/// at cache index `pos / ratio`.
+pub fn compress_decode(
+    kvp: &[f32],
+    scorep: &[f32],
+    ape: &[f32],
+    pos: usize,
+    st: &mut CompressorState,
+) -> Option<Vec<f32>> {
+    let (ratio, coff, d) = (st.ratio, st.coff, st.d);
+    let w = coff * d;
+    debug_assert_eq!(kvp.len(), w);
+    let overlap = coff == 2;
+    let slot = pos % ratio;
+    let base = if overlap { ratio + slot } else { slot };
+
+    st.kv[base * w..base * w + w].copy_from_slice(kvp);
+    for k in 0..w {
+        st.score[base * w + k] = scorep[k] + ape[slot * w + k];
+    }
+    if (pos + 1) % ratio != 0 {
+        return None;
+    }
+
+    let win = if overlap { 2 * ratio } else { ratio };
+    let mut kvw = vec![0f32; win * d];
+    let mut scw = vec![0f32; win * d];
+    if overlap {
+        for r in 0..ratio {
+            // previous window, FIRST half of dims
+            kvw[r * d..r * d + d].copy_from_slice(&st.kv[r * w..r * w + d]);
+            scw[r * d..r * d + d].copy_from_slice(&st.score[r * w..r * w + d]);
+            // current window, SECOND half of dims
+            let src = (ratio + r) * w + d;
+            kvw[(ratio + r) * d..(ratio + r) * d + d].copy_from_slice(&st.kv[src..src + d]);
+            scw[(ratio + r) * d..(ratio + r) * d + d].copy_from_slice(&st.score[src..src + d]);
+        }
+    } else {
+        kvw.copy_from_slice(&st.kv[..ratio * d]);
+        scw.copy_from_slice(&st.score[..ratio * d]);
+    }
+    let mut out = vec![0f32; d];
+    gated_pool(&kvw, &scw, 1, win, d, &mut out);
+
+    if overlap {
+        // This window becomes the next step's predecessor.
+        let (a, b) = st.kv.split_at_mut(ratio * w);
+        a.copy_from_slice(&b[..ratio * w]);
+        let (a, b) = st.score.split_at_mut(ratio * w);
+        a.copy_from_slice(&b[..ratio * w]);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    // Emission cadence: exactly one row every `ratio` steps, on the step where the window
+    // closes. An off-by-one in `should_compress` still emits the right COUNT over a long
+    // run, so the test checks WHICH steps fire, not how many.
+    #[test]
+    fn decode_emits_only_on_window_close() {
+        let (ratio, d) = (4usize, 3usize);
+        let w = 2 * d;
+        let mut st = CompressorState::new(ratio, d);
+        let ape = vec![0f32; ratio * w];
+        let fired: Vec<usize> = (0..12)
+            .filter(|&pos| {
+                compress_decode(&vec![1.0; w], &vec![0.0; w], &ape, pos, &mut st).is_some()
+            })
+            .collect();
+        assert_eq!(fired, vec![3, 7, 11], "must fire when (pos+1) % ratio == 0");
+    }
+
+    // The overlap window must draw its two halves from different state regions. Feed the
+    // FIRST half of dims a distinguishable value and the second half another: the pooled
+    // row must reflect the current window's SECOND half, not the buffer as stored.
+    #[test]
+    fn decode_overlap_takes_second_half_of_current_window() {
+        let (ratio, d) = (4usize, 2usize);
+        let w = 2 * d;
+        let mut st = CompressorState::new(ratio, d);
+        let ape = vec![0f32; ratio * w];
+        // first half of dims = 1.0, second half = 9.0; scores equal so the pool averages.
+        let mut kvp = vec![1.0f32; w];
+        for k in d..w {
+            kvp[k] = 9.0;
+        }
+        let mut out = None;
+        for pos in 0..ratio {
+            out = compress_decode(&kvp, &vec![0.0; w], &ape, pos, &mut st);
+        }
+        let out = out.expect("must emit on the closing step");
+        // The previous window is unfilled (-inf scores) so only the current window's
+        // SECOND half contributes: every channel must be 9.0, not 1.0 and not a blend.
+        for (k, &v) in out.iter().enumerate() {
+            assert!((v - 9.0).abs() < 1e-5, "channel {k} = {v}, expected the second dim-half (9.0)");
+        }
+    }
+}

@@ -52,10 +52,10 @@ pub struct Layer {
     pub hc_ffn_fn: Vec<f32>,
     pub hc_ffn_base: Vec<f32>,
     pub hc_ffn_scale: Vec<f32>,
-    // Per-sublayer input norms. V4 names them `attn_norm`/`ffn_norm`; the reference applies
-    // each AFTER `hc_pre` and before the sublayer.
-    pub attn_norm: Vec<f32>,
-    pub ffn_norm: Vec<f32>,
+    // V4's per-sublayer input norms are NOT separate fields: the converter canonicalizes
+    // `attn_norm`/`ffn_norm` to `input_layernorm`/`post_attention_layernorm`, so they land
+    // in `in_ln`/`post_ln` like every other arch. The reference applies each AFTER
+    // `hc_pre` and before the sublayer, which is the only V4-specific part.
 
     // GQA (MiniMax-M3, arch == MinimaxM3): standard q/k/v projections with per-head
     // QK-norm; RoPE is partial (see Config::qk_rope). `None`/empty on GLM, which
@@ -813,8 +813,6 @@ impl Layer {
             + v(&self.hc_ffn_fn)
             + v(&self.hc_ffn_base)
             + v(&self.hc_ffn_scale)
-            + v(&self.attn_norm)
-            + v(&self.ffn_norm)
             + q(&self.gate_proj)
             + q(&self.up_proj)
             + q(&self.down_proj)

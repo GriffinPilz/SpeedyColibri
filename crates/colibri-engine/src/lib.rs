@@ -200,8 +200,9 @@ fn load_layer(
         l.hc_ffn_fn = hcv("hc_ffn_fn", mw * n)?;
         l.hc_ffn_base = hcv("hc_ffn_base", mw)?;
         l.hc_ffn_scale = hcv("hc_ffn_scale", 3)?;
-        l.attn_norm = ld(shards, &p("attn_norm.weight"))?;
-        l.ffn_norm = ld(shards, &p("ffn_norm.weight"))?;
+        // V4's `attn_norm`/`ffn_norm` are canonicalized by the converter to
+        // `input_layernorm`/`post_attention_layernorm`, which `in_ln`/`post_ln` already
+        // hold — loaded above for every arch. No separate fields.
     } else {
         l.o = qt_load(
             shards,

@@ -1138,6 +1138,13 @@ fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, o
             crate::math::situ(*g, u, a.situ_beta, a.situ_linear_beta)
         } else if a.oai {
             crate::math::swiglu_oai(*g, u, a.alpha, a.limit)
+        } else if a.limit > 0.0 {
+            // DeepSeek-V4: plain SwiGLU with the reference's ASYMMETRIC clamp — `up` on
+            // both sides, `gate` only from above (silu already bounds it below). This is
+            // NOT the oai arm above: that one multiplies by `(u + 1)` and gates with
+            // `sigmoid(alpha*g)`, which V4 does not do. The clamps happen to be identical,
+            // which is exactly why reusing `oai` here would have looked right.
+            crate::dsv4::swiglu_clamped_one(*g, u, a.limit)
         } else {
             silu(*g) * u
         };

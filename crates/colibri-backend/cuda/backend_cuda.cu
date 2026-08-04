@@ -227,10 +227,29 @@ __global__ static void relu2_inplace(float *t, size_t n) {
 }
 
 /* Launch the selected gate*up activation-combine over `n` elements on `stream`. */
+/* DeepSeek-V4: plain SwiGLU under the reference's ASYMMETRIC clamp — `up` both sides,
+ * `gate` only from above (silu already bounds it below).
+ *
+ * The clamps are byte-identical to `swiglu_oai_mul` above; the PRODUCT is not. That one
+ * gates with `sigmoid(alpha*g)` and multiplies by `(u + 1)`, neither of which V4 does.
+ * Matching clamps are exactly why reusing the oai kernel here would have looked correct
+ * and been wrong everywhere the product saturates. Mirrors `dsv4::swiglu_clamped_one`. */
+__global__ static void swiglu_clamped_mul(float *gate, const float *up, size_t n,
+                                          float limit) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = fminf(gate[i], limit);
+        float u = fminf(fmaxf(up[i], -limit), limit);
+        gate[i] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
 static inline void act_mul(float *gate, const float *up, size_t n, cudaStream_t stream) {
     unsigned blocks = (unsigned)((n + 255) / 256);
     if (g_act_oai)
         swiglu_oai_mul<<<blocks, 256, 0, stream>>>(gate, up, n, g_act_alpha, g_act_limit);
+    else if (g_act_limit > 0.0f)
+        swiglu_clamped_mul<<<blocks, 256, 0, stream>>>(gate, up, n, g_act_limit);
     else
         silu_mul<<<blocks, 256, 0, stream>>>(gate, up, n);
 }

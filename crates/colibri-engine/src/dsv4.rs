@@ -593,3 +593,38 @@ mod v4_rope_table_tests {
         );
     }
 }
+
+/// Scalar form of [`swiglu_clamped`] for the per-element CPU expert loop.
+///
+/// `up` is clamped on BOTH sides, `gate` only from above — the reference's asymmetry,
+/// because silu already bounds the gate below. Result is `silu(gate) * up`, with no
+/// `(up + 1)` and no `sigmoid(alpha*g)`: those belong to the oai variant, whose clamps are
+/// identical and whose product is not.
+#[inline]
+pub fn swiglu_clamped_one(gate: f32, up: f32, limit: f32) -> f32 {
+    let g = gate.min(limit);
+    let u = up.clamp(-limit, limit);
+    (g / (1.0 + (-g).exp())) * u
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+
+    // The clamp must be ASYMMETRIC and must not be the oai product. Values are chosen to
+    // exceed the limit in each direction so a symmetric clamp, a missing clamp, and an
+    // `(up + 1)` product all fail — a test using small values would pass under all four.
+    #[test]
+    fn clamp_is_asymmetric_and_is_not_oai() {
+        let lim = 10.0f32;
+        // gate far below -limit must NOT be clamped up; silu(-50) ~ 0 so the product ~0.
+        assert!(swiglu_clamped_one(-50.0, 1.0, lim).abs() < 1e-6);
+        // gate far above +limit IS clamped: same result as feeding exactly the limit.
+        assert_eq!(swiglu_clamped_one(50.0, 1.0, lim), swiglu_clamped_one(lim, 1.0, lim));
+        // up is clamped BOTH ways.
+        assert_eq!(swiglu_clamped_one(1.0, 50.0, lim), swiglu_clamped_one(1.0, lim, lim));
+        assert_eq!(swiglu_clamped_one(1.0, -50.0, lim), swiglu_clamped_one(1.0, -lim, lim));
+        // and it is silu(g)*u, NOT silu(g)*(u+1): with u = 0 the product must be 0.
+        assert!(swiglu_clamped_one(2.0, 0.0, lim).abs() < 1e-6);
+    }
+}

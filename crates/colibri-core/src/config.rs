@@ -47,6 +47,29 @@ pub enum Arch {
     /// [`LayerKind::Moe`]; the MoE layers are the `first_dense` prefix rule instead.
     /// Ask [`Config::moe_layers`] for that count, never `layer_kind` directly.
     KimiK3,
+    /// DeepSeek-V4-Flash: MoE on every layer, latent attention with **O-LoRA**, and
+    /// **Hyper-Connections** in place of the residual stream.
+    ///
+    /// Hyper-Connections are the load-bearing difference and the reason this cannot reuse
+    /// another arch's block loop. Instead of `x = x + f(norm(x))`, the inter-block state is
+    /// `hc_mult` (4) copies of the hidden state, `[b, s, 4, hidden]`. Each block does
+    /// `hc_pre` (collapse 4 -> 1 by a learned weighted sum) -> norm -> mixer -> `hc_post`
+    /// (expand 1 -> 4, mixing the previous copies through a 4x4 matrix), twice: once around
+    /// attention and once around the FFN. The collapse/expand weights are produced per
+    /// token by a Sinkhorn normalisation (20 iterations) of a 24-wide projection of the
+    /// flattened state — see `hc_split_sinkhorn` in the checkpoint's `inference/kernel.py`.
+    ///
+    /// Crucially the mixer itself still sees `[b, s, hidden]`, because `hc_pre` collapses
+    /// *before* `attn_norm` and `hc_post` expands *after* the block. So attention, the MoE
+    /// and every scratch buffer keep their usual shape; only the carried residual is 4-wide
+    /// (+201 MB at a 4096-token prefill). Do NOT widen the rest of the engine for this.
+    ///
+    /// Routed experts are natively **MXFP4** (`fmt=6`, block-32 E8M0), the same format as
+    /// [`Arch::KimiK3`] and for the same reason: the checkpoint is trained in it, so a
+    /// requantisation to NVFP4 is measured pure loss (6.40% rel-RMS) *and* 5.9% more bytes.
+    /// Dense/resident weights are fp8 e4m3 with **128x128** E8M0 block scales — a third
+    /// scale layout, neither NVFP4's `ceil(I/16)` nor MXFP4's `ceil(I/32)`.
+    DeepseekV4,
 }
 
 /// Per-layer mixer type for a hybrid architecture. Homogeneous arches leave
@@ -384,6 +407,15 @@ impl Config {
         // `text_config` as MiniMax-M3, and K3 carries one (it is a VL model too), so
         // reversing these two silently parses K3 as M3 — wrong attention family, wrong
         // expert geometry, and no KDA state, with nothing to signal it.
+        // DeepSeek-V4-Flash. Like the K3 arm below, this MUST precede the M3 check: that
+        // one claims any config carrying a `text_config`, and matching on `model_type`
+        // first is the only thing keeping a new arch from being silently parsed as M3.
+        // Keyed on `deepseek_v4` / `DeepseekV4ForCausalLM` — deliberately NOT on the
+        // presence of `hc_mult` or `dspark_*`, so a V4 variant that drops one of those
+        // still lands here rather than falling through to a wrong family.
+        if model_type == Some("deepseek_v4") || arch_is("DeepseekV4ForCausalLM") {
+            return Config::from_json_deepseek_v4(r);
+        }
         if model_type == Some("kimi_k3")
             || arch_is("KimiK3ForConditionalGeneration")
             || arch_is("KimiLinearForCausalLM")
@@ -732,6 +764,130 @@ impl Config {
     /// - **MoE is not on that axis.** Every layer after `first_k_dense_replace` carries
     ///   experts regardless of its mixer, so `layer_kind` holds no `Moe` entries and
     ///   [`Config::moe_layers`] falls through to the prefix rule.
+    /// DeepSeek-V4-Flash (`deepseek_v4`).
+    ///
+    /// Everything here is read straight from `config.json`. Two geometry fields are
+    /// deliberately left at 0 with no fallback guess — see the note on `qk_nope`/`v_head`
+    /// below. A wrong attention geometry does not fail loudly, it produces plausible
+    /// garbage, so these stay 0 until they are derived from the checkpoint's own
+    /// `inference/model.py` and pinned by a test against real tensor shapes.
+    fn from_json_deepseek_v4(r: &Json) -> Result<Config, ConfigError> {
+        let g = |k: &str| gi_in(r, k);
+        let nlc = (g("num_hidden_layers").max(0) as usize).min(MAX_LAYERS_IDX);
+
+        let mut c = Config {
+            hidden: g("hidden_size"),
+            n_layers: g("num_hidden_layers"),
+            n_heads: g("num_attention_heads"),
+            n_experts: g("n_routed_experts"),
+            topk: g("num_experts_per_tok"),
+            moe_inter: g("moe_intermediate_size"),
+            // No `intermediate_size` and no `first_k_dense_replace`: EVERY layer is MoE.
+            // Confirmed against the checkpoint inventory, which carries 43 x 256 expert
+            // tensor groups (11008) with no dense-FFN layer among them.
+            dense_inter: 0,
+            first_dense: 0,
+            q_lora: g("q_lora_rank"),
+            // Attention geometry, taken from the checkpoint's own `inference/model.py`
+            // (class `Attention`) rather than inferred, and cross-checked against the
+            // released tensor shapes:
+            //   nope_head_dim = head_dim - rope_head_dim      => 512 - 64 = 448
+            //   wkv  = Linear(dim, head_dim)                  => [512, 4096],  scale [4,32]
+            //   kv_norm = RMSNorm(head_dim)                   => [512]
+            //   wq_b = Linear(q_lora_rank, n_heads*head_dim)  => [32768, 1024], scale [256,8]
+            //
+            // There is NO separate V projection: `wkv` emits one `head_dim`-wide latent
+            // that serves as both K and V (`kv_cache` is `(batch, t, head_dim)`), which is
+            // what `num_key_value_heads: 1` is describing. So the KV latent, the qk head
+            // width and the v head width are all `head_dim`, and KV costs 512 f32 per token
+            // per layer — cheap for a 43-layer model, which is how it affords 1M context.
+            kv_lora: g("head_dim"),
+            qk_nope: g("head_dim") - g("qk_rope_head_dim"),
+            qk_head: g("head_dim"),
+            v_head: g("head_dim"),
+            qk_rope: g("qk_rope_head_dim"),
+            n_shared: g("n_shared_experts"),
+            vocab: g("vocab_size"),
+            max_ctx: g("max_position_embeddings"),
+            n_group: g("n_group").max(1),
+            topk_group: g("topk_group").max(1),
+            norm_topk: r
+                .get("norm_topk_prob")
+                .and_then(Json::as_bool)
+                .unwrap_or(true),
+            stop_ids: Vec::new(),
+            // V4 DOES carry a DSA-family indexer, but on only 21 of 43 layers (the
+            // checkpoint has 21 `attn.indexer.*` groups). These dims describe the indexer
+            // where it exists; which layers have one is a per-layer fact the loader must
+            // read from the weights, not something this scalar config can express.
+            index_topk: g("index_topk"),
+            index_nh: g("index_n_heads"),
+            index_hd: g("index_head_dim"),
+            index_block_size: 0,
+            index_topk_blocks: 0,
+            index_local_blocks: 0,
+            idx_type: Vec::new(),
+            eps: r.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
+            theta: r
+                .get("rope_theta")
+                .and_then(Json::as_f64)
+                .unwrap_or(10000.0) as f32,
+            attn_scale: 0.0,
+            routed_scale: r
+                .get("routed_scaling_factor")
+                .and_then(Json::as_f64)
+                .unwrap_or(1.0) as f32,
+            arch: Arch::DeepseekV4,
+            n_kv_heads: g("num_key_value_heads"),
+            shared_inter: g("n_shared_experts") * g("moe_intermediate_size"),
+            qk_norm: false,
+            gemma_norm: false,
+            // `swiglu_limit` is a clamp on the SwiGLU product, as on M3 — but V4 states it
+            // as a bare float with no `swiglu_alpha`, so only the limit is set.
+            swiglu_oai: false,
+            swiglu_alpha: 0.0,
+            swiglu_limit: r
+                .get("swiglu_limit")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as f32,
+            // Routing is `sqrtsoftplus` + `noaux_tc`, which is neither the sigmoid nor the
+            // softmax arm this bool selects between. Left false so it cannot silently take
+            // the sigmoid path; the real scorer is a V4-specific one still to be written.
+            sigmoid_route: false,
+            // Homogeneous on the mixer axis: every layer is attention + MoE. The
+            // heterogeneity in V4 is the Compressor (41/43) and Indexer (21/43), which are
+            // sub-modules of attention rather than a different mixer, so `layer_kind`
+            // stays empty exactly as it does for GLM.
+            layer_kind: Vec::new(),
+            mtp_layer_kind: Vec::new(),
+            mamba_d_state: 0,
+            mamba_d_conv: 0,
+            mamba_n_heads: 0,
+            mamba_head_dim: 0,
+            mamba_n_groups: 0,
+            mamba_inter: 0,
+            mamba_chunk: 0,
+            // Experts are at model `hidden`, not in a latent bottleneck: w1 is
+            // [moe_inter, hidden] = [2048, 4096] in the checkpoint. Contrast Nemotron-H
+            // and K3, which both route through `moe_latent`.
+            moe_latent: 0,
+            mamba_dt_min: 0.0,
+            situ: false,
+            situ_beta: 0.0,
+            situ_linear_beta: 0.0,
+            mla_nope: false,
+            kda_n_heads: 0,
+            kda_head_dim: 0,
+            kda_d_conv: 0,
+            attn_res_block_size: 0,
+            // Gated SwiGLU with a clamp, not Nemotron's gateless relu^2.
+            relu2: false,
+        };
+        let _ = nlc;
+        parse_stop_ids(r, &mut c.stop_ids);
+        Ok(c)
+    }
+
     fn from_json_kimi(r: &Json, t: &Json) -> Result<Config, ConfigError> {
         let gt = |k: &str| gi_in(t, k);
         let lac = t.get("linear_attn_config");

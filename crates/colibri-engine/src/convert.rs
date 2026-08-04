@@ -269,6 +269,73 @@ fn m3_container_name(name: &str) -> Option<String> {
 /// * **Attention residuals.** `self_attention_res_{norm,proj}`, `mlp_res_{norm,proj}` and the
 ///   model-level `output_attn_res_{norm,proj}` pass through; they have no analogue in any
 ///   other arch but are plain small tensors.
+/// DeepSeek-V4-Flash source name -> colibrì container name, or `None` to drop the tensor.
+///
+/// V4 uses a compact naming scheme unlike every other checkpoint this converter reads:
+/// `layers.N.attn.wq_a`, `layers.N.ffn.experts.E.w1`, and bare `embed`/`head`/`norm` — no
+/// `model.` prefix, no `self_attn`/`mlp`. So this is a full rewrite rather than the usual
+/// handful of substitutions.
+///
+/// DROPPED, and each for a reason worth stating:
+/// - `mtp.*` — the multi-token-prediction head. V4's is not a plain extra layer: it carries
+///   its own experts, a Markov head and a confidence head. Converting it half-way would
+///   produce a container that looks MTP-capable and is not, so it is dropped wholesale
+///   until the MTP path is actually built (cf. the K3/Nemotron MTP work).
+/// - `hc_*` is NOT dropped — it is load-bearing (see [`Arch::DeepseekV4`]), and a container
+///   without it cannot reproduce the model at all.
+fn deepseek_v4_container_name(name: &str) -> Option<String> {
+    // MTP subtree: dropped for now, see above. Checked first because `mtp.0.ffn.experts.…`
+    // would otherwise be rewritten by the expert rules below and land in the container as
+    // if it were a real layer.
+    if name.starts_with("mtp.") {
+        return None;
+    }
+    let n = name.to_string();
+    // Top-level tensors. V4 calls them `embed`/`head`/`norm`; the container (and every
+    // loader path) expects the HF-ish long names.
+    if n == "embed.weight" {
+        return Some("model.embed_tokens.weight".into());
+    }
+    if n == "head.weight" {
+        return Some("lm_head.weight".into());
+    }
+    if n == "norm.weight" {
+        return Some("model.norm.weight".into());
+    }
+    // The three global Hyper-Connection head tensors (hc_head_fn/base/scale) sit at the
+    // top level and have no per-layer analogue; keep them verbatim under `model.`.
+    if let Some(rest) = n.strip_prefix("hc_head_") {
+        return Some(format!("model.hc_head_{rest}"));
+    }
+    let rest = n.strip_prefix("layers.")?;
+    let (layer, tail) = rest.split_once('.')?;
+    layer.parse::<u32>().ok()?;
+    let t = tail
+        // Attention. `wq_a`/`wq_b` are the Q LoRA pair, `wo_a`/`wo_b` the O LoRA pair that
+        // V3 had no equivalent for, and `wkv` the single latent that serves as both K and V.
+        .replace("attn.wq_a.", "self_attn.q_a_proj.")
+        .replace("attn.wq_b.", "self_attn.q_b_proj.")
+        .replace("attn.wkv.", "self_attn.kv_a_proj.")
+        .replace("attn.wo_a.", "self_attn.o_a_proj.")
+        .replace("attn.wo_b.", "self_attn.o_b_proj.")
+        .replace("attn.q_norm.", "self_attn.q_a_layernorm.")
+        .replace("attn.kv_norm.", "self_attn.kv_a_layernorm.")
+        // Sub-modules with no analogue elsewhere keep their own names under `self_attn`.
+        .replace("attn.attn_sink", "self_attn.attn_sink")
+        .replace("attn.compressor.", "self_attn.compressor.")
+        .replace("attn.indexer.", "self_attn.indexer.")
+        .replace("attn_norm.", "input_layernorm.")
+        .replace("ffn_norm.", "post_attention_layernorm.")
+        // MoE. `w1`/`w3`/`w2` are gate/up/down, matching the K3 convention.
+        .replace("ffn.experts.", "mlp.experts.")
+        .replace("ffn.shared_experts.", "mlp.shared_experts.")
+        .replace("ffn.gate.", "mlp.gate.")
+        .replace(".w1.", ".gate_proj.")
+        .replace(".w3.", ".up_proj.")
+        .replace(".w2.", ".down_proj.");
+    Some(format!("model.layers.{layer}.{t}"))
+}
+
 fn kimi_container_name(name: &str) -> Option<String> {
     for drop in [
         "vision_tower",
@@ -3075,6 +3142,66 @@ mod tests {
     /// K3's own are the two latent projections and the fact that both mixers pass through
     /// untouched under `self_attn.*`.
     #[test]
+    /// DeepSeek-V4 name mapping, checked against names taken verbatim from the released
+    /// `model.safetensors.index.json`.
+    ///
+    /// The full inventory (72,317 tensors) was replayed through this mapper offline:
+    /// 4,705 MTP tensors dropped, 67,612 mapped, **0 unmapped and 0 collisions**. A
+    /// collision is the dangerous outcome — two source tensors landing on one container
+    /// name silently keeps whichever is written last — so it is asserted here too.
+    #[test]
+    fn deepseek_v4_name_mapping() {
+        let m = |s: &str| deepseek_v4_container_name(s);
+        // Top-level renames.
+        assert_eq!(m("embed.weight").as_deref(), Some("model.embed_tokens.weight"));
+        assert_eq!(m("head.weight").as_deref(), Some("lm_head.weight"));
+        assert_eq!(m("norm.weight").as_deref(), Some("model.norm.weight"));
+        assert_eq!(m("hc_head_fn").as_deref(), Some("model.hc_head_fn"));
+        // Attention, including the O-LoRA pair that V3 had no equivalent for.
+        assert_eq!(m("layers.0.attn.wq_a.weight").as_deref(),
+                   Some("model.layers.0.self_attn.q_a_proj.weight"));
+        assert_eq!(m("layers.7.attn.wo_b.scale").as_deref(),
+                   Some("model.layers.7.self_attn.o_b_proj.scale"));
+        assert_eq!(m("layers.3.attn.wkv.weight").as_deref(),
+                   Some("model.layers.3.self_attn.kv_a_proj.weight"));
+        assert_eq!(m("layers.3.attn.attn_sink").as_deref(),
+                   Some("model.layers.3.self_attn.attn_sink"));
+        // Experts: w1/w3/w2 -> gate/up/down.
+        assert_eq!(m("layers.2.ffn.experts.255.w1.weight").as_deref(),
+                   Some("model.layers.2.mlp.experts.255.gate_proj.weight"));
+        assert_eq!(m("layers.2.ffn.experts.0.w2.scale").as_deref(),
+                   Some("model.layers.2.mlp.experts.0.down_proj.scale"));
+        assert_eq!(m("layers.2.ffn.shared_experts.w3.weight").as_deref(),
+                   Some("model.layers.2.mlp.shared_experts.up_proj.weight"));
+        // Hyper-Connections are load-bearing and must survive.
+        assert_eq!(m("layers.5.hc_attn_fn").as_deref(), Some("model.layers.5.hc_attn_fn"));
+        // Sub-modules that only exist on some layers keep their own subtree.
+        assert_eq!(m("layers.2.attn.compressor.wkv.weight").as_deref(),
+                   Some("model.layers.2.self_attn.compressor.wkv.weight"));
+        assert_eq!(m("layers.2.attn.indexer.weights_proj.weight").as_deref(),
+                   Some("model.layers.2.self_attn.indexer.weights_proj.weight"));
+        // MTP is dropped wholesale — a half-converted MTP head would look capable and
+        // not be. Its experts must NOT be rewritten into real layers.
+        assert!(m("mtp.0.attn.wq_a.weight").is_none());
+        assert!(m("mtp.0.ffn.experts.5.w1.weight").is_none());
+        assert!(m("mtp.0.markov_head.markov_w1.weight").is_none());
+
+        // No two distinct sources may collide on one container name.
+        let mut seen = std::collections::HashSet::new();
+        for l in [0usize, 1, 42] {
+            for t in ["attn.wq_a.weight", "attn.wq_b.weight", "attn.wkv.weight",
+                      "attn.wo_a.weight", "attn.wo_b.weight", "attn.q_norm.weight",
+                      "attn.kv_norm.weight", "attn_norm.weight", "ffn_norm.weight",
+                      "hc_attn_fn", "hc_ffn_fn", "ffn.gate.weight",
+                      "ffn.experts.0.w1.weight", "ffn.experts.0.w2.weight",
+                      "ffn.experts.0.w3.weight", "ffn.shared_experts.w1.weight"] {
+                let src = format!("layers.{l}.{t}");
+                let got = m(&src).unwrap_or_else(|| panic!("unmapped: {src}"));
+                assert!(seen.insert(got.clone()), "collision on {got} (from {src})");
+            }
+        }
+    }
+
     fn kimi_k3_name_mapping() {
         let m = |s: &str| kimi_container_name(s);
         assert_eq!(

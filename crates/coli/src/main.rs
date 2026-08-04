@@ -826,11 +826,17 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             // Indexer and a working one look identical from the outside.
             {
                 let (scored, seen, kept) = colibri_engine::forward::dsv4_indexer_stats();
+                let (skipped, skip_max) = colibri_engine::forward::dsv4_indexer_skips();
                 if scored > 0 {
                     println!(
                         "indexer: {scored} queries scored, {seen} candidate rows -> {kept} kept \
                          ({:.1}% pruned)",
                         100.0 * (seen - kept) as f64 / seen as f64
+                    );
+                }
+                if skipped > 0 {
+                    println!(
+                        "indexer: {skipped} queries kept everything (largest candidate set {skip_max})"
                     );
                 }
             }

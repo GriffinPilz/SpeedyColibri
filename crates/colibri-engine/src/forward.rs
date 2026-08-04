@@ -391,12 +391,22 @@ fn dsv4_indexer_enabled() -> bool {
 static IDX_SCORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static IDX_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static IDX_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDX_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDX_SKIP_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(queries scored, candidate rows seen, rows kept)`. All zero means the scoring path
 /// never ran — either the context is too short to prune, or it is not wired up.
 pub fn dsv4_indexer_stats() -> (u64, u64, u64) {
     let rel = std::sync::atomic::Ordering::Relaxed;
     (IDX_SCORED.load(rel), IDX_SEEN.load(rel), IDX_KEPT.load(rel))
+}
+
+/// `(queries that took the keep-everything shortcut, the largest candidate count among
+/// them)`. If that maximum ever exceeds `index_topk`, the shortcut fired when it should
+/// have scored — which is the difference between "nothing to prune" and "did not prune".
+pub fn dsv4_indexer_skips() -> (u64, u64) {
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    (IDX_SKIPPED.load(rel), IDX_SKIP_MAX.load(rel))
 }
 
 /// How many compressed rows the Indexer keeps per query. `index_topk` (512) unless
@@ -2330,6 +2340,9 @@ fn dsv4_compress_select(
         // under 2048) and it keeps the Indexer from costing anything where it cannot
         // change the answer.
         if topk == 0 || avail <= topk {
+            let rel = std::sync::atomic::Ordering::Relaxed;
+            IDX_SKIPPED.fetch_add(1, rel);
+            IDX_SKIP_MAX.fetch_max(avail as u64, rel);
             out.push((0..avail).collect());
             continue;
         }

@@ -61,6 +61,22 @@ pub struct Layer {
     // `1 + (ratio == 4)`, so `comp_wkv`/`comp_wgate` are [coff*head_dim, hidden] and
     // `comp_ape` is [ratio, coff*head_dim]. The shapes therefore depend on the ratio, and
     // getting the ratio wrong is a load error rather than a silent numeric one.
+    // DeepSeek-V4 Indexer (21 of 43 layers): picks which compressed blocks attention
+    // actually keys on. It carries its OWN Compressor — same algorithm as the main one but
+    // at `index_head_dim` (128) instead of `head_dim` (512), so `compress_prefill` /
+    // `compress_decode` serve both unchanged — plus a q projection off the SHARED q-LoRA
+    // bottleneck and a per-head weighting.
+    //
+    // Distinct from `ix_wk`/`ix_wq`/`ix_wp` above, which are GLM's DSA indexer: that one
+    // scores raw keys, this one scores compressed blocks and has no `wk` at all. V4 is
+    // excluded from the GLM arm for exactly that reason.
+    pub idx_wq_b: Option<QTensor>,
+    pub idx_wproj: Option<QTensor>,
+    pub idx_comp_wkv: Option<QTensor>,
+    pub idx_comp_wgate: Option<QTensor>,
+    pub idx_comp_ape: Vec<f32>,
+    pub idx_comp_norm: Vec<f32>,
+
     pub comp_ratio: i32,
     pub comp_wkv: Option<QTensor>,
     pub comp_wgate: Option<QTensor>,
@@ -895,6 +911,12 @@ impl Layer {
             // sublayer, so 3.1 MB per layer and ~135 MB across V4's 43 layers — small
             // against 145 GB, but omitting it is the exact silent over-generous budget
             // this function's doc warns about.
+            + oq(&self.idx_wq_b)
+            + oq(&self.idx_wproj)
+            + oq(&self.idx_comp_wkv)
+            + oq(&self.idx_comp_wgate)
+            + v(&self.idx_comp_ape)
+            + v(&self.idx_comp_norm)
             + oq(&self.comp_wkv)
             + oq(&self.comp_wgate)
             + v(&self.comp_ape)

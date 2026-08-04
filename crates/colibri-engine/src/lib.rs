@@ -231,6 +231,27 @@ fn load_layer(
                 .into());
             }
         }
+        // Indexer, on the 21 layers that have one. Presence is probed rather than derived:
+        // `compress_ratios` says which layers have a COMPRESSOR (41), and the indexer set
+        // (21) is a subset of those — deriving one from the other would silently ask 20
+        // layers for tensors they do not ship.
+        if shards.has(&p("self_attn.indexer.wq_b.weight")) {
+            let inh = cfg.index_nh as usize;
+            let ihd = cfg.index_hd as usize;
+            let ql = cfg.q_lora as usize;
+            let icoff = if l.comp_ratio == 4 { 2 } else { 1 };
+            let iw = icoff * ihd;
+            l.idx_wq_b =
+                Some(qt_load(shards, &p("self_attn.indexer.wq_b.weight"), inh * ihd, ql, dbits)?);
+            l.idx_wproj =
+                Some(qt_load(shards, &p("self_attn.indexer.weights_proj.weight"), inh, d, dbits)?);
+            l.idx_comp_wkv =
+                Some(qt_load(shards, &p("self_attn.indexer.compressor.wkv.weight"), iw, d, dbits)?);
+            l.idx_comp_wgate =
+                Some(qt_load(shards, &p("self_attn.indexer.compressor.wgate.weight"), iw, d, dbits)?);
+            l.idx_comp_ape = ld(shards, &p("self_attn.indexer.compressor.ape"))?;
+            l.idx_comp_norm = ld(shards, &p("self_attn.indexer.compressor.norm.weight"))?;
+        }
         l.hc_attn_fn = hcv("hc_attn_fn", mw * n)?;
         l.hc_attn_base = hcv("hc_attn_base", mw)?;
         l.hc_attn_scale = hcv("hc_attn_scale", 3)?;

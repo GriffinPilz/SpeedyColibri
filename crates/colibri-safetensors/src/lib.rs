@@ -1564,6 +1564,15 @@ fn bad(path: &Path, name: &str, field: &str) -> io::Error {
 /// Convert `raw` bytes of the given dtype into `out[..numel]` as f32.
 fn convert_to_f32(dtype: DType, raw: &[u8], out: &mut [f32]) {
     match dtype {
+        // An I64 tensor is an index table (DeepSeek-V4's `tid2eid` token->expert lookup),
+        // not a weight. Reaching here means something upstream is treating it as one, and
+        // reinterpreting expert IDs as floats would produce a model that runs and is
+        // silently wrong — the worst outcome. Stop instead.
+        DType::I64 => panic!(
+            "convert_to_f32 called on an I64 index tensor ({} bytes) — index tables are \
+             passed through verbatim, never converted to f32",
+            raw.len()
+        ),
         DType::F32 => {
             for (o, chunk) in out.iter_mut().zip(raw.chunks_exact(4)) {
                 *o = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);

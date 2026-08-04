@@ -22,6 +22,13 @@ pub enum DType {
     F8E4M3,
     /// float8 e5m2 — the other FP8 weight variant (has inf/nan). Converter-only.
     F8E5M2,
+    /// signed 64-bit integer. NOT a weight type — it exists because DeepSeek-V4 ships an
+    /// index table (`ffn.gate.tid2eid`, `[vocab, top_k]`, a token-id -> expert-id lookup
+    /// used by its hash-routing layers) inside the weight shards. Without an arm here
+    /// `DType::parse` returns None and the reader rejects the ENTIRE checkpoint over three
+    /// tensors, reported as "unsupported dtype: I64" with no hint which tensor caused it.
+    /// Never converted to f32; only its size is ever needed, to skip past it.
+    I64,
 }
 
 impl DType {
@@ -32,9 +39,18 @@ impl DType {
             "BF16" => Some(DType::Bf16),
             "F16" => Some(DType::F16),
             "F32" => Some(DType::F32),
-            "U8" | "I8" => Some(DType::U8),
+            // `F8_E8M0` is the MX block-scale type: one byte holding a raw exponent, which
+            // the MXFP4 path consumes verbatim exactly as it does K3's `U8` scales. It maps
+            // to the raw-bytes variant for the same reason `I8` does — the reader hands the
+            // bytes through and the format tag decides how to read them.
+            //
+            // Without this arm `DType::parse` returns None and EVERY scale tensor in a
+            // DeepSeek-V4 checkpoint is rejected at load, which reads as a corrupt file
+            // rather than an unsupported dtype.
+            "U8" | "I8" | "F8_E8M0" => Some(DType::U8),
             "F8_E4M3" | "F8_E4M3FN" => Some(DType::F8E4M3),
             "F8_E5M2" => Some(DType::F8E5M2),
+            "I64" => Some(DType::I64),
             _ => None,
         }
     }
@@ -51,6 +67,7 @@ impl DType {
             DType::U8 => "U8",
             DType::F8E4M3 => "F8_E4M3",
             DType::F8E5M2 => "F8_E5M2",
+            DType::I64 => "I64",
         }
     }
 
@@ -60,6 +77,7 @@ impl DType {
             DType::F32 => 4,
             DType::Bf16 | DType::F16 => 2,
             DType::U8 | DType::F8E4M3 | DType::F8E5M2 => 1,
+            DType::I64 => 8,
         }
     }
 
@@ -74,6 +92,10 @@ impl DType {
             DType::U8 => 3,
             DType::F8E4M3 => 4,
             DType::F8E5M2 => 5,
+            // Past the C enum on purpose: an I64 index table must never be handed to the
+            // C-compatible inference path, and giving it a code that path knows would let
+            // it try.
+            DType::I64 => 6,
         }
     }
 }

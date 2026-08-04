@@ -109,6 +109,12 @@ pub struct ConvertOpts {
     /// Its routed experts are already MXFP4 and pass through unquantized — see
     /// [`kimi_container_name`].
     pub kimi: bool,
+    /// source is DeepSeek-V4-Flash (`deepseek_v4`): MoE on every layer, latent attention
+    /// with an O-LoRA, and Hyper-Connections in place of the residual. Its compact naming
+    /// (`layers.N.attn.wq_a`, bare `embed`/`head`/`norm`) needs a full rewrite — see
+    /// [`deepseek_v4_container_name`]. Routed experts are MXFP4 and pass through
+    /// unquantised, as K3's do.
+    pub deepseek_v4: bool,
     /// How many container layer indices the MTP speculative head occupies, starting at
     /// `n_layers` — `Config::mtp_head_layers()`. **1** for GLM/M3 (one sparse block) and
     /// **2** for Nemotron-H (`mtp_hybrid_override_pattern == "*E"`: an attention sublayer
@@ -130,6 +136,7 @@ impl Default for ConvertOpts {
             gemma_norm: false,
             nemotron: false,
             kimi: false,
+            deepseek_v4: false,
             mtp_layers: 1,
         }
     }
@@ -290,6 +297,15 @@ fn deepseek_v4_container_name(name: &str) -> Option<String> {
     if name.starts_with("mtp.") {
         return None;
     }
+    // `ffn.gate.tid2eid` is an I64 [vocab, top_k] token-id -> expert-id table on the three
+    // hash-routing layers (`num_hash_layers`). Dropped for now, deliberately and visibly:
+    // it is an index table, not a weight, so it cannot go through the quantising writer,
+    // and the hash-routing forward path does not exist yet. A container without it is
+    // incomplete for those 3 of 43 layers — see task #59. Restore this together with the
+    // routing path, passing the bytes through verbatim rather than converting them.
+    if name.ends_with(".tid2eid") {
+        return None;
+    }
     let n = name.to_string();
     // Top-level tensors. V4 calls them `embed`/`head`/`norm`; the container (and every
     // loader path) expects the HF-ish long names.
@@ -429,6 +445,20 @@ fn classify_head(
         || name.ends_with(".weight_scale_2")
         || name.ends_with(".input_scale")
     {
+        return Kind::Skip;
+    }
+    // DeepSeek-V4 spells the same sidecar `<stem>.scale`. Without this arm every scale is
+    // ALSO emitted as a standalone tensor — and, having no quantised form of its own, as
+    // F32: a second copy of data already inside the MXFP4 blob, at 4 bytes per E8M0 byte.
+    // Measured: the container came out 189.4 GB from a 167 GB source, with f32=34031
+    // tensors (~33k expert scales) instead of the handful of norms it should be. A 4-bit
+    // container must never be larger than its own fp8 source; that inequality is the
+    // cheapest check that this rule is working.
+    //
+    // Safe as a blanket rule: `.scale` sidecars are consumed by their parent weight on
+    // both paths — MXFP4 folds them into the blob, and the fp8 path reads them as block
+    // scales — so there is no case where one should be emitted on its own.
+    if name.ends_with(".scale") {
         return Kind::Skip;
     }
     let li = layer_idx(name);
@@ -598,16 +628,31 @@ fn dequant(shards: &Shards, name: &str) -> io::Result<(Vec<f32>, Vec<i64>)> {
             // Both MULTIPLY: W[o,i] = fp8(o,i) · scale(block of (o,i)). The scale
             // sidecar is the weight name with `_scale_inv` appended.
             let (o, i) = two_dims(&t.shape, name)?;
-            let sname = format!("{name}_scale_inv");
-            let st = shards.find(&sname).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "FP8 weight {name} has neither {sname} (block scales) \
-                         nor {name}_scale (per-tensor scale)"
-                    ),
-                )
-            })?;
+            // Sidecar spelling differs by publisher for the SAME 128x128 block layout:
+            // DeepSeek-V3/GLM/MiniMax write `<weight>_scale_inv`; DeepSeek-V4 replaces the
+            // `.weight` suffix with `.scale`. Try the historical name first so nothing
+            // changes for existing checkpoints, then V4's.
+            let alt = name
+                .strip_suffix(".weight")
+                .map(|stem| format!("{stem}.scale"));
+            let (sname, st) = match shards.find(&format!("{name}_scale_inv")) {
+                Some(st) => (format!("{name}_scale_inv"), st),
+                None => {
+                    let a = alt.clone().unwrap_or_default();
+                    match shards.find(&a) {
+                        Some(st) => (a, st),
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "FP8 weight {name} has no block-scale sidecar: tried \
+                                     {name}_scale_inv, {a}"
+                                ),
+                            ))
+                        }
+                    }
+                }
+            };
             let (nbo, nbi) = two_dims(&st.shape, &sname)?;
 
             // fp8 codes → f32 (byte-per-element), then scale by block.
@@ -1268,9 +1313,33 @@ fn quantize_nvfp4_out(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, 
 ///
 /// Structural rather than keyed on `opts.kimi`: any MXFP4 checkpoint should pass through,
 /// and a K3 checkpoint that ever ships a differently-blocked tensor should NOT.
+/// The MXFP4 scale sidecar for a packed-weight tensor, plus its stem.
+///
+/// Two publishers, two spellings of the SAME layout:
+///   compressed-tensors (Kimi-K3): `<stem>.weight_packed` + `<stem>.weight_scale`
+///   DeepSeek-V4:                  `<stem>.weight`        + `<stem>.scale`
+///
+/// This exists as ONE function because the detector and the emitter both need it and they
+/// were resolving it independently — `mxfp4_source` accepted V4's spelling while
+/// `mxfp4_passthrough_out` still appended `.weight_scale`, so a V4 expert was recognised as
+/// MXFP4 and then failed to load its own scale (`...w1.weight.weight_scale`). Detection and
+/// emission must not be able to disagree about where a tensor's scale lives.
+fn mxfp4_scale_name(name: &str) -> Option<(&str, String)> {
+    if let Some(stem) = name.strip_suffix(".weight_packed") {
+        return Some((stem, format!("{stem}.weight_scale")));
+    }
+    let stem = name.strip_suffix(".weight")?;
+    Some((stem, format!("{stem}.scale")))
+}
+
 fn mxfp4_source(shards: &Shards, name: &str) -> Option<(usize, usize)> {
-    let stem = name.strip_suffix(".weight_packed")?;
-    let sname = format!("{stem}.weight_scale");
+    // Two naming conventions for the same layout:
+    //   compressed-tensors (Kimi-K3): `<stem>.weight_packed` + `<stem>.weight_scale`
+    //   DeepSeek-V4:                  `<stem>.weight`        + `<stem>.scale`
+    // The structural test below is what actually decides MXFP4 — the names only say where
+    // to look. Accepting V4's spelling here is what keeps its experts on the bit-exact
+    // passthrough instead of a 6.40% rel-RMS requantisation.
+    let (_stem, sname) = mxfp4_scale_name(name)?;
     let (w, s) = (shards.find(name)?, shards.find(&sname)?);
     if w.dtype != DType::U8 || s.dtype != DType::U8 {
         return None;
@@ -1309,9 +1378,14 @@ fn mxfp4_passthrough_out(
         shards.read_raw(n, &mut b)?;
         Ok(b)
     };
-    let stem = src.strip_suffix(".weight_packed").unwrap_or(src);
+    let (_stem, sname) = mxfp4_scale_name(src).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not an MXFP4 packed-weight name: {src}"),
+        )
+    })?;
     let mut blob = read(src)?;
-    blob.extend_from_slice(&read(&format!("{stem}.weight_scale"))?);
+    blob.extend_from_slice(&read(&sname)?);
     Ok((
         OutTensor {
             name: out_name.to_string(),
@@ -1679,6 +1753,13 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
     // and classification use `out_name`.
     let out_name: String = if opts.minimax {
         match m3_container_name(name) {
+            Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
+            _ => return Ok(TensorOut::Skip),
+        }
+    } else if opts.deepseek_v4 {
+        // Every layer is MoE and the MTP head is dropped by name, so the plain `n_layers`
+        // ceiling applies (as in the M3/K3 branches).
+        match deepseek_v4_container_name(name) {
             Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
             _ => return Ok(TensorOut::Skip),
         }
@@ -3185,6 +3266,12 @@ mod tests {
         assert!(m("mtp.0.attn.wq_a.weight").is_none());
         assert!(m("mtp.0.ffn.experts.5.w1.weight").is_none());
         assert!(m("mtp.0.markov_head.markov_w1.weight").is_none());
+        // The I64 index table is dropped, not fed to the quantising writer. Without this
+        // the converter panics on shard 1 (`convert_to_f32 called on an I64 index tensor`).
+        assert!(m("layers.0.ffn.gate.tid2eid").is_none());
+        // ...but the ordinary gate weights still map.
+        assert_eq!(m("layers.0.ffn.gate.weight").as_deref(),
+                   Some("model.layers.0.mlp.gate.weight"));
 
         // No two distinct sources may collide on one container name.
         let mut seen = std::collections::HashSet::new();

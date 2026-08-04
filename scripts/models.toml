@@ -108,3 +108,10 @@ notes     = "Hybrid: 93 layers = 69 KDA (delta-rule linear attn) + 24 gated MLA 
 ["kimi-k3".convert_env]
 # MXFP4 expert passthrough + the K3 name mapping are auto-detected from the source
 # config's `model_type: kimi_k3`; int8 resident is the default. Nothing to override.
+
+["deepseek-v4-flash"]
+container = "DeepSeek-V4-Flash-0731-container"
+source    = "DeepSeek-V4-Flash-0731-src"
+arch      = "deepseek_v4"
+hf_repo   = "unsloth/DeepSeek-V4-Flash-0731"
+notes     = "43 layers, all MoE (256 exp top-6 + 1 shared). Latent attention with O-LoRA; Hyper-Connections replace the residual (4 copies of the hidden state, [b,s,4,4096]). Compressor on 41/43 layers, DSA-family indexer on 21/43, DSpark on 40-42. Routed experts are natively MXFP4 and pass through bit-exact; dense weights are fp8 e4m3 with 128x128 E8M0 block scales. 1M context. Ships its own reference impl in inference/."

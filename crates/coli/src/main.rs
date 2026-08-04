@@ -506,8 +506,12 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         .as_ref()
         .map(|c| c.arch == colibri_core::Arch::KimiK3)
         .unwrap_or(false);
+    let deepseek_v4 = src_cfg
+        .as_ref()
+        .map(|c| c.arch == colibri_core::Arch::DeepseekV4)
+        .unwrap_or(false);
     let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
-    let n_layers = if minimax || nemotron || kimi {
+    let n_layers = if minimax || nemotron || kimi || deepseek_v4 {
         src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)
     } else {
         env_u32("COLI_NLAYERS", 78) as usize
@@ -529,6 +533,7 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // Drop the resulting shard into an existing container (Shards::open indexes
         // every *.safetensors in the dir) to enable drafting without re-converting.
         mtp_only: env_u32("COLI_MTP_ONLY", 0) != 0,
+        deepseek_v4,
         // MiniMax-M3 name/norm handling (auto-detected above).
         minimax,
         gemma_norm,

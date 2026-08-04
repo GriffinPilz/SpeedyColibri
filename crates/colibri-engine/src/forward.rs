@@ -2063,6 +2063,9 @@ fn dsv4_attention(
     let rd = cfg.qk_rope as usize; // 64
     let ql = cfg.q_lora as usize;
     let half = rd / 2;
+    let prof = crate::forward::profile_on();
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    let t_proj = std::time::Instant::now();
 
     // ---- q: wq_a -> q_norm -> wq_b -> per-head RMS -> rope -----------------
     let mut q_lat = vec![0f32; s * ql];
@@ -2097,7 +2100,12 @@ fn dsv4_attention(
         kv.latent_row_mut(li, pos_base + i).copy_from_slice(&row[..hd]);
     }
 
+    if prof {
+        ATTN_PROJ_US.fetch_add(t_proj.elapsed().as_micros() as u64, rel);
+    }
+
     // ---- attention over the causal span, with the per-head sink -----------
+    let t_core = std::time::Instant::now();
     let total = pos_base + s;
     let cache = kv.latent_rows(li, 0, total).to_vec();
     let mut o = vec![0f32; s * h * hd];
@@ -2105,6 +2113,10 @@ fn dsv4_attention(
     // checked, because DeepSeek's other models DO apply one.
     let scale = (hd as f32).powf(-0.5);
     crate::dsv4::attention_dsv4(&q, &cache, &l.attn_sink, s, h, hd, pos_base, scale, &mut o);
+
+    if prof {
+        ATTN_CORE_US.fetch_add(t_core.elapsed().as_micros() as u64, rel);
+    }
 
     // ---- INVERSE rope on the output ---------------------------------------
     // V is the same latent as K and already carries the forward rotation, so the context
@@ -2119,6 +2131,7 @@ fn dsv4_attention(
     }
 
     // ---- grouped O-LoRA: block-diagonal `o_a`, then a dense `o_b` ----------
+    let t_o = std::time::Instant::now();
     let g = cfg.o_groups.max(1) as usize;
     let rank = cfg.o_lora as usize;
     let dg = h * hd / g;
@@ -2137,6 +2150,9 @@ fn dsv4_attention(
         }
     }
     matmul_qt(out, &mid, l.o_b.as_ref().expect("V4 layer missing o_b"), s);
+    if prof {
+        ATTN_OPROJ_US.fetch_add(t_o.elapsed().as_micros() as u64, rel);
+    }
 }
 
 /// One DeepSeek-V4 block: two Hyper-Connection sublayers (attention, then MoE).

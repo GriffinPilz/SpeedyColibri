@@ -1148,6 +1148,23 @@ impl Backend for CudaBackend {
     }
 }
 
+/// MXFP4 experts with the engine's configured SwiGLU (DeepSeek-V4). The `_situ` twin
+/// applies K3's activation instead; the two differ only in that step.
+///
+/// # Safety
+/// `gate`/`up`/`down` must stay live across the call (it is synchronous, including the
+/// download); `x`/`y` hold `S*gate.I` / `S*down.O` floats.
+pub unsafe fn expert_mlp_mxfp4_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_mxfp4(gate, up, down, y, x, s as c_int) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,19 +1195,3 @@ mod tests {
     }
 }
 
-/// MXFP4 experts with the engine's configured SwiGLU (DeepSeek-V4). The `_situ` twin
-/// applies K3's activation instead; the two differ only in that step.
-///
-/// # Safety
-/// `gate`/`up`/`down` must stay live across the call (it is synchronous, including the
-/// download); `x`/`y` hold `S*gate.I` / `S*down.O` floats.
-pub unsafe fn expert_mlp_mxfp4_raw(
-    gate: *mut ColiCudaTensor,
-    up: *mut ColiCudaTensor,
-    down: *mut ColiCudaTensor,
-    y: *mut f32,
-    x: *const f32,
-    s: i32,
-) -> bool {
-    coli_cuda_expert_mlp_mxfp4(gate, up, down, y, x, s as c_int) != 0
-}

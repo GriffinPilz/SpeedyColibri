@@ -2837,6 +2837,15 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
  * deliberately NOT applied here, having been A/B'd as a slight loss (gpu-ffn 8911 -> 8375
  * ms with it OFF).
  *
+ * ⚠️ UNMEASURED SUSPICION (2026-08-03): this hands the kernel zero-copy HOST weight
+ * pointers through the `sg_uw`/`sg_dw` DEVICE arrays. On the decode path that exact
+ * indirection measured **2.8x slower** than passing the same pointers in kernel parameter
+ * space — same kernel, same grid, bit-identical output (see `SegP`). So this path is very
+ * likely paying the same tax, and the 2.4x regression recorded on
+ * `expert_seg_decode_enabled` was blamed on the wrong thing (16-row MMA tile waste; the
+ * decode GEMV tiles nothing and reproduced the penalty). Re-measure with a SegP-style
+ * parameter block before concluding anything about segmented prefill.
+ *
  * Returns 0 (caller falls back) on any shape mismatch, so this is a pure fast path. */
 extern "C" int coli_cuda_expert_seg_nvfp4_relu2(ColiCudaTensor *const *ups,
         ColiCudaTensor *const *downs, const int *rows, int count,

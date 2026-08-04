@@ -1070,13 +1070,22 @@ fn expert_seg_enabled() -> bool {
 /// bandwidth-bound: widening their reads to 512 B/warp left the per-call time unchanged
 /// (15349 -> 15688 ns).
 ///
-/// **MEASURED: a 2.4x REGRESSION. Leave off.** Nemotron decode, ABBA, 12 tokens, tokens
-/// identical in every arm: moe 1220 ms off vs 2963 ms on. `nvfp4_matmul_seg` tiles 16
-/// rows, so a 1-row expert wastes 15/16 of the MMA, and that redundant compute swamps the
-/// ~44x reduction in launches. It matches an earlier "seg-gemv" attempt recorded as
-/// measured-dead, so treat launch-batching for 1-row experts as settled unless someone
-/// writes a true segmented GEMV (one row per expert, many experts per grid) rather than
-/// reusing the 16-row matmul.
+/// **MEASURED: a 2.4x REGRESSION. Leave off** — but the reason recorded here was WRONG,
+/// and the conclusion drawn from it was wrong too. Nemotron decode, ABBA, 12 tokens,
+/// tokens identical in every arm: moe 1220 ms off vs 2963 ms on.
+///
+/// The original explanation was that `nvfp4_matmul_seg` tiles 16 rows, so a 1-row expert
+/// wastes 15/16 of the MMA and that redundant compute swamps the ~44x reduction in
+/// launches — hence "treat launch-batching for 1-row experts as settled".
+///
+/// **2026-08-03: that is falsified.** A true segmented GEMV (one row per expert, many
+/// experts per grid, tiling nothing) was written and reproduced the SAME ~2.5x penalty.
+/// The real cause is that both paths read zero-copy HOST weight pointers out of the
+/// `sg_uw`/`sg_dw` DEVICE arrays; passing the identical pointers in kernel PARAMETER space
+/// instead makes the identical kernel 2.8x faster. Launch batching was never the problem —
+/// with parameter-space pointers it is a **1.19x WIN** on Nemotron decode
+/// (11.28 -> 13.43 tok/s), which is what `COLI_NVFP4_SEG_GEMV` now ships by default.
+/// See `SegP` in backend_cuda.cu for the three-arm experiment.
 ///
 /// Kept as a knob because "why not just batch the launches?" is a question this profile
 /// will keep provoking, and this is the answer with a number.

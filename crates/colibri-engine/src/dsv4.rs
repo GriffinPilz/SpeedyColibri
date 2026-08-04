@@ -227,6 +227,40 @@ pub fn attention_dsv4(
     }
 }
 
+
+/// DeepSeek-V4 rotary embedding on the trailing `rd` dims, in place.
+///
+/// **Pairs are ADJACENT, not half-split.** The reference does
+/// `view_as_complex(x.unflatten(-1, (-1, 2)))`, pairing `(x0,x1), (x2,x3), …`. Llama-style
+/// code pairs `(x_i, x_{i+rd/2})` instead, and swapping the two conventions is silent —
+/// same shapes, same magnitudes, every token subtly mis-rotated. The round-trip test below
+/// would still pass under the wrong convention, which is why the forward result is pinned
+/// against reference vectors too.
+///
+/// `inverse` conjugates the rotation (`-theta`). V4 needs it on the attention OUTPUT
+/// because V is the same latent as K and already carries the forward rotation.
+///
+/// `cos`/`sin` are per position and hold `rd/2` entries. Only the LAST `rd` elements of
+/// `x` are touched; the leading `head_dim - rd` "nope" dims are left alone.
+pub fn rope_interleaved(x: &mut [f32], cos: &[f32], sin: &[f32], rd: usize, inverse: bool) {
+    debug_assert!(rd % 2 == 0 && rd <= x.len());
+    debug_assert_eq!(cos.len(), rd / 2);
+    debug_assert_eq!(sin.len(), rd / 2);
+    let off = x.len() - rd;
+    for k in 0..rd / 2 {
+        let (i, j) = (off + 2 * k, off + 2 * k + 1);
+        let (a, b) = (x[i], x[j]);
+        let (c, s) = (cos[k], sin[k]);
+        if inverse {
+            x[i] = a * c + b * s;
+            x[j] = -a * s + b * c;
+        } else {
+            x[i] = a * c - b * s;
+            x[j] = a * s + b * c;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +423,44 @@ mod tests {
         assert!(m0 < m1, "bigger sink must shed more mass: head0 kept {m0}, head1 {m1}");
         assert!(m1 < 1.0, "a sink must shed SOME mass; head 1 kept {m1}");
         assert!(m0 > 0.0 && m1 > 0.0, "mass must stay positive: {m0}, {m1}");
+    }
+
+
+    #[test]
+    fn rope_is_interleaved_and_invertible() {
+        const RD: usize = 8;
+        let x0: [f32; RD] = [
+            -0.5678163306, -0.456691087, 0.3495151199, -0.9556618557, 0.0281217185,
+            -0.0733127279, -0.7790557407, -0.4621380503,
+        ];
+        let cos = [0.9553364891f32, 0.4535961214, 0.7316888689, -0.7373937155];
+        let sin = [0.2955202067f32, -0.8912073601, 0.68163876, 0.6754631806];
+        let want_fwd: [f32; RD] = [
+            -0.4074942154, -0.6040948591, -0.6931541768, -0.7449749584, 0.0705491453,
+            -0.0344732536, 0.8866280446, -0.1854457745,
+        ];
+        let mut x = x0;
+        rope_interleaved(&mut x, &cos, &sin, RD, false);
+        for (i, (g, w)) in x.iter().zip(want_fwd.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-6, "fwd[{i}] = {g} want {w}");
+        }
+        // Inverse must return the original — and this alone does NOT prove the pairing is
+        // right (a half-split rope also round-trips), which is why the forward values above
+        // are pinned against the reference.
+        rope_interleaved(&mut x, &cos, &sin, RD, true);
+        for (i, (g, w)) in x.iter().zip(x0.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-5, "roundtrip[{i}] = {g} want {w}");
+        }
+    }
+
+    /// Only the trailing `rd` dims rotate; the leading "nope" dims must be untouched.
+    #[test]
+    fn rope_leaves_the_nope_dims_alone() {
+        let mut x = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        rope_interleaved(&mut x, &[0.0], &[1.0], 2, false);
+        assert_eq!(&x[..4], &[1.0, 2.0, 3.0, 4.0], "nope dims were rotated");
+        // (5,6) with cos=0,sin=1 -> (-6, 5)
+        assert!((x[4] + 6.0).abs() < 1e-6 && (x[5] - 5.0).abs() < 1e-6);
     }
 
     #[test]

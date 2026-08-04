@@ -830,10 +830,11 @@ pub fn mamba2_mixer(
         aug[..hist * conv_dim].copy_from_slice(&cs[conv_dim..kk * conv_dim]);
     }
     aug[hist * conv_dim..].copy_from_slice(&hbc[..s * conv_dim]);
+    // Only rows [hist, aug_len) are wanted; the history rows exist to feed the taps.
     let conv_aug = timed(&MAMBA_CONV_US, || {
-        causal_conv1d_silu(aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk)
+        causal_conv1d_silu(aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk, hist)
     });
-    let conv_out = &conv_aug[hist * conv_dim..aug_len * conv_dim]; // [s, conv_dim]
+    let conv_out = &conv_aug[..]; // [s, conv_dim]
                                                                    // Next state = the last k input columns of the augmented buffer.
     kv.mamba_conv_row_mut(layer)
         .copy_from_slice(&aug[(aug_len - kk) * conv_dim..aug_len * conv_dim]);
@@ -1828,7 +1829,8 @@ mod tests {
                 .copy_from_slice(&proj[b + d_inner..b + d_inner + conv_dim]);
             dt[t * nh..(t + 1) * nh].copy_from_slice(&proj[b + d_inner + conv_dim..b + proj_out]);
         }
-        let conv = causal_conv1d_silu(&hbc, &l.mamba_conv_w, &l.mamba_conv_b, s, conv_dim, k);
+        // Reference path: no history rows prepended, so every output row is wanted.
+        let conv = causal_conv1d_silu(&hbc, &l.mamba_conv_w, &l.mamba_conv_b, s, conv_dim, k, 0);
         let (mut h, mut bb, mut cc) = (
             vec![0f32; s * d_inner],
             vec![0f32; s * gn],

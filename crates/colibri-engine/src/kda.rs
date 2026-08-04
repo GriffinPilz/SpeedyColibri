@@ -256,8 +256,8 @@ pub fn kda_mixer(
         let mut full = Vec::with_capacity((pad + s) * d.c);
         full.extend_from_slice(prev);
         full.extend_from_slice(buf);
-        let out_full = causal_conv1d_silu(&full, w, &[], pad + s, d.c, d.k);
-        *buf = out_full[pad * d.c..].to_vec();
+        let out_full = causal_conv1d_silu(&full, w, &[], pad + s, d.c, d.k, pad);
+        *buf = out_full;
         // Next step's history is the last `pad` rows of the PRE-conv sequence, which
         // for s < pad correctly keeps part of the old carry.
         carries[idx * pad * d.c..(idx + 1) * pad * d.c]

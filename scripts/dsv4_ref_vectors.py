@@ -139,3 +139,101 @@ print(f"const IDX_Q: [f32; 32] = [{fmt(q.flatten().tolist())}];")
 print(f"const IDX_KV: [f32; 40] = [{fmt(kv.flatten().tolist())}];")
 print(f"const IDX_W: [f32; 4] = [{fmt(w.tolist())}];")
 print(f"const IDX_SCORE: [f32; 5] = [{fmt(index_score(q, kv, w).tolist())}];")
+
+
+# ---------------------------------------------------------------------------
+# model.py:285 Compressor. Transcribed for the OVERLAP case (compress_ratio == 4),
+# which is the intricate one: wkv/wgate emit `2*d`, the windows overlap, the softmax
+# is per-DIMENSION over `2*ratio` entries, and prefill leaves a remainder in the carry
+# state that the first decode steps then consume.
+#
+# The wkv/wgate matmuls are deliberately NOT included — they are ordinary matmuls
+# covered elsewhere. Feeding their OUTPUTS isolates the pooling and the state carry,
+# which is where this is hard to get right.
+class RefCompressor:
+    def __init__(self, ratio, d, ape):
+        self.ratio, self.d, self.ape = ratio, d, ape
+        self.overlap = ratio == 4
+        coff = 1 + self.overlap
+        slots = coff * ratio
+        self.kv_state = torch.zeros(slots, coff * d)
+        self.score_state = torch.full((slots, coff * d), float("-inf"))
+
+    def overlap_transform(self, t, value):
+        # t: [s, r, 2d] -> [s, 2r, d]
+        s, r, d = t.size(0), self.ratio, self.d
+        out = t.new_full((s, 2 * r, d), value)
+        out[:, r:] = t[:, :, d:]
+        out[1:, :r] = t[:-1, :, :d]
+        return out
+
+    def prefill(self, kv, score):
+        seqlen, r, d = kv.size(0), self.ratio, self.d
+        should = seqlen >= r
+        remainder = seqlen % r
+        cutoff = seqlen - remainder
+        offset = r if self.overlap else 0
+        if self.overlap and cutoff >= r:
+            self.kv_state[:r] = kv[cutoff - r:cutoff]
+            self.score_state[:r] = score[cutoff - r:cutoff] + self.ape
+        if remainder > 0:
+            self.kv_state[offset:offset + remainder] = kv[cutoff:]
+            self.score_state[offset:offset + remainder] = score[cutoff:] + self.ape[:remainder]
+            kv, score = kv[:cutoff], score[:cutoff]
+        if not should:
+            return None
+        kv = kv.unflatten(0, (-1, r))
+        score = score.unflatten(0, (-1, r)) + self.ape
+        if self.overlap:
+            kv = self.overlap_transform(kv, 0.0)
+            score = self.overlap_transform(score, float("-inf"))
+        return (kv * score.softmax(dim=1)).sum(dim=1)
+
+    def decode(self, kv, score, start_pos):
+        r, d = self.ratio, self.d
+        should = (start_pos + 1) % r == 0
+        score = score + self.ape[start_pos % r]
+        if self.overlap:
+            self.kv_state[r + start_pos % r] = kv
+            self.score_state[r + start_pos % r] = score
+            if not should:
+                return None
+            ks = torch.cat([self.kv_state[:r, :d], self.kv_state[r:, d:]], dim=0)
+            ss = torch.cat([self.score_state[:r, :d], self.score_state[r:, d:]], dim=0)
+            out = (ks * ss.softmax(dim=0)).sum(dim=0)
+            self.kv_state[:r] = self.kv_state[r:]
+            self.score_state[:r] = self.score_state[r:]
+            return out
+        self.kv_state[start_pos % r] = kv
+        self.score_state[start_pos % r] = score
+        if not should:
+            return None
+        return (self.kv_state * self.score_state.softmax(dim=0)).sum(dim=0)
+
+
+torch.manual_seed(11)
+R, D, S = 4, 8, 10          # 10 tokens => 2 full blocks + a remainder of 2
+ape = torch.randn(R, 2 * D)
+kvp = torch.randn(S, 2 * D)
+scp = torch.randn(S, 2 * D)
+c = RefCompressor(R, D, ape)
+pre = c.prefill(kvp, scp)
+print(f"const CMP_APE: [f32; {R * 2 * D}] = [{fmt(ape.flatten().tolist())}];")
+print(f"const CMP_KV: [f32; {S * 2 * D}] = [{fmt(kvp.flatten().tolist())}];")
+print(f"const CMP_SC: [f32; {S * 2 * D}] = [{fmt(scp.flatten().tolist())}];")
+print(f"const CMP_PREFILL: [f32; {pre.numel()}] = [{fmt(pre.flatten().tolist())}];")
+
+# then 8 decode steps from start_pos = S, collecting whatever they emit
+dk = torch.randn(8, 2 * D)
+ds = torch.randn(8, 2 * D)
+emitted, at = [], []
+for i in range(8):
+    o = c.decode(dk[i], ds[i], S + i)
+    if o is not None:
+        emitted.append(o)
+        at.append(i)
+print(f"const CMP_DEC_KV: [f32; {8 * 2 * D}] = [{fmt(dk.flatten().tolist())}];")
+print(f"const CMP_DEC_SC: [f32; {8 * 2 * D}] = [{fmt(ds.flatten().tolist())}];")
+print(f"const CMP_DEC_AT: [usize; {len(at)}] = [{', '.join(str(i) for i in at)}];")
+flat = torch.stack(emitted).flatten() if emitted else torch.zeros(0)
+print(f"const CMP_DECODE: [f32; {flat.numel()}] = [{fmt(flat.tolist())}];")

@@ -359,6 +359,13 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     Ok(())
 }
 
+/// Skip convolving the conv1d history rows whose outputs the caller discards (default on).
+/// `COLI_CONV_HIST=1` computes them anyway, which is the pre-2026-08-03 behaviour.
+fn conv_skip_hist() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_CONV_HIST").ok().as_deref() != Some("1"))
+}
+
 /// Per-layer state hash (`COLI_TRACE_STATE=1`), for finding where two runs of the *same*
 /// input first differ.
 ///
@@ -831,10 +838,14 @@ pub fn mamba2_mixer(
     }
     aug[hist * conv_dim..].copy_from_slice(&hbc[..s * conv_dim]);
     // Only rows [hist, aug_len) are wanted; the history rows exist to feed the taps.
+    // `COLI_CONV_HIST=1` restores the old "convolve everything, discard the front"
+    // behaviour so the two can be A/B'd in ONE binary — comparing two builds would put
+    // the arms in different processes and, in practice, different sessions.
+    let from = if conv_skip_hist() { hist } else { 0 };
     let conv_aug = timed(&MAMBA_CONV_US, || {
-        causal_conv1d_silu(aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk, hist)
+        causal_conv1d_silu(aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk, from)
     });
-    let conv_out = &conv_aug[..]; // [s, conv_dim]
+    let conv_out = &conv_aug[(hist - from) * conv_dim..]; // [s, conv_dim]
                                                                    // Next state = the last k input columns of the augmented buffer.
     kv.mamba_conv_row_mut(layer)
         .copy_from_slice(&aug[(aug_len - kk) * conv_dim..aug_len * conv_dim]);

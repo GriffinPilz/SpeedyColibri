@@ -381,6 +381,36 @@ fn dsv4_indexer_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_DSV4_INDEXER").ok().as_deref() != Some("0"))
 }
 
+/// How much the Indexer actually pruned: queries that reached the SCORING path, candidate
+/// rows they considered, and rows they kept.
+///
+/// This exists because the obvious end-to-end A/B cannot tell success from a no-op. The
+/// Indexer is designed to drop the LEAST relevant rows, so "tokens unchanged" is the
+/// expected result when it works — and also exactly what a silently-skipped Indexer
+/// produces. Counting the pruning distinguishes them; nothing else observable does.
+static IDX_SCORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDX_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDX_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(queries scored, candidate rows seen, rows kept)`. All zero means the scoring path
+/// never ran — either the context is too short to prune, or it is not wired up.
+pub fn dsv4_indexer_stats() -> (u64, u64, u64) {
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    (IDX_SCORED.load(rel), IDX_SEEN.load(rel), IDX_KEPT.load(rel))
+}
+
+/// How many compressed rows the Indexer keeps per query. `index_topk` (512) unless
+/// `COLI_DSV4_INDEX_TOPK` overrides it — a TEST knob: at 512 the selection cannot bite
+/// until 2048 tokens of context, so verifying it end-to-end costs a ten-minute prefill.
+/// Lowering it makes the same code path reachable in seconds.
+fn dsv4_index_topk(cfg: &colibri_core::Config) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let ov = *OVERRIDE.get_or_init(|| {
+        std::env::var("COLI_DSV4_INDEX_TOPK").ok().and_then(|v| v.parse::<usize>().ok())
+    });
+    ov.unwrap_or_else(|| cfg.index_topk.max(0) as usize)
+}
+
 /// Skip convolving the conv1d history rows whose outputs the caller discards (default on).
 /// `COLI_CONV_HIST=1` computes them anyway, which is the pre-2026-08-03 behaviour.
 fn conv_skip_hist() -> bool {
@@ -2167,14 +2197,37 @@ fn dsv4_compress_select(
         let _ = kv;
         (0..s).map(|i| (0..comp_avail(pos_base + i)).collect()).collect()
     };
+    // Say ONCE, out loud, why the Indexer is not selecting. Its success case is "tokens
+    // unchanged" — it drops the rows that scored lowest — so a structural skip is
+    // invisible in the output and indistinguishable from it working. That is not
+    // hypothetical: an end-to-end A/B at 2400 tokens came back byte-identical because the
+    // scoring path never ran at all.
     let ratio = l.comp_ratio as usize;
+    // An Indexer exists ONLY where `compress_ratio == 4`. A ratio-128 layer attending to
+    // every closed row is `get_compress_topk_idxs`, i.e. correct — so it must not be
+    // reported as a fault. Reporting it was worse than saying nothing: it fired first,
+    // and a one-shot warning then hid the real reason on the layers that do have one.
+    let expected = ratio == 4;
+    let inactive = |why: &str| {
+        if !expected {
+            return;
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("[dsv4] indexer INACTIVE on a ratio-4 layer: {why}"));
+    };
+    if !dsv4_indexer_enabled() || ratio == 0 {
+        return all(kv);
+    }
     let (Some(wq_b), Some(wproj)) = (l.idx_wq_b.as_ref(), l.idx_wproj.as_ref()) else {
+        inactive("no indexer.wq_b / weights_proj weights on the layer");
         return all(kv);
     };
     let (Some(cwkv), Some(cwgate)) = (l.idx_comp_wkv.as_ref(), l.idx_comp_wgate.as_ref()) else {
+        inactive("indexer weights present but its compressor wkv/wgate are missing");
         return all(kv);
     };
-    if !dsv4_indexer_enabled() || ratio == 0 || !kv.icomp_ready() {
+    if !kv.icomp_ready() {
+        inactive("icomp_init never ran — the indexer has nowhere to put its compressed KV");
         return all(kv);
     }
 
@@ -2232,6 +2285,7 @@ fn dsv4_compress_select(
 
     let n_ic = kv.icomp_rows(li).len() / ihd;
     if n_ic == 0 {
+        inactive("the indexer's compressor has emitted no rows yet");
         return all(kv);
     }
 
@@ -2260,7 +2314,10 @@ fn dsv4_compress_select(
     }
 
     let ikv = kv.icomp_rows(li);
-    let topk = cfg.index_topk.max(0) as usize;
+    // `COLI_DSV4_INDEX_TOPK` lowers the cap so selection engages at a context short enough
+    // to iterate on. At the real 512 it takes >2048 tokens — a ~10 minute prefill — to
+    // exercise the scoring path at all, which is far too slow a loop to debug against.
+    let topk = dsv4_index_topk(cfg);
     let mut out: Vec<Vec<usize>> = Vec::with_capacity(s);
     let mut score: Vec<f32> = Vec::new();
     for i in 0..s {
@@ -2296,6 +2353,10 @@ fn dsv4_compress_select(
             score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
         });
         order.truncate(topk);
+        let rel = std::sync::atomic::Ordering::Relaxed;
+        IDX_SCORED.fetch_add(1, rel);
+        IDX_SEEN.fetch_add(avail as u64, rel);
+        IDX_KEPT.fetch_add(order.len() as u64, rel);
         // Attention is order-invariant, but sorting keeps the index list deterministic
         // and makes an A/B against the all-rows arm diffable.
         order.sort_unstable();

@@ -821,6 +821,19 @@ fn cmd_gen(args: &[String]) -> ExitCode {
                 s.misses,
                 s.evictions
             );
+            // DeepSeek-V4 Indexer pruning. Not CUDA-gated: it is a model mechanism, and
+            // its success case is "tokens unchanged", so without this line a skipped
+            // Indexer and a working one look identical from the outside.
+            {
+                let (scored, seen, kept) = colibri_engine::forward::dsv4_indexer_stats();
+                if scored > 0 {
+                    println!(
+                        "indexer: {scored} queries scored, {seen} candidate rows -> {kept} kept \
+                         ({:.1}% pruned)",
+                        100.0 * (seen - kept) as f64 / seen as f64
+                    );
+                }
+            }
             #[cfg(feature = "cuda")]
             {
                 let (n, bytes, evict, budget) = colibri_engine::gpu::ffn_cache_stats();
@@ -1371,6 +1384,19 @@ fn finish_gen(
                 seq.len() - prompt.len(),
                 &seq[prompt.len()..]
             );
+            // DeepSeek-V4 Indexer pruning. Printed whenever it actually scored, because
+            // "tokens unchanged" is the SUCCESS case for a mechanism that drops the least
+            // relevant rows — and is indistinguishable from it never having run.
+            {
+                let (scored, seen, kept) = colibri_engine::forward::dsv4_indexer_stats();
+                if scored > 0 {
+                    println!(
+                        "indexer: {scored} queries scored, {seen} candidate rows -> {kept} kept \
+                         ({:.1}% pruned)",
+                        100.0 * (seen - kept) as f64 / seen as f64
+                    );
+                }
+            }
             #[cfg(feature = "cuda")]
             {
                 println!(

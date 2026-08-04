@@ -206,6 +206,31 @@ fn load_layer(
             }
             Ok(v)
         };
+        // Compressor, on the 41 layers that have one. `compress_ratios` is indexed by
+        // layer and is what decides both presence and shape.
+        l.comp_ratio = cfg.compress_ratios.get(i).copied().unwrap_or(0);
+        if l.comp_ratio > 0 {
+            let hd = cfg.qk_head as usize;
+            let coff = if l.comp_ratio == 4 { 2 } else { 1 };
+            let w = coff * hd;
+            l.comp_wkv =
+                Some(qt_load(shards, &p("self_attn.compressor.wkv.weight"), w, d, dbits)?);
+            l.comp_wgate =
+                Some(qt_load(shards, &p("self_attn.compressor.wgate.weight"), w, d, dbits)?);
+            l.comp_ape = ld(shards, &p("self_attn.compressor.ape"))?;
+            l.comp_norm = ld(shards, &p("self_attn.compressor.norm.weight"))?;
+            let want = l.comp_ratio as usize * w;
+            if l.comp_ape.len() != want {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: expected {want} f32 (ratio {} x {w}), got {} — compress_ratios[{i}] disagrees with the checkpoint",
+                        p("self_attn.compressor.ape"), l.comp_ratio, l.comp_ape.len()
+                    ),
+                )
+                .into());
+            }
+        }
         l.hc_attn_fn = hcv("hc_attn_fn", mw * n)?;
         l.hc_attn_base = hcv("hc_attn_base", mw)?;
         l.hc_attn_scale = hcv("hc_attn_scale", 3)?;

@@ -208,6 +208,15 @@ pub struct Config {
     /// `hc_eps` is the floor added to the Sinkhorn/sigmoid weights — NOT the RMS epsilon.
     /// The reference uses `norm_eps` for the rsqrt inside `hc_pre` and `hc_eps` only for
     /// the weights; conflating them is silent and shifts every mixing weight slightly.
+    /// DeepSeek-V4 Compressor: per-layer `compress_ratio`, 0 where the layer has none
+    /// (V4: layers 0-1 and 42+ are 0, the other 41 alternate 4 and 128). A ratio of 4
+    /// additionally turns on OVERLAPPING windows, which doubles the projection width —
+    /// so this vector determines tensor SHAPES, not just behaviour, and a wrong entry is
+    /// a load failure rather than a silent quality loss.
+    pub compress_ratios: Vec<i32>,
+    /// The Compressor's rope base, SEPARATE from `theta`: V4 uses 160000 here against
+    /// 10000 for attention. Reusing `theta` would place every compressed block wrongly.
+    pub compress_theta: f32,
     pub hc_mult: i32,
     pub hc_sinkhorn_iters: i32,
     pub hc_eps: f32,
@@ -514,6 +523,8 @@ impl Config {
             swiglu_limit: 0.0,
             // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
             // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -718,6 +729,8 @@ impl Config {
             swiglu_limit: t.get("swiglu_limit").and_then(Json::as_f64).unwrap_or(7.0) as f32,
             // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
             // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -897,6 +910,15 @@ impl Config {
             // Hyper-Connections: the residual stream becomes `[s, hc_mult, hidden]`.
             // Defaulted to 0 rather than 4 — a V4 variant that drops HC must run as a
             // plain residual, not silently get four copies it has no weights for.
+            compress_ratios: r
+                .get("compress_ratios")
+                .and_then(Json::as_array)
+                .map(|a| a.iter().filter_map(Json::as_f64).map(|v| v as i32).collect())
+                .unwrap_or_default(),
+            compress_theta: r
+                .get("compress_rope_theta")
+                .and_then(Json::as_f64)
+                .unwrap_or(10000.0) as f32,
             hc_mult: g("hc_mult"),
             hc_sinkhorn_iters: g("hc_sinkhorn_iters"),
             // Distinct from `eps` (the RMS epsilon): this one floors the Sinkhorn/sigmoid
@@ -1035,6 +1057,8 @@ impl Config {
             swiglu_limit: 0.0,
             // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
             // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -1217,6 +1241,8 @@ impl Config {
             swiglu_limit: 0.0,
             // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
             // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,

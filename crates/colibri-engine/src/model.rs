@@ -52,6 +52,21 @@ pub struct Layer {
     //   `*_scale` [3]
     // Empty on every other arch. Without them a V4 model loads and computes garbage, so
     // the loader treats a missing set on a V4 checkpoint as an error rather than a default.
+    // DeepSeek-V4 Compressor (41 of 43 layers). Learned gated pooling over `comp_ratio`
+    // consecutive tokens, producing the compressed KV that carries ALL context beyond the
+    // 128-token raw window — so this is not an optimisation, it is how V4 has long context
+    // at all. `comp_ratio == 0` means this layer has no compressor.
+    //
+    // Ratio 4 turns on OVERLAPPING windows, which doubles the projection width: `coff` is
+    // `1 + (ratio == 4)`, so `comp_wkv`/`comp_wgate` are [coff*head_dim, hidden] and
+    // `comp_ape` is [ratio, coff*head_dim]. The shapes therefore depend on the ratio, and
+    // getting the ratio wrong is a load error rather than a silent numeric one.
+    pub comp_ratio: i32,
+    pub comp_wkv: Option<QTensor>,
+    pub comp_wgate: Option<QTensor>,
+    pub comp_ape: Vec<f32>,
+    pub comp_norm: Vec<f32>,
+
     pub hc_attn_fn: Vec<f32>,
     pub hc_attn_base: Vec<f32>,
     pub hc_attn_scale: Vec<f32>,
@@ -814,6 +829,10 @@ impl Layer {
             // sublayer, so 3.1 MB per layer and ~135 MB across V4's 43 layers — small
             // against 145 GB, but omitting it is the exact silent over-generous budget
             // this function's doc warns about.
+            + oq(&self.comp_wkv)
+            + oq(&self.comp_wgate)
+            + v(&self.comp_ape)
+            + v(&self.comp_norm)
             + v(&self.hc_attn_fn)
             + v(&self.hc_attn_base)
             + v(&self.hc_attn_scale)

@@ -146,3 +146,68 @@ mod tests {
         assert_eq!((-2.5f32).round_ties_even(), -2.0);
     }
 }
+
+/// Split a quantized weight into `g` row-blocks, sharing nothing.
+///
+/// DeepSeek-V4's `o_a` is block-diagonal by construction: group `gi`'s output rows read
+/// only group `gi`'s slice of the attention output, so the "matmul" is `g` independent
+/// `[rank, dg]` matmuls, not one `[g*rank, g*dg]` one. Keeping it whole would force either
+/// a dense dequantization (134 MB per layer — 5.8 GB across V4's 43 layers) or a per-row
+/// CPU dot; splitting once at load lets every group take the ordinary `matmul_qt` path.
+///
+/// Rows are contiguous in every supported format, so this is a slice-and-copy. Returns
+/// `None` for formats whose rows are not independently addressable, so the caller can
+/// decline rather than silently produce a wrong split.
+pub fn split_row_blocks(w: &QTensor, g: usize) -> Option<Vec<QTensor>> {
+    if g == 0 || w.o as usize % g != 0 {
+        return None;
+    }
+    let rows = w.o as usize / g;
+    let i = w.i as usize;
+    let mut out = Vec::with_capacity(g);
+    for gi in 0..g {
+        let r0 = gi * rows;
+        let mut t = QTensor {
+            fmt_code: w.fmt_code,
+            o: rows as i32,
+            i: w.i,
+            gpu_eligible: w.gpu_eligible,
+            ..Default::default()
+        };
+        match w.fmt_code {
+            0 => t.qf = w.qf[r0 * i..(r0 + rows) * i].to_vec(),
+            1 => {
+                t.q8 = w.q8[r0 * i..(r0 + rows) * i].to_vec();
+                t.s = w.s[r0..r0 + rows].to_vec();
+            }
+            _ => return None,
+        }
+        out.push(t);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    // The split must reproduce the original rows exactly. A wrong stride would still
+    // yield g tensors of the right SHAPE — the failure is in the values, not the dims,
+    // which is why this compares reconstructed rows rather than counting tensors.
+    #[test]
+    fn split_row_blocks_preserves_rows() {
+        let (o, i, g) = (8usize, 4usize, 4usize);
+        let w: Vec<f32> = (0..o * i).map(|k| k as f32 * 0.5 - 3.0).collect();
+        let t = qtensor_from_f32(&w, o, i, 16);
+        let parts = split_row_blocks(&t, g).expect("f32 must split");
+        assert_eq!(parts.len(), g);
+        for gi in 0..g {
+            assert_eq!(parts[gi].o as usize, o / g);
+            for r in 0..o / g {
+                let want = &w[((gi * (o / g)) + r) * i..((gi * (o / g)) + r + 1) * i];
+                let got = &parts[gi].qf[r * i..(r + 1) * i];
+                assert_eq!(want, got, "group {gi} row {r}");
+            }
+        }
+    }
+}

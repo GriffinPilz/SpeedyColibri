@@ -34,6 +34,12 @@ pub struct Layer {
     // left empty on V4 — the two are mutually exclusive, never both populated.
     pub o_a: Option<QTensor>,
     pub o_b: Option<QTensor>,
+    /// `o_a` pre-split into its `o_groups` row-blocks. V4's O-LoRA is block-diagonal —
+    /// group `gi`'s rows read only group `gi`'s slice of the attention output — so the
+    /// operation is `g` independent matmuls, not one big one. Split once at load so each
+    /// takes the ordinary `matmul_qt` path; dequantizing `o_a` whole would be 134 MB per
+    /// layer. Empty unless the arch has an O-LoRA.
+    pub o_a_groups: Vec<QTensor>,
     // Per-head attention sink, f32 [n_heads] (DeepSeek-V4). Empty elsewhere.
     pub attn_sink: Vec<f32>,
 
@@ -802,6 +808,7 @@ impl Layer {
             + q(&self.o)
             + oq(&self.o_a)
             + oq(&self.o_b)
+            + self.o_a_groups.iter().map(&q).sum::<u64>()
             + v(&self.attn_sink)
             // Hyper-Connections. `*_fn` is the big one: [24, 16384] f32 = 1.5 MB per
             // sublayer, so 3.1 MB per layer and ~135 MB across V4's 43 layers — small

@@ -172,6 +172,16 @@ fn load_layer(
         let (ob_o, ob_i) = (d, g * rank);
         l.o_a = Some(qt_load(shards, &p("self_attn.o_a_proj.weight"), oa_o, oa_i, dbits)?);
         l.o_b = Some(qt_load(shards, &p("self_attn.o_b_proj.weight"), ob_o, ob_i, dbits)?);
+        // Split `o_a` into its row-blocks now; the forward path never uses it whole.
+        // A format whose rows are not independently addressable declines here rather than
+        // producing a silently mis-strided split.
+        l.o_a_groups = crate::quantize::split_row_blocks(l.o_a.as_ref().unwrap(), g)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: cannot split into {g} O-LoRA groups (fmt {})",
+                        p("self_attn.o_a_proj.weight"),
+                        l.o_a.as_ref().unwrap().fmt_code),
+            ))?;
         // Per-head sink, one f32 per attention head.
         l.attn_sink = ld(shards, &p("self_attn.attn_sink"))?;
         // Hyper-Connection weights for this layer's two sublayers, plus their input norms.

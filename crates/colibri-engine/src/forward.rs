@@ -952,6 +952,14 @@ pub fn forward<P: ExpertProvider>(
         return kimi_forward(model, kv, provider, ids, pos_base, hidden_out);
     }
 
+    // DeepSeek-V4 likewise owns its loop: Hyper-Connections make the residual stream
+    // `[s, hc_mult, hidden]`, so there is no single hidden vector for the shared loop to
+    // carry. Gated on `hc_mult` rather than on the arch tag so a V4 variant that ships
+    // without HC would take the ordinary path instead of indexing copies it does not have.
+    if cfg.arch == Arch::DeepseekV4 && cfg.hc_mult > 0 {
+        return dsv4_forward(model, kv, provider, ids, pos_base, hidden_out);
+    }
+
     // Small multi-token forwards (the MTP verify / replay) run the routed NVFP4 experts on
     // the bit-exact per-row gemv path, so a collided expert (>1 row) matches sequential
     // decode to the bit — pairs with the Mamba `exact` scan gate. Held for this forward's
@@ -2004,4 +2012,318 @@ mod tests {
             "93 layers / block 12 -> boundaries at 0,12,..,84"
         );
     }
+}
+
+// ===================== DeepSeek-V4-Flash =====================
+//
+// V4 owns its layer loop for a stronger reason than Kimi-K3 does: its residual stream is
+// `[s, hc_mult, hidden]`, not `[s, hidden]`. Hyper-Connections keep `hc_mult` copies and
+// mix them with learned weights at every sublayer boundary, so there is no single hidden
+// vector to hand to the shared loop.
+//
+// Block order, transcribed from `Block.forward` in the reference `inference/model.py`:
+//
+//     residual = x
+//     x, post, comb = hc_pre(x, hc_attn_*)   # [hc,d] -> [d]
+//     x = attn_norm(x)                       # in_ln
+//     x = attn(x)
+//     x = hc_post(x, residual, post, comb)   # [d] -> [hc,d]
+//     residual = x                           # RE-TAKEN: the POST-ATTENTION stream
+//     x, post, comb = hc_pre(x, hc_ffn_*)
+//     x = ffn_norm(x)                        # post_ln
+//     x = ffn(x)
+//     x = hc_post(x, residual, post, comb)
+//
+// The second `residual = x` is load-bearing. Reusing the block input would typecheck and
+// still produce plausible activations.
+
+/// `cos`/`sin` rows for one absolute position.
+#[inline]
+fn v4_rope_rows<'a>(cos: &'a [f32], sin: &'a [f32], pos: usize, half: usize) -> (&'a [f32], &'a [f32]) {
+    (&cos[pos * half..(pos + 1) * half], &sin[pos * half..(pos + 1) * half])
+}
+
+/// One DeepSeek-V4 attention sublayer over `xn[s, hidden]` (already `hc_pre`'d and normed)
+/// into `out[s, hidden]`.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_attention(
+    cfg: &colibri_core::Config,
+    l: &Layer,
+    li: usize,
+    kv: &mut KvCache,
+    xn: &[f32],
+    s: usize,
+    pos_base: usize,
+    cos: &[f32],
+    sin: &[f32],
+    out: &mut [f32],
+) {
+    let h = cfg.n_heads as usize;
+    let hd = cfg.qk_head as usize; // 512 — V4's head_dim; K and V are the same latent
+    let rd = cfg.qk_rope as usize; // 64
+    let ql = cfg.q_lora as usize;
+    let half = rd / 2;
+
+    // ---- q: wq_a -> q_norm -> wq_b -> per-head RMS -> rope -----------------
+    let mut q_lat = vec![0f32; s * ql];
+    matmul_qt(&mut q_lat, xn, &l.q_a, s);
+    let mut row = vec![0f32; ql.max(hd)];
+    for i in 0..s {
+        rmsnorm(&mut row[..ql], &q_lat[i * ql..(i + 1) * ql], &l.q_a_ln, cfg.eps);
+        q_lat[i * ql..(i + 1) * ql].copy_from_slice(&row[..ql]);
+    }
+    let mut q = vec![0f32; s * h * hd];
+    matmul_qt(&mut q, &q_lat, &l.q_b, s);
+    // Parameter-free, and NOT the same normalisation as `q_a_ln` above.
+    crate::dsv4::per_head_rms(&mut q, hd, cfg.eps);
+    for i in 0..s {
+        let (c, sn) = v4_rope_rows(cos, sin, pos_base + i, half);
+        for hh in 0..h {
+            let b = (i * h + hh) * hd;
+            crate::dsv4::rope_interleaved(&mut q[b..b + hd], c, sn, rd, false);
+        }
+    }
+
+    // ---- kv: wkv -> kv_norm -> rope, then into the latent cache ------------
+    // ONE `head_dim`-wide latent is both K and V. There is no `kv_b` and no separate value
+    // projection, which is exactly why the MLA path cannot be reused here (it asserts a
+    // `kv_lora + qk_rope` width that V4 does not have).
+    let mut kvt = vec![0f32; s * hd];
+    matmul_qt(&mut kvt, xn, &l.kv_a, s);
+    for i in 0..s {
+        rmsnorm(&mut row[..hd], &kvt[i * hd..(i + 1) * hd], &l.kv_a_ln, cfg.eps);
+        let (c, sn) = v4_rope_rows(cos, sin, pos_base + i, half);
+        crate::dsv4::rope_interleaved(&mut row[..hd], c, sn, rd, false);
+        kv.latent_row_mut(li, pos_base + i).copy_from_slice(&row[..hd]);
+    }
+
+    // ---- attention over the causal span, with the per-head sink -----------
+    let total = pos_base + s;
+    let cache = kv.latent_rows(li, 0, total).to_vec();
+    let mut o = vec![0f32; s * h * hd];
+    // Reference: `softmax_scale = head_dim ** -0.5`. No YaRN mscale, despite YaRN rope —
+    // checked, because DeepSeek's other models DO apply one.
+    let scale = (hd as f32).powf(-0.5);
+    crate::dsv4::attention_dsv4(&q, &cache, &l.attn_sink, s, h, hd, pos_base, scale, &mut o);
+
+    // ---- INVERSE rope on the output ---------------------------------------
+    // V is the same latent as K and already carries the forward rotation, so the context
+    // inherits it and must be de-rotated. Omitting this leaves every output rotated by its
+    // own position: right magnitudes, wrong model.
+    for i in 0..s {
+        let (c, sn) = v4_rope_rows(cos, sin, pos_base + i, half);
+        for hh in 0..h {
+            let b = (i * h + hh) * hd;
+            crate::dsv4::rope_interleaved(&mut o[b..b + hd], c, sn, rd, true);
+        }
+    }
+
+    // ---- grouped O-LoRA: block-diagonal `o_a`, then a dense `o_b` ----------
+    let g = cfg.o_groups.max(1) as usize;
+    let rank = cfg.o_lora as usize;
+    let dg = h * hd / g;
+    let mut mid = vec![0f32; s * g * rank];
+    for (gi, wg) in l.o_a_groups.iter().enumerate() {
+        // Gather this group's slice of every row, so the group's matmul sees `[s, dg]`.
+        let mut xg = vec![0f32; s * dg];
+        for i in 0..s {
+            xg[i * dg..(i + 1) * dg].copy_from_slice(&o[i * h * hd + gi * dg..i * h * hd + (gi + 1) * dg]);
+        }
+        let mut yg = vec![0f32; s * rank];
+        matmul_qt(&mut yg, &xg, wg, s);
+        for i in 0..s {
+            mid[i * g * rank + gi * rank..i * g * rank + (gi + 1) * rank]
+                .copy_from_slice(&yg[i * rank..(i + 1) * rank]);
+        }
+    }
+    matmul_qt(out, &mid, l.o_b.as_ref().expect("V4 layer missing o_b"), s);
+}
+
+/// One DeepSeek-V4 block: two Hyper-Connection sublayers (attention, then MoE).
+#[allow(clippy::too_many_arguments)]
+fn dsv4_layer_forward<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    l: &Layer,
+    li: usize,
+    x: &mut [f32], // [s, hc, d] — the Hyper-Connection stream, in place
+    s: usize,
+    pos_base: usize,
+    cos: &[f32],
+    sin: &[f32],
+    sc: &mut Dsv4Scratch,
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    let hc = cfg.hc_mult as usize;
+    let iters = cfg.hc_sinkhorn_iters as usize;
+
+    // Two passes with identical shape; only the weights and the sublayer differ.
+    for pass in 0..2 {
+        let (hc_fn, hc_scale, hc_base, norm) = if pass == 0 {
+            (&l.hc_attn_fn, &l.hc_attn_scale, &l.hc_attn_base, &l.in_ln)
+        } else {
+            (&l.hc_ffn_fn, &l.hc_ffn_scale, &l.hc_ffn_base, &l.post_ln)
+        };
+        // `residual` is re-read from `x` on BOTH passes — the FFN's residual is the
+        // post-attention stream, not the block input.
+        sc.residual[..s * hc * d].copy_from_slice(&x[..s * hc * d]);
+
+        for i in 0..s {
+            crate::hc::hc_pre(
+                &sc.residual[i * hc * d..(i + 1) * hc * d],
+                hc_fn,
+                hc_scale,
+                hc_base,
+                hc,
+                d,
+                cfg.eps,     // norm_eps: the rsqrt inside hc_pre
+                cfg.hc_eps,  // hc_eps: floors the Sinkhorn weights — a DIFFERENT epsilon
+                iters,
+                &mut sc.mixed[i * d..(i + 1) * d],
+                &mut sc.post[i],
+                &mut sc.comb[i],
+            );
+        }
+        for i in 0..s {
+            rmsnorm(
+                &mut sc.normed[i * d..(i + 1) * d],
+                &sc.mixed[i * d..(i + 1) * d],
+                norm,
+                cfg.eps,
+            );
+        }
+
+        if pass == 0 {
+            timed(&ATTN_US, || {
+                dsv4_attention(cfg, l, li, kv, &sc.normed[..s * d], s, pos_base, cos, sin, &mut sc.sub[..s * d]);
+            });
+        } else {
+            timed(&MOE_US, || {
+                crate::moe::dsv4_moe(cfg, l, li, &sc.normed[..s * d], s, &mut sc.sub[..s * d], provider)
+            })?;
+        }
+
+        for i in 0..s {
+            crate::hc::hc_post(
+                &sc.sub[i * d..(i + 1) * d],
+                &sc.residual[i * hc * d..(i + 1) * hc * d],
+                &sc.post[i],
+                &sc.comb[i],
+                hc,
+                d,
+                &mut x[i * hc * d..(i + 1) * hc * d],
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Buffers reused across V4 layers. Allocating these per layer costs more than the
+/// arithmetic at `s = 1`, and the Hyper-Connection stream makes them `hc_mult` times the
+/// usual size, so the churn is 4x what it would be on a plain residual.
+struct Dsv4Scratch {
+    residual: Vec<f32>,
+    mixed: Vec<f32>,
+    normed: Vec<f32>,
+    sub: Vec<f32>,
+    post: Vec<[f32; crate::hc::MAX_HC]>,
+    comb: Vec<[[f32; crate::hc::MAX_HC]; crate::hc::MAX_HC]>,
+}
+
+impl Dsv4Scratch {
+    fn new(s: usize, hc: usize, d: usize) -> Self {
+        Dsv4Scratch {
+            residual: vec![0f32; s * hc * d],
+            mixed: vec![0f32; s * d],
+            normed: vec![0f32; s * d],
+            sub: vec![0f32; s * d],
+            post: vec![[0f32; crate::hc::MAX_HC]; s],
+            comb: vec![[[0f32; crate::hc::MAX_HC]; crate::hc::MAX_HC]; s],
+        }
+    }
+}
+
+/// DeepSeek-V4 forward. Owns its layer loop because the residual stream is
+/// `[s, hc_mult, hidden]`.
+///
+/// **Context limit.** V4's raw KV cache is a ring buffer of `sliding_window` (128) rows;
+/// everything older is reachable only through the Compressor, which is not implemented.
+/// This path keeps the full history and attends densely over it, which is EXACTLY what the
+/// reference computes while the span fits in the window, and diverges past it. That is a
+/// hard edge, so it is reported once rather than left to look like ordinary drift.
+fn dsv4_forward<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    ids: &[i32],
+    pos_base: usize,
+    hidden_out: &mut [f32],
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    let hc = cfg.hc_mult as usize;
+    let s = ids.len();
+    let total = pos_base + s;
+
+    if cfg.window > 0 && total > cfg.window as usize {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "[dsv4] context {total} exceeds sliding_window {} and the Compressor is not \
+                 implemented — output past this point does NOT match the reference. \
+                 Everything up to {} tokens is exact.",
+                cfg.window, cfg.window
+            );
+        });
+    }
+
+    // YaRN tables for the whole span. `original_max_position_embeddings` and the betas are
+    // fixed by the checkpoint; see `yarn_rope_tables` for why they are transcribed.
+    let (cos, sin) = crate::dsv4::yarn_rope_tables(
+        cfg.qk_rope as usize,
+        total.max(1),
+        cfg.theta,
+        16.0,
+        65536,
+        32.0,
+        1.0,
+    );
+
+    // Embed, then REPEAT into all `hc_mult` copies — the reference's
+    // `h.unsqueeze(2).repeat(1, 1, hc_mult, 1)`. Seeding only copy 0 would leave the other
+    // three at zero and the Sinkhorn mixing would quietly propagate that.
+    let mut x = vec![0f32; s * hc * d];
+    timed(&EMBED_US, || {
+        let mut e = vec![0f32; d];
+        for (i, &tok) in ids.iter().enumerate() {
+            embed_row(&model.embed, tok as usize, &mut e);
+            for k in 0..hc {
+                x[(i * hc + k) * d..(i * hc + k) * d + d].copy_from_slice(&e);
+            }
+        }
+    });
+
+    let mut sc = Dsv4Scratch::new(s, hc, d);
+    for (li, l) in model.layers.iter().enumerate() {
+        dsv4_layer_forward(model, kv, provider, l, li, &mut x, s, pos_base, &cos, &sin, &mut sc)?;
+    }
+
+    // Collapse `[hc, d] -> [d]` with the model-level head: a plain sigmoid gate, NO
+    // Sinkhorn, and a scalar scale where the per-layer one takes a 3-vector.
+    for i in 0..s {
+        crate::hc::hc_head(
+            &x[i * hc * d..(i + 1) * hc * d],
+            &model.hc_head_fn,
+            model.hc_head_scale,
+            &model.hc_head_base,
+            hc,
+            d,
+            cfg.eps,
+            cfg.hc_eps,
+            &mut hidden_out[i * d..(i + 1) * d],
+        );
+    }
+    Ok(())
 }

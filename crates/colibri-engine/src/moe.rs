@@ -3279,3 +3279,83 @@ mod tests {
         }
     }
 }
+
+/// DeepSeek-V4's MoE sublayer: `sqrtsoftplus` + `noaux_tc` routing over 256 experts
+/// (top-6) at model `hidden` — NOT in a latent bottleneck like Nemotron-H or K3 — plus one
+/// shared expert.
+///
+/// ⚠️ **KNOWN GAP: the expert activation is the standard SwiGLU, not V4's clamped one.**
+/// V4 sets `swiglu_limit` 10.0 and the reference clamps the product asymmetrically (`up`
+/// both sides, `gate` only from above, because silu already bounds it below);
+/// [`crate::dsv4::swiglu_clamped`] implements that and is verified, but the shared
+/// `compute_experts_partial` path applies the activation internally. Wiring it through is
+/// a change to that shared path, so it is called out here rather than left to look
+/// correct. Outputs will differ from the reference wherever the product exceeds ±10.
+pub fn dsv4_moe<P: ExpertProvider>(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    x: &[f32],
+    s_len: usize,
+    out: &mut [f32],
+    provider: &P,
+) -> io::Result<()> {
+    let d = cfg.hidden as usize;
+    let e_n = cfg.n_experts as usize;
+    let k = (cfg.topk as usize).min(e_n);
+
+    let mut logits = vec![0f32; s_len * e_n];
+    let _rt = std::time::Instant::now();
+    router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
+    if crate::forward::profile_on() {
+        crate::forward::ROUTER_US
+            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // `route_topk` applies sqrt(softplus(z)) for the WEIGHTS and adds the bias only for
+    // SELECTION (noaux_tc). Three layers ship no bias at all — they route by a `tid2eid`
+    // hash table that is not implemented — so those fall back to unbiased selection and
+    // are wrong by omission until it lands.
+    let mut idxs = vec![0usize; s_len * k];
+    let mut ws = vec![0f32; s_len * k];
+    let mut picked: Vec<(u32, f32)> = Vec::with_capacity(k);
+    for si in 0..s_len {
+        crate::dsv4::route_topk(
+            &logits[si * e_n..(si + 1) * e_n],
+            &l.router_bias,
+            k,
+            cfg.routed_scale,
+            &mut picked,
+        );
+        for (j, &(e, w)) in picked.iter().enumerate() {
+            idxs[si * k + j] = e as usize;
+            ws[si * k + j] = w;
+        }
+    }
+    log_routing(layer, s_len, k, &idxs);
+
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+    let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
+    let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+    let partial = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, x, s_len, d)?;
+    for (o, p) in out.iter_mut().zip(partial.iter()) {
+        *o += *p;
+    }
+
+    // Shared expert (weight 1.0, every position), same SwiGLU triple as the routed ones.
+    if cfg.n_shared > 0 {
+        let _st = std::time::Instant::now();
+        let mut sh = vec![0f32; s_len * d];
+        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
+        for (o, &v) in out.iter_mut().zip(sh.iter()) {
+            *o += v;
+        }
+        if crate::forward::profile_on() {
+            crate::forward::SHARED_US
+                .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    Ok(())
+}

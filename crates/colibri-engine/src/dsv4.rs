@@ -116,6 +116,42 @@ pub fn swiglu_clamped(gate: &mut [f32], up: &[f32], limit: f32) {
     }
 }
 
+
+/// Grouped O-LoRA output projection: `[n_heads*head_dim] -> [hidden]`.
+///
+/// V4 splits the attention output into `g` groups and sends each through its OWN slice of
+/// `wo_a`, then concatenates and applies `wo_b`:
+///
+/// ```text
+///   o   : [g, dg]           dg = n_heads*head_dim / g
+///   wo_a: [g, rank, dg]     (stored flat as [g*rank, dg])
+///   mid : [g, rank]         mid[gi][r] = sum_d o[gi][d] * wo_a[gi][r][d]
+///   out : wo_b @ mid.flatten()          wo_b: [hidden, g*rank]
+/// ```
+///
+/// The grouping is the part that is easy to get wrong: `wo_a` is a **block-diagonal**
+/// operator, not a dense `[g*rank, g*dg]` one. Treating it as dense would multiply every
+/// group by every slice — same output shape, silently different model, and no assertion
+/// anywhere would fire. The test drives per-group-distinct inputs so a dense read produces
+/// visibly different numbers.
+pub fn o_lora_grouped(o: &[f32], wo_a: &[f32], g: usize, rank: usize, mid: &mut [f32]) {
+    let dg = o.len() / g;
+    debug_assert_eq!(o.len(), g * dg);
+    debug_assert_eq!(wo_a.len(), g * rank * dg);
+    debug_assert_eq!(mid.len(), g * rank);
+    for gi in 0..g {
+        let src = &o[gi * dg..(gi + 1) * dg];
+        for r in 0..rank {
+            let row = &wo_a[(gi * rank + r) * dg..(gi * rank + r + 1) * dg];
+            let mut acc = 0.0f64;
+            for (a, b) in row.iter().zip(src) {
+                acc += (*a as f64) * (*b as f64);
+            }
+            mid[gi * rank + r] = acc as f32;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +221,51 @@ mod tests {
         // And the weights sum to route_scale.
         let s: f32 = out.iter().map(|&(_, w)| w).sum();
         assert!((s - 1.5).abs() < 1e-5, "weights sum to {s}, want route_scale 1.5");
+    }
+
+
+    #[test]
+    fn o_lora_is_block_diagonal_per_group() {
+        const G: usize = 3;
+        const DG: usize = 4;
+        const R: usize = 2;
+        let o: [f32; G * DG] = [
+            0.3355941016, -0.2018069339, -0.3996449568, 0.4824536835, 0.502964959,
+            -0.1215207255, -0.8406737872, 0.5007970179, -0.568683225, 0.3366070281,
+            -0.340533081, 0.9958108747,
+        ];
+        let wo_a: [f32; G * R * DG] = [
+            -0.0842778559, -0.054506896, 0.2843292964, -0.2830184939, -0.0037952994,
+            -0.0335753325, 0.2136387231, -0.3279327701, 0.4416431718, -0.0533161334,
+            0.7175545354, -0.1721734342, 0.219693547, 0.1894987069, 0.2305708847,
+            0.0995794559, 0.0601189274, 0.1930313327, 0.423112906, -0.3680631313,
+            -0.1372767793, 0.470703903, -0.0966227811, 0.0222486675,
+        ];
+        let want: [f32; G * R] = [
+            -0.267457366, -0.2380899563, -0.4608431761, -0.0564956688, -0.4798181325,
+            0.2915679619,
+        ];
+        let mut mid = [0f32; G * R];
+        o_lora_grouped(&o, &wo_a, G, R, &mut mid);
+        for (i, (g, w)) in mid.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-6, "mid[{i}] = {g} want {w}");
+        }
+
+        // Prove the PAIRING matters: run group 1's input through group 0's slice. If the
+        // implementation ignored the grouping (or mismatched the strides) this is the kind
+        // of value it would produce, and it must differ from the correct one.
+        //
+        // My first attempt at this check compared wo_a[..DG] against o[..DG], which IS
+        // mid[0] by definition — it agreed trivially and asserted nothing. The test caught
+        // that, which is the argument for making the contrast explicit rather than assumed.
+        let mut crossed = 0.0f64;
+        for (a, b) in wo_a[..DG].iter().zip(o[DG..2 * DG].iter()) {
+            crossed += (*a as f64) * (*b as f64);
+        }
+        assert!(
+            (crossed as f32 - mid[0]).abs() > 1e-3,
+            "group 0's slice gives the same answer on group 1's input — grouping unproven"
+        );
     }
 
     #[test]

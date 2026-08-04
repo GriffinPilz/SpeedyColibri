@@ -167,10 +167,10 @@ pub fn o_lora_grouped(o: &[f32], wo_a: &[f32], g: usize, rank: usize, mid: &mut 
 /// finite and plausibly scaled, just uniformly too large. The test pins a large negative
 /// sink against a large positive one so the denominators differ visibly.
 ///
-/// DENSE over `[0, pos]`. That is exact only while every query's window covers the whole
-/// cache — `seqlen <= sliding_window` (128) with no compressed entries. Beyond that V4
-/// attends to a window plus compressed positions, and running dense is WRONG, not merely
-/// slow: it attends to positions the model never does. Callers must enforce that.
+/// DENSE over `[0, pos]` — a convenience wrapper over [`attention_dsv4_sparse`] that
+/// builds the plain causal index list. Exact only while every query's window covers the
+/// whole cache (`seqlen <= sliding_window`, no compressed entries); past that, callers
+/// must build a real index list, because attending densely is WRONG, not merely slow.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_dsv4(
     q: &[f32],
@@ -183,19 +183,64 @@ pub fn attention_dsv4(
     scale: f32,
     out: &mut [f32],
 ) {
+    let topk = pos_base + s;
+    let mut idxs = vec![-1i32; s * topk];
+    for i in 0..s {
+        for (j, slot) in idxs[i * topk..i * topk + pos_base + i + 1].iter_mut().enumerate() {
+            *slot = j as i32;
+        }
+    }
+    attention_dsv4_sparse(q, kv, attn_sink, s, h, hd, &idxs, topk, scale, out);
+}
+
+/// DeepSeek-V4 attention over an EXPLICIT per-query key-index list.
+///
+/// `idxs` is `[S, topk]` of indices into `kv`, with **`-1` meaning masked** — the same
+/// contract as the reference `sparse_attn` kernel, whose gather does
+/// `kv[idxs[i]] if idxs[i] != -1 else 0` and forces those scores to `-inf`.
+///
+/// Causality is carried by the index list rather than derived from a position, and that is
+/// the whole point: V4's key set is **not a prefix**. Each query sees a sliding raw window
+/// PLUS a set of compressed blocks that on 21 of 43 layers is chosen per-query by the
+/// Indexer. There is no single `pos` that describes it. The previous signature took one,
+/// which forced the caller to pretend the key set was contiguous; it computed
+/// `pos_base - raw_from` on `usize`, which underflowed on any prompt longer than the
+/// 128-token window and walked off the end of the cache.
+///
+/// Duplicate indices are permitted and meaningful: the reference deliberately lets a
+/// compressed block that overlaps the raw window be attended BOTH ways.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_dsv4_sparse(
+    q: &[f32],
+    kv: &[f32],
+    attn_sink: &[f32],
+    s: usize,
+    h: usize,
+    hd: usize,
+    idxs: &[i32],
+    topk: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
     debug_assert_eq!(q.len(), s * h * hd);
     debug_assert_eq!(out.len(), s * h * hd);
     debug_assert_eq!(attn_sink.len(), h);
+    debug_assert_eq!(idxs.len(), s * topk);
+    let rows = kv.len() / hd;
     let mut scores: Vec<f32> = Vec::new();
     for i in 0..s {
-        let pos = pos_base + i;
-        let n = pos + 1;
-        debug_assert!(kv.len() >= n * hd, "kv cache shorter than the causal span");
+        let sel = &idxs[i * topk..(i + 1) * topk];
         for hh in 0..h {
             let qv = &q[(i * h + hh) * hd..(i * h + hh) * hd + hd];
             scores.clear();
             let mut m = f32::NEG_INFINITY;
-            for j in 0..n {
+            for &t in sel {
+                if t < 0 {
+                    scores.push(f32::NEG_INFINITY);
+                    continue;
+                }
+                let j = t as usize;
+                debug_assert!(j < rows, "key index {j} past the {rows}-row cache");
                 let kr = &kv[j * hd..(j + 1) * hd];
                 let mut acc = 0.0f64;
                 for (a, b) in qv.iter().zip(kr) {
@@ -207,7 +252,8 @@ pub fn attention_dsv4(
             }
             let mut den = 0.0f32;
             for v in scores.iter_mut() {
-                *v = (*v - m).exp();
+                // A masked slot contributes nothing: exp(-inf - m) == 0.
+                *v = if v.is_finite() { (*v - m).exp() } else { 0.0 };
                 den += *v;
             }
             // Sink: denominator only. Stabilised against the same max the scores used,
@@ -216,9 +262,12 @@ pub fn attention_dsv4(
             let dst = &mut out[(i * h + hh) * hd..(i * h + hh) * hd + hd];
             dst.fill(0.0);
             let inv = 1.0 / den;
-            for (j, &w) in scores.iter().enumerate() {
+            for (k, &w) in scores.iter().enumerate() {
+                if w == 0.0 {
+                    continue;
+                }
                 let w = w * inv;
-                let vr = &kv[j * hd..(j + 1) * hd];
+                let vr = &kv[sel[k] as usize * hd..(sel[k] as usize + 1) * hd];
                 for (o, &v) in dst.iter_mut().zip(vr) {
                     *o += w * v;
                 }
@@ -1150,7 +1199,10 @@ fn e4m3_round(v: f32) -> f32 {
     // e4m3's smallest normal is 2^-6; below that it is subnormal with a fixed step.
     let e = a.log2().floor().max(-6.0);
     let step = (e - 3.0).exp2(); // 3 mantissa bits => 8 steps per binade
-    ((a / step).round() * step).min(448.0).copysign(v)
+    // Ties to EVEN, matching the hardware cast (and `e2m1_round` below). `f32::round`
+    // is ties-away-from-zero, which disagrees on exactly the midpoints — e.g. 12.5 steps
+    // becomes 13 instead of 12.
+    ((a / step).round_ties_even() * step).min(448.0).copysign(v)
 }
 
 /// In-place FP8 activation simulation: block-wise quantise then immediately dequantise.
@@ -1162,17 +1214,92 @@ fn e4m3_round(v: f32) -> f32 {
 /// the rope dims specifically NOT, so the two halves are meant to carry different
 /// precision.
 ///
-/// `block` is the group size along the last dim (64 for V4's KV call). Scale is
-/// `amax / 448` per block, matching the kernel's `fp8_max`.
+/// `block` is the group size along the last dim (64 for V4's KV call).
+///
+/// The scale is a **power of two**, not `amax / 448`. The reference passes
+/// `scale_fmt` into `act_quant`, which sets `round_scale = scale_fmt is not None`, and
+/// `Transformer.__init__` resolves `scale_fmt` to `"ue8m0"` for this checkpoint — so the
+/// `round_scale` branch is the live one and the scale goes through `fast_round_scale`.
+/// The module-level default is `None`, which is what makes reading the call site alone
+/// misleading. A plain `amax/448` scale is wrong by up to 2x per block.
 pub fn act_quant_sim(x: &mut [f32], block: usize) {
     for grp in x.chunks_mut(block) {
-        let amax = grp.iter().fold(0f32, |m, &v| m.max(v.abs()));
-        if amax == 0.0 {
-            continue;
-        }
-        let s = amax / 448.0;
+        let amax = grp.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-4);
+        let s = round_pow2_scale(amax, 448.0);
         for v in grp.iter_mut() {
             *v = e4m3_round(*v / s) * s;
+        }
+    }
+}
+
+/// `2^ceil(log2(amax / fmt_max))` — the reference's `fast_round_scale`.
+///
+/// The E8M0 scale formats (`ue8m0`, and FP4's block scale) store only an exponent, so the
+/// scale must be an exact power of two. The reference computes it by bit-twiddling the
+/// float rather than calling `log2`; this is the same value, and the `mantissa != 0`
+/// term is what makes it a CEILING — an exact power of two keeps its own exponent
+/// instead of being bumped one binade.
+///
+/// Takes `fmt_max` and DIVIDES, where the reference multiplies by a precomputed `1/max`.
+/// Division is correctly rounded, so `448/448` is exactly `1.0`; the reciprocal form can
+/// land a hair above 1, and since the result is a ceiling on the exponent, one ulp there
+/// doubles the scale for the whole block. Only bites when amax is exactly `fmt_max * 2^k`,
+/// which is precisely the case the tests pin.
+#[inline]
+pub fn round_pow2_scale(amax: f32, fmt_max: f32) -> f32 {
+    let t = amax / fmt_max;
+    let bits = t.to_bits();
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let man = bits & 0x007F_FFFF;
+    ((exp + i32::from(man != 0)) as f32).exp2()
+}
+
+/// Round to the nearest representable E2M1 (FP4) value, ties to even.
+///
+/// The whole format is 8 magnitudes: `0, 0.5, 1, 1.5, 2, 3, 4, 6`. Every tie lands on the
+/// value with an even mantissa bit, which for this table is always the one further from
+/// zero at the binade start and closer to zero elsewhere — so the rule cannot be replaced
+/// by "round half up" or "round half away from zero" without changing 7 of the inputs.
+#[inline]
+fn e2m1_round(v: f32) -> f32 {
+    const LEVELS: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    // Mantissa-bit parity of each level, for ties-to-even.
+    const EVEN: [bool; 8] = [true, false, true, false, true, false, true, false];
+    let a = v.abs();
+    if a >= 6.0 {
+        return 6.0f32.copysign(v);
+    }
+    let mut best = 0usize;
+    for k in 1..LEVELS.len() {
+        let (dk, db) = ((a - LEVELS[k]).abs(), (a - LEVELS[best]).abs());
+        // Strictly closer wins; an exact tie goes to whichever has an even mantissa.
+        if dk < db || (dk == db && EVEN[k] && !EVEN[best]) {
+            best = k;
+        }
+    }
+    LEVELS[best].copysign(v)
+}
+
+/// In-place FP4 (E2M1) activation simulation — the reference's
+/// `fp4_act_quant(x, fp4_block_size, inplace=True)`, block 32.
+///
+/// **`fp4_block_size = 32` is a module-level constant in `inference/model.py`, not a
+/// config field** — `kernel.py`'s `fp4_act_quant` independently defaults to 32. It was
+/// worth pinning rather than guessing: the block size sets which values share a scale, so
+/// a wrong one leaves the Indexer scoring a plausible-looking but differently-distributed
+/// query against its keys.
+///
+/// Unlike the FP8 path this quantises the WHOLE row including the rope dims, and it is
+/// applied only where the reference applies it: the Indexer's query, and the Indexer's own
+/// Compressor output (`rotate=True`).
+pub fn fp4_act_quant_sim(x: &mut [f32], block: usize) {
+    for grp in x.chunks_mut(block) {
+        // The reference floors amax at 6*2^-126 — the smallest value for which the
+        // power-of-two scale stays a normal float.
+        let amax = grp.iter().fold(0f32, |m, &v| m.max(v.abs())).max(6.0 * (-126f32).exp2());
+        let s = round_pow2_scale(amax, 6.0);
+        for v in grp.iter_mut() {
+            *v = e2m1_round((*v / s).clamp(-6.0, 6.0)) * s;
         }
     }
 }
@@ -1181,19 +1308,41 @@ pub fn act_quant_sim(x: &mut [f32], block: usize) {
 mod act_quant_tests {
     use super::*;
 
-    // It must actually LOSE precision, and it must preserve the block maximum. A no-op
-    // passes any "output is close to input" check, so assert both directions: the max
-    // survives exactly, and a value needing more than 3 mantissa bits moves.
+    // It must actually LOSE precision, and every value must stay within one quantisation
+    // step. A no-op passes any "output is close to input" check, so assert both directions.
+    //
+    // NOTE: the block max does NOT survive exactly, and an earlier version of this test
+    // asserted that it did. That assertion encoded a `amax/448` scale; the real scale is
+    // `2^ceil(log2(amax/448))` (`scale_fmt="ue8m0"` => `round_scale=True`), so `amax` maps
+    // to somewhere in (224, 448] rather than exactly onto 448 and picks up its own rounding.
     #[test]
-    fn act_quant_rounds_but_preserves_the_block_max() {
+    fn act_quant_rounds_and_stays_within_a_step() {
         // 1 + 1/64 needs 6 mantissa bits, so e4m3 cannot represent it and it must move.
         let mut x = vec![1.0 + 1.0 / 64.0, 100.0];
         let before = x.clone();
         act_quant_sim(&mut x, 2);
-        assert!((x[1] - 100.0).abs() < 1e-3, "block max must survive: {}", x[1]);
         assert!((x[0] - before[0]).abs() > 1e-4, "value needing 6 mantissa bits must round");
-        // and it must stay CLOSE — a wrong scale would move it far.
-        assert!((x[0] - before[0]).abs() < 0.05, "moved too far: {} -> {}", before[0], x[0]);
+        // Scale for this block is 2^ceil(log2(100/448)) = 2^-2. In scaled units 100 becomes
+        // 400, which sits in the 2^8 binade where e4m3's step is 2^(8-3) = 32 — so the step
+        // back in original units is 32 * 2^-2 = 8. Everything must land within half of that.
+        for (v, b) in x.iter().zip(&before) {
+            assert!((v - b).abs() <= 4.0 + 1e-6, "{b} -> {v} moved more than half a step");
+        }
+    }
+
+    // The scale is a power of two, and that is the whole substance of the `ue8m0` fix.
+    // Pin it directly: a block whose amax is exactly a power of two must round-trip
+    // representable values EXACTLY, which an `amax/448` scale would not.
+    #[test]
+    fn act_quant_scale_is_a_power_of_two() {
+        assert_eq!(round_pow2_scale(448.0, 448.0), 1.0);
+        assert_eq!(round_pow2_scale(896.0, 448.0), 2.0);
+        // Not an exact power of two => ceiling, so 100/448 = 0.223 -> 2^-2.
+        assert_eq!(round_pow2_scale(100.0, 448.0), 0.25);
+        // With scale exactly 1, every e4m3-representable value is a fixed point.
+        let mut x = vec![448.0f32, 2.0, 1.5];
+        act_quant_sim(&mut x, 3);
+        assert_eq!(x, vec![448.0, 2.0, 1.5]);
     }
 
     // Blocks are independent: a huge value in one block must not degrade another.
@@ -1208,6 +1357,152 @@ mod act_quant_tests {
     fn act_quant_leaves_zero_blocks_alone() {
         let mut x = vec![0.0f32; 4];
         act_quant_sim(&mut x, 2);
+        assert!(x.iter().all(|&v| v == 0.0), "an all-zero block must not produce NaN");
+    }
+}
+
+#[cfg(test)]
+mod sparse_attention_tests {
+    use super::*;
+
+    // q = [1,0]; both keys score 1.0 against it but carry opposite values, so the weights
+    // are visible directly in the output. A very negative sink keeps its mass out of the
+    // denominator, which would otherwise scale every expectation below.
+    fn fixture() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let q = vec![1.0f32, 0.0];
+        let kv = vec![1.0f32, 5.0, 1.0, -5.0, 1.0, 0.0];
+        (q, kv, vec![-100.0f32])
+    }
+
+    // A masked slot must contribute NOTHING. Treating -1 as "key 0" or as an all-zero key
+    // both keep the output finite and plausibly scaled — the zero key is the nastier one,
+    // since it still adds exp(0) of mass to the denominator and shrinks every output.
+    #[test]
+    fn masked_slots_are_not_keys() {
+        let (q, kv, sink) = fixture();
+        let mut a = vec![0f32; 2];
+        let mut b = vec![0f32; 2];
+        attention_dsv4_sparse(&q, &kv, &sink, 1, 1, 2, &[0, 1, -1, -1], 4, 1.0, &mut a);
+        attention_dsv4_sparse(&q, &kv, &sink, 1, 1, 2, &[0, 1], 2, 1.0, &mut b);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-6, "padding changed the result: {a:?} vs {b:?}");
+        }
+        // and the value is the plain average of the two equally-scored keys
+        assert!((a[0] - 1.0).abs() < 1e-6, "{a:?}");
+        assert!(a[1].abs() < 1e-6, "{a:?}");
+    }
+
+    // Duplicates are MEANINGFUL, not a bug to dedupe: V4 lets a compressed block that
+    // overlaps the raw window be attended both ways, so a repeated index must carry
+    // repeated weight.
+    #[test]
+    fn duplicate_indices_count_twice() {
+        let (q, kv, sink) = fixture();
+        let mut out = vec![0f32; 2];
+        attention_dsv4_sparse(&q, &kv, &sink, 1, 1, 2, &[0, 0, 1], 3, 1.0, &mut out);
+        // (2*[1,5] + [1,-5]) / 3 = [1, 5/3]
+        assert!((out[0] - 1.0).abs() < 1e-5, "{out:?}");
+        assert!((out[1] - 5.0 / 3.0).abs() < 1e-5, "{out:?}");
+    }
+
+    // The key set is a SET, not a prefix: a query may skip a key in the middle. This is
+    // what the Indexer does, and what the old position-derived signature could not express.
+    #[test]
+    fn a_gap_in_the_middle_is_honoured() {
+        let (q, kv, sink) = fixture();
+        let mut out = vec![0f32; 2];
+        // keys 0 and 2 only — key 1 is never listed.
+        attention_dsv4_sparse(&q, &kv, &sink, 1, 1, 2, &[0, 2], 2, 1.0, &mut out);
+        // ([1,5] + [1,0]) / 2 = [1, 2.5]
+        assert!((out[1] - 2.5).abs() < 1e-5, "key 1 leaked in: {out:?}");
+    }
+
+    // The dense wrapper must still be the plain causal case — this is what every other V4
+    // test exercises, so a regression here would be broad but silent.
+    #[test]
+    fn dense_wrapper_is_causal() {
+        let (q3, kv, sink) = {
+            let (_, kv, sink) = fixture();
+            // three queries, all equal, so only the causal span distinguishes them
+            (vec![1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0], kv, sink)
+        };
+        let mut out = vec![0f32; 6];
+        attention_dsv4(&q3, &kv, &sink, 3, 1, 2, 0, 1.0, &mut out);
+        // query 0 sees key 0 only => exactly v0
+        assert!((out[0] - 1.0).abs() < 1e-5 && (out[1] - 5.0).abs() < 1e-5, "{out:?}");
+        // query 1 sees keys 0,1 => [1, 0]
+        assert!(out[3].abs() < 1e-5, "{out:?}");
+        // query 2 sees keys 0,1,2 => [1, 0]
+        assert!(out[5].abs() < 1e-5, "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod fp4_tests {
+    use super::*;
+
+    // The eight magnitudes ARE the format. Pin them: a table that is subtly wrong (say
+    // 5.0 instead of 6.0 at the top, a uniform step, or a missing 1.5) still produces
+    // finite, plausibly-scaled output, so nothing downstream would notice.
+    #[test]
+    fn e2m1_levels_are_exact_fixed_points() {
+        for v in [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0] {
+            assert_eq!(e2m1_round(v), v, "{v} must be representable");
+            assert_eq!(e2m1_round(-v), -v, "-{v} must be representable");
+        }
+    }
+
+    // Every tie in E2M1 resolves to the neighbour with an even mantissa bit. Checked
+    // exhaustively over all seven midpoints, because "round half away from zero" agrees
+    // on some of them and disagrees on others — a partial test would not separate them.
+    #[test]
+    fn e2m1_ties_go_to_even() {
+        // (input, expected). Half-away-from-zero would give 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0.
+        for (x, want) in [
+            (0.25f32, 0.0f32),
+            (0.75, 1.0),
+            (1.25, 1.0),
+            (1.75, 2.0),
+            (2.5, 2.0),
+            (3.5, 4.0),
+            (5.0, 4.0),
+        ] {
+            assert_eq!(e2m1_round(x), want, "tie at {x}");
+            assert_eq!(e2m1_round(-x), -want, "tie at -{x}");
+        }
+    }
+
+    // A power-of-two scale means a block whose amax is 6*2^k round-trips its own maximum
+    // exactly — and it must LOSE something in between, or it is a no-op.
+    #[test]
+    fn fp4_sim_is_lossy_but_keeps_a_scaled_max() {
+        let mut x = vec![6.0f32, 3.0, 1.7, 0.1];
+        let before = x.clone();
+        fp4_act_quant_sim(&mut x, 4);
+        // amax = 6 => scale 2^ceil(log2(1)) = 1, so the levels land on themselves.
+        assert_eq!(x[0], 6.0);
+        assert_eq!(x[1], 3.0);
+        assert_eq!(x[2], 1.5, "1.7 must snap to the 1.5 level");
+        assert!((x[3] - before[3]).abs() > 1e-6, "0.1 must move — the format has no such value");
+    }
+
+    // Blocks are independent, exactly as in the FP8 path.
+    #[test]
+    fn fp4_sim_scales_per_block() {
+        let mut x = vec![6.0f32, 3.0, 600.0, 300.0];
+        fp4_act_quant_sim(&mut x, 2);
+        assert_eq!(x[0], 6.0, "small block keeps its own scale");
+        // Second block: amax 600 => scale 2^ceil(log2(100)) = 2^7 = 128.
+        // 600/128 = 4.6875 -> 4 (nearest level, 4.6875 is closer to 4 than to 6) -> 512.
+        assert_eq!(x[2], 512.0);
+    }
+
+    // An all-zero block must not divide by zero. The reference floors amax at 6*2^-126
+    // precisely so the power-of-two scale stays a normal float.
+    #[test]
+    fn fp4_sim_survives_a_zero_block() {
+        let mut x = vec![0.0f32; 8];
+        fp4_act_quant_sim(&mut x, 4);
         assert!(x.iter().all(|&v| v == 0.0), "an all-zero block must not produce NaN");
     }
 }

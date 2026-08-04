@@ -292,6 +292,15 @@ pub struct KvCache {
     comp_len: Vec<usize>,
     comp_state: Vec<Option<crate::dsv4::CompressorState>>,
     comp_dim: usize,
+    /// DeepSeek-V4 **Indexer** compressed KV. Same shape as `comp` but at
+    /// `index_head_dim` (128, not 512) and only on the layers whose `compress_ratio` is 4.
+    /// The Indexer owns a SEPARATE Compressor constructed with `rotate=True`, so these
+    /// rows are Hadamard-rotated and FP4-simulated — they are not a view of `comp`, and
+    /// scoring against `comp` instead would silently compare against the wrong space.
+    icomp: Vec<Vec<f32>>,
+    icomp_len: Vec<usize>,
+    icomp_state: Vec<Option<crate::dsv4::CompressorState>>,
+    icomp_dim: usize,
     /// per-layer full key buffer, each `[max_t * kv_dim]` — GQA only (else empty).
     k_full: Vec<Vec<f32>>,
     /// per-layer full value buffer, each `[max_t * kv_dim]` — GQA only (else empty).
@@ -368,6 +377,10 @@ impl KvCache {
             comp_len: Vec::new(),
             comp_state: Vec::new(),
             comp_dim: 0,
+            icomp: Vec::new(),
+            icomp_len: Vec::new(),
+            icomp_state: Vec::new(),
+            icomp_dim: 0,
             max_t,
             kv_lora,
             qk_rope,
@@ -589,7 +602,32 @@ impl KvCache {
             0
         };
         let device_shadow = if cfg!(feature = "cuda") { mla } else { 0 };
-        Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4
+        Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4 + Self::compressed_bytes_per_token(cfg)
+    }
+
+    /// DeepSeek-V4's compressed KV, per token.
+    ///
+    /// A compressor layer emits one `qk_head`-wide row every `compress_ratio` tokens, so
+    /// it costs `qk_head / ratio` floats per token — 128 floats on a ratio-4 layer, 4 on a
+    /// ratio-128 one. Layers with an Indexer (`ratio == 4`) carry a SECOND set at
+    /// `index_hd`. Zero on every other arch, where `compress_ratios` is empty.
+    ///
+    /// This was missing entirely: the compressed rows are the only reason V4 has context
+    /// past its 128-token window, so leaving them out of the reservation under-commits by
+    /// more the longer the sequence — exactly backwards.
+    fn compressed_bytes_per_token(cfg: &Config) -> usize {
+        let n = cfg.layer_kind.len().max(cfg.n_layers as usize);
+        cfg.compress_ratios
+            .iter()
+            .take(n)
+            .filter(|&&r| r > 0)
+            .map(|&r| {
+                let r = r as usize;
+                let main = cfg.qk_head as usize / r;
+                let idx = if r == 4 { cfg.index_hd as usize / r } else { 0 };
+                (main + idx) * 4
+            })
+            .sum()
     }
 
     /// Per-sequence KV bytes that do **not** scale with context length: the recurrent
@@ -735,6 +773,55 @@ impl KvCache {
     /// Mutable access to a layer's Compressor carry state.
     pub fn comp_state_mut(&mut self, layer: usize) -> Option<&mut crate::dsv4::CompressorState> {
         self.comp_state.get_mut(layer).and_then(|o| o.as_mut())
+    }
+
+    /// Allocate the Indexer's compressed KV — only on layers where `ratios[i] == want`
+    /// (V4 builds an Indexer exactly when `compress_ratio == 4`), at `index_head_dim`.
+    pub fn icomp_init(
+        &mut self,
+        n_layers: usize,
+        ratios: &[i32],
+        want: i32,
+        head_dim: usize,
+        max_blocks: usize,
+    ) {
+        let has = |i: usize| ratios.get(i).copied().unwrap_or(0) == want;
+        self.icomp = (0..n_layers)
+            .map(|i| if has(i) { vec![0f32; max_blocks * head_dim] } else { Vec::new() })
+            .collect();
+        self.icomp_len = vec![0usize; n_layers];
+        self.icomp_state = (0..n_layers)
+            .map(|i| has(i).then(|| crate::dsv4::CompressorState::new(want as usize, head_dim)))
+            .collect();
+        self.icomp_dim = head_dim;
+    }
+
+    /// Append one Indexer compressed row. Drops past capacity, like [`Self::comp_push`].
+    pub fn icomp_push(&mut self, layer: usize, row: &[f32]) {
+        let d = self.icomp_dim;
+        let n = self.icomp_len[layer];
+        if (n + 1) * d <= self.icomp[layer].len() {
+            self.icomp[layer][n * d..(n + 1) * d].copy_from_slice(row);
+            self.icomp_len[layer] = n + 1;
+        }
+    }
+
+    /// The Indexer compressed rows written so far for `layer`; empty when it has none.
+    pub fn icomp_rows(&self, layer: usize) -> &[f32] {
+        match self.icomp.get(layer) {
+            Some(v) => &v[..self.icomp_len[layer] * self.icomp_dim],
+            None => &[],
+        }
+    }
+
+    /// Whether [`Self::icomp_init`] has run.
+    pub fn icomp_ready(&self) -> bool {
+        !self.icomp.is_empty()
+    }
+
+    /// Mutable access to a layer's Indexer-Compressor carry state.
+    pub fn icomp_state_mut(&mut self, layer: usize) -> Option<&mut crate::dsv4::CompressorState> {
+        self.icomp_state.get_mut(layer).and_then(|o| o.as_mut())
     }
 
     /// Roped k_rot row for `(layer, pos)`.

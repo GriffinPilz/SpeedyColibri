@@ -1045,6 +1045,25 @@ fn mark_gpu_eligible(l: &mut Layer) {
     for t in l.o_a_groups.iter_mut() {
         t.gpu_eligible = true;
     }
+    // DeepSeek-V4's Compressor and Indexer projections.
+    //
+    // `comp_wkv`/`comp_wgate` run on EVERY token of 41 layers — they are how V4 has any
+    // context past its 128-token window — and were unmarked from the day the Compressor
+    // shipped, i.e. two `[4096 -> 1024]` matmuls per layer per token on a single core.
+    // The four `idx_*` are the same story for the Indexer's 21 layers, including its own
+    // Compressor. Nothing fails when these are missing; the work just moves off the GPU.
+    for t in [
+        &mut l.comp_wkv,
+        &mut l.comp_wgate,
+        &mut l.idx_wq_b,
+        &mut l.idx_wproj,
+        &mut l.idx_comp_wkv,
+        &mut l.idx_comp_wgate,
+    ] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
     // DSA indexer projections: batched in `indexer_forward`, so they want the GPU.
     // `matmul_qt`'s CPU path is single-threaded — a batched call on one core is
     // *slower* than the old per-query GEMVs spread across the indexer's worker
@@ -1382,10 +1401,18 @@ mod gpu_eligible_tests {
             ix_wk: q(),
             ix_wq: q(),
             ix_wp: q(),
+            o_a: q(),
+            o_b: q(),
+            comp_wkv: q(),
+            comp_wgate: q(),
+            idx_wq_b: q(),
+            idx_wproj: q(),
+            idx_comp_wkv: q(),
+            idx_comp_wgate: q(),
             ..Default::default()
         };
         mark_gpu_eligible(&mut l);
-        let opts: [(&str, &Option<colibri_core::QTensor>); 17] = [
+        let opts: [(&str, &Option<colibri_core::QTensor>); 25] = [
             ("q_proj", &l.q_proj),
             ("k_proj", &l.k_proj),
             ("v_proj", &l.v_proj),
@@ -1403,6 +1430,14 @@ mod gpu_eligible_tests {
             ("ix_wk", &l.ix_wk),
             ("ix_wq", &l.ix_wq),
             ("ix_wp", &l.ix_wp),
+            ("o_a", &l.o_a),
+            ("o_b", &l.o_b),
+            ("comp_wkv", &l.comp_wkv),
+            ("comp_wgate", &l.comp_wgate),
+            ("idx_wq_b", &l.idx_wq_b),
+            ("idx_wproj", &l.idx_wproj),
+            ("idx_comp_wkv", &l.idx_comp_wkv),
+            ("idx_comp_wgate", &l.idx_comp_wgate),
         ];
         for (name, t) in opts {
             assert!(
@@ -1410,6 +1445,23 @@ mod gpu_eligible_tests {
                 "{name} is missing from mark_gpu_eligible"
             );
         }
+
+        // The list above is ALSO hand-maintained, which is the very trap this test exists
+        // to catch — it passed for as long as `comp_wkv`/`comp_wgate` were missing, simply
+        // because nobody added them here either. Count the struct's fields from source and
+        // require the list to match, so a new `Option<QTensor>` cannot be added without
+        // this failing. Same technique as `Layer::resident_bytes`'s guard.
+        let src = include_str!("model.rs");
+        let start = src.find("pub struct Layer {").expect("Layer struct");
+        let body = &src[start..start + src[start..].find("\n}").expect("struct end")];
+        let n_fields = body.matches(": Option<QTensor>").count();
+        assert_eq!(
+            opts.len(),
+            n_fields,
+            "Layer has {n_fields} Option<QTensor> fields but this test checks {} — add the \
+             new one here AND to mark_gpu_eligible",
+            opts.len()
+        );
     }
 }
 

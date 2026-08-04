@@ -2214,10 +2214,12 @@ fn dsv4_compress_select(
             }
         }
     }
+    // Snapshot before pushing — see the identical note on the main Compressor above.
+    let ibase = kv.icomp_rows(li).len() / ihd;
     for (bi, r) in rows.into_iter().enumerate() {
         let mut nr = vec![0f32; ihd];
         rmsnorm(&mut nr, &r, &l.idx_comp_norm, cfg.eps);
-        let b = kv.icomp_rows(li).len() / ihd + bi;
+        let b = ibase + bi;
         let p = b * ratio;
         if (p + 1) * half <= ccos.len() {
             let (c, sn) = v4_rope_rows(ccos, csin, p, half);
@@ -2403,12 +2405,17 @@ fn dsv4_attention(
                     }
                 }
             }
+            // Snapshot the block count BEFORE pushing: `comp_rows` grows by one each
+            // iteration, so reading it inside the loop gave `base + 2*bi` and roped every
+            // block after the first at twice its spacing. Only reachable when one call
+            // emits several blocks — i.e. prefill, which used to panic before it got here.
+            let base = kv.comp_rows(li).len() / hd;
             for (bi, row) in rows.into_iter().enumerate() {
                 let mut nr = vec![0f32; hd];
                 rmsnorm(&mut nr, &row, &l.comp_norm, cfg.eps);
                 // Block `b` covers tokens [b*ratio, (b+1)*ratio); the reference ropes it at
                 // the window's END, i.e. `start_pos + 1 - ratio` for the decode emission.
-                let b = kv.comp_rows(li).len() / hd + bi;
+                let b = base + bi;
                 let p = b * ratio;
                 if (p + 1) * half <= ccos.len() {
                     let (c, sn) = v4_rope_rows(ccos, csin, p, half);

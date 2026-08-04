@@ -217,6 +217,12 @@ pub struct Config {
     /// The Compressor's rope base, SEPARATE from `theta`: V4 uses 160000 here against
     /// 10000 for attention. Reusing `theta` would place every compressed block wrongly.
     pub compress_theta: f32,
+    /// DeepSeek-V4 hash routing: the FIRST `num_hash_layers` (3) MoE layers pick their
+    /// experts from a `tid2eid[token_id]` table instead of by top-k score. Those layers
+    /// still run the router matmul — it supplies the WEIGHTS — and ship no bias at all,
+    /// because a bias only ever shifts a comparison and there is no comparison here.
+    /// 0 on every other arch.
+    pub n_hash_layers: i32,
     pub hc_mult: i32,
     pub hc_sinkhorn_iters: i32,
     pub hc_eps: f32,
@@ -525,6 +531,7 @@ impl Config {
             // is the "plain residual" case, and `window == 0` means "no ring buffer".
             compress_ratios: Vec::new(),
             compress_theta: 0.0,
+            n_hash_layers: 0,
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -731,6 +738,7 @@ impl Config {
             // is the "plain residual" case, and `window == 0` means "no ring buffer".
             compress_ratios: Vec::new(),
             compress_theta: 0.0,
+            n_hash_layers: 0,
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -919,6 +927,10 @@ impl Config {
                 .get("compress_rope_theta")
                 .and_then(Json::as_f64)
                 .unwrap_or(10000.0) as f32,
+            n_hash_layers: r
+                .get("num_hash_layers")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as i32,
             hc_mult: g("hc_mult"),
             hc_sinkhorn_iters: g("hc_sinkhorn_iters"),
             // Distinct from `eps` (the RMS epsilon): this one floors the Sinkhorn/sigmoid
@@ -1059,6 +1071,7 @@ impl Config {
             // is the "plain residual" case, and `window == 0` means "no ring buffer".
             compress_ratios: Vec::new(),
             compress_theta: 0.0,
+            n_hash_layers: 0,
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -1243,6 +1256,7 @@ impl Config {
             // is the "plain residual" case, and `window == 0` means "no ring buffer".
             compress_ratios: Vec::new(),
             compress_theta: 0.0,
+            n_hash_layers: 0,
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,

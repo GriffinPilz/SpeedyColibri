@@ -2609,6 +2609,9 @@ fn dsv4_layer_forward<P: ExpertProvider>(
     li: usize,
     x: &mut [f32], // [s, hc, d] — the Hyper-Connection stream, in place
     s: usize,
+    // Token ids for these rows — needed ONLY by the `n_hash_layers` MoE layers, which
+    // select experts from `tid2eid[token_id]` rather than from the router scores.
+    ids: &[i32],
     pos_base: usize,
     cos: &[f32],
     sin: &[f32],
@@ -2663,7 +2666,7 @@ fn dsv4_layer_forward<P: ExpertProvider>(
             });
         } else {
             timed(&MOE_US, || {
-                crate::moe::dsv4_moe(cfg, l, li, &sc.normed[..s * d], s, &mut sc.sub[..s * d], provider)
+                crate::moe::dsv4_moe(cfg, l, li, &sc.normed[..s * d], s, ids, &mut sc.sub[..s * d], provider)
             })?;
         }
 
@@ -2812,7 +2815,7 @@ fn dsv4_forward<P: ExpertProvider>(
         // with one table per layer regardless of whether we run the pooling.
         let compressed = cfg.compress_ratios.get(li).copied().unwrap_or(0) > 0;
         let (mcos, msin) = if compressed { (&ccos, &csin) } else { (&ncos, &nsin) };
-        dsv4_layer_forward(model, kv, provider, l, li, &mut x, s, pos_base, mcos, msin, &ccos, &csin, &mut sc)?;
+        dsv4_layer_forward(model, kv, provider, l, li, &mut x, s, ids, pos_base, mcos, msin, &ccos, &csin, &mut sc)?;
     }
 
     // Collapse `[hc, d] -> [d]` with the model-level head: a plain sigmoid gate, NO

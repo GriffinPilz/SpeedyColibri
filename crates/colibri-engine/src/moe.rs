@@ -3328,12 +3328,14 @@ mod tests {
 /// `compute_experts_partial` path applies the activation internally. Wiring it through is
 /// a change to that shared path, so it is called out here rather than left to look
 /// correct. Outputs will differ from the reference wherever the product exceeds ±10.
+#[allow(clippy::too_many_arguments)]
 pub fn dsv4_moe<P: ExpertProvider>(
     cfg: &Config,
     l: &Layer,
     layer: usize,
     x: &[f32],
     s_len: usize,
+    ids: &[i32],
     out: &mut [f32],
     provider: &P,
 ) -> io::Result<()> {
@@ -3350,23 +3352,41 @@ pub fn dsv4_moe<P: ExpertProvider>(
     }
 
     // `route_topk` applies sqrt(softplus(z)) for the WEIGHTS and adds the bias only for
-    // SELECTION (noaux_tc). Three layers ship no bias at all — they route by a `tid2eid`
-    // hash table that is not implemented — so those fall back to unbiased selection and
-    // are wrong by omission until it lands.
+    // SELECTION (noaux_tc).
+    //
+    // The first `n_hash_layers` layers replace SELECTION with `tid2eid[token_id]` and keep
+    // the same weights — see `route_hash`. `tid2eid` is empty on every other layer and on
+    // containers converted before it was kept, so this falls back to score routing rather
+    // than failing; that fallback is what those 3 layers did unconditionally before.
+    let hash = !l.tid2eid.is_empty() && ids.len() == s_len;
+    debug_assert!(
+        l.tid2eid.is_empty() || ids.len() == s_len,
+        "hash layer {layer} got {} ids for {s_len} rows",
+        ids.len()
+    );
     let mut idxs = vec![0usize; s_len * k];
     let mut ws = vec![0f32; s_len * k];
     let mut picked: Vec<(u32, f32)> = Vec::with_capacity(k);
     for si in 0..s_len {
-        crate::dsv4::route_topk(
-            &logits[si * e_n..(si + 1) * e_n],
-            &l.router_bias,
-            k,
-            cfg.routed_scale,
-            &mut picked,
-        );
+        let row = &logits[si * e_n..(si + 1) * e_n];
+        if hash {
+            let t = ids[si].max(0) as usize;
+            let base = t * k;
+            let eids = l.tid2eid.get(base..base + k).unwrap_or(&[]);
+            crate::dsv4::route_hash(row, eids, cfg.routed_scale, &mut picked);
+        } else {
+            crate::dsv4::route_topk(row, &l.router_bias, k, cfg.routed_scale, &mut picked);
+        }
         for (j, &(e, w)) in picked.iter().enumerate() {
             idxs[si * k + j] = e as usize;
             ws[si * k + j] = w;
+        }
+        // A hash row can yield FEWER than k entries when the table repeats an expert
+        // (merged by `route_hash`). Pad the tail with the first pick at weight 0 so the
+        // fixed-stride union sees no stale index from a previous row.
+        for j in picked.len()..k {
+            idxs[si * k + j] = picked.first().map(|&(e, _)| e as usize).unwrap_or(0);
+            ws[si * k + j] = 0.0;
         }
     }
     log_routing(layer, s_len, k, &idxs);

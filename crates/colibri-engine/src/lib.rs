@@ -252,6 +252,57 @@ fn load_layer(
             l.idx_comp_ape = ld(shards, &p("self_attn.indexer.compressor.ape"))?;
             l.idx_comp_norm = ld(shards, &p("self_attn.indexer.compressor.norm.weight"))?;
         }
+        // Hash routing (`num_hash_layers`, the first 3 layers). Stored as F32 because its
+        // values are expert IDs and every integer below 2^24 is exact in f32; converted to
+        // indices once, here, rather than casting per token in the router.
+        //
+        // Probed rather than derived from `n_hash_layers`: an older container converted
+        // before the table was kept simply has no such tensor, and asking for it would
+        // fail the whole load instead of falling back to score routing.
+        // A container converted before the table was kept has none, and those layers fall
+        // back to score routing — which loads, generates, and is wrong. Say so once.
+        if cfg.arch == colibri_core::Arch::DeepseekV4
+            && (i as i32) < cfg.n_hash_layers
+            && !shards.has(&p("mlp.gate.tid2eid"))
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "[dsv4] this container has no `mlp.gate.tid2eid`, so the first {} \
+                     layers will select experts by SCORE instead of by the hash table. \
+                     Reconvert (with COLI_KEEP_INDEXER=1) to fix.",
+                    cfg.n_hash_layers
+                );
+            });
+        }
+        if cfg.arch == colibri_core::Arch::DeepseekV4 && shards.has(&p("mlp.gate.tid2eid")) {
+            let raw = ld(shards, &p("mlp.gate.tid2eid"))?;
+            let want = cfg.vocab as usize * cfg.topk as usize;
+            if raw.len() != want {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: expected {want} entries (vocab {} x topk {}), got {}",
+                        p("mlp.gate.tid2eid"), cfg.vocab, cfg.topk, raw.len()
+                    ),
+                )
+                .into());
+            }
+            let n_exp = cfg.n_experts as i64;
+            l.tid2eid = raw
+                .iter()
+                .map(|&v| {
+                    let e = v as i64;
+                    if e < 0 || e >= n_exp {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("{}: expert id {e} outside 0..{n_exp}", p("mlp.gate.tid2eid")),
+                        ));
+                    }
+                    Ok(e as u32)
+                })
+                .collect::<std::io::Result<Vec<u32>>>()?;
+        }
         l.hc_attn_fn = hcv("hc_attn_fn", mw * n)?;
         l.hc_attn_base = hcv("hc_attn_base", mw)?;
         l.hc_attn_scale = hcv("hc_attn_scale", 3)?;

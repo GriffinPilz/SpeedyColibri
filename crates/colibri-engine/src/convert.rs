@@ -298,14 +298,13 @@ fn deepseek_v4_container_name(name: &str) -> Option<String> {
         return None;
     }
     // `ffn.gate.tid2eid` is an I64 [vocab, top_k] token-id -> expert-id table on the three
-    // hash-routing layers (`num_hash_layers`). Dropped for now, deliberately and visibly:
-    // it is an index table, not a weight, so it cannot go through the quantising writer,
-    // and the hash-routing forward path does not exist yet. A container without it is
-    // incomplete for those 3 of 43 layers — see task #59. Restore this together with the
-    // routing path, passing the bytes through verbatim rather than converting them.
-    if name.ends_with(".tid2eid") {
-        return None;
-    }
+    // hash-routing layers (`num_hash_layers`). It is now KEPT, and stored as F32: the
+    // values are expert IDs (< 256), every integer below 2^24 is exact in f32, and that
+    // avoids giving the container an integer tensor path used by exactly one tensor.
+    // 129280 x 6 x 4 B = 3.1 MB per layer, 9.3 MB total.
+    //
+    // It was dropped until the routing path existed, which left 3 of 43 layers selecting
+    // experts by score when the model selects them by table.
     let n = name.to_string();
     // Top-level tensors. V4 calls them `embed`/`head`/`norm`; the container (and every
     // loader path) expects the HF-ish long names.
@@ -523,6 +522,11 @@ fn classify_head(
     }
     if name.ends_with("mlp.gate.weight") {
         return Kind::F32; // router (NOT gate_proj)
+    }
+    // DeepSeek-V4's token-id -> expert-id table. F32 because its values are small exact
+    // integers; see the mapper for why it is not given an integer tensor path.
+    if name.ends_with("mlp.gate.tid2eid") {
+        return Kind::F32;
     }
     if name.ends_with("norm.weight") || name == "model.norm.weight" {
         return Kind::F32;
@@ -3266,9 +3270,12 @@ mod tests {
         assert!(m("mtp.0.attn.wq_a.weight").is_none());
         assert!(m("mtp.0.ffn.experts.5.w1.weight").is_none());
         assert!(m("mtp.0.markov_head.markov_w1.weight").is_none());
-        // The I64 index table is dropped, not fed to the quantising writer. Without this
-        // the converter panics on shard 1 (`convert_to_f32 called on an I64 index tensor`).
-        assert!(m("layers.0.ffn.gate.tid2eid").is_none());
+        // The I64 index table is KEPT, mapped like any other gate tensor and stored as
+        // F32 (its values are expert IDs, exact in f32). It is what the three hash-routing
+        // layers select with; dropping it left them choosing experts by score instead.
+        assert_eq!(m("layers.0.ffn.gate.tid2eid").as_deref(),
+                   Some("model.layers.0.mlp.gate.tid2eid"));
+        assert_eq!(classify("model.layers.0.mlp.gate.tid2eid", 43, false, false), Kind::F32);
         // ...but the ordinary gate weights still map.
         assert_eq!(m("layers.0.ffn.gate.weight").as_deref(),
                    Some("model.layers.0.mlp.gate.weight"));

@@ -114,4 +114,12 @@ container = "DeepSeek-V4-Flash-0731-container"
 source    = "DeepSeek-V4-Flash-0731-src"
 arch      = "deepseek_v4"
 hf_repo   = "unsloth/DeepSeek-V4-Flash-0731"
+prompt    = ""   # TODO: no canonical benchmark prompt yet — see the header note; V4 is not in the bench matrix
 notes     = "43 layers, all MoE (256 exp top-6 + 1 shared). Latent attention with O-LoRA; Hyper-Connections replace the residual (4 copies of the hidden state, [b,s,4,4096]). Compressor on 41/43 layers, DSA-family indexer on 21/43, DSpark on 40-42. Routed experts are natively MXFP4 and pass through bit-exact; dense weights are fp8 e4m3 with 128x128 E8M0 block scales. 1M context. Ships its own reference impl in inference/."
+
+["deepseek-v4-flash".convert_env]
+# WITHOUT THIS the 21 Indexer layers are dropped — 231 tensors, silently. `classify`'s
+# `keep_idx` defaults to off (it exists for GLM's DSA indexer), and a container converted
+# without it loads and generates perfectly well while every ratio-4 layer falls back to
+# attending to ALL compressed rows. Cost me one full 145 GB conversion to rediscover.
+COLI_KEEP_INDEXER = "1"

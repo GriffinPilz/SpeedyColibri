@@ -82,6 +82,11 @@ pub struct Layer {
     pub comp_wgate: Option<QTensor>,
     pub comp_ape: Vec<f32>,
     pub comp_norm: Vec<f32>,
+    /// DeepSeek-V4 hash routing: `[vocab, topk]` flattened, expert IDs. Non-empty only on
+    /// the first `n_hash_layers` (3) layers. `u32` rather than `Vec<f32>` because these
+    /// are indices — the container stores them as exactly-representable f32 only to avoid
+    /// an integer tensor path used by one tensor, and they are converted once, at load.
+    pub tid2eid: Vec<u32>,
 
     pub hc_attn_fn: Vec<f32>,
     pub hc_attn_base: Vec<f32>,
@@ -993,6 +998,9 @@ impl Layer {
             + oq(&self.o_a)
             + oq(&self.o_b)
             + self.o_a_groups.iter().map(&q).sum::<u64>()
+            // Not via `v`: this is a Vec<u32>, and the field-count guard below keys on the
+            // `Vec<f32>` declarations. 3.1 MB on each of the three hash layers.
+            + (self.tid2eid.len() * 4) as u64
             + v(&self.attn_sink)
             // Hyper-Connections. `*_fn` is the big one: [24, 16384] f32 = 1.5 MB per
             // sublayer, so 3.1 MB per layer and ~135 MB across V4's 43 layers — small

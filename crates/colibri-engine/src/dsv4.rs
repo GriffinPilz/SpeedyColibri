@@ -91,6 +91,48 @@ pub fn route_topk(
     out.sort_unstable_by_key(|&(e, _)| e);
 }
 
+/// Hash routing: the expert set comes from `tid2eid[token_id]`, not from the scores.
+///
+/// V4's first `num_hash_layers` (3) layers replace top-k SELECTION with a fixed
+/// token-id -> expert-id table. **They still run the router matmul**, because it supplies
+/// the WEIGHTS — `scores.gather(1, indices)` on the same `sqrt_softplus` scores every
+/// other layer uses, then normalised and scaled by `route_scale`. Skipping the matmul on
+/// these layers because "routing is a lookup" would leave the six chosen experts with no
+/// weights at all.
+///
+/// These layers ship **no bias** (`bias = None`, not a zero bias). That is consistent:
+/// the bias exists only to shift selection, and selection here is not a comparison.
+///
+/// Duplicate entries are merged by SUMMING their weights. Applying expert `e` twice with
+/// weight `w` equals applying it once with `2w`, and the downstream union expects each
+/// expert once.
+pub fn route_hash(logits: &[f32], eids: &[u32], route_scale: f32, out: &mut Vec<(u32, f32)>) {
+    out.clear();
+    if eids.is_empty() {
+        return;
+    }
+    let n = logits.len();
+    let mut sum = 0.0f32;
+    for &e in eids {
+        let e = e as usize;
+        debug_assert!(e < n, "tid2eid entry {e} past {n} experts");
+        if e >= n {
+            continue;
+        }
+        let w = sqrt_softplus(logits[e]);
+        sum += w;
+        match out.iter_mut().find(|(x, _)| *x == e as u32) {
+            Some((_, acc)) => *acc += w,
+            None => out.push((e as u32, w)),
+        }
+    }
+    let inv = if sum > 0.0 { route_scale / sum } else { 0.0 };
+    for (_, w) in out.iter_mut() {
+        *w *= inv;
+    }
+    out.sort_unstable_by_key(|&(e, _)| e);
+}
+
 /// V4's clamped SwiGLU: `silu(min(gate, limit)) * clamp(up, -limit, limit)`.
 ///
 /// **The clamp is asymmetric and that is not a typo.** The reference clamps `up` on BOTH
@@ -1358,6 +1400,71 @@ mod act_quant_tests {
         let mut x = vec![0.0f32; 4];
         act_quant_sim(&mut x, 2);
         assert!(x.iter().all(|&v| v == 0.0), "an all-zero block must not produce NaN");
+    }
+}
+
+#[cfg(test)]
+mod hash_routing_tests {
+    use super::*;
+
+    // Selection is the TABLE, not the scores — the whole point. Give the table the two
+    // WORST-scoring experts and check they are exactly what comes out; a `route_topk`
+    // that ignored `eids` would return the two best and pass any weaker check.
+    #[test]
+    fn selection_comes_from_the_table_not_the_scores() {
+        let logits = vec![5.0f32, -3.0, 4.0, -4.0];
+        let mut out = Vec::new();
+        route_hash(&logits, &[1, 3], 1.0, &mut out);
+        assert_eq!(out.iter().map(|&(e, _)| e).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    // The router matmul still supplies the WEIGHTS. They are the unbiased sqrt-softplus
+    // scores at the chosen indices, normalised over the chosen set and scaled — so a
+    // higher-scoring chosen expert must get more weight, and the total must be route_scale.
+    #[test]
+    fn weights_are_normalised_unbiased_scores_times_scale() {
+        let logits = vec![5.0f32, -3.0, 4.0, -4.0];
+        let mut out = Vec::new();
+        route_hash(&logits, &[0, 2], 1.5, &mut out);
+        let total: f32 = out.iter().map(|&(_, w)| w).sum();
+        assert!((total - 1.5).abs() < 1e-5, "weights must sum to route_scale: {total}");
+        let (w0, w2) = (out[0].1, out[1].1);
+        let (s0, s2) = (sqrt_softplus(5.0), sqrt_softplus(4.0));
+        assert!(w0 > w2, "expert 0 scores higher so must weigh more: {w0} vs {w2}");
+        assert!((w0 / w2 - s0 / s2).abs() < 1e-4, "weights must keep the score ratio");
+    }
+
+    // A repeated expert is merged by SUMMING, so it ends up with the weight it would
+    // have had from two entries. Emitting it twice would break the downstream union,
+    // which assumes each expert appears once.
+    #[test]
+    fn duplicate_table_entries_merge_by_summing() {
+        let logits = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut out = Vec::new();
+        route_hash(&logits, &[2, 2, 0], 1.0, &mut out);
+        assert_eq!(out.len(), 2, "expert 2 must appear once: {out:?}");
+        let w2 = out.iter().find(|&&(e, _)| e == 2).unwrap().1;
+        let w0 = out.iter().find(|&&(e, _)| e == 0).unwrap().1;
+        // 2*s2 vs s0, normalised over 2*s2 + s0
+        let (s0, s2) = (sqrt_softplus(1.0), sqrt_softplus(3.0));
+        let denom = 2.0 * s2 + s0;
+        assert!((w2 - 2.0 * s2 / denom).abs() < 1e-5, "{w2}");
+        assert!((w0 - s0 / denom).abs() < 1e-5, "{w0}");
+    }
+
+    // A layer with no table must produce nothing, so the caller falls back to score
+    // routing rather than silently routing every token to expert 0.
+    //
+    // NOTE: an out-of-range expert id is NOT tested as "gracefully skipped" — it
+    // `debug_assert`s. The loader validates every entry against `n_experts` when it
+    // builds the table, so reaching `route_hash` with a bad id means the table is
+    // corrupt, and quietly dropping an expert there would be a wrong model that runs.
+    #[test]
+    fn an_empty_table_selects_nothing() {
+        let logits = vec![1.0f32, 2.0];
+        let mut out = vec![(9u32, 9.0f32)];
+        route_hash(&logits, &[], 1.0, &mut out);
+        assert!(out.is_empty(), "an empty table must not leave stale picks: {out:?}");
     }
 }
 

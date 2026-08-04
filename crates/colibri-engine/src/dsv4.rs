@@ -628,3 +628,161 @@ mod clamp_tests {
         assert!(swiglu_clamped_one(2.0, 0.0, lim).abs() < 1e-6);
     }
 }
+
+/// The Compressor's overlap transform: `[nblk, ratio, 2*d]` -> `[nblk, 2*ratio, d]`.
+///
+/// Only used at `compress_ratio == 4`, where the Compressor runs OVERLAPPING windows so
+/// block boundaries are smoother. The projections emit `2*d` per token: the first `d` dims
+/// feed the *overlapping* window, the second `d` the *normal* one. Transcribed from
+/// `Compressor.overlap_transform`:
+///
+/// ```text
+///   out[i, ratio.. ] = t[i,   :, d.. ]      # normal   window, this block
+///   out[i, ..ratio ] = t[i-1, :, ..d ]      # overlap  window, the PREVIOUS block
+///   out[0, ..ratio ] = fill                 # block 0 has no predecessor
+/// ```
+///
+/// The `i-1` is the whole point and is what makes it "overlapping". Using `i` there
+/// produces the right shape, plausible values, and no overlap at all — which is why the
+/// test below pins a distinguishable value per (block, slot) rather than checking dims.
+/// `fill` is 0 for the values and -inf for the scores, so block 0's absent predecessor
+/// contributes nothing after the softmax.
+pub fn overlap_transform(t: &[f32], nblk: usize, ratio: usize, d: usize, fill: f32) -> Vec<f32> {
+    debug_assert_eq!(t.len(), nblk * ratio * 2 * d);
+    let mut out = vec![fill; nblk * 2 * ratio * d];
+    for i in 0..nblk {
+        for r in 0..ratio {
+            // normal window: second half of this block's dims
+            let src = (i * ratio + r) * 2 * d + d;
+            let dst = (i * 2 * ratio + ratio + r) * d;
+            out[dst..dst + d].copy_from_slice(&t[src..src + d]);
+            // overlap window: first half of the PREVIOUS block's dims
+            if i > 0 {
+                let src = ((i - 1) * ratio + r) * 2 * d;
+                let dst = (i * 2 * ratio + r) * d;
+                out[dst..dst + d].copy_from_slice(&t[src..src + d]);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod compressor_tests {
+    use super::*;
+
+    // Every (block, position, half) gets a unique value, so a transform that took the
+    // CURRENT block instead of the previous one, or swapped the halves, or wrote the slot
+    // ranges in the wrong order, all fail. A uniform-valued input would pass under all of
+    // those while having exactly the right shape.
+    #[test]
+    fn overlap_transform_pulls_from_the_previous_block() {
+        let (nblk, ratio, d) = (3usize, 4usize, 2usize);
+        // value = 100*block + 10*pos + (0 for first half, 5 for second half) + dim
+        let mut t = vec![0f32; nblk * ratio * 2 * d];
+        for i in 0..nblk {
+            for r in 0..ratio {
+                for k in 0..d {
+                    t[(i * ratio + r) * 2 * d + k] = (100 * i + 10 * r + k) as f32;
+                    t[(i * ratio + r) * 2 * d + d + k] = (100 * i + 10 * r + 5 + k) as f32;
+                }
+            }
+        }
+        let o = overlap_transform(&t, nblk, ratio, d, f32::NEG_INFINITY);
+        assert_eq!(o.len(), nblk * 2 * ratio * d);
+        for i in 0..nblk {
+            for r in 0..ratio {
+                for k in 0..d {
+                    // normal half: this block's SECOND half of dims
+                    assert_eq!(
+                        o[(i * 2 * ratio + ratio + r) * d + k],
+                        (100 * i + 10 * r + 5 + k) as f32,
+                        "normal slot, block {i} pos {r}"
+                    );
+                    // overlap half: the PREVIOUS block's FIRST half of dims
+                    let got = o[(i * 2 * ratio + r) * d + k];
+                    if i == 0 {
+                        assert!(got.is_infinite() && got < 0.0, "block 0 overlap must be the fill");
+                    } else {
+                        assert_eq!(
+                            got,
+                            (100 * (i - 1) + 10 * r + k) as f32,
+                            "overlap slot must come from block {}, not {i}", i - 1
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Gated pooling: `out[b] = sum_w softmax(score[b, :, :])[w] * kv[b, w, :]`.
+///
+/// The softmax is over the WINDOW axis (`w`), independently per block — the reference's
+/// `score.softmax(dim=2)` on `[b, s, window, d]`. Note it is per-DIMENSION too: each of
+/// the `d` channels gets its own softmax across the window, because `score` is the full
+/// width of `kv`, not a scalar per slot. Reducing to one weight per slot would be the
+/// natural simplification and is wrong.
+///
+/// `-inf` scores (block 0's absent overlap predecessor) contribute exactly zero, which is
+/// why the transform fills scores with `-inf` and values with `0`.
+pub fn gated_pool(kv: &[f32], score: &[f32], nblk: usize, win: usize, d: usize, out: &mut [f32]) {
+    debug_assert_eq!(kv.len(), nblk * win * d);
+    debug_assert_eq!(score.len(), nblk * win * d);
+    debug_assert_eq!(out.len(), nblk * d);
+    for b in 0..nblk {
+        for k in 0..d {
+            let mut m = f32::NEG_INFINITY;
+            for w in 0..win {
+                m = m.max(score[(b * win + w) * d + k]);
+            }
+            // An all -inf column would make `exp(x - m)` NaN; it cannot occur for a real
+            // block (the normal window is always populated), so treat it as zero weight
+            // rather than propagating NaN into the KV cache.
+            if !m.is_finite() {
+                out[b * d + k] = 0.0;
+                continue;
+            }
+            let mut den = 0.0f32;
+            let mut acc = 0.0f32;
+            for w in 0..win {
+                let e = (score[(b * win + w) * d + k] - m).exp();
+                den += e;
+                acc += e * kv[(b * win + w) * d + k];
+            }
+            out[b * d + k] = acc / den;
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    // Two properties a wrong reduction axis would break: (1) a -inf slot contributes
+    // nothing, and (2) the softmax is PER-DIMENSION, so two channels with opposite score
+    // orderings must select opposite window slots. A scalar-per-slot weighting would give
+    // both channels the same winner and pass a single-channel test.
+    #[test]
+    fn pool_softmaxes_per_dimension_and_ignores_neg_inf() {
+        let (nblk, win, d) = (1usize, 3usize, 2usize);
+        // channel 0 favours slot 0, channel 1 favours slot 1; slot 2 is masked out.
+        let kv = vec![
+            10.0, 20.0, // slot 0
+            30.0, 40.0, // slot 1
+            50.0, 60.0, // slot 2 (masked)
+        ];
+        let score = vec![
+            9.0, 0.0,
+            0.0, 9.0,
+            f32::NEG_INFINITY, f32::NEG_INFINITY,
+        ];
+        let mut out = vec![0f32; nblk * d];
+        gated_pool(&kv, &score, nblk, win, d, &mut out);
+        // channel 0 -> ~slot 0's value (10), channel 1 -> ~slot 1's value (40)
+        assert!((out[0] - 10.0).abs() < 0.1, "ch0 got {}", out[0]);
+        assert!((out[1] - 40.0).abs() < 0.1, "ch1 got {}", out[1]);
+        // the masked slot's large values (50/60) must not leak in
+        assert!(out[0] < 20.0 && out[1] < 50.0, "masked slot leaked: {out:?}");
+    }
+}

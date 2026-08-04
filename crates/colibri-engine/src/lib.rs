@@ -18,6 +18,7 @@ pub mod dsa;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+pub mod hc;
 pub mod kda;
 pub mod linear;
 pub mod loader;

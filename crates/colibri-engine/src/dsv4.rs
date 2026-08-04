@@ -235,6 +235,49 @@ pub fn attention_dsv4(
     attention_dsv4_sparse(q, kv, attn_sink, s, h, hd, &idxs, topk, scale, out);
 }
 
+/// Build the per-query key-index list for [`attention_dsv4_sparse`].
+///
+/// Key space is two-part, as in the reference: `n_raw` raw rows starting at absolute
+/// position `raw_lo`, then the compressed rows offset by `n_raw`. Per query at absolute
+/// position `p`:
+/// - **window** — raw positions `max(0, p+1-win) ..= p`, i.e. `get_window_topk_idxs`.
+/// - **compressed** — whatever `sel[i]` holds: every closed row on a ratio-128 layer
+///   (`get_compress_topk_idxs`), or the Indexer's top-k on a ratio-4 one.
+///
+/// Both parts are padded to a fixed stride with `-1` (masked), so `topk` is uniform
+/// across queries even though the counts are not.
+///
+/// Extracted from `dsv4_attention` to be testable on its own: this is the arithmetic that
+/// previously underflowed on `usize` and walked off the cache, and it decides what the
+/// model attends to — the one thing no amount of downstream testing can recover.
+pub fn key_indices(
+    win: usize,
+    total: usize,
+    pos_base: usize,
+    s: usize,
+    raw_lo: usize,
+    n_raw: usize,
+    sel: &[Vec<usize>],
+) -> (Vec<i32>, usize) {
+    let win_w = win.min(total);
+    let comp_w = sel.iter().map(|v| v.len()).max().unwrap_or(0);
+    let topk = win_w + comp_w;
+    let mut idxs = vec![-1i32; s * topk];
+    for i in 0..s {
+        let p = pos_base + i;
+        let row = &mut idxs[i * topk..(i + 1) * topk];
+        let wcount = win.min(p + 1);
+        let wstart = (p + 1) - wcount;
+        for (k, slot) in row[..wcount].iter_mut().enumerate() {
+            *slot = ((wstart + k) - raw_lo) as i32;
+        }
+        for (k, &t) in sel[i].iter().enumerate() {
+            row[win_w + k] = (n_raw + t) as i32;
+        }
+    }
+    (idxs, topk)
+}
+
 /// DeepSeek-V4 attention over an EXPLICIT per-query key-index list.
 ///
 /// `idxs` is `[S, topk]` of indices into `kv`, with **`-1` meaning masked** — the same
@@ -1647,6 +1690,10 @@ const CMP_DEC_KV: [f32; 128] = [1.0282f32, -0.95809096f32, -1.320243f32, -0.7080
 const CMP_DEC_SC: [f32; 128] = [0.79823416f32, -0.93080282f32, -0.71673328f32, -1.0696759f32, 0.096262746f32, 0.27633426f32, 1.2209487f32, 0.93442923f32, -0.99210596f32, -0.47616288f32, 0.70488632f32, 0.025717556f32, 1.3657246f32, 1.4473208f32, -0.46700665f32, 0.7171281f32, -0.28620645f32, 0.14870869f32, 1.0555689f32, 1.4698336f32, -0.93807244f32, 0.96038878f32, -0.68813974f32, -0.29267713f32, -0.43563277f32, 0.14553894f32, -0.49930865f32, -0.78457808f32, 1.2475897f32, 0.16672069f32, -0.33338231f32, -0.083774365f32, -0.82711279f32, -0.20469582f32, 0.72464144f32, 0.28750136f32, 0.77856326f32, -0.4386985f32, 0.17768846f32, -0.13496919f32, 0.54871768f32, 0.031928942f32, -0.93412066f32, 0.50538987f32, 0.99466485f32, 2.2254913f32, -2.6320543f32, 1.7921826f32, -1.4252253f32, 1.1850488f32, -0.81649822f32, 0.81906664f32, 1.0534604f32, -1.9213799f32, -0.85834581f32, -0.54518491f32, -0.75722945f32, -0.11812954f32, 1.2678713f32, 0.90029889f32, -0.025864407f32, -1.5149385f32, 0.87858546f32, 0.82239789f32, 0.1917953f32, -0.39037141f32, -1.1913899f32, 0.75353128f32, 0.35611269f32, 0.49744195f32, 1.7558457f32, -0.21568428f32, -1.0923637f32, 0.82938874f32, -2.1549311f32, 0.50670904f32, 0.5765329f32, 1.3942415f32, 0.90749967f32, -0.68698919f32, -0.62599415f32, 1.415998f32, -0.25759619f32, 0.0079628294f32, 0.25370547f32, -0.9849503f32, 1.6819547f32, -0.91569716f32, 1.2923079f32, -0.12945357f32, 1.5176507f32, -2.0061421f32, -0.44905174f32, 0.9760111f32, 2.1541495f32, 0.69007456f32, -1.4235982f32, -0.54585218f32, 0.058994465f32, -0.81819212f32, -0.02371067f32, -0.86964494f32, 1.2285522f32, 1.4708543f32, 0.30330139f32, -1.8498753f32, 0.97850209f32, -0.43430129f32, -2.4426892f32, 1.6465185f32, -0.55297083f32, 1.1851395f32, 0.77718985f32, -0.08558175f32, -1.3931558f32, -0.36579853f32, -0.56406546f32, 0.54658407f32, 0.048680633f32, 0.89318496f32, 1.7125527f32, -0.1594919f32, -1.0620359f32, -0.54301322f32, -1.1869813f32, -0.70194107f32, -1.5105433f32, -0.16732219f32];
 const CMP_DEC_AT: [usize; 2] = [1, 5];
 const CMP_DECODE: [f32; 16] = [-0.21438542f32, -0.2943075f32, -0.42643994f32, -0.30879754f32, 0.59517753f32, -1.3683102f32, -0.13959113f32, -0.047694378f32, 0.2751978f32, -0.36406153f32, 0.23002705f32, 0.49375531f32, 1.0555544f32, -0.31154799f32, 0.6553899f32, 0.41941389f32];
+const WIN_PREFILL: [i32; 40] = [0, -1, -1, -1, 0, 1, -1, -1, 0, 1, 2, -1, 0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6, 4, 5, 6, 7, 5, 6, 7, 8, 6, 7, 8, 9];
+const CMP_PREFILL_BLK: [i32; 20] = [-1, -1, -1, -1, -1, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, 1, 0, 1, 0, 1];
+const WIN_DECODE: [i32; 4] = [7, 8, 9, 10];
+const CMP_DECODE_BLK: [i32; 2] = [0, 1];
 
     fn close(a: &[f32], b: &[f32], tol: f32, what: &str) {
         assert_eq!(a.len(), b.len(), "{what}: length");
@@ -1750,5 +1797,84 @@ const CMP_DECODE: [f32; 16] = [-0.21438542f32, -0.2943075f32, -0.42643994f32, -0
         }
         assert_eq!(at, CMP_DEC_AT, "emitted on different steps than the reference");
         close(&out, &CMP_DECODE, 1e-5, "compress_decode");
+    }
+
+    // What the model ATTENDS TO — `get_window_topk_idxs` + `get_compress_topk_idxs`.
+    //
+    // The reference's index VALUES live in its own key space (all rows at prefill, a
+    // win-slot RING BUFFER at decode, compressed offset past them); colibri lays the cache
+    // out as raw-from-`raw_lo` then compressed. Comparing values would compare layouts, so
+    // both sides are decoded to the ABSOLUTE positions and BLOCK ids actually attended.
+    //
+    // This is the arithmetic that underflowed on `usize` and walked off the cache, and it
+    // is unrecoverable downstream: attend to the wrong keys and everything after is
+    // confidently wrong.
+    fn decode_row(row: &[i32], raw_lo: usize, n_raw: usize) -> (Vec<i32>, Vec<i32>) {
+        let (mut pos, mut blk) = (Vec::new(), Vec::new());
+        for &v in row {
+            if v < 0 {
+                continue;
+            }
+            if (v as usize) < n_raw {
+                pos.push(raw_lo as i32 + v);
+            } else {
+                blk.push(v - n_raw as i32);
+            }
+        }
+        (pos, blk)
+    }
+
+    fn check_span(pos_base: usize, s: usize, win: usize, ratio: usize, n_comp: usize,
+                  want_win: &[i32], want_blk: &[i32]) {
+        let total = pos_base + s;
+        let raw_lo = (pos_base + 1) - win.min(pos_base + 1);
+        let n_raw = total - raw_lo;
+        // The non-Indexer selection: every compressed row whose window has CLOSED.
+        let sel: Vec<Vec<usize>> =
+            (0..s).map(|i| (0..(((pos_base + i) + 1) / ratio).min(n_comp)).collect()).collect();
+        let (idxs, topk) = key_indices(win, total, pos_base, s, raw_lo, n_raw, &sel);
+        for i in 0..s {
+            let (pos, blk) = decode_row(&idxs[i * topk..(i + 1) * topk], raw_lo, n_raw);
+            let wp: Vec<i32> = want_win[i * win..(i + 1) * win].iter().copied()
+                .filter(|&v| v >= 0).collect();
+            let wb: Vec<i32> = want_blk[i * n_comp..(i + 1) * n_comp].iter().copied()
+                .filter(|&v| v >= 0).collect();
+            assert_eq!(pos, wp, "query {i} (abs {}) window", pos_base + i);
+            assert_eq!(blk, wb, "query {i} (abs {}) compressed blocks", pos_base + i);
+        }
+    }
+
+    // Prefill: 10 tokens, window 4, ratio 4. Covers the causal ramp (query 0 sees one key),
+    // the window sliding off the start, and blocks becoming visible only once closed.
+    #[test]
+    fn prefill_key_span_matches_the_reference() {
+        check_span(0, 10, 4, 4, 2, &WIN_PREFILL, &CMP_PREFILL_BLK);
+    }
+
+    // Decode at position 10 against the same history. The reference reads its ring buffer
+    // in rotated slot order; the positions must come out identical regardless.
+    #[test]
+    fn decode_key_span_matches_the_reference() {
+        check_span(10, 1, 4, 4, 2, &WIN_DECODE, &CMP_DECODE_BLK);
+    }
+
+    // The compressed rows deliberately OVERLAP the raw window — the reference attends to a
+    // recent token both raw and compressed. Pin it: at position 10 with window 4, block 1
+    // covers positions 4..8, and block 0 covers 0..4, while the window covers 7..10. Block
+    // 1 therefore overlaps position 7, and both are present.
+    #[test]
+    fn compressed_blocks_overlap_the_raw_window() {
+        let (win, ratio) = (4usize, 4usize);
+        let (pos_base, s, total) = (10usize, 1usize, 11usize);
+        let raw_lo = (pos_base + 1) - win.min(pos_base + 1);
+        let n_raw = total - raw_lo;
+        let sel = vec![vec![0usize, 1usize]];
+        let (idxs, topk) = key_indices(win, total, pos_base, s, raw_lo, n_raw, &sel);
+        let (pos, blk) = decode_row(&idxs[..topk], raw_lo, n_raw);
+        assert_eq!(pos, vec![7, 8, 9, 10]);
+        assert_eq!(blk, vec![0, 1]);
+        // block 1 spans 4..8, so position 7 is carried BOTH ways. Excluding it (the old
+        // "would double-count" rule) is what this pins against.
+        assert!(pos.contains(&7) && blk.contains(&1), "the overlap was dropped");
     }
 }

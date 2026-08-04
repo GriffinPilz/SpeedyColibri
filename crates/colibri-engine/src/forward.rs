@@ -2535,22 +2535,7 @@ fn dsv4_attention(
     // the old code excluded them ("would double-count"), which is not what V4 does.
     let comp_avail = |p: usize| if ratio > 0 { ((p + 1) / ratio).min(n_comp) } else { 0 };
     let sel = dsv4_compress_select(cfg, l, li, kv, xn, &q_lat, s, pos_base, ccos, csin, &comp_avail);
-    let win_w = win.min(total);
-    let comp_w = sel.iter().map(|v| v.len()).max().unwrap_or(0);
-    let topk = win_w + comp_w;
-    let mut idxs = vec![-1i32; s * topk];
-    for i in 0..s {
-        let p = pos_base + i;
-        let row = &mut idxs[i * topk..(i + 1) * topk];
-        let wcount = win.min(p + 1);
-        let wstart = (p + 1) - wcount;
-        for (k, slot) in row[..wcount].iter_mut().enumerate() {
-            *slot = ((wstart + k) - raw_lo) as i32;
-        }
-        for (k, &t) in sel[i].iter().enumerate() {
-            row[win_w + k] = (n_raw + t) as i32;
-        }
-    }
+    let (idxs, topk) = crate::dsv4::key_indices(win, total, pos_base, s, raw_lo, n_raw, &sel);
 
     let mut o = vec![0f32; s * h * hd];
     // Reference: `softmax_scale = head_dim ** -0.5`. No YaRN mscale, despite YaRN rope —

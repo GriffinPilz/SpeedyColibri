@@ -237,3 +237,59 @@ print(f"const CMP_DEC_SC: [f32; {8 * 2 * D}] = [{fmt(ds.flatten().tolist())}];")
 print(f"const CMP_DEC_AT: [usize; {len(at)}] = [{', '.join(str(i) for i in at)}];")
 flat = torch.stack(emitted).flatten() if emitted else torch.zeros(0)
 print(f"const CMP_DECODE: [f32; {flat.numel()}] = [{fmt(flat.tolist())}];")
+
+
+# ---------------------------------------------------------------------------
+# model.py:261 get_window_topk_idxs and model.py:275 get_compress_topk_idxs.
+#
+# The reference's index VALUES are in its own key space (all `seqlen` rows at prefill, a
+# `win`-slot RING BUFFER at decode, compressed rows offset past them). colibri lays the
+# cache out as raw-from-`raw_lo` then compressed. Comparing raw values would only compare
+# layouts, so both sides are decoded to what actually matters: the set of ABSOLUTE token
+# positions and the set of compressed BLOCK ids each query attends to.
+def ref_window(win, seqlen, start_pos):
+    """-> per-query list of absolute positions (reference semantics, decoded)."""
+    rows = []
+    for i in range(seqlen):
+        p = start_pos + i
+        if start_pos == 0:
+            lo = max(0, p - win + 1)
+            rows.append([v for v in range(lo, lo + min(seqlen, win)) if v <= p])
+        else:
+            # ring slots cat([arange(sp%win+1, win), arange(0, sp%win+1)]); slot v holds the
+            # newest position q <= p with q % win == v.
+            sp = start_pos % win
+            slots = list(range(sp + 1, win)) + list(range(0, sp + 1))
+            out = []
+            for v in slots:
+                q = p - ((p - v) % win)
+                if 0 <= q <= p:
+                    out.append(q)
+            rows.append(sorted(out))
+    return rows
+
+
+def ref_compress(ratio, seqlen, start_pos, n_comp):
+    """-> per-query list of compressed block ids (offset stripped)."""
+    rows = []
+    for i in range(seqlen):
+        p = start_pos + i
+        rows.append(list(range(min((p + 1) // ratio, n_comp))))
+    return rows
+
+
+def pad(rows, w):
+    return [r + [-1] * (w - len(r)) for r in rows]
+
+
+def emit2(name, rows, w):
+    flat = [x for r in pad(rows, w) for x in r]
+    print(f"const {name}: [i32; {len(flat)}] = [{', '.join(str(x) for x in flat)}];")
+
+
+WIN, RAT, SEQ = 4, 4, 10
+NCMP = SEQ // RAT
+emit2("WIN_PREFILL", ref_window(WIN, SEQ, 0), WIN)
+emit2("CMP_PREFILL_BLK", ref_compress(RAT, SEQ, 0, NCMP), NCMP)
+emit2("WIN_DECODE", ref_window(WIN, 1, SEQ), WIN)
+emit2("CMP_DECODE_BLK", ref_compress(RAT, 1, SEQ, NCMP), NCMP)

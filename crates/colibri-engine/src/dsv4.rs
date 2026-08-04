@@ -152,6 +152,81 @@ pub fn o_lora_grouped(o: &[f32], wo_a: &[f32], g: usize, rank: usize, mid: &mut 
     }
 }
 
+
+/// DeepSeek-V4 attention core: 64 query heads against ONE shared latent, with a per-head
+/// attention sink.
+///
+/// `q` is `[S, H, hd]` and `kv` is `[T, hd]` — a single latent per position serving as both
+/// K and V (`num_key_value_heads: 1`), so every head reads the same cache. Callers pass q
+/// and kv already normed and rope-applied; the caller also applies the INVERSE rope to the
+/// output (V is that same roped latent, so the rotation has to be undone).
+///
+/// **The sink contributes to the DENOMINATOR only** — `sum_exp += exp(sink[h] - max)` with
+/// no matching term in the numerator, i.e. a learned "attend to nothing" mass per head.
+/// Adding it to both, or treating it as an extra key with a value, is silent: outputs stay
+/// finite and plausibly scaled, just uniformly too large. The test pins a large negative
+/// sink against a large positive one so the denominators differ visibly.
+///
+/// DENSE over `[0, pos]`. That is exact only while every query's window covers the whole
+/// cache — `seqlen <= sliding_window` (128) with no compressed entries. Beyond that V4
+/// attends to a window plus compressed positions, and running dense is WRONG, not merely
+/// slow: it attends to positions the model never does. Callers must enforce that.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_dsv4(
+    q: &[f32],
+    kv: &[f32],
+    attn_sink: &[f32],
+    s: usize,
+    h: usize,
+    hd: usize,
+    pos_base: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(q.len(), s * h * hd);
+    debug_assert_eq!(out.len(), s * h * hd);
+    debug_assert_eq!(attn_sink.len(), h);
+    let mut scores: Vec<f32> = Vec::new();
+    for i in 0..s {
+        let pos = pos_base + i;
+        let n = pos + 1;
+        debug_assert!(kv.len() >= n * hd, "kv cache shorter than the causal span");
+        for hh in 0..h {
+            let qv = &q[(i * h + hh) * hd..(i * h + hh) * hd + hd];
+            scores.clear();
+            let mut m = f32::NEG_INFINITY;
+            for j in 0..n {
+                let kr = &kv[j * hd..(j + 1) * hd];
+                let mut acc = 0.0f64;
+                for (a, b) in qv.iter().zip(kr) {
+                    acc += (*a as f64) * (*b as f64);
+                }
+                let sc = (acc as f32) * scale;
+                m = m.max(sc);
+                scores.push(sc);
+            }
+            let mut den = 0.0f32;
+            for v in scores.iter_mut() {
+                *v = (*v - m).exp();
+                den += *v;
+            }
+            // Sink: denominator only. Stabilised against the same max the scores used,
+            // exactly as the reference kernel does.
+            den += (attn_sink[hh] - m).exp();
+            let dst = &mut out[(i * h + hh) * hd..(i * h + hh) * hd + hd];
+            dst.fill(0.0);
+            let inv = 1.0 / den;
+            for (j, &w) in scores.iter().enumerate() {
+                let w = w * inv;
+                let vr = &kv[j * hd..(j + 1) * hd];
+                for (o, &v) in dst.iter_mut().zip(vr) {
+                    *o += w * v;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +341,54 @@ mod tests {
             (crossed as f32 - mid[0]).abs() > 1e-3,
             "group 0's slice gives the same answer on group 1's input — grouping unproven"
         );
+    }
+
+
+    #[test]
+    fn attention_sink_lands_in_the_denominator_only() {
+        const S: usize = 2;
+        const H: usize = 2;
+        const HD: usize = 4;
+        let q: [f32; S * H * HD] = [
+            0.3379032508, 0.3834890916, -0.0756740387, -0.5830266066, -0.1004603573,
+            0.4513336327, 0.5064108515, 0.3598505688, 0.7793086476, 0.3152932911,
+            -1.877775699, -0.3249812003, -0.4180281703, 0.807281146, 1.0113295607,
+            -0.3436872418,
+        ];
+        let kv: [f32; 3 * HD] = [
+            0.1168053345, 0.350209567, -0.5709518924, 0.1920349968, 0.3827639102,
+            -0.2535910361, -0.3726996383, 0.6406087806, -0.1964679144, 0.8522606005,
+            -0.261153981, 0.3652516174,
+        ];
+        let sink = [0.3f32, -1.2];
+        let want: [f32; S * H * HD] = [
+            0.051212224, 0.1535461619, -0.2503286031, 0.0841959772, 0.0889944675,
+            0.2668261175, -0.4350106083, 0.1463122583, 0.1648992436, 0.0607652527,
+            -0.3423565076, 0.2746081392, 0.1913274224, 0.0741464273, -0.4011202593,
+            0.3185897833,
+        ];
+        let mut out = vec![0f32; S * H * HD];
+        let scale = (HD as f32).powf(-0.5);
+        attention_dsv4(&q, &kv, &sink, S, H, HD, 0, scale, &mut out);
+        for (i, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-6, "out[{i}] = {g} want {w}");
+        }
+
+        // Head 0's sink is +0.3 and head 1's is -1.2, so head 0 sheds much more mass to the
+        // sink. If the sink were ignored (or added to numerator and denominator alike) both
+        // heads would keep full mass and the ratio below would be ~1.
+        let mut no_sink = vec![0f32; S * H * HD];
+        attention_dsv4(&q, &kv, &[-40.0, -40.0], S, H, HD, 0, scale, &mut no_sink);
+        let m0 = out[0] / no_sink[0];
+        let m1 = out[HD] / no_sink[HD];
+        // RELATIONAL, not a magic threshold. Head 0's sink (+0.3) is larger than head 1's
+        // (-1.2), so head 0 must shed strictly more mass; and any sink at all must shed
+        // some. Picking absolute cutoffs here needs the denominator computed by hand — at
+        // position 0 there is a single key, so even a -1.2 sink takes ~24% of the mass,
+        // which is why an eyeballed ">0.95" was wrong while the implementation was right.
+        assert!(m0 < m1, "bigger sink must shed more mass: head0 kept {m0}, head1 {m1}");
+        assert!(m1 < 1.0, "a sink must shed SOME mass; head 1 kept {m1}");
+        assert!(m0 > 0.0 && m1 > 0.0, "mass must stay positive: {m0}, {m1}");
     }
 
     #[test]

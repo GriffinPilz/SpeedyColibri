@@ -2237,6 +2237,56 @@ extern "C" int coli_cuda_expert_mlp_mxfp4_situ(ColiCudaTensor *gate,ColiCudaTens
     return 1;
 }
 
+/* MXFP4 experts with the engine's configured SwiGLU, the sibling of the `_situ` entry
+ * above. DeepSeek-V4's experts are MXFP4 but gated SwiGLU, not K3's situ, so neither the
+ * situ path (wrong activation) nor `coli_cuda_expert_mlp` (reads BLOCK scales as per-row
+ * f32 — that combination took an illegal memory access) could serve them, and every one
+ * of V4's 258 routed experts per token fell to the scalar CPU loop.
+ *
+ * `act_mul` applies whatever activation the engine has set, so this computes exactly what
+ * the CPU path computes today. In particular it does NOT yet apply V4's `swiglu_limit`
+ * clamp — that gap is real and tracked, and this change neither closes nor widens it.
+ * Making the GPU silently apply a DIFFERENT activation from the CPU would be far worse
+ * than sharing a known-incomplete one. */
+extern "C" int coli_cuda_expert_mlp_mxfp4(ColiCudaTensor *gate,ColiCudaTensor *up,
+        ColiCudaTensor *down,float *y,const float *x,int S){
+    if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=6||up->fmt!=6||down->fmt!=6||
+       gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
+       gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
+    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert mxfp4 input upload"))return 0;
+    const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
+    const uint8_t *gbs=(const uint8_t*)gate->bscale,*ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
+    float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
+        if(S==1){
+        int tpb=256,wpb=tpb>>5;
+        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
+        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+        act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
+        mxfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
+    }else{
+        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+        mxfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
+        act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
+        mxfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert mxfp4 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert mxfp4 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert mxfp4 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    return 1;
+}
+
 extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *up,
         ColiCudaTensor *down,float *y,const float *x,int S){
     if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=5||up->fmt!=5||down->fmt!=5||

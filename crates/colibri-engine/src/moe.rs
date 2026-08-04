@@ -1088,6 +1088,13 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
             ) {
                 return;
             }
+        } else if crate::gpu::try_expert_ffn_mxfp4(gate, up, down, x, nr, out) {
+            // MXFP4 SwiGLU experts (DeepSeek-V4). Tried BEFORE `try_expert_ffn`: that path
+            // ends in `coli_cuda_expert_mlp`, which reads block scales as a per-row f32
+            // array. It used to launch anyway and take an illegal memory access, which —
+            // CUDA errors being sticky — dropped the whole process to the CPU matmul. It
+            // now declines, so the ordering is belt-and-braces rather than load-bearing.
+            return;
         } else if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
             return;
         }

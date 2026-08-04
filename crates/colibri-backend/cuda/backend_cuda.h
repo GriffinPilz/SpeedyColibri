@@ -58,6 +58,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap_mxfp4(ColiCudaTensor **tensor,
         const void *weights, const void *bscale, float gscale, int I, int O, int device);
 
 /* Kimi-K3 MXFP4 expert FFN with the situ activation. fmt must be 6 on all three. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_mxfp4(ColiCudaTensor *gate,
+        ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S);
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_mxfp4_situ(ColiCudaTensor *gate,
         ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S,
         float beta, float linear_beta);

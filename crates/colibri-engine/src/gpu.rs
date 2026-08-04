@@ -923,6 +923,49 @@ pub fn try_expert_ffn(
     ok
 }
 
+/// MXFP4 expert FFN with the engine's configured SwiGLU — DeepSeek-V4's experts.
+///
+/// V4's experts are MXFP4 but gated SwiGLU, which fits neither existing path: the `_situ`
+/// twin below computes K3's activation, and `coli_cuda_expert_mlp` reads BLOCK scales as
+/// a per-row f32 array and took an illegal memory access on them. So every one of V4's
+/// 258 routed experts per token ran the scalar CPU loop.
+///
+/// Zero-copy only, like the other nibble/block-scale paths.
+pub fn try_expert_ffn_mxfp4(
+    gate: &QTensor,
+    up: &QTensor,
+    down: &QTensor,
+    x: &[f32],
+    nr: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if gate.fmt_code != 6 || up.fmt_code != 6 || down.fmt_code != 6 {
+        return false;
+    }
+    let (Some(g), Some(u), Some(d)) = (wrap_fresh(gate), wrap_fresh(up), wrap_fresh(down)) else {
+        return false;
+    };
+    // SAFETY: g/u/d live to end of scope, covering the synchronous kernel + download;
+    // x/out are sized [nr, gate.i] / [nr, down.o] by `ffn`.
+    let ok = unsafe {
+        cuda::expert_mlp_mxfp4_raw(
+            g.as_raw(),
+            u.as_raw(),
+            d.as_raw(),
+            out.as_mut_ptr(),
+            x.as_ptr(),
+            nr as i32,
+        )
+    };
+    if ok {
+        GPU_FFN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 /// Try the gateless ReLU² expert FFN `out = down(relu(up·x)²)` on the GPU (Nemotron-H's
 /// two-tensor expert — no gate projection). NVFP4-only: reuses the same zero-copy NVFP4
 /// decode as [`try_expert_ffn`], with a relu² activation between the up and down GEMMs.

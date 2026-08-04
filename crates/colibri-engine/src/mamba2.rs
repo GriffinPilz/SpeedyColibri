@@ -60,6 +60,14 @@ fn silu(x: f32) -> f32 {
 /// Causal padding: output at token `t`, channel `c` is
 /// `Σ_{j=0..k} weight[c,j] * input[t - (k-1) + j, c]` (out-of-range = 0), i.e. the
 /// kernel's last tap aligns with the current token. Returns `[seq, channels]`.
+/// `out_from` is the first input row whose output is wanted; rows before it are read
+/// (they are the convolution's history) but never convolved.
+///
+/// Every caller prepends `k-1` history rows and then slices exactly those rows back off,
+/// so computing them was pure waste — and at decode it is most of the work: one new token
+/// behind 3 history rows meant **3 of 4 output rows were computed and discarded**. The
+/// returned buffer holds `(seq - out_from) * channels` floats, i.e. only the rows the
+/// caller keeps.
 pub fn causal_conv1d_silu(
     input: &[f32],
     weight: &[f32],
@@ -67,12 +75,15 @@ pub fn causal_conv1d_silu(
     seq: usize,
     channels: usize,
     k: usize,
+    out_from: usize,
 ) -> Vec<f32> {
     assert_eq!(input.len(), seq * channels);
     assert_eq!(weight.len(), channels * k);
     assert!(bias.is_empty() || bias.len() == channels);
-    let mut out = vec![0.0f32; seq * channels];
-    for t in 0..seq {
+    assert!(out_from <= seq);
+    let mut out = vec![0.0f32; (seq - out_from) * channels];
+    for t in out_from..seq {
+        let o = (t - out_from) * channels;
         for c in 0..channels {
             let mut acc = if bias.is_empty() { 0.0 } else { bias[c] };
             for j in 0..k {
@@ -82,7 +93,7 @@ pub fn causal_conv1d_silu(
                     acc += weight[c * k + j] * input[(t - off) * channels + c];
                 }
             }
-            out[t * channels + c] = silu(acc);
+            out[o + c] = silu(acc);
         }
     }
     out
@@ -479,7 +490,7 @@ mod tests {
     #[test]
     fn causal_conv_is_causal() {
         // channels=1, k=2, weight=[0,1] (identity of current token), no bias, silu applied.
-        let out = causal_conv1d_silu(&[1.0, 2.0, 3.0], &[0.0, 1.0], &[], 3, 1, 2);
+        let out = causal_conv1d_silu(&[1.0, 2.0, 3.0], &[0.0, 1.0], &[], 3, 1, 2, 0);
         for (i, &x) in [1.0f32, 2.0, 3.0].iter().enumerate() {
             assert!((out[i] - silu(x)).abs() < 1e-6);
         }

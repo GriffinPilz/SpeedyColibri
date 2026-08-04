@@ -68,6 +68,19 @@ pub(crate) static SCATTER_US: AtomicU64 = AtomicU64::new(0);
 /// (`matmul_f32`) and the shared-expert FFN. Incremented from `moe`.
 pub(crate) static ROUTER_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHARED_US: AtomicU64 = AtomicU64::new(0);
+/// Further sub-totals of `MOE_US`, added because the printed breakdown accounted for
+/// only ~74% of `MOE_US` on Nemotron-H decode and the missing 26% was the single
+/// largest unexplained block in the whole step. A phase timer whose parts do not sum
+/// to it is not a breakdown, so the printout now shows the residual explicitly.
+///
+/// - `MOE_FC_US`  — the two latent projections `fc1`/`fc2` in `nemotron_moe`.
+/// - `MOE_SEL_US` — top-K selection and the union/weight matrix build (pure CPU).
+/// - `MOE_GRP_US` — the grouped expert call: descriptor wrapping, the fused kernel,
+///   and the weighted scatter. On Nemotron this replaces the per-expert loop that
+///   `GATHER_US`/`GPUFFN_US`/`SCATTER_US` measure, which is why those read ~0 here.
+pub(crate) static MOE_FC_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MOE_SEL_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MOE_GRP_US: AtomicU64 = AtomicU64::new(0);
 /// Sub-totals of `ATTN_US`: q/kv projections, RoPE + latent-cache write, the DSA
 /// lightning indexer, the attention core (sparse/dense), and the output projection.
 /// Incremented from `attention_with`.
@@ -342,7 +355,40 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     for j in 0..s * d {
         x[j] += tmp[j];
     }
+    trace_state(li, s, pos_base, x);
     Ok(())
+}
+
+/// Skip convolving the conv1d history rows whose outputs the caller discards (default on).
+/// `COLI_CONV_HIST=1` computes them anyway, which is the pre-2026-08-03 behaviour.
+fn conv_skip_hist() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_CONV_HIST").ok().as_deref() != Some("1"))
+}
+
+/// Per-layer state hash (`COLI_TRACE_STATE=1`), for finding where two runs of the *same*
+/// input first differ.
+///
+/// Token identity is a poor detector of nondeterminism: it only fires when a bit
+/// difference happens to flip an argmax, so a real race shows up as a rare, unreproducible
+/// token change with no indication of where it came from. Hashing the residual stream
+/// after every layer turns that into an exact (step, layer) coordinate on the first
+/// occurrence.
+///
+/// FNV-1a over the raw f32 bits — bitwise, not approximate: two states that differ in the
+/// last ULP must hash differently, or the tool would launder exactly what it is looking for.
+pub(crate) fn trace_state(li: usize, s: usize, pos_base: usize, x: &[f32]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("COLI_TRACE_STATE").ok().as_deref() == Some("1")) {
+        return;
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for v in x {
+        for b in v.to_bits().to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    eprintln!("[trace] pos={pos_base} s={s} layer={li} h={h:016x}");
 }
 
 /// Kimi-K3's "attention residual": a softmax attention over the stack's saved states
@@ -791,10 +837,15 @@ pub fn mamba2_mixer(
         aug[..hist * conv_dim].copy_from_slice(&cs[conv_dim..kk * conv_dim]);
     }
     aug[hist * conv_dim..].copy_from_slice(&hbc[..s * conv_dim]);
+    // Only rows [hist, aug_len) are wanted; the history rows exist to feed the taps.
+    // `COLI_CONV_HIST=1` restores the old "convolve everything, discard the front"
+    // behaviour so the two can be A/B'd in ONE binary — comparing two builds would put
+    // the arms in different processes and, in practice, different sessions.
+    let from = if conv_skip_hist() { hist } else { 0 };
     let conv_aug = timed(&MAMBA_CONV_US, || {
-        causal_conv1d_silu(aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk)
+        causal_conv1d_silu(aug, &l.mamba_conv_w, &l.mamba_conv_b, aug_len, conv_dim, kk, from)
     });
-    let conv_out = &conv_aug[hist * conv_dim..aug_len * conv_dim]; // [s, conv_dim]
+    let conv_out = &conv_aug[(hist - from) * conv_dim..]; // [s, conv_dim]
                                                                    // Next state = the last k input columns of the augmented buffer.
     kv.mamba_conv_row_mut(layer)
         .copy_from_slice(&aug[(aug_len - kk) * conv_dim..aug_len * conv_dim]);
@@ -1609,13 +1660,29 @@ where
                 spawn as f64 / 1e3,
             );
         }
+        // Every sub-total of MOE_US, plus the residual. `other` is what no timer
+        // claims — keep it printed even when it is small, because the only reason
+        // this line exists is that a 26% residual sat here unnoticed.
+        let moe_parts = ms(&ROUTER_US)
+            + ms(&GATHER_US)
+            + ms(&GPUFFN_US)
+            + ms(&SCATTER_US)
+            + ms(&SHARED_US)
+            + ms(&LOAD_US)
+            + ms(&MOE_FC_US)
+            + ms(&MOE_SEL_US)
+            + ms(&MOE_GRP_US);
         eprintln!(
-            "[profile] moe-compute breakdown: router {:.0} ms | gather {:.0} ms | gpu-ffn(+sync) {:.0} ms | scatter {:.0} ms | shared {:.0} ms",
+            "[profile] moe-compute breakdown: router {:.0} ms | select {:.0} ms | fc1+fc2 {:.0} ms | group {:.0} ms | gather {:.0} ms | gpu-ffn(+sync) {:.0} ms | scatter {:.0} ms | shared {:.0} ms | other {:.0} ms",
             ms(&ROUTER_US),
+            ms(&MOE_SEL_US),
+            ms(&MOE_FC_US),
+            ms(&MOE_GRP_US),
             ms(&GATHER_US),
             ms(&GPUFFN_US),
             ms(&SCATTER_US),
             ms(&SHARED_US),
+            (ms(&MOE_US) - moe_parts).max(0.0),
         );
         eprintln!(
             "[profile] attn breakdown: proj {:.0} ms | rope+cache {:.0} ms | dsa-indexer {:.0} ms | core {:.0} ms | o-proj {:.0} ms",
@@ -1781,7 +1848,8 @@ mod tests {
                 .copy_from_slice(&proj[b + d_inner..b + d_inner + conv_dim]);
             dt[t * nh..(t + 1) * nh].copy_from_slice(&proj[b + d_inner + conv_dim..b + proj_out]);
         }
-        let conv = causal_conv1d_silu(&hbc, &l.mamba_conv_w, &l.mamba_conv_b, s, conv_dim, k);
+        // Reference path: no history rows prepended, so every output row is wanted.
+        let conv = causal_conv1d_silu(&hbc, &l.mamba_conv_w, &l.mamba_conv_b, s, conv_dim, k, 0);
         let (mut h, mut bb, mut cc) = (
             vec![0f32; s * d_inner],
             vec![0f32; s * gn],

@@ -1694,6 +1694,7 @@ const WIN_PREFILL: [i32; 40] = [0, -1, -1, -1, 0, 1, -1, -1, 0, 1, 2, -1, 0, 1, 
 const CMP_PREFILL_BLK: [i32; 20] = [-1, -1, -1, -1, -1, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, 1, 0, 1, 0, 1];
 const WIN_DECODE: [i32; 4] = [7, 8, 9, 10];
 const CMP_DECODE_BLK: [i32; 2] = [0, 1];
+const ATTN_OUT: [f32; 128] = [4.5551867f32, 1.655988f32, 0.70843071f32, -0.23912674f32, -1.1866839f32, 1.7479371f32, 1.1467896f32, 0.19923186f32, -0.74832541f32, -1.6958828f32, -1.262628f32, 2.0113223f32, 1.0637648f32, 0.11620742f32, -0.83135021f32, -3.2142119f32, 1.5021236f32, 0.55456591f32, -0.39299154f32, -1.340549f32, -1.51811f32, 2.3666561f32, 1.4190989f32, 0.4715414f32, -0.47601613f32, -1.4235736f32, 1.8574575f32, 0.90990007f32, -0.037657499f32, -0.98521495f32, -1.9327724f32, 0.51563215f32, -2.6731739f32, -5.0339503f32, -5.0895042f32, -5.1450586f32, -5.2006125f32, 3.6409237f32, 4.7949457f32, 4.7393918f32, 4.6838379f32, 4.6282825f32, 3.4903896f32, -5.0131168f32, -5.0686712f32, -5.1242256f32, -5.17978f32, -2.8378141f32, 4.8157787f32, 4.7602243f32, 4.7046704f32, 4.649116f32, 5.6375346f32, -4.9922848f32, -5.0478392f32, -5.1033931f32, -5.1589475f32, -5.2145014f32, 4.8366117f32, 4.7810574f32, 4.725503f32, 4.6699486f32, 4.6143947f32, -0.48124814f32, -3.8547039f32, -6.6683683f32, -6.6372437f32, -6.6061187f32, -6.5749941f32, 0.35290623f32, 6.6524391f32, 6.6835637f32, 6.7146888f32, 6.7458143f32, 1.8204643f32, -6.6800404f32, -6.6489158f32, -6.6177907f32, -6.5866652f32, -4.3851562f32, 6.6407671f32, 6.6718922f32, 6.7030172f32, 6.7341423f32, 6.5131264f32, -6.6917124f32, -6.6605873f32, -6.6294622f32, -6.5983377f32, -6.5672126f32, 6.6290951f32, 6.6602201f32, 6.6913452f32, 6.7224698f32, 6.7535949f32, -1.7283459f32, -6.707962f32, -9.7521267f32, -9.4412117f32, -9.1302967f32, -8.8193808f32, 3.1436431f32, 8.6111603f32, 8.9220762f32, 9.2329922f32, 9.5439081f32, 1.7049173f32, -9.868721f32, -9.557806f32, -9.2468901f32, -8.9359741f32, -2.2872777f32, 8.4945669f32, 8.8054829f32, 9.1163988f32, 9.4273148f32, 8.5492496f32, -9.9853153f32, -9.6743994f32, -9.3634834f32, -9.0525684f32, -8.7416515f32, 8.3779745f32, 8.6888905f32, 8.9998055f32, 9.3107214f32, 9.6216373f32, -2.9977577f32];
 
     fn close(a: &[f32], b: &[f32], tol: f32, what: &str) {
         assert_eq!(a.len(), b.len(), "{what}: length");
@@ -1876,5 +1877,85 @@ const CMP_DECODE_BLK: [i32; 2] = [0, 1];
         // block 1 spans 4..8, so position 7 is carried BOTH ways. Excluding it (the old
         // "would double-count" rule) is what this pins against.
         assert!(pos.contains(&7) && blk.contains(&1), "the overlap was dropped");
+    }
+
+    // The attention ASSEMBLY, not its pieces. Each component above has its own vector
+    // test; this pins the ORDER they run in — which is what no component test can catch
+    // and what an end-to-end run against the real model would otherwise be needed for:
+    //
+    //   per-head RMS AFTER wq_b (and distinct from the learned q_norm before it)
+    //   rope on the trailing rd dims
+    //   FP8 sim on the NON-rope KV dims only
+    //   attention with the sink in the denominator
+    //   INVERSE rope on the output — V is that same roped latent, so it must be undone
+    //   grouped (block-diagonal) O-LoRA, then wo_b
+    //
+    // Inputs are built from exact integer arithmetic identical to the generator's, so no
+    // transcendental has to agree between torch and Rust; only the output is baked.
+    fn gen(n: usize, mul: usize, m: usize) -> Vec<f32> {
+        let half = (m / 2) as f32;
+        (0..n).map(|k| (((k * mul) % m) as f32 - half) / half).collect()
+    }
+
+    #[test]
+    fn attention_assembly_matches_the_reference() {
+        const S: usize = 4;
+        const H: usize = 2;
+        const HD: usize = 128;
+        const RD: usize = 64;
+        const G: usize = 2;
+        const RANK: usize = 8;
+        const DIM: usize = 32;
+        const WIN: usize = 3;
+        let (cos, sin) = yarn_rope_tables(RD, S, 160000.0, 16.0, 65536, 32.0, 1.0);
+        let half = RD / 2;
+
+        let mut q = gen(S * H * HD, 37, 101);
+        per_head_rms(&mut q, HD, 1e-6);
+        for i in 0..S {
+            let (c, sn) = (&cos[i * half..(i + 1) * half], &sin[i * half..(i + 1) * half]);
+            for hh in 0..H {
+                let b = (i * H + hh) * HD;
+                rope_interleaved(&mut q[b..b + HD], c, sn, RD, false);
+            }
+        }
+
+        let mut kv = gen(S * HD, 53, 97);
+        for i in 0..S {
+            let (c, sn) = (&cos[i * half..(i + 1) * half], &sin[i * half..(i + 1) * half]);
+            let row = &mut kv[i * HD..(i + 1) * HD];
+            rope_interleaved(row, c, sn, RD, false);
+            act_quant_sim(&mut row[..HD - RD], 64);
+        }
+
+        // window-only key span: no compressor on this layer
+        let sel: Vec<Vec<usize>> = vec![Vec::new(); S];
+        let (idxs, topk) = key_indices(WIN, S, 0, S, 0, S, &sel);
+        let mut o = vec![0f32; S * H * HD];
+        attention_dsv4_sparse(
+            &q, &kv, &[-0.5, 0.25], S, H, HD, &idxs, topk, (HD as f32).powf(-0.5), &mut o,
+        );
+
+        for i in 0..S {
+            let (c, sn) = (&cos[i * half..(i + 1) * half], &sin[i * half..(i + 1) * half]);
+            for hh in 0..H {
+                let b = (i * H + hh) * HD;
+                rope_interleaved(&mut o[b..b + HD], c, sn, RD, true);
+            }
+        }
+
+        let dg = H * HD / G;
+        let wo_a = gen(G * RANK * dg, 29, 89);
+        let wo_b = gen(DIM * G * RANK, 41, 83);
+        let mut got = vec![0f32; S * DIM];
+        let mut mid = vec![0f32; G * RANK];
+        for i in 0..S {
+            o_lora_grouped(&o[i * H * HD..(i + 1) * H * HD], &wo_a, G, RANK, &mut mid);
+            for d in 0..DIM {
+                got[i * DIM + d] =
+                    (0..G * RANK).map(|r| mid[r] * wo_b[d * G * RANK + r]).sum();
+            }
+        }
+        close(&got, &ATTN_OUT, 2e-4, "attention assembly");
     }
 }

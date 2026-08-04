@@ -293,3 +293,64 @@ emit2("WIN_PREFILL", ref_window(WIN, SEQ, 0), WIN)
 emit2("CMP_PREFILL_BLK", ref_compress(RAT, SEQ, 0, NCMP), NCMP)
 emit2("WIN_DECODE", ref_window(WIN, 1, SEQ), WIN)
 emit2("CMP_DECODE_BLK", ref_compress(RAT, 1, SEQ, NCMP), NCMP)
+
+
+# ---------------------------------------------------------------------------
+# model.py:490 Attention.forward — the ASSEMBLY, not the pieces.
+#
+# Every component already has its own vector test; what this pins is the ORDER:
+# per-head RMS AFTER wq_b (and distinct from q_norm), rope on the last rd dims, the FP8
+# sim on the non-rope KV dims only, attention, the INVERSE rope on the output (V is the
+# same roped latent, so the rotation has to be undone), then the grouped O-LoRA.
+#
+# Inputs are generated from exact integer arithmetic, identical on both sides, so only the
+# OUTPUT is baked — no transcendental has to agree between torch and Rust.
+S, H, HD, RD = 4, 2, 128, 64
+G, RANK, DIM, WIN = 2, 8, 32, 3
+EPS = 1e-6
+
+
+def gen(n, mul, mod):
+    half = mod // 2
+    return torch.tensor([float((k * mul) % mod - half) for k in range(n)]) / float(half)
+
+
+def rope(x, cos, sin, rd, inverse=False):
+    y = x.clone()
+    seg = y[..., -rd:]
+    a, b = seg[..., 0::2].clone(), seg[..., 1::2].clone()
+    c, sn = cos, (-sin if inverse else sin)
+    seg[..., 0::2] = a * c - b * sn
+    seg[..., 1::2] = a * sn + b * c
+    return y
+
+
+def sparse_attn(q, kv, sink, idxs, scale):
+    out = torch.zeros_like(q)
+    for i in range(q.size(0)):
+        sel = [v for v in idxs[i] if v >= 0]
+        K = kv[sel]
+        for hh in range(q.size(1)):
+            sc = (q[i, hh] @ K.T) * scale
+            m = sc.max()
+            pr = torch.exp(sc - m)
+            den = pr.sum() + torch.exp(sink[hh] - m)
+            out[i, hh] = (pr @ K) / den
+    return out
+
+
+qc, qs = freqs(RD, S, 65536, 160000.0, 16.0, 32.0, 1.0)
+q = gen(S * H * HD, 37, 101).view(S, H, HD)
+q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + EPS)   # parameter-free per-head RMS
+q = rope(q, qc[:, None, :], qs[:, None, :], RD)
+kv = gen(S * HD, 53, 97).view(S, HD)
+kv = rope(kv, qc, qs, RD)
+kv = torch.cat([act_quant_sim(kv[:, :HD - RD].flatten(), 64).view(S, -1), kv[:, HD - RD:]], dim=1)
+idxs = [[v for v in range(max(0, p - WIN + 1), p + 1)] for p in range(S)]
+o = sparse_attn(q, kv, torch.tensor([-0.5, 0.25]), idxs, HD ** -0.5)
+o = rope(o, qc[:, None, :], qs[:, None, :], RD, inverse=True)
+dg = H * HD // G
+wo_a = gen(G * RANK * dg, 29, 89).view(G, RANK, dg)
+wo_b = gen(DIM * G * RANK, 41, 83).view(DIM, G * RANK)
+mid = torch.einsum("sgd,grd->sgr", o.reshape(S, G, dg), wo_a).reshape(S, G * RANK)
+print(f"const ATTN_OUT: [f32; {S * DIM}] = [{fmt((mid @ wo_b.T).flatten().tolist())}];")

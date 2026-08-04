@@ -701,9 +701,14 @@ impl KvCache {
         }
     }
 
-    /// The compressed rows written so far for `layer`.
+    /// The compressed rows written so far for `layer`. Empty when the Compressor is off
+    /// or the layer has none — returning a slice rather than indexing, because the caller
+    /// asks unconditionally and `comp` is only allocated when `comp_init` runs.
     pub fn comp_rows(&self, layer: usize) -> &[f32] {
-        &self.comp[layer][..self.comp_len[layer] * self.comp_dim]
+        match self.comp.get(layer) {
+            Some(v) => &v[..self.comp_len[layer] * self.comp_dim],
+            None => &[],
+        }
     }
 
     /// Whether `comp_init` has run (buffers allocated).

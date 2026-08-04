@@ -359,6 +359,16 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     Ok(())
 }
 
+/// Run the DeepSeek-V4 Compressor (`COLI_DSV4_COMPRESS=1`, default ON).
+///
+/// The Compressor is how V4 has context past `sliding_window`; without it the model is
+/// exact to 128 tokens and wrong beyond. The knob exists to A/B its cost, not because
+/// running it is optional for correctness.
+fn dsv4_compress_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_DSV4_COMPRESS").ok().as_deref() != Some("0"))
+}
+
 /// Skip convolving the conv1d history rows whose outputs the caller discards (default on).
 /// `COLI_CONV_HIST=1` computes them anyway, which is the pre-2026-08-03 behaviour.
 fn conv_skip_hist() -> bool {
@@ -2124,6 +2134,8 @@ fn dsv4_attention(
     pos_base: usize,
     cos: &[f32],
     sin: &[f32],
+    ccos: &[f32],
+    csin: &[f32],
     out: &mut [f32],
 ) {
     let h = cfg.n_heads as usize;
@@ -2172,15 +2184,84 @@ fn dsv4_attention(
         ATTN_PROJ_US.fetch_add(t_proj.elapsed().as_micros() as u64, rel);
     }
 
+    // ---- Compressor: pool this step's tokens into compressed KV blocks ----
+    //
+    // These blocks carry ALL context older than the sliding window. Emitted once every
+    // `comp_ratio` tokens, normed, and roped with the Compressor's OWN base
+    // (`compress_theta` 160000) at the position where each window ENDS.
+    if dsv4_compress_enabled() && l.comp_ratio > 0 {
+        if let (Some(wkv), Some(wgate)) = (l.comp_wkv.as_ref(), l.comp_wgate.as_ref()) {
+            let cw = wkv.o as usize;
+            let ratio = l.comp_ratio as usize;
+            let mut ckv = vec![0f32; s * cw];
+            let mut csc = vec![0f32; s * cw];
+            matmul_qt(&mut ckv, xn, wkv, s);
+            matmul_qt(&mut csc, xn, wgate, s);
+            let mut rows: Vec<Vec<f32>> = Vec::new();
+            if let Some(st) = kv.comp_state_mut(li) {
+                if pos_base == 0 {
+                    rows = crate::dsv4::compress_prefill(&ckv, &csc, &l.comp_ape, s, ratio, hd, st)
+                        .chunks_exact(hd)
+                        .map(|r| r.to_vec())
+                        .collect();
+                } else {
+                    for i in 0..s {
+                        if let Some(r) = crate::dsv4::compress_decode(
+                            &ckv[i * cw..(i + 1) * cw],
+                            &csc[i * cw..(i + 1) * cw],
+                            &l.comp_ape,
+                            pos_base + i,
+                            st,
+                        ) {
+                            rows.push(r);
+                        }
+                    }
+                }
+            }
+            for (bi, row) in rows.into_iter().enumerate() {
+                let mut nr = vec![0f32; hd];
+                rmsnorm(&mut nr, &row, &l.comp_norm, cfg.eps);
+                // Block `b` covers tokens [b*ratio, (b+1)*ratio); the reference ropes it at
+                // the window's END, i.e. `start_pos + 1 - ratio` for the decode emission.
+                let b = kv.comp_rows(li).len() / hd + bi;
+                let p = b * ratio;
+                if (p + 1) * half <= ccos.len() {
+                    let (c, sn) = v4_rope_rows(ccos, csin, p, half);
+                    crate::dsv4::rope_interleaved(&mut nr, c, sn, rd, false);
+                }
+                kv.comp_push(li, &nr);
+            }
+        }
+    }
+
     // ---- attention over the causal span, with the per-head sink -----------
+    //
+    // The keys are the raw sliding window PLUS the compressed blocks. Compressed rows are
+    // prepended: they stand for older positions, and `attention_dsv4` treats the leading
+    // rows as the earliest context. Without them attention sees only what fits in the
+    // window, which is why context was capped at 128.
     let t_core = std::time::Instant::now();
     let total = pos_base + s;
-    let cache = kv.latent_rows(li, 0, total).to_vec();
+    let win = if cfg.window > 0 { cfg.window as usize } else { total };
+    let raw_from = total.saturating_sub(win);
+    let comp_rows = if dsv4_compress_enabled() && l.comp_ratio > 0 {
+        // Only blocks whose window ended BEFORE the raw span begins; the rest would
+        // double-count tokens the raw window already carries.
+        (raw_from / l.comp_ratio as usize).min(kv.comp_rows(li).len() / hd)
+    } else {
+        0
+    };
+    let mut cache = Vec::with_capacity((comp_rows + total - raw_from) * hd);
+    cache.extend_from_slice(&kv.comp_rows(li)[..comp_rows * hd]);
+    cache.extend_from_slice(kv.latent_rows(li, raw_from, total));
+    // `attention_dsv4` derives the causal span from `pos_base`, so shift it to this
+    // cache's own coordinates: `comp_rows` compressed keys then the raw tail.
+    let attn_pos = comp_rows + (pos_base - raw_from);
     let mut o = vec![0f32; s * h * hd];
     // Reference: `softmax_scale = head_dim ** -0.5`. No YaRN mscale, despite YaRN rope —
     // checked, because DeepSeek's other models DO apply one.
     let scale = (hd as f32).powf(-0.5);
-    crate::dsv4::attention_dsv4(&q, &cache, &l.attn_sink, s, h, hd, pos_base, scale, &mut o);
+    crate::dsv4::attention_dsv4(&q, &cache, &l.attn_sink, s, h, hd, attn_pos, scale, &mut o);
 
     if prof {
         ATTN_CORE_US.fetch_add(t_core.elapsed().as_micros() as u64, rel);
@@ -2236,6 +2317,8 @@ fn dsv4_layer_forward<P: ExpertProvider>(
     pos_base: usize,
     cos: &[f32],
     sin: &[f32],
+    ccos: &[f32],
+    csin: &[f32],
     sc: &mut Dsv4Scratch,
 ) -> io::Result<()> {
     let cfg = &model.cfg;
@@ -2281,7 +2364,7 @@ fn dsv4_layer_forward<P: ExpertProvider>(
 
         if pass == 0 {
             timed(&ATTN_US, || {
-                dsv4_attention(cfg, l, li, kv, &sc.normed[..s * d], s, pos_base, cos, sin, &mut sc.sub[..s * d]);
+                dsv4_attention(cfg, l, li, kv, &sc.normed[..s * d], s, pos_base, cos, sin, ccos, csin, &mut sc.sub[..s * d]);
             });
         } else {
             timed(&MOE_US, || {
@@ -2351,13 +2434,15 @@ fn dsv4_forward<P: ExpertProvider>(
     let s = ids.len();
     let total = pos_base + s;
 
-    if cfg.window > 0 && total > cfg.window as usize {
+    // Only a concern when the Compressor is OFF: with it on, context past the window is
+    // carried by the compressed blocks, which is the whole point of the mechanism.
+    if cfg.window > 0 && total > cfg.window as usize && !dsv4_compress_enabled() {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
             eprintln!(
-                "[dsv4] context {total} exceeds sliding_window {} and the Compressor is not \
-                 implemented — output past this point does NOT match the reference. \
-                 Everything up to {} tokens is exact.",
+                "[dsv4] context {total} exceeds sliding_window {} with the Compressor \
+                 DISABLED — everything past {} tokens is missing from attention. \
+                 Unset COLI_DSV4_COMPRESS=0 to carry it in compressed blocks.",
                 cfg.window, cfg.window
             );
         });
@@ -2375,6 +2460,27 @@ fn dsv4_forward<P: ExpertProvider>(
         1.0,
     );
 
+    // The Compressor ropes its blocks with its OWN base (160000 vs attention's 10000).
+    let (ccos, csin) = crate::dsv4::yarn_rope_tables(
+        cfg.qk_rope as usize, total.max(1), cfg.compress_theta, 16.0, 65536, 32.0, 1.0,
+    );
+    if dsv4_compress_enabled() && kv.comp_rows_len() == 0 {
+        let min_ratio = cfg
+            .compress_ratios
+            .iter()
+            .copied()
+            .filter(|&r| r > 0)
+            .min()
+            .unwrap_or(4)
+            .max(1) as usize;
+        kv.comp_init(
+            model.layers.len(),
+            &cfg.compress_ratios,
+            cfg.qk_head as usize,
+            cfg.max_ctx as usize / min_ratio + 2,
+        );
+    }
+
     // Embed, then REPEAT into all `hc_mult` copies — the reference's
     // `h.unsqueeze(2).repeat(1, 1, hc_mult, 1)`. Seeding only copy 0 would leave the other
     // three at zero and the Sinkhorn mixing would quietly propagate that.
@@ -2391,7 +2497,7 @@ fn dsv4_forward<P: ExpertProvider>(
 
     let mut sc = Dsv4Scratch::new(s, hc, d);
     for (li, l) in model.layers.iter().enumerate() {
-        dsv4_layer_forward(model, kv, provider, l, li, &mut x, s, pos_base, &cos, &sin, &mut sc)?;
+        dsv4_layer_forward(model, kv, provider, l, li, &mut x, s, pos_base, &cos, &sin, &ccos, &csin, &mut sc)?;
     }
 
     // Collapse `[hc, d] -> [d]` with the model-level head: a plain sigmoid gate, NO

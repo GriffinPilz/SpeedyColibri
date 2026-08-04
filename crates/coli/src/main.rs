@@ -3291,10 +3291,26 @@ fn preload_all_experts<P>(
     P: colibri_engine::ExpertProvider + Send + Sync + 'static,
 {
     use colibri_engine::ExpertProvider as _;
+    // `max_residency` means "the expert set fits", which is the safe auto-on condition.
+    // DeepSeek-V4 does NOT fit — 137 GiB of experts against a ~90 GiB budget, 66% coverage
+    // — and preloading it evicts as it goes, yet it is still a clear win. Measured on
+    // gx10-42b2, page cache dropped between arms (without that, a preload run leaves ~98 GB
+    // warm and the NEXT lazy run reads 4.66 — pure carry-over, which is how this nearly got
+    // recorded as noise):
+    //
+    //     preload off   3.12 / 3.16 tok/s        preload on   4.08 / 4.12   -> 1.31x
+    //
+    // The hit rate gets WORSE (90% -> 73%) and 5306 evictions happen; it wins anyway,
+    // because preload converts thousands of scattered decode-time reads into one sequential
+    // 20 s bulk read. That mechanism does not depend on fitting.
+    //
+    // Enabled for V4 specifically rather than fleet-wide: the argument generalises but the
+    // MEASUREMENT does not, and GLM/K3/M3 sit in different coverage regimes that were not
+    // tested here. Widen it only with numbers for those.
     let want = match std::env::var("COLI_PRELOAD_EXPERTS").ok().as_deref() {
         Some("0") => false,
         Some("1") => true,
-        _ => max_residency,
+        _ => max_residency || cfg.arch == colibri_core::Arch::DeepseekV4,
     };
     if !want {
         return;

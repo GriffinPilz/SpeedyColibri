@@ -37,6 +37,26 @@ pub struct Layer {
     // Per-head attention sink, f32 [n_heads] (DeepSeek-V4). Empty elsewhere.
     pub attn_sink: Vec<f32>,
 
+    // DeepSeek-V4 Hyper-Connections, one set per sublayer (attention and FFN). These are
+    // the weights of the RESIDUAL STREAM itself, not of a sublayer: `hc_pre` collapses the
+    // `hc_mult` copies into one using them, and `hc_post` expands back. All f32 in the
+    // checkpoint and small enough to stay dense:
+    //   `*_fn`    [mix_width(hc), hc*hidden]  = [24, 16384] at hc=4, hidden=4096
+    //   `*_base`  [mix_width(hc)]             = [24]
+    //   `*_scale` [3]
+    // Empty on every other arch. Without them a V4 model loads and computes garbage, so
+    // the loader treats a missing set on a V4 checkpoint as an error rather than a default.
+    pub hc_attn_fn: Vec<f32>,
+    pub hc_attn_base: Vec<f32>,
+    pub hc_attn_scale: Vec<f32>,
+    pub hc_ffn_fn: Vec<f32>,
+    pub hc_ffn_base: Vec<f32>,
+    pub hc_ffn_scale: Vec<f32>,
+    // Per-sublayer input norms. V4 names them `attn_norm`/`ffn_norm`; the reference applies
+    // each AFTER `hc_pre` and before the sublayer.
+    pub attn_norm: Vec<f32>,
+    pub ffn_norm: Vec<f32>,
+
     // GQA (MiniMax-M3, arch == MinimaxM3): standard q/k/v projections with per-head
     // QK-norm; RoPE is partial (see Config::qk_rope). `None`/empty on GLM, which
     // uses the MLA fields above instead. `o` (above) is the shared output proj.
@@ -744,6 +764,14 @@ pub struct Model {
     pub output_attn_res_norm: Vec<f32>,
     pub output_attn_res_proj: Vec<f32>,
 
+    /// DeepSeek-V4's model-level Hyper-Connection head: the final `[hc, hidden] -> [hidden]`
+    /// collapse before `final_norm` and the LM head. Unlike the per-layer `hc_pre` this has
+    /// **no Sinkhorn** — a plain sigmoid gate — and `hc_head_scale` is a single scalar where
+    /// the per-layer one is a 3-vector. Empty on every other arch.
+    pub hc_head_fn: Vec<f32>,
+    pub hc_head_base: Vec<f32>,
+    pub hc_head_scale: f32,
+
     /// whether the DSA lightning indexer weights are present
     pub has_dsa: bool,
     /// whether the native MTP speculative head is present and loaded
@@ -775,6 +803,18 @@ impl Layer {
             + oq(&self.o_a)
             + oq(&self.o_b)
             + v(&self.attn_sink)
+            // Hyper-Connections. `*_fn` is the big one: [24, 16384] f32 = 1.5 MB per
+            // sublayer, so 3.1 MB per layer and ~135 MB across V4's 43 layers — small
+            // against 145 GB, but omitting it is the exact silent over-generous budget
+            // this function's doc warns about.
+            + v(&self.hc_attn_fn)
+            + v(&self.hc_attn_base)
+            + v(&self.hc_attn_scale)
+            + v(&self.hc_ffn_fn)
+            + v(&self.hc_ffn_base)
+            + v(&self.hc_ffn_scale)
+            + v(&self.attn_norm)
+            + v(&self.ffn_norm)
             + q(&self.gate_proj)
             + q(&self.up_proj)
             + q(&self.down_proj)

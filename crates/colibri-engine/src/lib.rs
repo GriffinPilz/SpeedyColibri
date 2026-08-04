@@ -174,6 +174,34 @@ fn load_layer(
         l.o_b = Some(qt_load(shards, &p("self_attn.o_b_proj.weight"), ob_o, ob_i, dbits)?);
         // Per-head sink, one f32 per attention head.
         l.attn_sink = ld(shards, &p("self_attn.attn_sink"))?;
+        // Hyper-Connection weights for this layer's two sublayers, plus their input norms.
+        // These are the residual stream's own parameters — without them the stream is not
+        // merely unoptimised, it is undefined — so a missing tensor is an error, not a
+        // default. Shapes are checked against Config here rather than trusted, because a
+        // silently short `*_fn` would make `chunks_exact` yield fewer mixes and quietly
+        // drop the tail of the mixing matrix.
+        let hc = cfg.hc_mult as usize;
+        let mw = crate::hc::mix_width(hc);
+        let n = hc * d;
+        let mut hcv = |name: &str, want: usize| -> std::io::Result<Vec<f32>> {
+            let v = ld(shards, &p(name))?;
+            if v.len() != want {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}: expected {want} f32, got {} — Config says hc_mult={hc}, hidden={d}",
+                            p(name), v.len()),
+                ));
+            }
+            Ok(v)
+        };
+        l.hc_attn_fn = hcv("hc_attn_fn", mw * n)?;
+        l.hc_attn_base = hcv("hc_attn_base", mw)?;
+        l.hc_attn_scale = hcv("hc_attn_scale", 3)?;
+        l.hc_ffn_fn = hcv("hc_ffn_fn", mw * n)?;
+        l.hc_ffn_base = hcv("hc_ffn_base", mw)?;
+        l.hc_ffn_scale = hcv("hc_ffn_scale", 3)?;
+        l.attn_norm = ld(shards, &p("attn_norm.weight"))?;
+        l.ffn_norm = ld(shards, &p("ffn_norm.weight"))?;
     } else {
         l.o = qt_load(
             shards,
@@ -1098,6 +1126,24 @@ pub fn load_model_with(snap: impl AsRef<Path>, opts: LoadOptions) -> Result<Mode
         (Vec::new(), Vec::new())
     };
 
+    // DeepSeek-V4's model-level Hyper-Connection head. Same reasoning as K3's block above:
+    // loaded unconditionally when the config declares HC rather than probed, because a V4
+    // container without it cannot produce logits — the `[hc, hidden]` stream would reach
+    // the LM head unconverted. `hc_head_scale` is a 1-element tensor, not a vector.
+    let (hc_head_fn, hc_head_base, hc_head_scale) = if cfg.hc_mult > 0 {
+        let scale = ld(&shards, "model.hc_head_scale")?;
+        let s = *scale.first().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "model.hc_head_scale is empty")
+        })?;
+        (
+            ld(&shards, "model.hc_head_fn")?,
+            ld(&shards, "model.hc_head_base")?,
+            s,
+        )
+    } else {
+        (Vec::new(), Vec::new(), 0.0)
+    };
+
     let mut layers = Vec::with_capacity(cfg.n_layers as usize);
     for i in 0..cfg.n_layers as usize {
         let sparse = i as i32 >= cfg.first_dense;
@@ -1121,6 +1167,9 @@ pub fn load_model_with(snap: impl AsRef<Path>, opts: LoadOptions) -> Result<Mode
         layers,
         output_attn_res_norm,
         output_attn_res_proj,
+        hc_head_fn,
+        hc_head_base,
+        hc_head_scale,
         has_dsa,
         has_mtp: mtp.is_some(),
         mtp,

@@ -199,6 +199,23 @@ pub struct Config {
     pub swiglu_alpha: f32,
     /// SwiGLU clamp limit (`swiglu_limit`, MiniMax-M3) — used only when `swiglu_oai`.
     pub swiglu_limit: f32,
+    /// DeepSeek-V4 Hyper-Connections. `hc_mult` copies of the hidden state replace the
+    /// residual, so the stream is `[s, hc_mult, hidden]` and **every activation buffer is
+    /// `hc_mult` times wider**. 0 for every other arch, which is also the "no HC" switch:
+    /// `hc_mult == 0` must behave exactly as a plain residual.
+    ///
+    /// `hc_sinkhorn_iters` is the normalisation loop count inside `hc_split_sinkhorn`, and
+    /// `hc_eps` is the floor added to the Sinkhorn/sigmoid weights — NOT the RMS epsilon.
+    /// The reference uses `norm_eps` for the rsqrt inside `hc_pre` and `hc_eps` only for
+    /// the weights; conflating them is silent and shifts every mixing weight slightly.
+    pub hc_mult: i32,
+    pub hc_sinkhorn_iters: i32,
+    pub hc_eps: f32,
+    /// DeepSeek-V4 sliding window (`sliding_window`, 128). The raw KV cache is a RING
+    /// BUFFER of exactly this many entries — older context is reachable only through the
+    /// Compressor. So a build without the Compressor is exact for prompts up to this
+    /// length and wrong beyond it, rather than approximate everywhere.
+    pub window: i32,
     /// Sigmoid expert scoring with an additive routing bias (MiniMax-M3
     /// `scoring_func == "sigmoid"` + `e_score_correction_bias`); `false` = GLM.
     pub sigmoid_route: bool,
@@ -495,6 +512,12 @@ impl Config {
             swiglu_oai: false,
             swiglu_alpha: 0.0,
             swiglu_limit: 0.0,
+            // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
+            // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            window: 0,
             sigmoid_route: false,
             // Nemotron-H-only fields (unused by GLM).
             layer_kind: Vec::new(),
@@ -693,6 +716,12 @@ impl Config {
                 .and_then(Json::as_f64)
                 .unwrap_or(1.702) as f32,
             swiglu_limit: t.get("swiglu_limit").and_then(Json::as_f64).unwrap_or(7.0) as f32,
+            // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
+            // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            window: 0,
             sigmoid_route: scoring == "sigmoid",
             // Nemotron-H-only fields (unused by MiniMax).
             layer_kind: Vec::new(),
@@ -865,6 +894,19 @@ impl Config {
                 .get("swiglu_limit")
                 .and_then(Json::as_f64)
                 .unwrap_or(0.0) as f32,
+            // Hyper-Connections: the residual stream becomes `[s, hc_mult, hidden]`.
+            // Defaulted to 0 rather than 4 — a V4 variant that drops HC must run as a
+            // plain residual, not silently get four copies it has no weights for.
+            hc_mult: g("hc_mult"),
+            hc_sinkhorn_iters: g("hc_sinkhorn_iters"),
+            // Distinct from `eps` (the RMS epsilon): this one floors the Sinkhorn/sigmoid
+            // mixing weights. The reference uses `norm_eps` for the rsqrt and `hc_eps`
+            // only for the weights.
+            hc_eps: r.get("hc_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
+            // The raw KV cache is a ring buffer of this many rows; everything older lives
+            // in the Compressor. Until that lands, context is exact to `window` and wrong
+            // past it — a hard edge, not a gentle degradation.
+            window: g("sliding_window"),
             // Routing is `sqrtsoftplus` + `noaux_tc`, which is neither the sigmoid nor the
             // softmax arm this bool selects between. Left false so it cannot silently take
             // the sigmoid path; the real scorer is a V4-specific one still to be written.
@@ -991,6 +1033,12 @@ impl Config {
             swiglu_oai: false,
             swiglu_alpha: 0.0,
             swiglu_limit: 0.0,
+            // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
+            // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            window: 0,
             sigmoid_route: t.get("moe_router_activation_func").and_then(Json::as_str)
                 == Some("sigmoid"),
             layer_kind,
@@ -1167,6 +1215,12 @@ impl Config {
             swiglu_oai: false,
             swiglu_alpha: 0.0,
             swiglu_limit: 0.0,
+            // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
+            // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            window: 0,
             // DeepSeek-style sigmoid router with an additive correction bias.
             sigmoid_route: true,
             layer_kind,

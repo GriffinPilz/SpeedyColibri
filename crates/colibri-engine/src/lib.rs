@@ -980,6 +980,23 @@ fn mark_gpu_eligible(l: &mut Layer) {
     ] {
         t.gpu_eligible = true;
     }
+    // DeepSeek-V4's O-LoRA. `o_a_groups` is the one the forward path actually calls —
+    // `o_a` is only its source — and the split happens in the LOADER, before this pass
+    // runs, so the blocks inherited `gpu_eligible = false` and every one of them took the
+    // single-threaded CPU matmul. Measured cost of that omission: the O-LoRA was
+    // **305 ms/token, 58% of V4 decode**, at ~0.89 ms per group matmul against 21.8 us
+    // for the same shape in `coli gpubench` — 40x off, because it was not on the GPU at
+    // all. Counting dispatches is what identified it: 4 GPU matmuls per layer where 13
+    // were expected. Exactly the omission the M3 note below records, with the same shape
+    // of consequence.
+    for t in [&mut l.o_a, &mut l.o_b] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
+    for t in l.o_a_groups.iter_mut() {
+        t.gpu_eligible = true;
+    }
     // DSA indexer projections: batched in `indexer_forward`, so they want the GPU.
     // `matmul_qt`'s CPU path is single-threaded — a batched call on one core is
     // *slower* than the old per-query GEMVs spread across the indexer's worker

@@ -490,3 +490,106 @@ mod tests {
         assert!(a[0].abs() < 1e-6, "silu(-20) should be ~0, got {}", a[0]);
     }
 }
+
+/// YaRN rotary tables for DeepSeek-V4: `cos`/`sin` for positions `0..seqlen`, each row
+/// `rd/2` entries, laid out row-major.
+///
+/// Transcribed from `precompute_freqs_cis` in the reference `inference/model.py`, not
+/// re-derived — YaRN has several published variants that disagree in the ramp. The
+/// interpolation only applies when `original_seq_len > 0`; V4 sets 65536 with `factor` 16,
+/// which is what stretches the trained window to 1M.
+///
+/// Note `find_correction_range` clamps against `dim - 1` while the ramp is built over
+/// `dim/2` entries. That asymmetry is in the reference and is preserved deliberately —
+/// "fixing" it changes every frequency, silently.
+pub fn yarn_rope_tables(
+    rd: usize,
+    seqlen: usize,
+    base: f32,
+    factor: f32,
+    original_seq_len: usize,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = rd / 2;
+    let mut freqs: Vec<f32> = (0..half)
+        .map(|i| 1.0 / base.powf((2 * i) as f32 / rd as f32))
+        .collect();
+
+    if original_seq_len > 0 {
+        let corr = |rot: f32| -> f32 {
+            rd as f32 * ((original_seq_len as f32) / (rot * 2.0 * std::f32::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let low = corr(beta_fast).floor().max(0.0);
+        let high = corr(beta_slow).ceil().min((rd - 1) as f32);
+        let (lo, hi) = if low == high { (low, high + 0.001) } else { (low, high) };
+        for (i, f) in freqs.iter_mut().enumerate() {
+            let smooth = 1.0 - (((i as f32) - lo) / (hi - lo)).clamp(0.0, 1.0);
+            *f = *f / factor * (1.0 - smooth) + *f * smooth;
+        }
+    }
+
+    let mut cos = vec![0f32; seqlen * half];
+    let mut sin = vec![0f32; seqlen * half];
+    for t in 0..seqlen {
+        for (i, &f) in freqs.iter().enumerate() {
+            let a = t as f32 * f;
+            cos[t * half + i] = a.cos();
+            sin[t * half + i] = a.sin();
+        }
+    }
+    (cos, sin)
+}
+
+/// Parameter-free per-head RMS applied to `q` after `wq_b`, in place.
+///
+/// The reference does `q *= rsqrt(q.square().mean(-1) + eps)` with **no learned weight** —
+/// distinct from the `q_norm` RMSNorm applied a few lines earlier to the LoRA bottleneck,
+/// which does have one. Two normalisations on the same tensor, one weighted and one not;
+/// reusing `q_norm`'s weight here, or skipping this entirely, is silent either way.
+pub fn per_head_rms(q: &mut [f32], head_dim: usize, eps: f32) {
+    debug_assert_eq!(q.len() % head_dim, 0);
+    for head in q.chunks_exact_mut(head_dim) {
+        let mut ss = 0.0f64;
+        for &v in head.iter() {
+            ss += (v as f64) * (v as f64);
+        }
+        let r = (1.0 / ((ss / head_dim as f64) + eps as f64).sqrt()) as f32;
+        for v in head.iter_mut() {
+            *v *= r;
+        }
+    }
+}
+
+#[cfg(test)]
+mod v4_rope_table_tests {
+    use super::*;
+
+    // YaRN must actually CHANGE the frequencies, and only the low ones. A table that
+    // silently came out equal to plain RoPE would still round-trip, still look sane, and
+    // still mis-place every long-context token — so pin the shape of the effect, not just
+    // that it runs.
+    #[test]
+    fn yarn_interpolates_low_frequencies_only() {
+        let (rd, base, factor, orig) = (64usize, 10000.0f32, 16.0f32, 65536usize);
+        // A LARGE position. The first version of this test sampled position 1, where every
+        // angle is ~0 and cos is ~1 in both arms: a real 5x frequency change showed up as a
+        // 9e-9 difference and the test reported "YaRN changed nothing". The slow
+        // frequencies are ~1e-4, so the position has to be O(1/freq) before the effect is
+        // representable at all.
+        let pos = 4096usize;
+        let (c_plain, _) = yarn_rope_tables(rd, pos + 1, base, 1.0, 0, 32.0, 1.0);
+        let (c_yarn, _) = yarn_rope_tables(rd, pos + 1, base, factor, orig, 32.0, 1.0);
+        let half = rd / 2;
+        let plain = &c_plain[pos * half..(pos + 1) * half];
+        let yarn = &c_yarn[pos * half..(pos + 1) * half];
+        // The FASTEST frequency (index 0) is left alone by the ramp.
+        assert!((plain[0] - yarn[0]).abs() < 1e-6, "fastest freq must be untouched");
+        // Some frequency must actually move, or `factor` did nothing.
+        assert!(
+            plain.iter().zip(yarn).any(|(a, b)| (a - b).abs() > 1e-4),
+            "YaRN changed nothing — factor/original_seq_len are not reaching the ramp"
+        );
+    }
+}

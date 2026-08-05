@@ -3448,10 +3448,14 @@ pub fn dsv4_moe<P: ExpertProvider>(
     //     `scratch_mu` serializes the expert ENTRY points; something outside them is not
     //     thread-safe, and this is the same family as the CUDA suite needing
     //     `--test-threads=1`.
-    //   - and the prize is small either way: `shared` is 661 ms of a 36.4 s run — 1.8% of
-    //     total wall, and that is the CEILING, since the overlap can hide at most all of it.
+    //   - and the prize is bounded: an NGEN 1-vs-16 difference puts `shared` at **19.4 ms
+    //     per decode forward**, ~8% of a ~220 ms decode token (and 1.8% of a whole run,
+    //     which is mostly prefill — quote whichever you mean). That is the CEILING, since
+    //     the overlap can hide at most all of it.
     //
-    // 1.8% is not worth making the device-context path thread-safe for all five models.
+    // ~8% of decode is not worth making the device-context path thread-safe for all five
+    // models, given the failure mode is a sticky context error that silently drops every
+    // expert to the CPU.
     if cfg.n_shared > 0 {
         let _st = std::time::Instant::now();
         let mut sh = vec![0f32; s_len * d];

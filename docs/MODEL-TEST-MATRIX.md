@@ -226,6 +226,52 @@ mxfp4_expert_ffn_gpu_matches_cpu_at_every_s` against `matmul_qt`, at S = 1/4/16/
 at two shapes — 320×160 as well as 128×64, since K=128 runs the KT tile loop exactly once
 and proves nothing about the multi-tile accumulation every real expert does.
 
+### DSpark: DO NOT BUILD THE FORWARD — a fine-grained MoE cannot amortize a verify
+
+Five previous cost models for this were written and every one was contradicted by
+measurement, so this is measured. `coli gen` with `COLI_NGEN=1` on a prompt of S tokens is
+exactly **one forward of S rows**, so its profile totals *are* cost(S) — no differencing.
+MoE has no context dependence (an expert sees `[S, 4096]` wherever the tokens sit), so a
+short prompt measures the MoE term correctly. Mean of 2 reps, which agreed closely:
+
+| S | gpu-ffn | ×(S=1) | expert-load | ×(S=1) | moe | ×(S=1) |
+|---|---|---|---|---|---|---|
+| 1 | 45 ms | 1.00 | 313 ms | 1.00 | 438 ms | 1.00 |
+| 2 | 92 | 2.04 | 389 | 1.24 | 563 | 1.29 |
+| 4 | 173 | 3.83 | 567 | 1.81 | 817 | 1.87 |
+| 6 | 230 | **5.11** | 696 | 2.22 | 992 | **2.27** |
+| 8 | 299 | 6.64 | 838 | 2.68 | 1211 | 2.77 |
+
+**`gpu-ffn` is essentially linear in rows.** That is the whole answer. V4 routes top-6 of
+256, so six rows almost never share an expert: a 6-row verify does ~6× the expert weight
+reads, and expert weight reading is what `gpu-ffn` costs. The amortization that makes
+speculative decoding pay in a dense model — many rows through one weight matrix — does not
+exist here. Only `expert-load` amortizes (2.22× at 6 rows), because the *union* of experts
+grows sublinearly.
+
+With MoE at ~74% of a decode step (`moe` 177.5 ms of ~240 ms, NGEN 1→16, n=2) and
+`dspark_block_size` 5 ⇒ a 6-row verify:
+
+| attention scaling assumption | verify / decode | best case (100% accept) | break-even accept |
+|---|---|---|---|
+| free (idle GPU absorbs 6 queries) | 1.94× | 3.1× | **~49%** |
+| linear (6×) | 3.24× | 1.85× | **~74%** |
+
+Against a **~24-25% measured acceptance** (Nemotron's MTP), expected tokens per verify is
+`(1-a⁶)/(1-a)` = 1.33, giving **0.69× to 0.41× — a 31-59% loss**. And that is before the
+draft head's 11.2 GB (768 experts across 3 stages) competes for residency on a box already
+44 GiB short, which slows the base case too.
+
+Converter and loader stay (`COLI_DSPARK=1`, container `-v3`); the forward is not worth
+writing. **Revisit only if V4's acceptance is shown to be ~2× Nemotron's, or if the expert
+compute stops being per-row-linear.**
+
+*Caveat on the attention row:* it is a bound, not a measurement. Attention per decode
+forward could not be resolved here — prefill contributes ~15 s of `attn` with ~1.5 s of
+run-to-run spread, against ~1-2 s from 15 decode forwards, so two of the four NGEN
+differences came out **negative**. That is this file's own precision warning, demonstrated.
+The MoE row, which decides the verdict, is well determined (159.8 and 195.3 ms/forward).
+
 ## Cross-model transfer queue
 
 **Findings established on one model that have NOT been checked on the others.** This is the

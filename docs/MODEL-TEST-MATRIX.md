@@ -226,6 +226,13 @@ mxfp4_expert_ffn_gpu_matches_cpu_at_every_s` against `matmul_qt`, at S = 1/4/16/
 at two shapes — 320×160 as well as 128×64, since K=128 runs the KT tile loop exactly once
 and proves nothing about the multi-tile accumulation every real expert does.
 
+**Fleet safety.** Only V4 and K3 reach these kernels; the other four models are NVFP4
+(fmt 5) and untouched. K3 goes through the situ variant, which the same commit rewires, so
+it was re-run end to end (16-token prompt, 3 gen, both GEMV modes): **tokens identical
+across arms** (`[276, 7612, 318]`), 0.39 vs 0.38 tok/s, 15339 vs 15330 expert FFNs
+dispatched. K3 is SSD-bound at its ~0.4 tok/s floor, so an expert-compute kernel is
+invisible to it — correct, and no faster.
+
 ### DSpark: DO NOT BUILD THE FORWARD — a fine-grained MoE cannot amortize a verify
 
 Five previous cost models for this were written and every one was contradicted by

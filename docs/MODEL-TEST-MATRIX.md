@@ -180,7 +180,17 @@ comparable to anything here. V4 now carries the same English prose as the other 
 `gpu-ffn` is **301 dispatches per decode token** = `43 layers × 6 routed + 43 shared`,
 i.e. one per expert, at 190 µs each. V4 takes `coli_cuda_expert_mlp_mxfp4` (one expert per
 call) where the NVFP4 path takes `coli_cuda_expert_group_nvfp4_relu2` (a group per call).
-Giving MXFP4 the same segmented parameter-space treatment is task #62; expected ~1.14×.
+
+**That framing was wrong, and grouping was built to disprove it (`fafd192`).** Dispatches
+went 301 → 43 exactly as intended, tokens were identical, and it measured **~10% slower**
+(decode 239 → 251 ms/tok). The syncs were never the cost. `coli gpubench 1 300` says why:
+4-bit tops out at ~190 GB/s where int8 does 400-556 on the same shapes, and is slower in
+absolute time while reading half the bytes — so 4-bit experts are **dequant-bound, not
+bandwidth- or launch-bound**. Cutting launches could not have helped.
+
+The lever that follows from that is reading each weight *once* and amortizing its dequant
+over rows, which is what the weight-stationary kernel does — see the MXFP4 kernel table
+below.
 
 **Precision warning for anyone re-measuring V4 decode:** decode is a small slice of total
 wall, so an NGEN difference is a difference of two large numbers. At gap 32 the extremes

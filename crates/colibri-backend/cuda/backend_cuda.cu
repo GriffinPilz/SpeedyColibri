@@ -1118,6 +1118,90 @@ static bool nvfp4_wsmm_launch(float *y,const float *x,const uint8_t *w,const uin
     return true;
 }
 
+/* Weight-stationary small-M MXFP4 matmul — the fmt-6 mirror of `nvfp4_wsmm` above, with
+ * the block-16 e4m3 scale swapped for MXFP4's block-32 E8M0. Same contract, same MT
+ * bucketing, same reason: at prefill a routed expert sees only S = tokens*top_k/n_experts
+ * rows (DeepSeek-V4: 512*6/256 = 12; Kimi-K3 similar), so `mxfp4_matmul`'s 16x16 WMMA tile
+ * runs at a fraction of its utilization AND re-dequantizes the whole weight once per 16-row
+ * m-tile. #90 measured that shape at 0.26% of tensor peak on the NVFP4 side and fixed it
+ * there; fmt 6 kept the WMMA tile because nothing enumerated it — the same closed-set
+ * dispatch trap that left the decode GEMV narrow.
+ *
+ * NOT applicable to decode: V4 routes top-6 of 256, so a decode expert sees exactly ONE
+ * row and there is no reuse to amortize the dequant over. Decode's lever is the GEMV read
+ * pattern below, not this. */
+template<int MT>
+__global__ static void mxfp4_wsmm(float *y,const float *x,const uint8_t *w,
+        const uint8_t *bs,float g,int M,int K,int N){
+    const int KT=128;
+    extern __shared__ float mxwsmm_xs[];    // [MT][KT], row-major m*KT+kk
+    int warp=threadIdx.x>>5, lane=threadIdx.x&31, wpb=blockDim.x>>5;
+    int n=blockIdx.x*wpb+warp;              // output column this warp owns
+    int Kh=(K+1)>>1, nb=(K+31)>>5;
+    const uint8_t *wr=w+(size_t)(n<N?n:0)*Kh;
+    const uint8_t *br=bs+(size_t)(n<N?n:0)*nb;
+    float acc[MT];
+    #pragma unroll
+    for(int m=0;m<MT;m++) acc[m]=0.f;
+    for(int k0=0;k0<K;k0+=KT){
+        int kt=min(KT,K-k0);
+        for(int idx=threadIdx.x; idx<M*kt; idx+=blockDim.x){
+            int m=idx/kt, kk=idx-m*kt;
+            mxwsmm_xs[m*KT+kk]=x[(size_t)m*K+k0+kk];
+        }
+        __syncthreads();
+        if(n<N){
+            for(int kk=lane;kk<kt;kk+=32){
+                int k=k0+kk;
+                uint8_t byte=wr[k>>1];
+                int nib=(k&1)?(byte>>4):(byte&0xF);
+                float wv=e2m1f(nib)*e8m0f(br[k>>5]);
+                #pragma unroll
+                for(int m=0;m<MT;m++){
+                    float xv=(m<M)?mxwsmm_xs[m*KT+kk]:0.f;
+                    acc[m]+=xv*wv;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if(n<N){
+        #pragma unroll
+        for(int m=0;m<MT;m++){
+            if(m>=M) continue;
+            float a=acc[m];
+            #pragma unroll
+            for(int o=16;o>0;o>>=1) a+=__shfl_down_sync(0xffffffff,a,o);
+            if(lane==0) y[(size_t)m*N+n]=a*g;
+        }
+    }
+}
+
+/* Dispatch the MXFP4 weight-stationary kernel at the smallest MT bucket >= M. Mirror of
+ * `nvfp4_wsmm_launch`: returns false above the largest bucket so the caller keeps WMMA.
+ *
+ * `COLI_MXFP4_WSMM=0` forces every call to decline, i.e. restores the pre-port WMMA path.
+ * The NVFP4 twin deliberately has no such knob — S is the only thing that should decide,
+ * and an override can only disagree with the shape actually being computed. This one
+ * exists because the WMMA path is otherwise unreachable at these S, so there would be no
+ * way to A/B the port against what it replaced. Do not use it to tune. */
+static bool mxfp4_wsmm_launch(float *y,const float *x,const uint8_t *w,const uint8_t *bs,
+        float g,int M,int K,int N,cudaStream_t s){
+    static int s_on=-1;
+    if(s_on<0){const char*e=getenv("COLI_MXFP4_WSMM");s_on=e?atoi(e):1;}
+    if(!s_on) return false;
+    const int TPB=128, wpb=TPB>>5;
+    dim3 grid((unsigned)((N+wpb-1)/wpb));
+    #define MXWSMM_CASE(MT) do{ size_t sh=(size_t)(MT)*128*sizeof(float); \
+        mxfp4_wsmm<MT><<<grid,TPB,sh,s>>>(y,x,w,bs,g,M,K,N); }while(0)
+    if(M<=8) MXWSMM_CASE(8);
+    else if(M<=16) MXWSMM_CASE(16);
+    else if(M<=32) MXWSMM_CASE(32);
+    else return false;
+    #undef MXWSMM_CASE
+    return true;
+}
+
 /* Launch the S==1 NVFP4 GEMV under COLI_NVFP4_GEMV:
  *   0 = narrow (original: one nibble-pair byte shared by lanes 2j/2j+1, x staged in shared)
  *   1 = one byte per lane + shared x
@@ -1174,6 +1258,121 @@ static void nvfp4_gemv_dispatch(float *y,const float *x,const uint8_t *w,const u
     else if(s_mode==2) nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
     else if(nvfp4_u32_ok(w,K)) nvfp4_gemv_u32<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
     else               nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+}
+
+/* ---------------------------------------------------------------------------------
+ * MXFP4 decode GEMV read patterns — the fmt-6 mirror of the NVFP4 family above.
+ *
+ * This exists because the read-pattern work (#46) was done ONE FORMAT OVER. It added
+ * `nvfp4_gemv_wide_g`/`_u32` and routed every fmt-5 call site through a single
+ * dispatcher, precisely so a read-pattern change would land everywhere — and fmt 6
+ * kept `mxfp4_gemv`, whose loop is `for(k=lane;k<K;k+=32)` with `byte=wr[k>>1]`. Lanes
+ * 2j and 2j+1 therefore load the SAME byte and a warp fetches 16 B per step where the
+ * wide kernel fetches 32 B. That is the closed-set dispatch trap the comment above
+ * warns about, one arm short.
+ *
+ * It matters more here than it did there: DeepSeek-V4 routes top-6 of 256 experts, so
+ * every routed expert in decode is an S==1 GEMV, and `gpu-ffn` is the largest single
+ * sub-phase of a V4 decode step.
+ *
+ * The narrow kernel scales per element (`x*e2m1*e8m0`); these scale per 2-nibble byte
+ * (`(a+b)*sc`) exactly as the NVFP4 versions do. Same value, different summation order,
+ * so output is NOT bit-identical to the old kernel — correctness is against the CPU
+ * dequant reference, not against `mxfp4_gemv`.
+ * --------------------------------------------------------------------------------- */
+
+/* One byte (2 nibbles) per lane, x read straight from device — no shared staging, so no
+ * shared-memory occupancy cap. Mirror of `nvfp4_gemv_wide_g` with block-32 E8M0. */
+__global__ static void mxfp4_gemv_wide_g(float *y,const float *x,const uint8_t *w,
+                                         const uint8_t *bs,float g,int K,int N){
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+31)>>5;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int kb=lane;kb<Kh;kb+=32){
+        uint8_t byte=wr[kb];
+        int k0=kb<<1;
+        float sc=e8m0f(br[k0>>5]);
+        float a=x[k0]*e2m1f(byte&0xF);
+        float b=(k0+1<K)?x[k0+1]*e2m1f(byte>>4):0.f;
+        acc+=(a+b)*sc;
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* Full-line MXFP4 GEMV: each lane loads a uint32 (4 bytes = 8 nibbles), so a warp fetches
+ * one 128 B cache line per step. k0 = kw*8 is 8-aligned, so all 8 nibbles fall inside one
+ * 32-element MXFP4 block and share `br[k0>>5]` — the block-32 layout makes this strictly
+ * safer than the block-16 NVFP4 version, which needed the same argument at 16.
+ *
+ * Selected only under an explicit COLI_MXFP4_GEMV=3; see the dispatcher for why it is not
+ * the default. */
+__global__ static void mxfp4_gemv_u32(float *y,const float *x,const uint8_t *w,
+                                      const uint8_t *bs,float g,int K,int N){
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+31)>>5, Kw=Kh>>2;
+    const uint32_t *wr=(const uint32_t*)(w+(size_t)n*Kh);
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int kw=lane;kw<Kw;kw+=32){
+        uint32_t v=wr[kw];
+        int k0=kw<<3;                       /* 8 nibbles per uint32 */
+        float sc=e8m0f(br[k0>>5]);          /* k0..k0+7 share one block scale */
+        float p=0.f;
+        #pragma unroll
+        for(int j=0;j<8;j++){
+            int nib=(v>>(j<<2))&0xF;
+            p+=x[k0+j]*e2m1f(nib);
+        }
+        acc+=p*sc;
+    }
+    /* tail: whatever bytes the uint32 sweep could not cover */
+    for(int kb=(Kw<<2)+lane;kb<Kh;kb+=32){
+        uint8_t byte=w[(size_t)n*Kh+kb];
+        int k0=kb<<1;
+        float sc=e8m0f(br[k0>>5]);
+        float a=x[k0]*e2m1f(byte&0xF);
+        float b=(k0+1<K)?x[k0+1]*e2m1f(byte>>4):0.f;
+        acc+=(a+b)*sc;
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* ONE dispatcher for every MXFP4 decode GEMV, under COLI_MXFP4_GEMV:
+ *   0 = narrow (the original `mxfp4_gemv`: one byte shared by lanes 2j/2j+1, x in shared)
+ *   2 = one byte per lane, x from device  (default)
+ *   3 = uint32 per lane — a full 128 B/warp cache line (needs Kh % 4 == 0 and a 4-aligned
+ *       base; `nvfp4_u32_ok` tests both and is format-independent)
+ *
+ * Mode 1 is deliberately absent: it was the shared-x variant of mode 2, and mode 2 beat it
+ * on the NVFP4 side by freeing the occupancy cap. There is no reason to port a kernel that
+ * lost.
+ *
+ * Default 2, not 3, for the SAME correctness reason the NVFP4 dispatcher documents: mode 3
+ * is chosen per call from the weight POINTER, and expert weights come from a recycling
+ * buffer pool, so the same expert lands at a different address run to run — mode 3 on one
+ * run, mode 2 on the next, two summation orders, two answers. That produced a real decode
+ * divergence on M2.7 and there mode 2 was also faster (read width stops paying past
+ * 32 B/warp). Do not use mode 3 to produce reference output. */
+static void mxfp4_gemv_dispatch(float *y,const float *x,const uint8_t *w,const uint8_t *bs,
+        float g,int K,int N,cudaStream_t s){
+    static int s_mode=-1;
+    if(s_mode<0){const char*e=getenv("COLI_MXFP4_GEMV");s_mode=e?atoi(e):2;}
+    const int tpb=256,wpb=tpb>>5;
+    unsigned blocks=(unsigned)((N+wpb-1)/wpb);
+    size_t shm=(size_t)K*sizeof(float);
+    if(s_mode==0)      mxfp4_gemv     <<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
+    else if(s_mode==3&&nvfp4_u32_ok(w,K)) mxfp4_gemv_u32<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+    else               mxfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
 }
 
 /* Single-row decode GEMV (S==1) for int8 W8A16 — mirror of `fp8a16_gemv` with the
@@ -2423,17 +2622,26 @@ extern "C" int coli_cuda_expert_mlp_mxfp4_situ(ColiCudaTensor *gate,ColiCudaTens
     float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
     unsigned sblocks=(unsigned)(((size_t)S*I+255)/256);
     if(S==1){
-        int tpb=256,wpb=tpb>>5;
-        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
-        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+        // Same dispatcher as the plain MXFP4 expert — the situ variant differs only in the
+        // activation between the two GEMMs, never in how the weight is read.
+        mxfp4_gemv_dispatch(ctx->gate,ctx->x,gw,gbs,gg,D,I,ctx->stream);
+        mxfp4_gemv_dispatch(ctx->up,  ctx->x,uw,ubs,ug,D,I,ctx->stream);
         situ_mul<<<sblocks,256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I,beta,linear_beta);
-        mxfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
+        mxfp4_gemv_dispatch(ctx->y,ctx->gate,dw,dbs,dg,I,D,ctx->stream);
     }else{
-        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
-        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
-        mxfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
-        situ_mul<<<sblocks,256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I,beta,linear_beta);
-        mxfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+        bool did_ws=false;
+        if(mxfp4_wsmm_launch(ctx->gate,ctx->x,gw,gbs,gg,S,D,I,ctx->stream)){
+            mxfp4_wsmm_launch(ctx->up,ctx->x,uw,ubs,ug,S,D,I,ctx->stream);
+            situ_mul<<<sblocks,256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I,beta,linear_beta);
+            did_ws=mxfp4_wsmm_launch(ctx->y,ctx->gate,dw,dbs,dg,S,I,D,ctx->stream);
+        }
+        if(!did_ws){
+            dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+            dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+            mxfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
+            situ_mul<<<sblocks,256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I,beta,linear_beta);
+            mxfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+        }
     }
     if(!cuda_ok(cudaGetLastError(),"expert mxfp4 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -2473,17 +2681,33 @@ extern "C" int coli_cuda_expert_mlp_mxfp4(ColiCudaTensor *gate,ColiCudaTensor *u
     const uint8_t *gbs=(const uint8_t*)gate->bscale,*ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
     float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
         if(S==1){
-        int tpb=256,wpb=tpb>>5;
-        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
-        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+        // Every MXFP4 decode GEMV goes through the dispatcher — see its comment for why
+        // the narrow kernel these call sites used to launch was leaving half the read
+        // width on the table.
+        mxfp4_gemv_dispatch(ctx->gate,ctx->x,gw,gbs,gg,D,I,ctx->stream);
+        mxfp4_gemv_dispatch(ctx->up,  ctx->x,uw,ubs,ug,D,I,ctx->stream);
         act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
-        mxfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
+        mxfp4_gemv_dispatch(ctx->y,ctx->gate,dw,dbs,dg,I,D,ctx->stream);
     }else{
-        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
-        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
-        mxfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
-        act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
-        mxfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+        // Weight-stationary small-M path (the #90 fix, ported to fmt 6). A routed expert
+        // at prefill sees S = tokens*top_k/n_experts rows — 12 on V4 at 512 tokens — where
+        // the 16x16 WMMA tile below re-dequantizes the whole weight per m-tile. Declines
+        // above S=32, which is where the MMA amortizes and WMMA is the better kernel; the
+        // shared expert (S = all tokens) therefore still takes WMMA, as it should.
+        bool did_ws=false;
+        if(mxfp4_wsmm_launch(ctx->gate,ctx->x,gw,gbs,gg,S,D,I,ctx->stream)){
+            // Same S ⇒ the up/down launches take the same MT bucket and cannot decline.
+            mxfp4_wsmm_launch(ctx->up,ctx->x,uw,ubs,ug,S,D,I,ctx->stream);
+            act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
+            did_ws=mxfp4_wsmm_launch(ctx->y,ctx->gate,dw,dbs,dg,S,I,D,ctx->stream);
+        }
+        if(!did_ws){
+            dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+            dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+            mxfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
+            act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
+            mxfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+        }
     }
     if(!cuda_ok(cudaGetLastError(),"expert mxfp4 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -4469,14 +4693,15 @@ extern "C" int coli_cuda_expert_group_mxfp4(ColiCudaTensor *const *gates,
         float *xc = ctx->x + (size_t)off * D, *gc = ctx->gate + (size_t)off * I,
               *uc = ctx->up + (size_t)off * I, *yc = ctx->y + (size_t)off * D;
         if (S == 1) {
-            int tpb = 256, wpb = tpb >> 5;
-            mxfp4_gemv<<<(unsigned)((I + wpb - 1) / wpb), tpb, (size_t)D * sizeof(float), ctx->stream>>>(
-                gc, xc, gw, gbs, g->gscale, D, I);
-            mxfp4_gemv<<<(unsigned)((I + wpb - 1) / wpb), tpb, (size_t)D * sizeof(float), ctx->stream>>>(
-                uc, xc, uw, ubs, u->gscale, D, I);
+            mxfp4_gemv_dispatch(gc, xc, gw, gbs, g->gscale, D, I, ctx->stream);
+            mxfp4_gemv_dispatch(uc, xc, uw, ubs, u->gscale, D, I, ctx->stream);
             act_mul(gc, uc, (size_t)I, ctx->stream);
-            mxfp4_gemv<<<(unsigned)((D + wpb - 1) / wpb), tpb, (size_t)I * sizeof(float), ctx->stream>>>(
-                yc, gc, dw, dbs, d->gscale, I, D);
+            mxfp4_gemv_dispatch(yc, gc, dw, dbs, d->gscale, I, D, ctx->stream);
+        } else if (mxfp4_wsmm_launch(gc, xc, gw, gbs, g->gscale, S, D, I, ctx->stream)) {
+            // Weight-stationary below S=32; declines above and the WMMA tile takes over.
+            mxfp4_wsmm_launch(uc, xc, uw, ubs, u->gscale, S, D, I, ctx->stream);
+            act_mul(gc, uc, (size_t)S * I, ctx->stream);
+            mxfp4_wsmm_launch(yc, gc, dw, dbs, d->gscale, S, I, D, ctx->stream);
         } else {
             dim3 hidden((unsigned)((I + 63) / 64), (unsigned)((S + 15) / 16));
             dim3 output((unsigned)((D + 63) / 64), (unsigned)((S + 15) / 16));

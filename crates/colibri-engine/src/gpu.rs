@@ -1907,6 +1907,102 @@ mod tests {
     use crate::linear::matmul_qt;
     use crate::quantize::qtensor_from_f32;
 
+    /// A deterministic MXFP4 weight [o, i]: nibble k of row r cycles the e2m1 codebook and
+    /// the E8M0 block scale varies per block AND per row, so a wrong nibble order or a
+    /// wrong block stride (32, not NVFP4's 16) cannot coincide with the right answer.
+    /// Same construction as `linear::tests::matmul_qt_reconstructs_mxfp4`, which pins the
+    /// CPU arm this test uses as its reference.
+    fn mxfp4_weight(o: usize, i: usize, seed: usize) -> QTensor {
+        let nb = i / 32;
+        let mut q4 = vec![0u8; o * i / 2];
+        let mut bs = vec![0u8; o * nb];
+        for r in 0..o {
+            for k in 0..i {
+                let nib = ((k + r * 3 + seed) % 16) as u8;
+                let idx = r * (i / 2) + (k >> 1);
+                if k & 1 == 1 {
+                    q4[idx] |= nib << 4;
+                } else {
+                    q4[idx] |= nib;
+                }
+            }
+            for b in 0..nb {
+                bs[r * nb + b] = (126 + ((b + r + seed) % 3) as i32) as u8;
+            }
+        }
+        QTensor {
+            fmt_code: 6,
+            q4: colibri_core::Bytes::Owned(q4),
+            bs: colibri_core::Bytes::Owned(bs),
+            g: 0.5,
+            o: o as i32,
+            i: i as i32,
+            ..Default::default()
+        }
+    }
+
+    /// The MXFP4 expert FFN on the GPU must agree with the CPU reference at every S, and
+    /// this is the ONLY check that covers it: the read-pattern and weight-stationary
+    /// kernels sum in a different order than the kernels they replace, so cross-kernel
+    /// token identity is the wrong gate — agreement with `matmul_qt` is the right one.
+    ///
+    /// S is chosen to enter each arm of `coli_cuda_expert_mlp_mxfp4`: 1 = the decode GEMV
+    /// dispatcher, 4/16/32 = the three weight-stationary MT buckets, 33 = the WMMA tile
+    /// the WSMM launcher declines into. A kernel that quietly truncates rows past its
+    /// bucket, or one that never runs at all, fails here rather than in a benchmark.
+    ///
+    /// The shapes matter as much as S. `mxfp4_wsmm` sweeps K in KT=128 tiles, so a K of
+    /// exactly 128 runs that loop ONCE and proves nothing about accumulating across tiles
+    /// or about a short final tile — which is the shape every real expert has (D=4096,
+    /// I=2048). 320x160 gives gate/up K=320 (two full tiles + 64) and down K=160 (one full
+    /// tile + 32); 128x64 keeps the exact-multiple case alongside it.
+    ///
+    /// Sets the CUDA activation globals; run CUDA tests with `--test-threads=1` (task #57).
+    #[test]
+    fn mxfp4_expert_ffn_gpu_matches_cpu_at_every_s() {
+        if !available() || !zerocopy() {
+            eprintln!("skip: no zero-copy CUDA device");
+            return;
+        }
+        set_activation(false, 0.0, 0.0); // plain SiLU: act_mul -> silu_mul
+
+        for &(d, inter) in &[(128usize, 64usize), (320, 160)] {
+            let gate = mxfp4_weight(inter, d, 0);
+            let up = mxfp4_weight(inter, d, 5);
+            let down = mxfp4_weight(d, inter, 9);
+
+            for &s in &[1usize, 4, 16, 32, 33] {
+                let x: Vec<f32> =
+                    (0..s * d).map(|k| ((k % 11) as f32 - 5.0) * 0.05).collect();
+
+                // CPU reference — exactly `moe::ffn_cpu`'s plain-SwiGLU arm.
+                let mut gg = vec![0f32; s * inter];
+                let mut uu = vec![0f32; s * inter];
+                matmul_qt(&mut gg, &x, &gate, s);
+                matmul_qt(&mut uu, &x, &up, s);
+                for (g, &u) in gg.iter_mut().zip(uu.iter()) {
+                    *g = crate::math::silu(*g) * u;
+                }
+                let mut want = vec![0f32; s * d];
+                matmul_qt(&mut want, &gg, &down, s);
+
+                let mut got = vec![0f32; s * d];
+                assert!(
+                    try_expert_ffn_mxfp4(&gate, &up, &down, &x, s, &mut got),
+                    "[{d}x{inter}] S={s}: the GPU MXFP4 expert declined — this test would \
+                     otherwise pass by comparing the CPU reference against a zero buffer"
+                );
+                let tol = 1e-3 * want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                for (j, (&a, &b)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() <= tol,
+                        "[{d}x{inter}] S={s} elem {j}: gpu {a} vs cpu {b} (tol {tol})"
+                    );
+                }
+            }
+        }
+    }
+
     // GPU vs CPU-NEON matmul at GLM-scale sizes.
     // `cargo test -p colibri-engine --features cuda --release -- --ignored --nocapture bench_matmul`
     #[test]

@@ -1434,22 +1434,40 @@ pub fn try_expert_group_nvfp4(
     d: usize,
     out: &mut [f32],
 ) -> bool {
+    try_expert_group_packed(active, activations, d, out, 5)
+}
+
+/// Grouped SwiGLU experts for a packed 4-bit format — NVFP4 (`fmt` 5) or MXFP4 (`fmt` 6).
+///
+/// Parameterised rather than duplicated: the gather/scatter, the chunking, and the RAM
+/// ledger accounting are identical between the two, and only the format check and the raw
+/// entry point differ. DeepSeek-V4 is MXFP4 and had NO grouped arm at all, so every expert
+/// took the per-expert path — 301 dispatches per decode token, each paying its own stream
+/// synchronise.
+#[allow(clippy::too_many_arguments)]
+pub fn try_expert_group_packed(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+    fmt: i32,
+) -> bool {
     if !available() || !zerocopy() {
         return false;
     }
     if active.is_empty() {
         return true;
     }
-    // Every expert must be a gpu-eligible NVFP4 three-tensor SwiGLU of the expected shape, or
-    // decline and let the caller run per-expert.
+    // Every expert must be a gpu-eligible three-tensor SwiGLU of `fmt` and the expected
+    // shape, or decline and let the caller run per-expert.
     if !active.iter().all(|(ex, _, _)| {
         ex.gate.gpu_eligible
-            && ex.gate.fmt_code == 5
+            && ex.gate.fmt_code == fmt
             && ex.gate.i as usize == d
             && ex.up.gpu_eligible
             && ex.down.gpu_eligible
-            && ex.up.fmt_code == 5
-            && ex.down.fmt_code == 5
+            && ex.up.fmt_code == fmt
+            && ex.down.fmt_code == fmt
             && ex.up.i as usize == d
             && ex.down.o as usize == d
     }) {
@@ -1552,14 +1570,15 @@ pub fn try_expert_group_nvfp4(
         // SAFETY: the wrapped tensors stay alive in `keep` until after the call, which is
         // synchronous through its own D2H; the sub-slices hold `part_rows * d` floats each.
         let called = unsafe {
-            cuda::expert_group_nvfp4_raw(
-                &gs,
-                &us,
-                &ds,
-                &rws,
+            let (yp, xp) = (
                 y_all[done * d..(done + part_rows) * d].as_mut_ptr(),
                 x_all[done * d..(done + part_rows) * d].as_ptr(),
-            )
+            );
+            if fmt == 6 {
+                cuda::expert_group_mxfp4_raw(&gs, &us, &ds, &rws, yp, xp)
+            } else {
+                cuda::expert_group_nvfp4_raw(&gs, &us, &ds, &rws, yp, xp)
+            }
         };
         drop(keep);
         if !called {

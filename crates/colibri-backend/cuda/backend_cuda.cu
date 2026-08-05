@@ -4416,3 +4416,81 @@ extern "C" int coli_cuda_dsv4_sparse_attn(const float *q, const float *kv, const
     if (!cuda_ok(cudaStreamSynchronize(dc->stream), "dsv4 sparse attn sync")) return 0;
     return 1;
 }
+
+// ---------------------------------------------------------------------------
+// Grouped MXFP4 SwiGLU experts (DeepSeek-V4).
+//
+// V4 had no fmt-6 arm in the grouped dispatch chain, so every expert took
+// `coli_cuda_expert_mlp_mxfp4` one at a time. Measured: **301 dispatches per decode
+// token** (43 layers x 6 routed + 43 shared), 190 us each. The cost is not the four
+// kernel launches — it is that EVERY call takes the scratch mutex, memcpys x into a
+// pinned buffer, uploads, downloads, and does a full `cudaStreamSynchronize`, because
+// `ctx->x/gate/up/y` is shared scratch that cannot overlap between calls.
+//
+// This hoists all of that out of the loop: one lock, one upload, one download, ONE sync
+// for the whole group. The per-expert math kernels are unchanged — deliberately, so any
+// output difference is a bug in this plumbing and not in the arithmetic.
+//
+// `act_mul` reads the activation globals, so V4's clamped SwiGLU (`swiglu_limit`) applies
+// here exactly as it does on the per-expert path.
+extern "C" int coli_cuda_expert_group_mxfp4(ColiCudaTensor *const *gates,
+        ColiCudaTensor *const *ups, ColiCudaTensor *const *downs,
+        const int *rows, int count, float *y, const float *x) {
+    if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
+    ColiCudaTensor *first = gates[0];
+    if (!first) return 0;
+    int device = first->device, D = first->I, I = first->O, total = 0;
+    for (int c = 0; c < count; c++) {
+        ColiCudaTensor *g = gates[c], *u = ups[c], *d = downs[c];
+        if (!g || !u || !d || rows[c] < 1 || g->fmt != 6 || u->fmt != 6 || d->fmt != 6 ||
+            g->device != device || u->device != device || d->device != device ||
+            g->I != D || g->O != I || u->I != D || u->O != I || d->I != I || d->O != D) return 0;
+        total += rows[c];
+    }
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx) || ctx->compute_major < 7) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    size_t xb = (size_t)total * D * sizeof(float), ib = (size_t)total * I * sizeof(float);
+    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->gate, &ctx->gate_cap, ib) ||
+        !reserve(&ctx->up, &ctx->up_cap, ib) || !reserve(&ctx->y, &ctx->y_cap, xb) ||
+        !reserve_pinned(&ctx->host_x, &ctx->host_x_cap, xb) ||
+        !reserve_pinned(&ctx->host_y, &ctx->host_y_cap, xb)) return 0;
+    std::memcpy(ctx->host_x, x, xb);
+    if (!cuda_ok(cudaMemcpyAsync(ctx->x, ctx->host_x, xb, cudaMemcpyHostToDevice, ctx->stream),
+                 "expert group mxfp4 upload")) return 0;
+    int off = 0;
+    for (int c = 0; c < count; c++) {
+        const int S = rows[c];
+        ColiCudaTensor *g = gates[c], *u = ups[c], *d = downs[c];
+        const uint8_t *gw = (const uint8_t *)g->weights, *uw = (const uint8_t *)u->weights,
+                      *dw = (const uint8_t *)d->weights;
+        const uint8_t *gbs = (const uint8_t *)g->bscale, *ubs = (const uint8_t *)u->bscale,
+                      *dbs = (const uint8_t *)d->bscale;
+        float *xc = ctx->x + (size_t)off * D, *gc = ctx->gate + (size_t)off * I,
+              *uc = ctx->up + (size_t)off * I, *yc = ctx->y + (size_t)off * D;
+        if (S == 1) {
+            int tpb = 256, wpb = tpb >> 5;
+            mxfp4_gemv<<<(unsigned)((I + wpb - 1) / wpb), tpb, (size_t)D * sizeof(float), ctx->stream>>>(
+                gc, xc, gw, gbs, g->gscale, D, I);
+            mxfp4_gemv<<<(unsigned)((I + wpb - 1) / wpb), tpb, (size_t)D * sizeof(float), ctx->stream>>>(
+                uc, xc, uw, ubs, u->gscale, D, I);
+            act_mul(gc, uc, (size_t)I, ctx->stream);
+            mxfp4_gemv<<<(unsigned)((D + wpb - 1) / wpb), tpb, (size_t)I * sizeof(float), ctx->stream>>>(
+                yc, gc, dw, dbs, d->gscale, I, D);
+        } else {
+            dim3 hidden((unsigned)((I + 63) / 64), (unsigned)((S + 15) / 16));
+            dim3 output((unsigned)((D + 63) / 64), (unsigned)((S + 15) / 16));
+            mxfp4_gate_up<<<hidden, 256, 0, ctx->stream>>>(gc, uc, xc, gw, uw, gbs, ubs,
+                                                           g->gscale, u->gscale, S, D, I);
+            act_mul(gc, uc, (size_t)S * I, ctx->stream);
+            mxfp4_matmul<<<output, 128, 0, ctx->stream>>>(yc, gc, dw, dbs, d->gscale, S, I, D);
+        }
+        off += S;
+    }
+    if (!cuda_ok(cudaGetLastError(), "expert group mxfp4 launch") ||
+        !cuda_ok(cudaMemcpyAsync(ctx->host_y, ctx->y, xb, cudaMemcpyDeviceToHost, ctx->stream),
+                 "expert group mxfp4 download") ||
+        !cuda_ok(cudaStreamSynchronize(ctx->stream), "expert group mxfp4 synchronize")) return 0;
+    std::memcpy(y, ctx->host_y, xb);
+    return 1;
+}

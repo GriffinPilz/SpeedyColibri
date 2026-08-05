@@ -1266,6 +1266,25 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         // and would read a gate tensor these experts don't ship.
         let grouped = if activation().relu2 {
             crate::gpu::try_expert_group_relu2(&active, activations, d, &mut out)
+        } else if dsv4_group_moe() && !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 6) {
+            // MXFP4 SwiGLU (DeepSeek-V4) — MEASURED NEGATIVE, so opt-in only.
+            //
+            // V4 had no grouped arm at all and fell to the per-expert call: 301 dispatches
+            // per decode token (43 layers x 6 routed + 43 shared), each paying its own
+            // scratch mutex, staging memcpys and a full `cudaStreamSynchronize`. Grouping
+            // cuts that to 43 — one per layer, confirmed by the counter — and tokens are
+            // identical. It is still SLOWER:
+            //
+            //   gather+gpu-ffn+scatter  0.8 + 57.3 + 1.9 = 60.0 ms/tok   (per-expert)
+            //   grouped `group` block                     66.2 ms/tok   (~10% worse)
+            //   decode total            239 -> 251 ms/tok
+            //
+            // So the syncs were never the cost: 190 us/dispatch is the 13.37 MB MXFP4
+            // weight read, and grouping only adds row-staging into `x_all`/`y_all` plus the
+            // chunking and per-call tensor wrapping. **Dispatch count was the wrong
+            // target.** A real win needs fewer BYTES or a fused kernel that keeps the
+            // weights resident across experts, not fewer launches.
+            crate::gpu::try_expert_group_packed(&active, activations, d, &mut out, 6)
         } else if !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5) {
             // NVFP4 SwiGLU (M2.7 / M3 / GLM-5.2). Until this arm existed these models were
             // offered the fp8 group, which declines on fmt 5, so every one of them fell
@@ -3329,6 +3348,16 @@ mod tests {
 /// a change to that shared path, so it is called out here rather than left to look
 /// correct. Outputs will differ from the reference wherever the product exceeds ±10.
 #[allow(clippy::too_many_arguments)]
+/// Route DeepSeek-V4's MXFP4 experts through the grouped kernel (`COLI_DSV4_GROUP_MOE=1`).
+///
+/// Default OFF because it MEASURED SLOWER — see the call site. Kept because the code is
+/// correct (tokens identical, 301 -> 43 dispatches) and is the starting point for a fused
+/// weight-stationary attempt, which is the version that could actually pay.
+fn dsv4_group_moe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_DSV4_GROUP_MOE").ok().as_deref() == Some("1"))
+}
+
 pub fn dsv4_moe<P: ExpertProvider>(
     cfg: &Config,
     l: &Layer,

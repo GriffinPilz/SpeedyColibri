@@ -223,6 +223,13 @@ pub struct Config {
     /// because a bias only ever shifts a comparison and there is no comparison here.
     /// 0 on every other arch.
     pub n_hash_layers: i32,
+    /// DeepSeek-V4 DSpark (speculative drafting, stored under `mtp.*`). All 0/empty on
+    /// every other arch. `dspark_targets` are the MAIN layers whose hidden states are
+    /// concatenated into stage 0's `main_proj` — they are sources, not DSpark layers.
+    pub dspark_block: i32,
+    pub dspark_noise_id: i32,
+    pub markov_rank: i32,
+    pub dspark_targets: Vec<i32>,
     pub hc_mult: i32,
     pub hc_sinkhorn_iters: i32,
     pub hc_eps: f32,
@@ -532,6 +539,10 @@ impl Config {
             compress_ratios: Vec::new(),
             compress_theta: 0.0,
             n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -739,6 +750,10 @@ impl Config {
             compress_ratios: Vec::new(),
             compress_theta: 0.0,
             n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -931,6 +946,20 @@ impl Config {
                 .get("num_hash_layers")
                 .and_then(Json::as_f64)
                 .unwrap_or(0.0) as i32,
+            dspark_block: r.get("dspark_block_size").and_then(Json::as_f64).unwrap_or(0.0) as i32,
+            dspark_noise_id: r
+                .get("dspark_noise_token_id")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as i32,
+            markov_rank: r
+                .get("dspark_markov_rank")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as i32,
+            dspark_targets: r
+                .get("dspark_target_layer_ids")
+                .and_then(Json::as_array)
+                .map(|a| a.iter().filter_map(Json::as_f64).map(|v| v as i32).collect())
+                .unwrap_or_default(),
             hc_mult: g("hc_mult"),
             hc_sinkhorn_iters: g("hc_sinkhorn_iters"),
             // Distinct from `eps` (the RMS epsilon): this one floors the Sinkhorn/sigmoid
@@ -1072,6 +1101,10 @@ impl Config {
             compress_ratios: Vec::new(),
             compress_theta: 0.0,
             n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,
@@ -1257,6 +1290,10 @@ impl Config {
             compress_ratios: Vec::new(),
             compress_theta: 0.0,
             n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
             hc_mult: 0,
             hc_sinkhorn_iters: 0,
             hc_eps: 0.0,

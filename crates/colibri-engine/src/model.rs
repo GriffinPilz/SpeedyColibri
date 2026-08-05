@@ -209,6 +209,38 @@ pub struct Layer {
     /// Kimi-K3 latent-MoE: RMSNorm applied in the `moe_latent` space, `[moe_latent]`.
     pub routed_expert_norm: Vec<f32>,
 }
+/// DeepSeek-V4's DSpark speculative head — the reference's "DSpark stages stored under the
+/// `mtp.*` checkpoint namespace", at layer indices `n_layers .. n_layers + stages.len()`.
+///
+/// A stage IS a V4 block (attention + MoE + Hyper-Connections), so each one loads through
+/// the ordinary layer loader. What makes it its own type is the extras: stage 0 projects
+/// the concatenated hidden states of `cfg.dspark_targets` down to one hidden width, and the
+/// LAST stage owns the vocabulary heads.
+///
+/// **Each stage carries its own 256-expert pool** — 10.3 GB of the head's ~11.2 GB. On a
+/// box that is already short of full residency for the main model, loading this competes
+/// with it. That is why it is opt-in.
+pub struct DsparkHead {
+    /// the stages in execution order; each a full V4 block
+    pub stages: Vec<Layer>,
+    /// stage 0: `[dim, dim * dspark_targets.len()]`, then `main_norm`
+    pub main_proj: Option<QTensor>,
+    pub main_norm: Vec<f32>,
+    /// last stage: final norm before the vocabulary head
+    pub norm: Vec<f32>,
+    /// last stage: rank-`markov_rank` token embedding and its head, a per-position logit
+    /// bias applied while sampling the drafted block
+    pub markov_w1: Option<QTensor>,
+    pub markov_w2: Option<QTensor>,
+    /// last stage: `[1, dim + markov_rank]`, scores the drafted block. Kept f32 — it is
+    /// one row, so quantising it buys nothing.
+    pub confidence: Vec<f32>,
+    /// last stage: its own Hyper-Connection head (plain sigmoid gate, no Sinkhorn)
+    pub hc_head_fn: Vec<f32>,
+    pub hc_head_base: Vec<f32>,
+    pub hc_head_scale: f32,
+}
+
 
 /// The MTP (multi-token prediction) speculative head — port of the `mtpL` /
 /// `eh_proj` / `enorm` / `hnorm` / `mtp_norm` members of the C `Model`.
@@ -976,6 +1008,10 @@ pub struct Model {
     /// was not set. `None` on the default containers, which are converted without
     /// `--mtp`.
     pub mtp: Option<MtpHead>,
+    /// DeepSeek-V4's DSpark drafting head. `None` unless `COLI_DSPARK=1` AND the container
+    /// actually ships it — it costs ~11.2 GB, most of it three private 256-expert pools,
+    /// so it is never loaded just because the weights are there.
+    pub dspark: Option<DsparkHead>,
 }
 
 impl Layer {
@@ -1099,6 +1135,21 @@ impl Model {
         n += (self.final_norm.len() * 4) as u64;
         for l in &self.layers {
             n += l.resident_bytes();
+        }
+        // DSpark's stages are Layers too, and they are NOT in `self.layers`. Omitting them
+        // is the same silent under-count this function's doc warns about: the budget comes
+        // out too generous by the head's dense weight and the expert cache overcommits.
+        if let Some(d) = &self.dspark {
+            for l in &d.stages {
+                n += l.resident_bytes();
+            }
+            n += [&d.main_norm, &d.norm, &d.confidence, &d.hc_head_fn, &d.hc_head_base]
+                .iter()
+                .map(|v| (v.len() * 4) as u64)
+                .sum::<u64>();
+            for t in [&d.main_proj, &d.markov_w1, &d.markov_w2] {
+                n += t.as_ref().map(|t| t.bytes().max(0) as u64).unwrap_or(0);
+            }
         }
         n
     }

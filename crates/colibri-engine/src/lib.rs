@@ -54,7 +54,7 @@ pub use forward::{
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load, two_dims_of};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
-pub use model::{KvCache, Layer, Model, MtpBlock, MtpHead, KV_UNSET};
+pub use model::{DsparkHead, KvCache, Layer, Model, MtpBlock, MtpHead, KV_UNSET};
 pub use moe::{
     cluster_ctx, compute_experts_partial, dense_mlp, kimi_moe, moe, moe_sharded, nemotron_moe,
     route, set_activation, set_cluster, ClusterCtx, Expert, ExpertLayout, ExpertProvider,
@@ -1302,6 +1302,75 @@ pub fn load_model_with(snap: impl AsRef<Path>, opts: LoadOptions) -> Result<Mode
     let has_dsa = (0..cfg.n_layers as usize)
         .any(|i| shards.has(&format!("model.layers.{i}.self_attn.indexer.wq_b.weight")));
 
+    // DSpark, opt-in. The stage COUNT is probed, never derived: the released config.json
+    // says `num_nextn_predict_layers = 1` while the checkpoint ships three stages, and
+    // believing it loads one third of the head without complaining. Same probe the
+    // converter does.
+    let dspark = if std::env::var("COLI_DSPARK").ok().as_deref() == Some("1")
+        && cfg.arch == colibri_core::Arch::DeepseekV4
+    {
+        let n = cfg.n_layers as usize;
+        let stages: Vec<usize> = (0..8)
+            .take_while(|i| shards.has(&format!("model.layers.{}.self_attn.q_a_proj.weight", n + i)))
+            .collect();
+        if stages.is_empty() {
+            eprintln!(
+                "[dsv4] COLI_DSPARK=1 but this container has no DSpark stages — reconvert \
+                 (the head is dropped by containers built before it was kept)."
+            );
+            None
+        } else {
+            let last = n + stages.len() - 1;
+            let optq = |nm: String, o: usize, i: usize| -> Result<Option<QTensor>, EngineError> {
+                Ok(if shards.has(&nm) { Some(qt_load(&shards, &nm, o, i, dbits)?) } else { None })
+            };
+            let optv = |nm: String| -> Result<Vec<f32>, EngineError> {
+                Ok(if shards.has(&nm) { ld(&shards, &nm)? } else { Vec::new() })
+            };
+            let d = cfg.hidden as usize;
+            let head = DsparkHead {
+                stages: stages
+                    .iter()
+                    // A DSpark stage is a full V4 block, and V4 is all-MoE — `sparse: true`.
+                    // Loading it dense asks for `mlp.gate_proj.weight`, which no V4 layer has.
+                    .map(|i| load_layer(&shards, &cfg, n + i, dbits, true))
+                    .collect::<Result<Vec<_>, EngineError>>()?,
+                main_proj: optq(
+                    format!("model.layers.{n}.main_proj.weight"),
+                    d,
+                    d * cfg.dspark_targets.len().max(1),
+                )?,
+                main_norm: optv(format!("model.layers.{n}.main_norm.weight"))?,
+                norm: optv(format!("model.layers.{last}.norm.weight"))?,
+                markov_w1: optq(
+                    format!("model.layers.{last}.markov_head.markov_w1.weight"),
+                    cfg.vocab as usize,
+                    cfg.markov_rank as usize,
+                )?,
+                markov_w2: optq(
+                    format!("model.layers.{last}.markov_head.markov_w2.weight"),
+                    cfg.vocab as usize,
+                    cfg.markov_rank as usize,
+                )?,
+                confidence: optv(format!("model.layers.{last}.confidence_head.proj.weight"))?,
+                hc_head_fn: optv(format!("model.layers.{last}.hc_head_fn"))?,
+                hc_head_base: optv(format!("model.layers.{last}.hc_head_base"))?,
+                hc_head_scale: optv(format!("model.layers.{last}.hc_head_scale"))?
+                    .first()
+                    .copied()
+                    .unwrap_or(0.0),
+            };
+            eprintln!(
+                "[dsv4] DSpark: {} stages at layers {n}..={last}, block {}, markov rank {}, \
+                 targets {:?}",
+                head.stages.len(), cfg.dspark_block, cfg.markov_rank, cfg.dspark_targets
+            );
+            Some(head)
+        }
+    } else {
+        None
+    };
+
     let mut model = Model {
         cfg,
         shards,
@@ -1319,6 +1388,7 @@ pub fn load_model_with(snap: impl AsRef<Path>, opts: LoadOptions) -> Result<Mode
         has_dsa,
         has_mtp: mtp.is_some(),
         mtp,
+        dspark,
     };
     // Dense weights are resident for the model's lifetime → GPU-cacheable.
     //

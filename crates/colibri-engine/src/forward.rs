@@ -2541,7 +2541,17 @@ fn dsv4_attention(
     // Reference: `softmax_scale = head_dim ** -0.5`. No YaRN mscale, despite YaRN rope —
     // checked, because DeepSeek's other models DO apply one.
     let scale = (hd as f32).powf(-0.5);
-    crate::dsv4::attention_dsv4_sparse(&q, &cache, &l.attn_sink, s, h, hd, &idxs, topk, scale, &mut o);
+    // GPU first. This core measured 48% of V4 decode as a scalar CPU loop, and `coli gen`
+    // reported `0 attention cores` — it had never run on the GPU. The CPU path stays as
+    // the fallback and as the exact-arithmetic reference (`COLI_DSV4_GPU_ATTN=0`).
+    #[cfg(feature = "cuda")]
+    let on_gpu =
+        crate::gpu::try_dsv4_sparse_attn(&mut o, &q, &cache, &l.attn_sink, &idxs, s, h, hd, topk);
+    #[cfg(not(feature = "cuda"))]
+    let on_gpu = false;
+    if !on_gpu {
+        crate::dsv4::attention_dsv4_sparse(&q, &cache, &l.attn_sink, s, h, hd, &idxs, topk, scale, &mut o);
+    }
 
     if prof {
         ATTN_CORE_US.fetch_add(t_core.elapsed().as_micros() as u64, rel);

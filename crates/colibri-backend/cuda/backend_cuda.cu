@@ -4315,3 +4315,104 @@ extern "C" int coli_cuda_pipe_sync(int device){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaDeviceSynchronize(),"pipe sync");
 }
+
+// ---------------------------------------------------------------------------
+// DeepSeek-V4 sparse attention core.
+//
+// Measured at 48% of V4 decode (144 of 300 ms/token) as a scalar Rust loop, with
+// `coli gen` reporting `0 attention cores` — this path had never touched the GPU.
+//
+// Contract matches `dsv4::attention_dsv4_sparse` exactly: `idxs` is [S,K] into `kv`,
+// `-1` means masked, duplicate indices are MEANINGFUL (V4 attends to a compressed block
+// that overlaps the raw window both ways), and the sink contributes to the DENOMINATOR
+// only. One shared latent serves as both K and V, so every head reads the same rows.
+//
+// One block per (query, head). Scores are warp-per-key so the K-loop needs no
+// __syncthreads; the reduction over `hd` is a shuffle within the warp.
+#define DSV4_WARP 32
+__global__ void dsv4_sparse_attn_kernel(
+        const float *__restrict__ q, const float *__restrict__ kv,
+        const float *__restrict__ sink, const int *__restrict__ idxs,
+        int H, int D, int K, int rows, float scale, float *__restrict__ out) {
+    extern __shared__ float sm[];
+    float *qs = sm;          // [D]
+    float *sc = sm + D;      // [K]
+    float *red = sm + D + K; // [blockDim.x / WARP]
+
+    const int i = blockIdx.x / H, hh = blockIdx.x % H;
+    const int tid = threadIdx.x, nth = blockDim.x;
+    const int lane = tid % DSV4_WARP, warp = tid / DSV4_WARP, nwarp = nth / DSV4_WARP;
+
+    for (int d = tid; d < D; d += nth) qs[d] = q[((size_t)i * H + hh) * D + d];
+    __syncthreads();
+
+    const int *sel = idxs + (size_t)i * K;
+    for (int t = warp; t < K; t += nwarp) {
+        const int j = sel[t];
+        if (j < 0 || j >= rows) { if (lane == 0) sc[t] = -INFINITY; continue; }
+        const float *kr = kv + (size_t)j * D;
+        float acc = 0.f;
+        for (int d = lane; d < D; d += DSV4_WARP) acc += qs[d] * kr[d];
+        #pragma unroll
+        for (int o = DSV4_WARP / 2; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+        if (lane == 0) sc[t] = acc * scale;
+    }
+    __syncthreads();
+
+    // max, then exp/sum — a masked slot stays exactly 0 and adds nothing.
+    float m = -INFINITY;
+    for (int t = tid; t < K; t += nth) m = fmaxf(m, sc[t]);
+    #pragma unroll
+    for (int o = DSV4_WARP / 2; o; o >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    if (tid == 0) { float g = -INFINITY; for (int w = 0; w < nwarp; ++w) g = fmaxf(g, red[w]); red[0] = g; }
+    __syncthreads();
+    m = red[0];
+
+    float ssum = 0.f;
+    for (int t = tid; t < K; t += nth) {
+        float e = isfinite(sc[t]) ? __expf(sc[t] - m) : 0.f;
+        sc[t] = e;
+        ssum += e;
+    }
+    #pragma unroll
+    for (int o = DSV4_WARP / 2; o; o >>= 1) ssum += __shfl_down_sync(0xffffffff, ssum, o);
+    if (lane == 0) red[warp] = ssum;
+    __syncthreads();
+    if (tid == 0) {
+        float g = 0.f;
+        for (int w = 0; w < nwarp; ++w) g += red[w];
+        // Sink: denominator only, stabilised against the same max the scores used.
+        red[0] = 1.f / (g + __expf(sink[hh] - m));
+    }
+    __syncthreads();
+    const float inv = red[0];
+
+    // Gather. Each thread owns a set of dims, so reads are coalesced across the warp for
+    // each key; duplicates in `sel` naturally accumulate twice, which is intended.
+    for (int d = tid; d < D; d += nth) {
+        float acc = 0.f;
+        for (int t = 0; t < K; ++t) {
+            const int j = sel[t];
+            if (j >= 0 && j < rows && sc[t] != 0.f) acc += sc[t] * kv[(size_t)j * D + d];
+        }
+        out[((size_t)i * H + hh) * D + d] = acc * inv;
+    }
+}
+
+extern "C" int coli_cuda_dsv4_sparse_attn(const float *q, const float *kv, const float *sink,
+        const int *idxs, int S, int H, int D, int K, int rows, float scale, float *out) {
+    if (!q || !kv || !sink || !idxs || !out || S < 1 || H < 1 || D < 1 || K < 1 || rows < 1) return 0;
+    if ((long long)S * H > 2147483647LL) return 0;
+    DeviceContext *dc = find_ctx(0);
+    if (!select_ctx(dc)) return 0;
+    int nth = 256;
+    size_t shmem = ((size_t)D + K + nth / DSV4_WARP) * sizeof(float);
+    // Bail rather than silently truncate — the caller's CPU path is correct, just slow.
+    if (shmem > 48 * 1024) return 0;
+    dsv4_sparse_attn_kernel<<<S * H, nth, shmem, dc->stream>>>(q, kv, sink, idxs, H, D, K, rows, scale, out);
+    if (!cuda_ok(cudaGetLastError(), "dsv4 sparse attn launch")) return 0;
+    if (!cuda_ok(cudaStreamSynchronize(dc->stream), "dsv4 sparse attn sync")) return 0;
+    return 1;
+}

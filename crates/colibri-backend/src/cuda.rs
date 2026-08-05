@@ -277,6 +277,21 @@ extern "C" {
         pos_base: c_int,
         device: c_int,
     ) -> c_int;
+    // DeepSeek-V4 sparse attention core: `idxs` is [S,K] into `kv`, -1 = masked,
+    // duplicates meaningful, sink in the denominator only.
+    fn coli_cuda_dsv4_sparse_attn(
+        q: *const f32,
+        kv: *const f32,
+        sink: *const f32,
+        idxs: *const c_int,
+        s: c_int,
+        h: c_int,
+        d: c_int,
+        k: c_int,
+        rows: c_int,
+        scale: f32,
+        out: *mut f32,
+    ) -> c_int;
     // DSA sparse prefill absorb: each query attends only to its indexer selection.
     fn coli_cuda_attention_absorb_sparse(
         kv_b: *mut ColiCudaTensor,
@@ -1034,6 +1049,27 @@ pub unsafe fn dsa_indexer_scores_raw(
     device: i32,
 ) -> bool {
     coli_cuda_dsa_indexer_scores(scores, qi, hw, keys, nsp, s0, nh, hd, t, pos_base, device) != 0
+}
+
+/// DeepSeek-V4 sparse attention core (48% of V4 decode as a scalar CPU loop).
+///
+/// # Safety
+/// `q` has `s*h*d` floats, `kv` `rows*d`, `sink` `h`, `idxs` `s*k` ints, `out` `s*h*d`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_sparse_attn_raw(
+    q: *const f32,
+    kv: *const f32,
+    sink: *const f32,
+    idxs: *const i32,
+    s: i32,
+    h: i32,
+    d: i32,
+    k: i32,
+    rows: i32,
+    scale: f32,
+    out: *mut f32,
+) -> bool {
+    coli_cuda_dsv4_sparse_attn(q, kv, sink, idxs, s, h, d, k, rows, scale, out) != 0
 }
 
 pub unsafe fn attention_absorb_sparse_raw(

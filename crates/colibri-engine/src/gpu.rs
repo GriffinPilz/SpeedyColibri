@@ -654,6 +654,67 @@ pub fn try_dsa_indexer_scores(
     }
 }
 
+/// DeepSeek-V4's sparse attention core on the GPU.
+///
+/// This path was measured at **48% of V4 decode** (144 of 300 ms/token) while running as a
+/// scalar Rust loop, with `coli gen` reporting `0 attention cores` — V4 attention had never
+/// touched the GPU at all. Same contract as `dsv4::attention_dsv4_sparse`: `-1` masks a
+/// slot, duplicate indices accumulate twice on purpose, sink in the denominator only.
+///
+/// The kernel accumulates in f32 where the CPU path uses f64, so results differ in the last
+/// bits and tokens can diverge on a near-tie. That is a different-but-valid numeric path,
+/// not a regression — `COLI_DSV4_GPU_ATTN=0` selects the CPU one for an exact A/B.
+#[allow(clippy::too_many_arguments)]
+pub fn try_dsv4_sparse_attn(
+    out: &mut [f32],
+    q: &[f32],
+    kv: &[f32],
+    sink: &[f32],
+    idxs: &[i32],
+    s: usize,
+    h: usize,
+    hd: usize,
+    topk: usize,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("COLI_DSV4_GPU_ATTN").ok().as_deref() != Some("0")) {
+        return false;
+    }
+    if !available() || s == 0 || h == 0 || hd == 0 || topk == 0 || hd % 32 != 0 {
+        return false;
+    }
+    let rows = kv.len() / hd;
+    if rows == 0
+        || q.len() < s * h * hd
+        || out.len() < s * h * hd
+        || sink.len() < h
+        || idxs.len() < s * topk
+    {
+        return false;
+    }
+    let scale = (hd as f32).powf(-0.5);
+    // SAFETY: every length checked above; the kernel bails on shared-memory overflow.
+    let ok = unsafe {
+        cuda::dsv4_sparse_attn_raw(
+            q.as_ptr(),
+            kv.as_ptr(),
+            sink.as_ptr(),
+            idxs.as_ptr(),
+            s as i32,
+            h as i32,
+            hd as i32,
+            topk as i32,
+            rows as i32,
+            scale,
+            out.as_mut_ptr(),
+        )
+    };
+    if ok {
+        GPU_ATTN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 /// `h0`/`hc` select the head slice `[h0, h0+hc)` to compute (tensor-parallel
 /// attention); the full-attention call passes `(0, h)`. A partial slice writes only
 /// its `ctx` head-columns and the kernel zeroes the rest, so summing the slices'

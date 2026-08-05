@@ -22,6 +22,20 @@ Every figure is a median of repeated runs on one build, token-identity gated.
 | **`minimax-m3`** | 229 GB | **16.8 tok/s** (30.4 s) | **1.9 tok/s** | **1.8 tok/s** |
 | **`glm-5.2`** (744B) | 403 GB | **7.4 tok/s** (69.5 s) | **0.6 tok/s** | **0.6 tok/s** |
 
+**Two newer arches**, measured **2026-08-05** on a different build. Deliberately a separate
+table: the rows above are one dated snapshot, and quietly appending to them is how a stale
+baseline turns into a wrong delta.
+
+| model | on disk | prefill | decode | serving |
+|---|---|---|---|---|
+| **`deepseek-v4-flash`** | 144 GB | **12.5 tok/s** (41 s) | **4.8 tok/s** | not measured |
+| **`kimi-k3`** (1.5T) | 1.4 TB | **~1.1 tok/s** (~8 min) | **~0.4 tok/s** | not measured |
+
+V4 decode is n=8, range 4.67–4.93, steady-state timer at 512-token context. K3's figures are
+coarser — decode from a short-prompt run and prefill from a single 512-token rep — because a
+K3 bench rep costs ~8 minutes and it streams a 1.4 TB container against 121 GB of RAM. Treat
+K3 as "it runs and is correct", not as a tuned number.
+
 **Serve any row with one command** — `docker/run-dgx.sh -h <hf_token> -p 8080 -m nemotron`
 (or `-m m2.7` / `-m m3` / `-m glm`). See [Quick start](#quick-start-dgx-spark).
 
@@ -116,6 +130,8 @@ Registered in [`scripts/models.toml`](scripts/models.toml) — serve any by name
 | **`minimax-m3`** | — | GQA (64Q/4KV, head_dim 128, partial rope 64) | 128, top-4 | NVFP4 | gemma-norm, swigluoai, per-head QK-norm; ~229 GB |
 | **`minimax-m2.7`** | — | GQA (48Q/8KV, head_dim 128, partial rope 64) | 256, top-8 | NVFP4 | per-layer QK-norm, plain SwiGLU, no shared expert, all-MoE; ~122 GB (**fits RAM**) |
 | **`nemotron-3-super`** | 120B-A12B | **hybrid**: 88 layers = 40 Mamba2 + 40 latent-MoE + 8 GQA (NoPE, no QK-norm) | 512, top-22 | NVFP4 | the only non-transformer here — a state-space/attention hybrid. Gateless ReLU² experts in a 1024-wide latent space; ~69 GB, the fastest of the four |
+| **`deepseek-v4-flash`** | — | latent attention + **O-LoRA** output projection, 128-token sliding window, Compressor on 41/43 layers, DSA-family Indexer on 21/43 | 256, top-6 + 1 shared | **MXFP4** | **Hyper-Connections replace the residual stream** — 4 copies of the hidden state, `[b,s,4,4096]`. All-MoE. Experts are QAT-native MXFP4 and pass through convert bit-exact. 3 layers route by a `tid2eid` hash table instead of the router. ~144 GB |
+| **`kimi-k3`** | 1.5T | **hybrid**: 93 layers = 69 KDA (delta-rule linear attn) + 24 gated MLA (NoPE + output gate) | 896, top-16 (latent, 3584-wide) | **MXFP4** | no ordinary residual — attention residuals thread `prefix_sum`/`block_residual` through the stack (`forward::kimi_forward`). 2 shared experts fused as one 6144-wide MLP, `situ` activation. **Run with `COLI_O_DIRECT=1`** (1.09× prefill / 1.13× decode expert-load, tokens identical — off by default because it *loses* on GLM and the mechanism is unexplained). 1561 GB source; ~1.4 TB container |
 
 **Which one loads** is chosen by the container you point `serve` at — one model per
 process. With Docker, set `COLI_MODEL_REPO` (and `COLI_MODEL_DIR` for a local snapshot);
@@ -256,7 +272,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `HF_TOKEN` | Hugging Face token for the first download (alt. to the `hf_...` arg) | none |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
-| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): nemotron 262,144 (its own max) · M3 ~400k · GLM ~290k · M2.7 ~190k | `32768` |
+| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): nemotron 262,144 (its own max) · M3 ~400k · GLM ~290k · M2.7 ~190k · **V4 ~40k** (an implementation limit, not architectural — see the note there) | `32768` |
 | `COLI_ALLOW_LONG_CTX` | `1` → serve past the model's advertised `max_position_embeddings`. Meaningful only for a **NoPE** model like Nemotron-3-Super, which has no positional table to overflow (its 262,144 is an advisory default; the model card documents up to 1M). The RAM clamp still applies. Quality past the validated length is not guaranteed — this is a quality decision, not a memory one | off |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
@@ -299,7 +315,10 @@ NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
 
 # Which models are registered (scripts/models.toml) — serve any of them by name:
 scripts/model.py list                     # name + arch notes (abbreviated here)
+#   deepseek-v4-flash 43 layers all-MoE, 256 exp top-6 + 1 shared, MXFP4 routed;
+#                     Hyper-Connections, Compressor 41/43, DSA-family Indexer 21/43…
 #   glm-5.2           MLA + DSA lightning indexer, 256 experts top-8, NVFP4 routed…
+#   kimi-k3           Hybrid: 93 layers = 69 KDA + 24 gated MLA, 896 exp top-16, MXFP4…
 #   minimax-m2.7      GQA (48Q/8KV, head_dim 128, partial rope 64), 256 experts top-8…
 #   minimax-m3        GQA (64Q/4KV, head_dim 128, partial rope 64), 128 experts top-4…
 #   nemotron-3-super  Hybrid: 88 layers = 40 Mamba2 + 40 latent-MoE + 8 GQA…
@@ -431,6 +450,28 @@ make it *lighter* per token than GLM's latent:
 | **Nemotron-3-Super** | hybrid — only **8 of 88** layers cache KV | **24 KB** + 166 MB/seq Mamba2 state | **262,144 — its full architectural max** (measured; 6.2 GB KV) |
 | **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | ~270 KB | **~400k** (measured clamp 402,690) |
 | **GLM-5.2** | MLA (compressed), mirrored | ~350 KB | ~290k |
+| **DeepSeek-V4-Flash** | latent, mirrored, + compressed rows | **206.9 KB** (`coli capacity`) | **~40k** at an 8 GB KV budget — see below |
+
+**DeepSeek-V4's number is an implementation limit, not an architectural one, and it is the
+largest known gap in this table.** The model advertises 1M context, and ~193 KB of that
+206.9 KB/token is raw latent + rope. But V4 keeps a **128-token sliding window** — at decode
+the engine's only reader takes `[pos-127, pos]`, and rows older than that are written and
+never read again:
+
+```rust
+// forward.rs — the sole V4 latent reader
+let raw_lo = (pos_base + 1) - win.min(pos_base + 1);   // win = 128
+cache.extend_from_slice(kv.latent_rows(li, raw_lo, total));
+```
+
+`KvCache` nevertheless allocates `max_t * kv_lora` per layer — the full context. Sizing the
+raw tier to the window (as the reference implementation's ring buffer does) would leave only
+the ~13.4 KB/token of compressed rows, which are what actually give V4 context past 128
+tokens. **Caveat before anyone attempts it:** at *prefill* the same read spans the whole
+chunk, so the ring must be `max(window, chunk)`, not 128 — a real change, not a one-liner.
+
+Everything above 2,400 tokens on V4 is allocator arithmetic; that is the longest context
+actually exercised.
 | **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | ~527 KB | ~190k |
 
 **The hybrid is in a different class here.** Nemotron caches KV on 8 attention layers
@@ -473,6 +514,27 @@ What's landed to push on that wall:
   single cache miss saturates the NVMe (2.4× cold-load throughput).
 - **Recycled read buffers** (`SharedBuf` pool) — kills per-expert allocation churn
   and a hidden 18 MB copy; warm expert loads got **21.7× faster**, decode 2.6×.
+
+**Where the wall actually is now, measured rather than assumed.** Sampling `nvidia-smi` and
+`/sys/block/nvme0n1/stat` once a second through a real DeepSeek-V4 run gives, at decode:
+**~10% of the 11.6 GB/s disk ceiling, 20% GPU, ~24% of 20 CPU cores, ~15% of memory
+bandwidth.** Nothing is saturated. Decode is **latency-bound** — the per-layer chain is
+strictly serial (attn → route → expert-load → expert-FFN), and each stage idles the
+resource the previous one used. That reframes the remaining work:
+
+- **Reading *faster* is finished.** GLM prefill already runs at **81.7%** of the device
+  ceiling. Two attempts to beat it are recorded as negatives so they are not retried:
+  buffered io_uring measured ~half our threaded `pread`, and `O_DIRECT` is regime-split
+  (−18% GLM decode, but a win on K3) so it stayed an explicit flag rather than a default.
+  What remains is reading **less** — residency and coverage, i.e. more nodes.
+- **Overlap is harder than it looks.** The one dependency-free concurrency in a V4 step —
+  running the shared expert during the routed experts' disk wait — hides 100% of its cost
+  and is still a **15× loss**, because concurrent GPU work from a second thread takes an
+  illegal memory access and a sticky CUDA error drops every expert to the CPU.
+- **4-bit experts are dequant-bound, not bandwidth-bound.** `coli gpubench` puts 4-bit at
+  ~190 GB/s against int8's 400–580 on the same shapes — slower in absolute time while
+  reading half the bytes. Grouping their dispatches was built and measured **~10% slower**;
+  the wins came instead from read width and cheaper dequant.
 
 Per-module port status and the milestone order live in **[PORTING.md](PORTING.md)**.
 
@@ -600,7 +662,25 @@ fits the cache, so every step still streams ~the whole expert set. The real leve
 **RAM-resident experts across a cluster**, which lifts the whole curve; a continuous-batching
 scheduler pairs with that, not with a single node.
 
-### Expert quantization: NVFP4 (default), e4m3 opt-out
+### Expert quantization: NVFP4 (default), e4m3 opt-out, MXFP4 passthrough
+
+**A third format, for checkpoints that arrive 4-bit already.** DeepSeek-V4 and Kimi-K3 ship
+QAT-trained **MXFP4** experts (block-32 nibbles + one E8M0 power-of-two scale per block, vs
+NVFP4's block-16 with an e4m3 scale). Those are **copied through convert bit-exact** rather
+than requantized — a dequant→requantize round trip measured **6.40% rel-RMS of pure loss and
+5.9% more bytes**, i.e. strictly worse on both axes. `convert` detects them by their scale
+sidecar and takes the passthrough path automatically; nothing in the pipeline ever quantizes
+*to* MXFP4.
+
+Both 4-bit formats are **dequant-bound rather than bandwidth-bound** — `coli gpubench 1 300`
+prints a per-call table for each, and 4-bit tops out near 190 GB/s where int8 does 400–580 on
+the same shapes *while reading half the bytes*. Consequences worth knowing before optimising
+them: the levers are read width and cheaper dequant, not fewer launches (grouping dispatches
+301→43 measured ~10% **slower**). One example of how sharp that is — the E8M0 scale decode is
+re-run once per weight *byte*, and two endpoint comparisons inside it cost **14% of the whole
+kernel**.
+
+The rest of this section is the NVFP4 path, which is what the four older models use.
 
 The routed experts (97% of the weights, and what every token streams) are stored as
 **NVFP4** — 4-bit block-scaled. Resident weights (attention / dense / shared) stay 8-bit

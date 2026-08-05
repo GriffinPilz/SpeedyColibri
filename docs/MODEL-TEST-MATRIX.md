@@ -148,6 +148,44 @@ I/O-oriented work (prefetch-ahead, eviction policy, autopin, RAM sweeps) was dev
 this model, and **those conclusions are regime-specific — re-measure before assuming they hold
 for a model whose experts fit in RAM.**
 
+## DeepSeek-V4-Flash: first sound measurements (2026-08-04)
+
+Deliberately NOT a column in the Coverage grid above — most levers are untested on V4, and
+thirty TODO cells would read as coverage rather than absence.
+
+**Every V4 figure recorded before this date was measured on `seq 1000 1199`**, a synthetic
+id range that drives the model into `[368, 85]` cycling. That is the trap in "Recurring
+traps" below, and it means the old 3.4-4.1 tok/s is from a different regime and is NOT
+comparable to anything here. V4 now carries the same English prose as the other four
+(`scripts/models.toml`, 512 ids, round-trip verified).
+
+| | value | method |
+|---|---|---|
+| decode | **3.5-4.0 tok/s** (~253 ms/tok) @ 512-token ctx | NGEN 8→40 difference, ABBA, n=8 |
+| prefill + startup | 85.6 s for 512 tokens + 8 gen | wall, of which ~21 s expert preload |
+| attention core | 144 → **24 ms/tok** (6.0×); prefill 55.2 → 7.7 s (7.1×) | `COLI_PROFILE` difference |
+| container | 155 GB (`-v3`, with DSpark) / 144 GB (`-v2`) | from 167 GB fp8 source |
+
+**Decode composition after the attention kernel** — the next lever is MoE, not attention:
+
+| phase | ms/tok | share |
+|---|---|---|
+| moe | 156.7 | 65.6% |
+| — expert-load | 69.5 | 29.1% |
+| — gpu-ffn | 57.3 | 24.0% |
+| attn | 80.8 | 33.8% |
+| — core | 24.2 | 10.1% |
+| — o-proj / proj | 36.8 / 16.2 | 22.2% |
+
+`gpu-ffn` is **301 dispatches per decode token** = `43 layers × 6 routed + 43 shared`,
+i.e. one per expert, at 190 µs each. V4 takes `coli_cuda_expert_mlp_mxfp4` (one expert per
+call) where the NVFP4 path takes `coli_cuda_expert_group_nvfp4_relu2` (a group per call).
+Giving MXFP4 the same segmented parameter-space treatment is task #62; expected ~1.14×.
+
+**Precision warning for anyone re-measuring V4 decode:** decode is a small slice of total
+wall, so an NGEN difference is a difference of two large numbers. At gap 32 the extremes
+span 1.82-3.74 tok/s — nearly useless. Widen the gap before trusting a delta.
+
 ## Cross-model transfer queue
 
 **Findings established on one model that have NOT been checked on the others.** This is the

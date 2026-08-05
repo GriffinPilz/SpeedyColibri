@@ -796,9 +796,25 @@ __global__ static void nvfp4_gemv_u32(float *y,const float *x,const uint8_t *w,
  * convert bit-exact, so this is the only kernel that can read them.
  * --------------------------------------------------------------------------------- */
 
-/* Decode one OCP E8M0 byte: a bare power of two, 2^(b-127). 0xFF is NaN. */
+/* Decode one OCP E8M0 byte: a bare power of two, 2^(b-127). 0xFF is NaN.
+ *
+ * `b` IS an IEEE-754 biased exponent, so 2^(b-127) is exactly the float whose exponent
+ * field is `b` and whose mantissa is zero — one shift and a bit-reinterpret. This used to
+ * call `exp2f`, a transcendental, once per weight BYTE (the GEMVs re-decode the block
+ * scale per byte, 16x per 32-element block), and 4-bit experts are dequant-bound, so that
+ * was on the critical path. `coli gpubench 1 300` made it visible: MXFP4 ran 22% SLOWER
+ * than NVFP4 at V4's 4096x2048 expert shape while reading 6% FEWER bytes — and NVFP4's
+ * `e4m3f` decodes through the hardware FP8 conversion intrinsic.
+ *
+ * Both endpoints keep a branch because the bit trick is wrong there:
+ *   b = 0xFF -> NaN by the OCP spec, where `255 << 23` would be +inf.
+ *   b = 0    -> 2^-127, which is SUBNORMAL, where `0 << 23` would be exactly +0.0.
+ * Neither occurs in a real block scale, but silently turning a tiny scale into zero is
+ * the kind of difference that shows up as one wrong token months later. */
 __device__ __forceinline__ static float e8m0f(uint8_t b) {
-    return (b == 0xFF) ? __int_as_float(0x7fffffff) : exp2f((float)b - 127.0f);
+    if (b == 0xFF) return __int_as_float(0x7fffffff);
+    if (b == 0) return exp2f(-127.0f);
+    return __int_as_float((int)b << 23);
 }
 
 /* Single-row decode GEMV (S==1 decode): one warp per output column. */

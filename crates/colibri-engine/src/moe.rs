@@ -3358,6 +3358,7 @@ fn dsv4_group_moe() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_DSV4_GROUP_MOE").ok().as_deref() == Some("1"))
 }
 
+
 pub fn dsv4_moe<P: ExpertProvider>(
     cfg: &Config,
     l: &Layer,
@@ -3425,12 +3426,32 @@ pub fn dsv4_moe<P: ExpertProvider>(
     }
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
     let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+
     let partial = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, x, s_len, d)?;
     for (o, p) in out.iter_mut().zip(partial.iter()) {
         *o += *p;
     }
 
     // Shared expert (weight 1.0, every position), same SwiGLU triple as the routed ones.
+    //
+    // MEASURED NEGATIVE — do not "overlap" this with the routed experts. It is the one
+    // concurrency in a V4 step that needs no prediction (it reads only `x`, nothing from
+    // the router), which makes it perpetually tempting: `compute_experts_partial` opens
+    // with a disk→RAM prefetch that holds no GPU state, so running the shared expert on
+    // its own thread beside it looks free. Tried 2026-08-05 (512-token prompt, NGEN 16):
+    //
+    //   - it works, completely: `shared 3552 ms | unhidden 3 ms` — 100% hidden.
+    //   - it is still a 15x LOSS: 4.16 -> 0.27 tok/s. Concurrent GPU work from a second
+    //     thread takes an illegal memory access, and a CUDA context error is sticky, so
+    //     the process re-inits the backend in a loop ("[CUDA] stream creation: an illegal
+    //     memory access was encountered") and every expert silently falls back to the CPU.
+    //     `scratch_mu` serializes the expert ENTRY points; something outside them is not
+    //     thread-safe, and this is the same family as the CUDA suite needing
+    //     `--test-threads=1`.
+    //   - and the prize is small either way: `shared` is 661 ms of a 36.4 s run — 1.8% of
+    //     total wall, and that is the CEILING, since the overlap can hide at most all of it.
+    //
+    // 1.8% is not worth making the device-context path thread-safe for all five models.
     if cfg.n_shared > 0 {
         let _st = std::time::Instant::now();
         let mut sh = vec![0f32; s_len * d];

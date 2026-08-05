@@ -290,12 +290,19 @@ fn m3_container_name(name: &str) -> Option<String> {
 ///   until the MTP path is actually built (cf. the K3/Nemotron MTP work).
 /// - `hc_*` is NOT dropped — it is load-bearing (see [`Arch::DeepseekV4`]), and a container
 ///   without it cannot reproduce the model at all.
-fn deepseek_v4_container_name(name: &str) -> Option<String> {
-    // MTP subtree: dropped for now, see above. Checked first because `mtp.0.ffn.experts.…`
-    // would otherwise be rewritten by the expert rules below and land in the container as
-    // if it were a real layer.
-    if name.starts_with("mtp.") {
-        return None;
+fn deepseek_v4_container_name(name: &str, n_layers: usize) -> Option<String> {
+    // DSpark / MTP subtree. The reference calls these "DSpark stages stored under the
+    // `mtp.*` checkpoint namespace" — `stage_id = layer_id - n_layers` — so they are
+    // remapped onto `model.layers.{n_layers .. n_layers+n_mtp_layers}` exactly as
+    // Nemotron's head is. That puts them in range of `classify_head`'s MTP window, so the
+    // expert rules (and the MXFP4 passthrough) apply to their 256-expert pools for free.
+    //
+    // Checked FIRST because `mtp.0.ffn.experts.…` would otherwise be rewritten by the
+    // expert rules below and land in the container as if it were a real layer.
+    if let Some(rest) = name.strip_prefix("mtp.") {
+        let (stage, tail) = rest.split_once('.')?;
+        let stage: usize = stage.parse().ok()?;
+        return Some(format!("model.layers.{}.{}", n_layers + stage, v4_tail(tail)));
     }
     // `ffn.gate.tid2eid` is an I64 [vocab, top_k] token-id -> expert-id table on the three
     // hash-routing layers (`num_hash_layers`). It is now KEPT, and stored as F32: the
@@ -325,7 +332,16 @@ fn deepseek_v4_container_name(name: &str) -> Option<String> {
     let rest = n.strip_prefix("layers.")?;
     let (layer, tail) = rest.split_once('.')?;
     layer.parse::<u32>().ok()?;
-    let t = tail
+    Some(format!("model.layers.{layer}.{}", v4_tail(tail)))
+}
+
+/// The per-layer tail rewrite, shared by the main layers and the DSpark stages — they are
+/// the same block shape, so a rule that applied to one and not the other would be a bug.
+/// DSpark's extra tensors (`main_proj`, `main_norm`, `markov_head.*`, `confidence_head.*`,
+/// `norm`, `hc_head_*`) match nothing here and pass through unchanged, which is what the
+/// loader expects.
+fn v4_tail(tail: &str) -> String {
+    tail
         // Attention. `wq_a`/`wq_b` are the Q LoRA pair, `wo_a`/`wo_b` the O LoRA pair that
         // V3 had no equivalent for, and `wkv` the single latent that serves as both K and V.
         .replace("attn.wq_a.", "self_attn.q_a_proj.")
@@ -347,8 +363,7 @@ fn deepseek_v4_container_name(name: &str) -> Option<String> {
         .replace("ffn.gate.", "mlp.gate.")
         .replace(".w1.", ".gate_proj.")
         .replace(".w3.", ".up_proj.")
-        .replace(".w2.", ".down_proj.");
-    Some(format!("model.layers.{layer}.{t}"))
+        .replace(".w2.", ".down_proj.")
 }
 
 fn kimi_container_name(name: &str) -> Option<String> {
@@ -526,6 +541,11 @@ fn classify_head(
     // DeepSeek-V4's token-id -> expert-id table. F32 because its values are small exact
     // integers; see the mapper for why it is not given an integer tensor path.
     if name.ends_with("mlp.gate.tid2eid") {
+        return Kind::F32;
+    }
+    // DSpark's confidence head is `[1, dim + markov_rank]` — a single row. Quantising it
+    // buys nothing and costs a scale per row of one.
+    if name.ends_with("confidence_head.proj.weight") {
         return Kind::F32;
     }
     if name.ends_with("norm.weight") || name == "model.norm.weight" {
@@ -1761,10 +1781,17 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             _ => return Ok(TensorOut::Skip),
         }
     } else if opts.deepseek_v4 {
-        // Every layer is MoE and the MTP head is dropped by name, so the plain `n_layers`
-        // ceiling applies (as in the M3/K3 branches).
-        match deepseek_v4_container_name(name) {
-            Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
+        // The DSpark/MTP stages are KEPT and remapped into
+        // `model.layers.{n_layers..n_layers+mtp_layers}`, so the ceiling has to include
+        // them or the head is silently discarded — the same trap the Nemotron branch
+        // documents below.
+        match deepseek_v4_container_name(name, opts.n_layers) {
+            Some(n)
+                if layer_idx(&n) < 0
+                    || (layer_idx(&n) as usize) < opts.n_layers + opts.mtp_layers =>
+            {
+                n
+            }
             _ => return Ok(TensorOut::Skip),
         }
     } else if opts.kimi {
@@ -1922,6 +1949,36 @@ pub fn convert_snapshot(
 
     let shards = Shards::open(indir)?;
     let nfiles = shards.num_files();
+
+    // DeepSeek-V4: PROBE the number of DSpark stages instead of believing the config.
+    //
+    // The released `config.json` says `num_nextn_predict_layers = 1` and
+    // `mtp_num_hidden_layers = 1`, but the checkpoint ships THREE stages (`mtp.0/1/2`,
+    // 768 = 3 x 256 experts) and the reference's own `inference/config.json` says
+    // `n_mtp_layers: 3`. Deriving the count from the config drops two stages of three,
+    // silently — the container still converts, still loads, and is simply missing most of
+    // the head. Counting the `mtp.<n>.` prefixes that actually exist cannot be wrong.
+    let mut opts = opts;
+    if opts.deepseek_v4 {
+        let stages = shards
+            .tensors()
+            .iter()
+            .filter_map(|t| t.name.strip_prefix("mtp."))
+            .filter_map(|r| r.split_once('.'))
+            .filter_map(|(n, _)| n.parse::<usize>().ok())
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        if stages > 0 && stages != opts.mtp_layers {
+            eprintln!(
+                "[convert] DSpark: checkpoint has {stages} stages, config implied {} — \
+                 using {stages}",
+                opts.mtp_layers
+            );
+            opts.mtp_layers = stages;
+        }
+    }
+    let opts = opts;
 
     // Group tensor names by their source shard so we stream one input file at a
     // time (bounds peak RAM to roughly one shard's worth of output).
@@ -3236,7 +3293,7 @@ mod tests {
     /// name silently keeps whichever is written last — so it is asserted here too.
     #[test]
     fn deepseek_v4_name_mapping() {
-        let m = |s: &str| deepseek_v4_container_name(s);
+        let m = |s: &str| deepseek_v4_container_name(s, 43);
         // Top-level renames.
         assert_eq!(m("embed.weight").as_deref(), Some("model.embed_tokens.weight"));
         assert_eq!(m("head.weight").as_deref(), Some("lm_head.weight"));
@@ -3265,11 +3322,25 @@ mod tests {
                    Some("model.layers.2.self_attn.compressor.wkv.weight"));
         assert_eq!(m("layers.2.attn.indexer.weights_proj.weight").as_deref(),
                    Some("model.layers.2.self_attn.indexer.weights_proj.weight"));
-        // MTP is dropped wholesale — a half-converted MTP head would look capable and
-        // not be. Its experts must NOT be rewritten into real layers.
-        assert!(m("mtp.0.attn.wq_a.weight").is_none());
-        assert!(m("mtp.0.ffn.experts.5.w1.weight").is_none());
-        assert!(m("mtp.0.markov_head.markov_w1.weight").is_none());
+        // DSpark stages land at layers n_layers.. — `stage_id = layer_id - n_layers` in
+        // the reference — and share the main block's tail rules, so their 256-expert pools
+        // pick up the MXFP4 passthrough for free.
+        assert_eq!(m("mtp.0.attn.wq_a.weight").as_deref(),
+                   Some("model.layers.43.self_attn.q_a_proj.weight"));
+        assert_eq!(m("mtp.1.ffn.experts.5.w1.weight").as_deref(),
+                   Some("model.layers.44.mlp.experts.5.gate_proj.weight"));
+        assert_eq!(m("mtp.2.ffn_norm.weight").as_deref(),
+                   Some("model.layers.45.post_attention_layernorm.weight"));
+        // DSpark's own tensors have no analogue in a main layer and pass through unchanged.
+        assert_eq!(m("mtp.2.markov_head.markov_w1.weight").as_deref(),
+                   Some("model.layers.45.markov_head.markov_w1.weight"));
+        assert_eq!(m("mtp.0.main_proj.weight").as_deref(),
+                   Some("model.layers.43.main_proj.weight"));
+        assert_eq!(m("mtp.2.confidence_head.proj.weight").as_deref(),
+                   Some("model.layers.45.confidence_head.proj.weight"));
+        // The confidence head is a single row; quantising it would be silly.
+        assert_eq!(classify_head("model.layers.45.confidence_head.proj.weight", 43, false, false, 3),
+                   Kind::F32);
         // The I64 index table is KEPT, mapped like any other gate tensor and stored as
         // F32 (its values are expert IDs, exact in f32). It is what the three hash-routing
         // layers select with; dropping it left them choosing experts by score instead.

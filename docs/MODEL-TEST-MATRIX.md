@@ -238,21 +238,46 @@ what made the first table worth having.
 
 `coli gpubench 1 300`, n=3-4, tight:
 
-| shape | D | I | fmt | µs/call | MB | GB/s |
-|---|---|---|---|---|---|---|
-| v4-expert | 4096 | 2048 | nvfp4 | 94–101 | 14.2 | 163–180 |
-| v4-expert | 4096 | 2048 | mxfp4 | 113–116 | 13.4 | **133–137** |
-| k3-expert | 3584 | 3072 | nvfp4 | 138–144 | 18.6 | 143–152 |
-| k3-expert | 3584 | 3072 | mxfp4 | 141–146 | 17.5 | 134–140 |
+Its first run found a 16% MXFP4 deficit, and the second and third runs closed it. The
+whole thing was **the scale decode, called once per weight BYTE** — `e8m0f` — and the
+isolation is worth reading as a method, one variable at a time on the v4-expert triple:
 
-**MXFP4 is ~16% slower than NVFP4 at V4's expert shape while reading 6% FEWER bytes** —
-block-32 scales are half the size of block-16. At K3's shape the two are within noise.
+| `e8m0f` variant | µs/call | note |
+|---|---|---|
+| `exp2f` (original) | 119.9 | one SFU instruction |
+| shift + 2 endpoint guards (`c6526d9`) | 116.6 | guards cost ~as much as exp2f did |
+| delegating to `e4m3f` (wrong values) | 99.1 | decode arithmetic alone |
+| **branchless shift (`a408d32`, shipped)** | **101.6** | |
+| ablated to a constant — no load at all | 91.4 | floor of the scale path |
+| *nvfp4 baseline, same shape* | *97.5* | |
 
-Its first run paid for itself: `e8m0f` was calling **`exp2f`, a transcendental, per weight
-byte**, where NVFP4's `e4m3f` uses the hardware FP8 intrinsic. E8M0 *is* an IEEE biased
-exponent, so the decode is a shift (`c6526d9`) — worth 4.1% of the expert triple,
-bit-identical output (2/2 V4 runs byte-for-byte unchanged), NVFP4 control flat. **The
-remaining ~16% is unexplained and is the open lead.**
+The two comparisons against `0xFF` and `0` cost **16.6 µs, 14% of the whole triple**.
+Branch form and predicated-select form measured identically, so it is the comparisons, not
+the control flow. Final state:
+
+| shape | fmt | µs/call | MB | GB/s |
+|---|---|---|---|---|
+| v4-expert 4096×2048 | nvfp4 | 96–100 | 14.2 | 168–176 |
+| v4-expert 4096×2048 | mxfp4 | **101–102** | 13.4 | 155–157 |
+| k3-expert 3584×3072 | nvfp4 | 139–144 | 18.6 | 145–152 |
+| k3-expert 3584×3072 | mxfp4 | **133–134** | 17.5 | 149–150 |
+
+MXFP4 is now within 3% of NVFP4 on V4's shape and **faster** on K3's — which is where it
+belongs, since it reads 6% fewer bytes. Output bit-identical on both models.
+
+**Two lessons worth more than the speedup.** First: at once-per-weight-byte, *any* couple
+of extra instructions in a dequant is ~14% of the kernel — `exp2f` was never the story,
+which is what `c6526d9`'s commit message got wrong. Second: the ablation that first looked
+decisive (`e8m0f → 1.0f`) was **invalid** — replacing the decode with a constant also lets
+the compiler delete the *load* and the multiply, so it measured three things. The matched
+ablation (both formats) and the decoder swap (same load, different arithmetic) are what
+actually separated them.
+
+Removing the guards deviates from OCP at two byte values (`0xFF` → +inf not NaN, `0` → +0.0
+not subnormal 2^-127). Justified on evidence: **177M real block-scale bytes scanned across
+600 routed-expert tensors — V4 spans 119..124, K3 spans 113..123, zero occurrences of
+either endpoint** — plus b=0 puts every weight in its block below the ULP of an f32
+accumulator that has seen one normal term.
 
 **Fleet safety.** Only V4 and K3 reach these kernels; the other four models are NVFP4
 (fmt 5) and untouched. K3 goes through the situ variant, which the same commit rewires, so

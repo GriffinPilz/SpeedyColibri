@@ -226,6 +226,34 @@ mxfp4_expert_ffn_gpu_matches_cpu_at_every_s` against `matmul_qt`, at S = 1/4/16/
 at two shapes — 320×160 as well as 128×64, since K=128 runs the KT tile loop exactly once
 and proves nothing about the multi-tile accumulation every real expert does.
 
+### MXFP4 is now microbenchmarkable — and it is slower than NVFP4 (`7ec0ec6`, `c6526d9`)
+
+`coli gpubench` built nvfp4 and int8 rows only, so MXFP4 — the format V4 and K3 use for
+*every* routed expert — could not be measured except through a ~7-minute model run. It
+cannot join the matmul table (fmt 6 is expert-only; there is no dense
+`coli_cuda_matmul_mxfp4`, and adding one purely to feed a benchmark would ship a path
+nothing calls), so `gpubench` now prints a **second table sweeping the fused expert triple
+for both 4-bit formats**. One format alone answers nothing; the cross-format comparison is
+what made the first table worth having.
+
+`coli gpubench 1 300`, n=3-4, tight:
+
+| shape | D | I | fmt | µs/call | MB | GB/s |
+|---|---|---|---|---|---|---|
+| v4-expert | 4096 | 2048 | nvfp4 | 94–101 | 14.2 | 163–180 |
+| v4-expert | 4096 | 2048 | mxfp4 | 113–116 | 13.4 | **133–137** |
+| k3-expert | 3584 | 3072 | nvfp4 | 138–144 | 18.6 | 143–152 |
+| k3-expert | 3584 | 3072 | mxfp4 | 141–146 | 17.5 | 134–140 |
+
+**MXFP4 is ~16% slower than NVFP4 at V4's expert shape while reading 6% FEWER bytes** —
+block-32 scales are half the size of block-16. At K3's shape the two are within noise.
+
+Its first run paid for itself: `e8m0f` was calling **`exp2f`, a transcendental, per weight
+byte**, where NVFP4's `e4m3f` uses the hardware FP8 intrinsic. E8M0 *is* an IEEE biased
+exponent, so the decode is a shift (`c6526d9`) — worth 4.1% of the expert triple,
+bit-identical output (2/2 V4 runs byte-for-byte unchanged), NVFP4 control flat. **The
+remaining ~16% is unexplained and is the open lead.**
+
 **Fleet safety.** Only V4 and K3 reach these kernels; the other four models are NVFP4
 (fmt 5) and untouched. K3 goes through the situ variant, which the same commit rewires, so
 it was re-run end to end (16-token prompt, 3 gen, both GEMV modes): **tokens identical

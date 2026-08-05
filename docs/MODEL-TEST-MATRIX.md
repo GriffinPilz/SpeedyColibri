@@ -161,12 +161,15 @@ comparable to anything here. V4 now carries the same English prose as the other 
 
 | | value | method |
 |---|---|---|
-| decode | **3.5-4.0 tok/s** (~253 ms/tok) @ 512-token ctx | NGEN 8→40 difference, ABBA, n=8 |
-| prefill + startup | 85.6 s for 512 tokens + 8 gen | wall, of which ~21 s expert preload |
+| decode | **4.8 tok/s** (~205 ms/tok) @ 512-token ctx, 2026-08-05 | steady-state timer, n=8 (4.67-4.93) |
+| — was | 3.5-4.0 tok/s (~253 ms/tok), 2026-08-04 | before the MXFP4 kernel work below |
+| prefill phase | **~41 s** for 512 tokens | `prefill N tok:` timer, n=8 |
+| prefill + startup | 85.6 s for 512 tokens + 8 gen — **2026-08-04, STALE** | wall, of which ~21 s expert preload |
 | attention core | 144 → **24 ms/tok** (6.0×); prefill 55.2 → 7.7 s (7.1×) | `COLI_PROFILE` difference |
 | container | 155 GB (`-v3`, with DSpark) / 144 GB (`-v2`) | from 167 GB fp8 source |
 
-**Decode composition after the attention kernel** — the next lever is MoE, not attention:
+**Decode composition — 2026-08-04, PREDATES the MXFP4 kernel work and no longer sums.**
+Kept because the *shares* still say where to look, not because the numbers are current:
 
 | phase | ms/tok | share |
 |---|---|---|
@@ -176,6 +179,15 @@ comparable to anything here. V4 now carries the same English prose as the other 
 | attn | 80.8 | 33.8% |
 | — core | 24.2 | 10.1% |
 | — o-proj / proj | 36.8 / 16.2 | 22.2% |
+
+**It could not be refreshed, and that is itself the finding.** An NGEN 1→16 difference on the
+current binary puts `moe` at 177.5 ms/forward and `attn` at ~60 — but the step is now ~205
+ms/tok, so those sum to more than the whole step. The differences are of two large,
+prefill-dominated totals: `attn` came out **negative in 2 of 4 pairs**. At a 512-token
+context the prefill term swamps 15 decode forwards, so **per-phase decode composition is
+not recoverable by NGEN differencing here** — only `moe`/`gpu-ffn` are well enough
+determined to compare across arms. Use a much wider NGEN gap, or a decode-only counter,
+before quoting a composition again.
 
 `gpu-ffn` is **301 dispatches per decode token** = `43 layers × 6 routed + 43 shared`,
 i.e. one per expert, at 190 µs each. V4 takes `coli_cuda_expert_mlp_mxfp4` (one expert per
@@ -278,6 +290,22 @@ not subnormal 2^-127). Justified on evidence: **177M real block-scale bytes scan
 600 routed-expert tensors — V4 spans 119..124, K3 spans 113..123, zero occurrences of
 either endpoint** — plus b=0 puts every weight in its block below the ULP of an f32
 accumulator that has seen one normal term.
+
+**End-to-end, it is smaller than the microbenchmark and partly unresolved.** Two binaries
+from the same tree differing only in `e8m0f`, ABBA-interleaved, n=4 per arm, V4 512-token
+prompt at NGEN 16:
+
+| metric | guards | branchless | |
+|---|---|---|---|
+| `gpu-ffn` (ms, cumulative) | 7397–7699 | 6960–7159 | **−6.9%, ranges disjoint** |
+| `moe` (ms) | 17634–18191 | 16770–17517 | **−4.9%, ranges disjoint** |
+| decode tok/s | 4.67–4.85 | 4.82–4.93 | +2.1%, **ranges OVERLAP** |
+| prefill (ms) | 41324–42245 | 40227–41366 | −2.2%, overlap |
+
+So: 13% on the isolated triple → 6.9% on cumulative `gpu-ffn` → **~2% on decode, which n=4
+cannot separate from noise.** Quote the kernel number as a kernel number. All 8 runs across
+both arms emitted one identical token sequence, which is the strongest form of the
+exactness claim — old and new are byte-for-byte the same model.
 
 **Fleet safety.** Only V4 and K3 reach these kernels; the other four models are NVFP4
 (fmt 5) and untouched. K3 goes through the situ variant, which the same commit rewires, so

@@ -796,24 +796,44 @@ __global__ static void nvfp4_gemv_u32(float *y,const float *x,const uint8_t *w,
  * convert bit-exact, so this is the only kernel that can read them.
  * --------------------------------------------------------------------------------- */
 
-/* Decode one OCP E8M0 byte: a bare power of two, 2^(b-127). 0xFF is NaN.
+/* Decode one OCP E8M0 byte: a bare power of two, 2^(b-127).
  *
  * `b` IS an IEEE-754 biased exponent, so 2^(b-127) is exactly the float whose exponent
- * field is `b` and whose mantissa is zero — one shift and a bit-reinterpret. This used to
- * call `exp2f`, a transcendental, once per weight BYTE (the GEMVs re-decode the block
- * scale per byte, 16x per 32-element block), and 4-bit experts are dequant-bound, so that
- * was on the critical path. `coli gpubench 1 300` made it visible: MXFP4 ran 22% SLOWER
- * than NVFP4 at V4's 4096x2048 expert shape while reading 6% FEWER bytes — and NVFP4's
- * `e4m3f` decodes through the hardware FP8 conversion intrinsic.
+ * field is `b` and whose mantissa is zero — one shift and a bit-reinterpret, and exact
+ * for every b in 1..254.
  *
- * Both endpoints keep a branch because the bit trick is wrong there:
- *   b = 0xFF -> NaN by the OCP spec, where `255 << 23` would be +inf.
- *   b = 0    -> 2^-127, which is SUBNORMAL, where `0 << 23` would be exactly +0.0.
- * Neither occurs in a real block scale, but silently turning a tiny scale into zero is
- * the kind of difference that shows up as one wrong token months later. */
+ * DELIBERATELY UNGUARDED at the two endpoints, which is a real (if unreachable)
+ * deviation from the OCP spec:
+ *   b = 0xFF -> +inf here, NaN per spec.
+ *   b = 0    -> +0.0 here, 2^-127 (a SUBNORMAL) per spec.
+ *
+ * The guards cost more than everything else in the decode put together. `coli gpubench
+ * 1 300` on the v4-expert triple (4096x2048), mode 2, isolating one thing at a time:
+ *
+ *   e8m0f with both endpoint guards        116.6 us      <- was the shipped form
+ *   ... delegating to e4m3f (wrong values)  99.1
+ *   ... branchless shift, no guards        100.0         <- this
+ *   ... ablated to a constant (no load)     91.4
+ *   nvfp4 baseline, same shape              97.5
+ *
+ * So the two comparisons cost 16.6 us — 14% of the whole triple — and removing them puts
+ * MXFP4 at parity with NVFP4, which is where it should be given it reads 6% FEWER bytes.
+ * (Branch form vs predicated-select form measured identically, so it is the comparisons,
+ * not the control flow.) This is the entire MXFP4-vs-NVFP4 gap; nothing else moved it.
+ *
+ * Safe because neither value occurs, and could not matter if it did:
+ *   - Scanned 177M real block-scale bytes — 600 routed-expert tensors sampled across
+ *     DeepSeek-V4 (range 119..124, 6 distinct values) and Kimi-K3 (113..123, 11 values).
+ *     ZERO b=0 and ZERO b=255 in either.
+ *   - b=0 means every weight in that block is at most 6*2^-127 ~ 3.5e-38, which is below
+ *     the ULP of an f32 accumulator that has seen a single normal-magnitude term. It
+ *     cannot change a dot product it participates in.
+ *   - b=255 is NaN, i.e. a corrupt checkpoint; +inf destroys the output just as loudly.
+ *
+ * `colibri_core::f8e8m0_to_f32` (the CPU reference) stays exact, so
+ * `gpu::tests::mxfp4_expert_ffn_gpu_matches_cpu_at_every_s` would catch a divergence if a
+ * checkpoint ever did carry those bytes. */
 __device__ __forceinline__ static float e8m0f(uint8_t b) {
-    if (b == 0xFF) return __int_as_float(0x7fffffff);
-    if (b == 0) return exp2f(-127.0f);
     return __int_as_float((int)b << 23);
 }
 

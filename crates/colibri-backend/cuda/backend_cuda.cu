@@ -1218,9 +1218,16 @@ __global__ static void mxfp4_wsmm(float *y,const float *x,const uint8_t *w,
  *
  * `COLI_MXFP4_WSMM=0` forces every call to decline, i.e. restores the pre-port WMMA path.
  * The NVFP4 twin deliberately has no such knob — S is the only thing that should decide,
- * and an override can only disagree with the shape actually being computed. This one
- * exists because the WMMA path is otherwise unreachable at these S, so there would be no
- * way to A/B the port against what it replaced. Do not use it to tune. */
+ * and an override can only disagree with the shape actually being computed. **This is NOT
+ * a tuning knob and must not be used as one**; it exists because the WMMA path is otherwise
+ * unreachable at these S, so without it there is no way to A/B this kernel against what it
+ * replaced.
+ *
+ * It stays now the port is measured (1.19x, `97e8b86`), rather than being removed as that
+ * commit implied. Reason, learned the hard way one commit later: `e8m0f` had no equivalent
+ * knob, so A/B-ing it meant hand-patching the source, building a second binary, and
+ * keeping the two straight — slower and easier to get wrong than `COLI_MXFP4_WSMM=0`.
+ * Same standing as `COLI_NVFP4_GEMV`'s modes, which are kept for exactly this. */
 static bool mxfp4_wsmm_launch(float *y,const float *x,const uint8_t *w,const uint8_t *bs,
         float g,int M,int K,int N,cudaStream_t s){
     static int s_on=-1;

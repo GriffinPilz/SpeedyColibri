@@ -196,6 +196,36 @@ below.
 wall, so an NGEN difference is a difference of two large numbers. At gap 32 the extremes
 span 1.82-3.74 tok/s — nearly useless. Widen the gap before trusting a delta.
 
+### MXFP4 kernels: both NVFP4 wins had been left one format over (`97e8b86`, 2026-08-05)
+
+`nvfp4_gemv_dispatch` exists so that a read-pattern change reaches every fmt-5 call site;
+`nvfp4_wsmm` fixed the re-dequantize-once-per-16-row-m-tile problem for fmt 5. Neither had
+a fmt-6 twin, so MXFP4 — the format V4 and K3 use for **every routed expert** — kept the
+original narrow GEMV (lanes 2j and 2j+1 loading the same byte, 16 B/warp) and the WMMA
+tile. Same closed-set dispatch trap, one arm short.
+
+ABBA-interleaved, n=4 per arm, 512-token prompt, container `-v2`:
+
+| change | arm | measured | effect |
+|---|---|---|---|
+| decode GEMV (`COLI_MXFP4_GEMV` 0→2) | narrow | 4.27 / 4.30 / 4.25 / 4.22 tok/s | — |
+| | byte-per-lane | 4.49 / 4.55 / 4.59 / 4.59 tok/s | **+6.9%** |
+| prefill WSMM (`COLI_MXFP4_WSMM` 0→1) | WMMA | gpu-ffn 8030-8554 ms | — |
+| | weight-stationary | gpu-ffn 6793-7102 ms | **1.19×** |
+
+Ranges do not overlap in either arm. WSMM moves prefill *wall* only −3.0%, because gpu-ffn
+is ~19% of V4 prefill where the 1.24× NVFP4 precedent had it at 62% of M2.7's — the kernel
+win transferred; the Amdahl share did not.
+
+**These kernels sum in a different order, so cross-kernel token identity is the wrong
+gate.** Tokens are identical across all 4 runs *within* each arm (both kernels
+deterministic — the dispatcher defaults to byte-per-lane rather than the uint32 mode, whose
+per-call selection reads the weight pointer and so varies with pooled buffer addresses),
+and differ *between* arms, as they must. Correctness is `gpu::tests::
+mxfp4_expert_ffn_gpu_matches_cpu_at_every_s` against `matmul_qt`, at S = 1/4/16/32/33 and
+at two shapes — 320×160 as well as 128×64, since K=128 runs the KT tile loop exactly once
+and proves nothing about the multi-tile accumulation every real expert does.
+
 ## Cross-model transfer queue
 
 **Findings established on one model that have NOT been checked on the others.** This is the

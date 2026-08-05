@@ -931,7 +931,12 @@ fn quantize_e4m3(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, OutTe
 /// Nearest e2m1 code (0..15, bit 3 = sign) for `t`. Mirrors [`e2m1_round`] but returns
 /// the packed nibble instead of the value; ties resolve to the first (even) magnitude,
 /// matching `e2m1_round`/the CUDA LUT decode.
-fn e2m1_code(t: f32) -> u8 {
+///
+/// `pub(crate)` for `gpubench::quantize_mxfp4`, which must not encode nibbles in a way the
+/// CUDA kernels do not decode — the benchmark would then be timing a kernel on data no
+/// real container can contain. Same reason `mxfp4_scale_name` is shared by the MXFP4
+/// detector and emitter: the two halves of a format must not be able to disagree.
+pub(crate) fn e2m1_code(t: f32) -> u8 {
     let a = t.abs();
     let mut best = 0usize;
     let mut bd = f32::INFINITY;

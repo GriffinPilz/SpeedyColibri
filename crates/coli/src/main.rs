@@ -1958,6 +1958,10 @@ fn cmd_repack(args: &[String]) -> ExitCode {
 /// blocking HtoD copy, a launch, a DtoH copy and a stream sync. The sweep includes a
 /// deliberately tiny shape whose arithmetic is negligible, so its time IS the fixed
 /// per-call floor and every real shape can be reported against it.
+///
+/// Prints two tables. The second sweeps the fused routed-expert FFN for nvfp4 AND mxfp4,
+/// which is the only way to measure MXFP4 at all — fmt 6 is expert-only, so it has no
+/// dense matmul the first table could call.
 #[cfg(feature = "cuda")]
 fn cmd_gpubench(args: &[String]) -> ExitCode {
     let s: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -1967,6 +1971,7 @@ fn cmd_gpubench(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     colibri_engine::gpubench::report(s, reps);
+    colibri_engine::gpubench::report_experts(s, reps);
     ExitCode::SUCCESS
 }
 

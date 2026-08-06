@@ -164,8 +164,11 @@ See PORTING.md for the C->Rust port status."#
 /// again at allocation would double-count. Unifying the two (admission converting its
 /// reservation instead of adding a second charge) is a real refactor of serve's admission
 /// path and is not attempted here.
-fn charge_gen_kv(model: &colibri_engine::Model, max_t: usize) {
-    let bytes = colibri_engine::KvCache::bytes_for(&model.cfg, max_t) as u64;
+/// `n_prompt`/`n_new` rather than a single total: on DeepSeek-V4 the raw KV is a ring, so
+/// generated tokens add no raw rows and charging them would take the difference straight
+/// out of the expert cache's budget.
+fn charge_gen_kv(model: &colibri_engine::Model, n_prompt: usize, n_new: usize) {
+    let bytes = colibri_engine::KvCache::bytes_for_split(&model.cfg, n_prompt, n_new) as u64;
     colibri_engine::ram::set_usage(colibri_engine::ram::Class::Kv, bytes);
 }
 
@@ -805,7 +808,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     // 1 on GLM/M3, 2 on Nemotron-H's `"*E"` head); hand-rolling
     // `KvCache::new(n_layers, ..)` would under-allocate on an MTP model.
     let mut kv = colibri_engine::KvCache::for_model(model, prompt.len() + n_new);
-    charge_gen_kv(model, prompt.len() + n_new);
+    charge_gen_kv(model, prompt.len(), n_new);
     match colibri_engine::generate_greedy(model, &mut kv, &*provider, &prompt, n_new) {
         Ok(seq) => {
             let cont: Vec<i32> = seq[prompt.len()..].to_vec();
@@ -1381,7 +1384,7 @@ fn finish_gen(
     n_new: usize,
 ) -> ExitCode {
     let mut kv = colibri_engine::KvCache::for_model(&model, prompt.len() + n_new);
-    charge_gen_kv(&model, prompt.len() + n_new);
+    charge_gen_kv(&model, prompt.len(), n_new);
     match colibri_engine::generate_greedy(model, &mut kv, provider, prompt, n_new) {
         Ok(seq) => {
             println!("prompt: {prompt:?}");

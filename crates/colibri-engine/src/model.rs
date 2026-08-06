@@ -368,6 +368,25 @@ pub struct KvCache {
     /// per-KDA-layer delta-rule association matrix, each `[n_heads, head_dim, head_dim]`.
     kda_state: Vec<Vec<f32>>,
 
+    /// Raw-KV **ring width**: when non-zero, `latent` and `k_rot` hold exactly this many
+    /// physical rows and absolute position `p` lives at `p % ring`. `0` means "no ring" —
+    /// row `p` is at index `p`, which is what every arch except DeepSeek-V4 does.
+    ///
+    /// V4's raw KV *is* a ring by construction: a query at `p` can only reach back
+    /// `sliding_window` positions, and everything older is reachable solely through the
+    /// Compressor. Retaining raw rows past that window is dead storage, and it was the
+    /// term that made context cost 206.9 KB/token instead of the 13.4 KB the compressed
+    /// rows actually need.
+    ///
+    /// Sized by [`KvCache::ring_ensure`] from the widest span a call will read, and never
+    /// shrunk: every live row's address is `p % ring`, so changing `ring` re-homes all of
+    /// them (which `ring_ensure` does explicitly, rather than leaving the mapping stale).
+    ring: usize,
+    /// Highest absolute position + 1 ever written to a ringed row. Only maintained while
+    /// `ring != 0`; it is what tells [`KvCache::ring_ensure`] which rows are still live
+    /// and therefore have to be carried across a resize.
+    ring_hi: usize,
+
     /// first valid position per layer (MTP partial caches start mid-sequence)
     pub kv_start: Vec<usize>,
     /// device-side KV shadow (persistent-KV GPU decode path); lazily allocated
@@ -394,6 +413,17 @@ pub const KV_UNSET: usize = usize::MAX;
 #[inline]
 fn lazy_zeros(n_rows: usize, len: usize) -> Vec<Vec<f32>> {
     (0..n_rows).map(|_| vec![0.0f32; len]).collect()
+}
+
+/// Physical row index of absolute position `pos` in a raw-KV buffer of `ring` rows;
+/// `ring == 0` means "not a ring", so the position indexes itself.
+///
+/// Free-standing because [`KvCache::ring_ensure`] has to apply it for TWO widths at once
+/// (old and new) while resizing, and a second copy of this rule living there is exactly
+/// how a resize ends up disagreeing with every read that follows it.
+#[inline]
+fn ring_slot(pos: usize, ring: usize) -> usize {
+    if ring == 0 { pos } else { pos % ring }
 }
 
 impl KvCache {
@@ -432,6 +462,8 @@ impl KvCache {
             mamba_conv_dim: 0,
             kda_conv: vec![Vec::new(); n_rows],
             kda_state: vec![Vec::new(); n_rows],
+            ring: 0,
+            ring_hi: 0,
             kv_start: vec![0; n_rows],
             #[cfg(feature = "cuda")]
             dev: None,
@@ -631,7 +663,27 @@ impl KvCache {
     /// the interim fix doubled the *whole* host figure, over-counting GQA ~2×; and the
     /// hybrid case charged all 88 Nemotron layers while omitting its `k_full`/`v_full`
     /// (a net ~3.7× over-count). Excludes [`KvCache::fixed_bytes`], which is per-sequence.
+    /// **Worst case, and deliberately so.** It is the cost of a sequence that is all
+    /// prompt. On a ringed arch (DeepSeek-V4) the raw rows stop accumulating at the ring
+    /// width, so a sequence that GENERATES most of its tokens costs far less — but the
+    /// consumers of this figure (`context_in_kv_budget`, serve's `ctx` planning) ask "how
+    /// long a context fits", and the honest answer to that is the all-prompt one. Lowering
+    /// it here would let a long prompt be admitted into memory that cannot hold it.
+    /// [`Self::bytes_for_split`] is the form that knows the prompt/generation split and
+    /// can charge the ring for what it really costs.
     pub fn bytes_per_token(cfg: &Config) -> usize {
+        Self::raw_row_bytes(cfg) + Self::compressed_bytes_per_token(cfg)
+    }
+
+    /// Bytes for ONE raw KV row across every KV-holding layer: latent (`kv_lora`) + roped
+    /// key (`qk_rope`), the GQA full K and V when those buffers exist, and the CUDA device
+    /// shadow, which mirrors **only** latent + rope (`k_full`/`v_full` are read from host
+    /// over GB10's unified memory) and so doubles just the MLA-style terms.
+    ///
+    /// Split out from [`Self::bytes_per_token`] because a ring makes "per row" and "per
+    /// token" different questions: V4 retains a bounded number of rows however many tokens
+    /// go past.
+    fn raw_row_bytes(cfg: &Config) -> usize {
         let mla = cfg.kv_lora as usize + cfg.qk_rope as usize; // mirrored on device
         let gqa_full = if Self::allocates_gqa_kv(cfg) {
             2 * cfg.n_kv_heads as usize * cfg.qk_head as usize // k_full + v_full: host only
@@ -639,7 +691,24 @@ impl KvCache {
             0
         };
         let device_shadow = if cfg!(feature = "cuda") { mla } else { 0 };
-        Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4 + Self::compressed_bytes_per_token(cfg)
+        Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4
+    }
+
+    /// How many raw KV rows a sequence of `n_prompt` prompt tokens and `n_new` generated
+    /// ones keeps resident.
+    ///
+    /// Without a ring that is every position, so both terms count. With one
+    /// (`cfg.window > 0`, DeepSeek-V4) it is `max(window, n_prompt)` and **`n_new` does
+    /// not appear**: prefill is the one call that reads all of its own rows, and every
+    /// decode step after it reads only the window, so the ring never grows again. That
+    /// asymmetry is the shape of the whole feature — generation became free, prompts did
+    /// not, and they stay expensive until prefill is chunked.
+    pub fn raw_rows(cfg: &Config, n_prompt: usize, n_new: usize) -> usize {
+        if cfg.window > 0 {
+            n_prompt.max(cfg.window as usize)
+        } else {
+            n_prompt.saturating_add(n_new)
+        }
     }
 
     /// DeepSeek-V4's compressed KV, per token.
@@ -703,8 +772,27 @@ impl KvCache {
     /// Total resident bytes for a sequence of `n_tokens`: the per-token KV plus the
     /// fixed per-sequence state. This is what a reservation should ask for.
     pub fn bytes_for(cfg: &Config, n_tokens: usize) -> usize {
-        Self::bytes_per_token(cfg)
-            .saturating_mul(n_tokens)
+        // All prompt: the worst split, and the only safe reading when the caller has not
+        // said how the tokens divide. Identical to `bytes_per_token * n + fixed` on every
+        // arch, ringed or not — `raw_rows(cfg, n, 0)` is `n` for a prompt at least a
+        // window long, and rounds UP to the window below that.
+        Self::bytes_for_split(cfg, n_tokens, 0)
+    }
+
+    /// [`Self::bytes_for`] for a caller that knows the prompt/generation split.
+    ///
+    /// The distinction only bites on a ringed arch, where it is the difference between
+    /// charging a 40k-token generation for 40k raw rows and charging it for the window's
+    /// worth it actually holds. Over-charging here is not free: `gen` reports this figure
+    /// as `Class::Kv`, and every byte of it is subtracted from the expert cache's budget.
+    pub fn bytes_for_split(cfg: &Config, n_prompt: usize, n_new: usize) -> usize {
+        let rows = Self::raw_rows(cfg, n_prompt, n_new);
+        Self::raw_row_bytes(cfg)
+            .saturating_mul(rows)
+            .saturating_add(
+                Self::compressed_bytes_per_token(cfg)
+                    .saturating_mul(n_prompt.saturating_add(n_new)),
+            )
             .saturating_add(Self::fixed_bytes(cfg))
     }
 
@@ -728,6 +816,11 @@ impl KvCache {
         tk: usize,
     ) -> Option<(*const f32, *const f32)> {
         let n_layers = self.latent.len();
+        // The device shadow mirrors the host rows at ABSOLUTE positions and uploads
+        // `pos_base..tk` incrementally, so it cannot read a ringed buffer. Only the MLA
+        // path syncs, and it never rings — assert rather than leave the two layouts to
+        // disagree silently if that ever changes.
+        assert_eq!(self.ring, 0, "sync_device on a ringed cache: the shadow is absolute-indexed");
         let (max_t, kvl, r) = (self.max_t, self.kv_lora, self.qk_rope);
         let dev = self
             .dev
@@ -750,12 +843,130 @@ impl KvCache {
         self.qk_rope
     }
 
+    // ---- raw-KV ring (DeepSeek-V4) ----------------------------------------
+    //
+    // See the `ring` field. Everything below is a no-op while `ring == 0`, which is the
+    // state every other architecture stays in for the cache's whole lifetime.
+
+    /// The ring width, or 0 when the raw rows are indexed by absolute position.
+    pub fn ring(&self) -> usize {
+        self.ring
+    }
+
+    /// Physical index of absolute position `pos` in the raw row buffers.
+    #[inline]
+    fn slot(&self, pos: usize) -> usize {
+        ring_slot(pos, self.ring)
+    }
+
+    /// Guarantee the raw rows can hold `rows` consecutive positions at once, turning
+    /// them into a ring the first time this is called.
+    ///
+    /// `rows` is the widest span a *single* call will read back — for V4 that is
+    /// `total - raw_lo`, computed by the one expression the reader also uses, so the two
+    /// cannot drift. Under-sizing here does not fault: it silently returns a row written
+    /// by some other position, which is why the caller derives `rows` rather than
+    /// guessing it.
+    ///
+    /// Growing is supported because it must be: `p % ring` is a different address for a
+    /// different `ring`, so a resize that left the existing rows where they were would
+    /// quietly re-point every live position. The live window is the last `ring` positions
+    /// below `ring_hi`; they are re-homed into the new buffer before it is installed.
+    /// Never shrinks — the win comes from the first sizing, and a shrink would be all
+    /// risk for no memory (the pages are already committed).
+    pub fn ring_ensure(&mut self, rows: usize) {
+        if rows == 0 || rows <= self.ring {
+            return;
+        }
+        let (kvl, r) = (self.kv_lora, self.qk_rope);
+        let n_rows = self.latent.len();
+        let old = self.ring;
+        if old == 0 {
+            // First call: the buffers still hold nothing (V4 sizes the ring before its
+            // first write), so there is no live data to carry — just re-allocate small.
+            // Deliberately re-allocating rather than truncating: `Vec::truncate` keeps the
+            // `max_t`-sized allocation, and shedding that address space is the point.
+            debug_assert_eq!(self.ring_hi, 0, "ring_ensure must size the ring before the first write");
+            self.latent = lazy_zeros(n_rows, rows * kvl);
+            self.k_rot = lazy_zeros(n_rows, rows * r);
+            self.ring = rows;
+            return;
+        }
+        let lo = self.ring_hi.saturating_sub(old);
+        let mut latent = lazy_zeros(n_rows, rows * kvl);
+        let mut k_rot = lazy_zeros(n_rows, rows * r);
+        for li in 0..n_rows {
+            for p in lo..self.ring_hi {
+                let (from, to) = (ring_slot(p, old), ring_slot(p, rows));
+                if kvl > 0 {
+                    let src = &self.latent[li][from * kvl..(from + 1) * kvl];
+                    latent[li][to * kvl..(to + 1) * kvl].copy_from_slice(src);
+                }
+                if r > 0 {
+                    let src = &self.k_rot[li][from * r..(from + 1) * r];
+                    k_rot[li][to * r..(to + 1) * r].copy_from_slice(src);
+                }
+            }
+        }
+        self.latent = latent;
+        self.k_rot = k_rot;
+        self.ring = rows;
+    }
+
+    /// Record that `pos` now holds live data, so a later [`Self::ring_ensure`] carries it.
+    #[inline]
+    fn ring_touch(&mut self, pos: usize) {
+        if self.ring != 0 && pos + 1 > self.ring_hi {
+            self.ring_hi = pos + 1;
+        }
+    }
+
+    /// Append raw rows `[start, end)` of `layer` to `out`.
+    ///
+    /// The read side of the ring: a span that wraps is two runs, not one, so this cannot
+    /// be a `&[f32]` the way [`Self::latent_rows`] is. Callers on a ringed cache must use
+    /// this — `latent_rows` asserts it is not ringed rather than returning a slice whose
+    /// rows belong to the wrong positions.
+    pub fn extend_latent_rows(&self, layer: usize, start: usize, end: usize, out: &mut Vec<f32>) {
+        self.extend_rows(&self.latent[layer], self.kv_lora, start, end, out);
+    }
+
+    /// [`Self::extend_latent_rows`] for the roped-key rows.
+    pub fn extend_krot_rows(&self, layer: usize, start: usize, end: usize, out: &mut Vec<f32>) {
+        self.extend_rows(&self.k_rot[layer], self.qk_rope, start, end, out);
+    }
+
+    fn extend_rows(&self, buf: &[f32], w: usize, start: usize, end: usize, out: &mut Vec<f32>) {
+        if self.ring == 0 {
+            out.extend_from_slice(&buf[start * w..end * w]);
+            return;
+        }
+        assert!(
+            end - start <= self.ring,
+            "ring holds {} rows but {}..{} was asked for — ring_ensure was not given this span",
+            self.ring,
+            start,
+            end,
+        );
+        let lo = self.slot(start);
+        let n = end - start;
+        // One run if the span ends before the wrap, two if it straddles it.
+        let head = n.min(self.ring - lo);
+        out.extend_from_slice(&buf[lo * w..(lo + head) * w]);
+        if head < n {
+            out.extend_from_slice(&buf[..(n - head) * w]);
+        }
+    }
+
     /// Normalized-latent row for `(layer, pos)`.
     pub fn latent_row(&self, layer: usize, pos: usize) -> &[f32] {
-        &self.latent[layer][pos * self.kv_lora..(pos + 1) * self.kv_lora]
+        let p = self.slot(pos);
+        &self.latent[layer][p * self.kv_lora..(p + 1) * self.kv_lora]
     }
     pub fn latent_row_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
-        &mut self.latent[layer][pos * self.kv_lora..(pos + 1) * self.kv_lora]
+        self.ring_touch(pos);
+        let p = self.slot(pos);
+        &mut self.latent[layer][p * self.kv_lora..(p + 1) * self.kv_lora]
     }
 
     /// DeepSeek-V4 compressed-KV rows and the per-layer Compressor carry state.
@@ -863,20 +1074,31 @@ impl KvCache {
 
     /// Roped k_rot row for `(layer, pos)`.
     pub fn krot_row(&self, layer: usize, pos: usize) -> &[f32] {
-        &self.k_rot[layer][pos * self.qk_rope..(pos + 1) * self.qk_rope]
+        let p = self.slot(pos);
+        &self.k_rot[layer][p * self.qk_rope..(p + 1) * self.qk_rope]
     }
     pub fn krot_row_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
-        &mut self.k_rot[layer][pos * self.qk_rope..(pos + 1) * self.qk_rope]
+        self.ring_touch(pos);
+        let p = self.slot(pos);
+        &mut self.k_rot[layer][p * self.qk_rope..(p + 1) * self.qk_rope]
     }
 
     /// Contiguous latent rows `[start, end)` for a layer — a single slice the
     /// batched `kv_b` reconstruction multiplies against.
+    ///
+    /// Asserts the cache is not ringed. On a ring the rows are contiguous only until the
+    /// wrap, and `[start*w..end*w]` would then be in bounds but hold *other positions'*
+    /// data — a wrong answer, not a panic. Ringed callers use
+    /// [`Self::extend_latent_rows`]; today only the MLA path (which never rings) is here.
     pub fn latent_rows(&self, layer: usize, start: usize, end: usize) -> &[f32] {
+        assert_eq!(self.ring, 0, "latent_rows on a ringed cache — use extend_latent_rows");
         &self.latent[layer][start * self.kv_lora..end * self.kv_lora]
     }
 
-    /// Contiguous roped-key rows `[start, end)` for a layer.
+    /// Contiguous roped-key rows `[start, end)` for a layer. Not ring-safe; see
+    /// [`Self::latent_rows`].
     pub fn krot_rows(&self, layer: usize, start: usize, end: usize) -> &[f32] {
+        assert_eq!(self.ring, 0, "krot_rows on a ringed cache — use extend_krot_rows");
         &self.k_rot[layer][start * self.qk_rope..end * self.qk_rope]
     }
 
@@ -1453,64 +1675,257 @@ mod kv_accounting_tests {
         );
     }
 
-    /// The KV storage contract DeepSeek-V4's 128-token sliding window depends on, pinned
-    /// BEFORE that tier becomes a ring buffer (task #69).
-    ///
-    /// V4 never reads its raw latent linearly: `dsv4_attention` takes
-    /// `latent_rows(li, raw_lo, total)` where the span is at most `cfg.window`. Today the
-    /// storage IS linear and `max_t`-sized, so the property below holds trivially — which
-    /// is exactly why it is worth writing down now. Once the tier is a ring of
-    /// `R = max(window, prefill_S)` rows with writes at `pos % R`, it must STILL hold, and
-    /// an off-by-one in that modulo yields plausible WRONG TOKENS rather than a crash.
-    /// This test is what such a change has to keep passing.
-    ///
-    /// Values are position-derived and per-lane distinct, so a span returned shifted by one
-    /// row — the likeliest ring bug — fails instead of coincidentally matching.
-    #[test]
-    fn latent_and_krot_spans_read_back_the_positions_written() {
-        const LAYERS: usize = 2;
-        const KV_LORA: usize = 4;
-        const QK_ROPE: usize = 2;
-        const WINDOW: usize = 8;
-        const TOTAL: usize = 40; // >> WINDOW, so a ring would wrap several times
+    // ---- the raw-KV ring (DeepSeek-V4, task #69) --------------------------
 
-        let mut kv = KvCache::new(LAYERS, KV_LORA, QK_ROPE, TOTAL);
-        let lat = |p: usize, j: usize| (p * 100 + j) as f32;
-        let rot = |p: usize, j: usize| -((p * 10 + j) as f32);
-        for li in 0..LAYERS {
-            for p in 0..TOTAL {
+    const RING_LAYERS: usize = 2;
+    const RING_KV_LORA: usize = 4;
+    const RING_QK_ROPE: usize = 2;
+    const RING_WINDOW: usize = 8;
+    /// Far past the window, so a ring of `RING_WINDOW` rows wraps several times.
+    const RING_TOTAL: usize = 40;
+
+    /// Position- and lane-derived, so a span returned shifted by one row — the likeliest
+    /// ring bug — fails instead of coincidentally matching.
+    fn ring_lat(p: usize, j: usize, li: usize) -> f32 {
+        (p * 100 + j) as f32 + li as f32 * 0.5
+    }
+    fn ring_rot(p: usize, j: usize, li: usize) -> f32 {
+        -((p * 10 + j) as f32) - li as f32 * 0.5
+    }
+
+    /// Write position `p` on every layer, then read back every span that a query at `p`
+    /// could ask for, checking each row against the position that wrote it.
+    ///
+    /// Interleaved on purpose: this is the order `dsv4_attention` actually runs in, and it
+    /// is the only order a ring can satisfy — writing position 40 into an 8-row ring has
+    /// already destroyed position 32, so a write-everything-then-read-everything test
+    /// would be asserting a property the design does not have.
+    fn ring_sweep(kv: &mut KvCache, window: usize, total: usize) {
+        for p in 0..total {
+            for li in 0..RING_LAYERS {
                 for (j, v) in kv.latent_row_mut(li, p).iter_mut().enumerate() {
-                    *v = lat(p, j) + li as f32 * 0.5;
+                    *v = ring_lat(p, j, li);
                 }
                 for (j, v) in kv.krot_row_mut(li, p).iter_mut().enumerate() {
-                    *v = rot(p, j) - li as f32 * 0.5;
+                    *v = ring_rot(p, j, li);
+                }
+            }
+            let (start, end) = ((p + 1).saturating_sub(window), p + 1);
+            for li in 0..RING_LAYERS {
+                let (mut lat, mut rot) = (Vec::new(), Vec::new());
+                kv.extend_latent_rows(li, start, end, &mut lat);
+                kv.extend_krot_rows(li, start, end, &mut rot);
+                assert_eq!(lat.len(), (end - start) * RING_KV_LORA);
+                assert_eq!(rot.len(), (end - start) * RING_QK_ROPE);
+                for (i, q) in (start..end).enumerate() {
+                    for j in 0..RING_KV_LORA {
+                        assert_eq!(
+                            lat[i * RING_KV_LORA + j],
+                            ring_lat(q, j, li),
+                            "layer {li} span [{start},{end}) row {q} lane {j}"
+                        );
+                    }
+                    for j in 0..RING_QK_ROPE {
+                        assert_eq!(
+                            rot[i * RING_QK_ROPE + j],
+                            ring_rot(q, j, li),
+                            "layer {li} krot span [{start},{end}) row {q} lane {j}"
+                        );
+                    }
+                }
+                // With no ring the borrowed slice must agree with the appended one; that
+                // equivalence is what lets the ring be swapped in under the reader.
+                if kv.ring() == 0 {
+                    assert_eq!(kv.latent_rows(li, start, end), &lat[..]);
+                    assert_eq!(kv.krot_rows(li, start, end), &rot[..]);
                 }
             }
         }
+    }
 
-        // Every window-sized span V4 can ask for, at every end position.
-        for li in 0..LAYERS {
-            for end in 1..=TOTAL {
-                let start = end.saturating_sub(WINDOW);
-                let got_lat = kv.latent_rows(li, start, end);
-                let got_rot = kv.krot_rows(li, start, end);
-                assert_eq!(got_lat.len(), (end - start) * KV_LORA);
-                assert_eq!(got_rot.len(), (end - start) * QK_ROPE);
-                for (i, p) in (start..end).enumerate() {
-                    for j in 0..KV_LORA {
-                        assert_eq!(
-                            got_lat[i * KV_LORA + j],
-                            lat(p, j) + li as f32 * 0.5,
-                            "layer {li} span [{start},{end}) row {p} lane {j}"
-                        );
-                    }
-                    for j in 0..QK_ROPE {
-                        assert_eq!(
-                            got_rot[i * QK_ROPE + j],
-                            rot(p, j) - li as f32 * 0.5,
-                            "layer {li} krot span [{start},{end}) row {p} lane {j}"
-                        );
-                    }
+    /// The storage contract DeepSeek-V4's 128-token sliding window depends on, in the
+    /// pre-ring layout: rows indexed by absolute position, buffers sized to `max_t`.
+    #[test]
+    fn latent_and_krot_spans_read_back_the_positions_written() {
+        let mut kv = KvCache::new(RING_LAYERS, RING_KV_LORA, RING_QK_ROPE, RING_TOTAL);
+        assert_eq!(kv.ring(), 0, "no arch rings by default");
+        ring_sweep(&mut kv, RING_WINDOW, RING_TOTAL);
+    }
+
+    /// ...and the same contract once the tier is a ring. This is the test the ring exists
+    /// to pass: an off-by-one in `pos % ring` returns a row that is in bounds and
+    /// plausible, so it would surface as wrong TOKENS, never as a crash.
+    #[test]
+    fn a_ringed_cache_reads_back_the_same_spans_as_a_linear_one() {
+        let mut kv = KvCache::new(RING_LAYERS, RING_KV_LORA, RING_QK_ROPE, RING_TOTAL);
+        kv.ring_ensure(RING_WINDOW);
+        assert_eq!(kv.ring(), RING_WINDOW);
+        ring_sweep(&mut kv, RING_WINDOW, RING_TOTAL);
+    }
+
+    /// The point of the exercise: a ring holds `R` rows however long the sequence runs.
+    /// Without this the buffers are `max_t`-sized and every generated token commits
+    /// another row — the term that made V4 context cost 206.9 KB/token.
+    #[test]
+    fn ring_storage_is_constant_in_context_length() {
+        let mut short = KvCache::new(1, RING_KV_LORA, RING_QK_ROPE, 1_000);
+        let mut long = KvCache::new(1, RING_KV_LORA, RING_QK_ROPE, 1_000_000);
+        short.ring_ensure(RING_WINDOW);
+        long.ring_ensure(RING_WINDOW);
+        assert_eq!(short.latent[0].len(), RING_WINDOW * RING_KV_LORA);
+        assert_eq!(long.latent[0].len(), RING_WINDOW * RING_KV_LORA);
+        assert_eq!(long.k_rot[0].len(), RING_WINDOW * RING_QK_ROPE);
+        // Same width at a thousand times the context — and far below what the linear
+        // layout would have addressed for the larger one.
+        assert!(long.latent[0].len() * 1000 < 1_000_000 * RING_KV_LORA);
+    }
+
+    /// Growing the ring re-homes the live rows. `p % ring` is a different address for a
+    /// different `ring`, so a resize that only reallocated would silently re-point every
+    /// position it kept. Reachable if one sequence ever prefills wider than the first call
+    /// sized for (an MTP verify batch, say) — rare, and silent if wrong.
+    #[test]
+    fn growing_the_ring_carries_the_live_rows_to_their_new_slots() {
+        let mut kv = KvCache::new(RING_LAYERS, RING_KV_LORA, RING_QK_ROPE, RING_TOTAL);
+        kv.ring_ensure(RING_WINDOW);
+        for p in 0..RING_TOTAL {
+            for li in 0..RING_LAYERS {
+                for (j, v) in kv.latent_row_mut(li, p).iter_mut().enumerate() {
+                    *v = ring_lat(p, j, li);
+                }
+                for (j, v) in kv.krot_row_mut(li, p).iter_mut().enumerate() {
+                    *v = ring_rot(p, j, li);
+                }
+            }
+        }
+        // 8 -> 13: not a multiple, so every live row lands in a different slot.
+        kv.ring_ensure(13);
+        assert_eq!(kv.ring(), 13);
+        let (lo, hi) = (RING_TOTAL - RING_WINDOW, RING_TOTAL);
+        for li in 0..RING_LAYERS {
+            let (mut lat, mut rot) = (Vec::new(), Vec::new());
+            kv.extend_latent_rows(li, lo, hi, &mut lat);
+            kv.extend_krot_rows(li, lo, hi, &mut rot);
+            for (i, p) in (lo..hi).enumerate() {
+                for j in 0..RING_KV_LORA {
+                    assert_eq!(lat[i * RING_KV_LORA + j], ring_lat(p, j, li), "row {p} lane {j}");
+                }
+                for j in 0..RING_QK_ROPE {
+                    assert_eq!(rot[i * RING_QK_ROPE + j], ring_rot(p, j, li), "krot {p} lane {j}");
+                }
+            }
+        }
+    }
+
+    /// A span wider than the ring is not representable — the rows it names no longer all
+    /// exist. Loud, because in bounds and wrong is the failure this whole design guards
+    /// against; `dsv4_attention` sizes the ring from the very span it then reads, so a
+    /// caller reaching this has broken that pairing.
+    #[test]
+    #[should_panic(expected = "ring holds")]
+    fn reading_more_rows_than_the_ring_holds_panics() {
+        let mut kv = KvCache::new(1, RING_KV_LORA, RING_QK_ROPE, RING_TOTAL);
+        kv.ring_ensure(RING_WINDOW);
+        let mut out = Vec::new();
+        kv.extend_latent_rows(0, 0, RING_WINDOW + 1, &mut out);
+    }
+
+    /// The borrowed-slice accessors are absolute-indexed and cannot serve a ring. They
+    /// refuse rather than return the wrong positions' data, which is what makes it safe
+    /// for the MLA path to keep using them.
+    #[test]
+    #[should_panic(expected = "use extend_latent_rows")]
+    fn latent_rows_refuses_a_ringed_cache() {
+        let mut kv = KvCache::new(1, RING_KV_LORA, RING_QK_ROPE, RING_TOTAL);
+        kv.ring_ensure(RING_WINDOW);
+        let _ = kv.latent_rows(0, 0, 4);
+    }
+
+    /// A ringed config: GLM's shape (so the non-ring arms of the accounting are exercised
+    /// unchanged) with V4's `sliding_window` set. `window` is the only field the raw-row
+    /// accounting keys off, which is exactly why the ring can be reasoned about without a
+    /// V4 checkpoint.
+    fn ringed_cfg(window: i32) -> Config {
+        let mut cfg = cfg_from(
+            r#"{"model_type":"nemotron_h","hidden_size":8,"num_hidden_layers":4,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,"vocab_size":8,
+                "hybrid_override_pattern":"ME*M","n_routed_experts":4,"num_experts_per_tok":2,
+                "moe_intermediate_size":6,"moe_latent_size":4,
+                "moe_shared_expert_intermediate_size":6,"norm_topk_prob":false,
+                "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
+                "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
+                "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
+        );
+        cfg.window = window;
+        cfg
+    }
+
+    /// The point of the ring, in the ledger: generated tokens add no raw rows.
+    ///
+    /// The residual growth is the COMPRESSED tier, which is what carries context past the
+    /// window and genuinely is per-token — so the assertion is "grows far slower", not
+    /// "does not grow".
+    #[test]
+    fn generated_tokens_stop_adding_raw_kv_rows_under_a_ring() {
+        let ring = ringed_cfg(128);
+        let flat = ringed_cfg(0);
+
+        // Same prompt, 100x the generation.
+        let (short, long) = (
+            KvCache::bytes_for_split(&ring, 512, 400),
+            KvCache::bytes_for_split(&ring, 512, 40_000),
+        );
+        assert_eq!(short, long, "no compressor on this cfg: generation is free");
+
+        // Without a ring the same pair scales with every token.
+        let flat_short = KvCache::bytes_for_split(&flat, 512, 400);
+        let flat_long = KvCache::bytes_for_split(&flat, 512, 40_000);
+        assert!(
+            flat_long > flat_short * 40,
+            "unringed: {flat_long} should be ~80x {flat_short}"
+        );
+        // And the ring is the whole reason: same prompt, same generation, ~80x apart.
+        assert!(
+            flat_long > long * 40,
+            "ring should be far cheaper: {long} vs {flat_long}"
+        );
+    }
+
+    /// Prompts are NOT cheaper. The ring holds `max(window, prompt)` rows, so a long
+    /// prompt costs exactly what it did — the honest limit until prefill is chunked, and
+    /// the reason `bytes_per_token` stays at its all-prompt worst case.
+    #[test]
+    fn a_long_prompt_still_costs_full_price_under_a_ring() {
+        let ring = ringed_cfg(128);
+        let flat = ringed_cfg(0);
+        for n in [512usize, 4_096, 40_000] {
+            assert_eq!(
+                KvCache::bytes_for(&ring, n),
+                KvCache::bytes_for(&flat, n),
+                "all-prompt sequence of {n}: the ring saves nothing"
+            );
+        }
+        // Below the window the ring rounds UP to it — it cannot hold fewer rows than the
+        // span every decode step reads.
+        assert_eq!(KvCache::raw_rows(&ring, 10, 0), 128);
+        assert_eq!(KvCache::raw_rows(&flat, 10, 0), 10);
+    }
+
+    /// `bytes_for` is the split-free form and must stay the all-prompt worst case: it
+    /// feeds serve's admission and `context_in_kv_budget`, where guessing a cheaper split
+    /// would admit a prompt into memory that cannot hold it.
+    #[test]
+    fn bytes_for_is_still_per_token_times_n_plus_fixed() {
+        for cfg in [ringed_cfg(128), ringed_cfg(0), kimi_k3_cfg()] {
+            let (pt, fx) = (KvCache::bytes_per_token(&cfg), KvCache::fixed_bytes(&cfg));
+            for n in [1usize, 128, 100_000] {
+                // Only exact once the prompt reaches the window; below it the ring rounds
+                // up, which is a larger charge, never a smaller one.
+                let want = pt * n + fx;
+                let got = KvCache::bytes_for(&cfg, n);
+                assert!(got >= want, "cfg window {}: {got} < {want} at n={n}", cfg.window);
+                if n >= cfg.window.max(0) as usize {
+                    assert_eq!(got, want, "cfg window {}: n={n}", cfg.window);
                 }
             }
         }

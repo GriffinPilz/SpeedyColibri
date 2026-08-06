@@ -2142,6 +2142,96 @@ mod tests {
             "93 layers / block 12 -> boundaries at 0,12,..,84"
         );
     }
+
+    // ---- DeepSeek-V4 raw-KV ring (task #69) -------------------------------
+
+    /// Replay of what `dsv4_attention` does to the raw latent tier, driven through the
+    /// same [`dsv4_ring_for`] the production path calls, with one distinguishable value
+    /// per (position, lane) standing in for the projected row: size the ring, write this
+    /// call's rows, read the span back. Returns the key blocks the attention core would
+    /// see — the only thing the ring can change.
+    ///
+    /// `ring: false` skips the sizing (passing `window` through unchanged, so the SPAN is
+    /// identical) and leaves the cache linear. That arm is the reference.
+    fn dsv4_replay(window: i32, ring: bool, prompt: usize, gen: usize) -> Vec<Vec<f32>> {
+        const W: usize = 6; // stands in for cfg.qk_head
+        let mut kv = KvCache::new(1, W, 2, prompt + gen);
+        let val = |p: usize, j: usize| (p * 100 + j) as f32;
+        let mut seen = Vec::new();
+        let mut pos_base = 0usize;
+        for s in std::iter::once(prompt).chain(std::iter::repeat(1).take(gen)) {
+            let (raw_lo, total, _) = if ring {
+                dsv4_ring_for(&mut kv, pos_base, s, window)
+            } else {
+                dsv4_raw_span(pos_base, s, window)
+            };
+            for i in 0..s {
+                let p = pos_base + i;
+                for (j, v) in kv.latent_row_mut(0, p).iter_mut().enumerate() {
+                    *v = val(p, j);
+                }
+            }
+            let mut cache = Vec::new();
+            kv.extend_latent_rows(0, raw_lo, total, &mut cache);
+            seen.push(cache);
+            pos_base = total;
+        }
+        seen
+    }
+
+    /// The ring is a storage change, not a model change: every key block the attention
+    /// core is handed must be byte-identical with and without it.
+    ///
+    /// Run across prompt lengths on both sides of the window, because the two regimes
+    /// size the ring differently — a from-scratch prefill needs all `S` rows, a decode
+    /// step only `window` — and it is the handoff between them that a modulo bug lands in.
+    #[test]
+    fn the_ring_does_not_change_the_keys_dsv4_attention_sees() {
+        const WINDOW: i32 = 8;
+        for prompt in [1usize, 3, 7, 8, 9, 20] {
+            let linear = dsv4_replay(WINDOW, false, prompt, 40);
+            let ringed = dsv4_replay(WINDOW, true, prompt, 40);
+            assert_eq!(linear.len(), ringed.len());
+            for (step, (a, b)) in linear.iter().zip(&ringed).enumerate() {
+                assert_eq!(a, b, "prompt {prompt}, step {step}: ring changed the key block");
+            }
+        }
+    }
+
+    /// ...and it holds a constant number of rows while doing so. Without this the test
+    /// above would still pass on a ring sized to the whole sequence, which is the change
+    /// not being made.
+    #[test]
+    fn the_ring_stays_window_sized_across_a_long_generation() {
+        const WINDOW: i32 = 8;
+        let mut kv = KvCache::new(1, 6, 2, 10_000);
+        let mut pos_base = 0usize;
+        for s in std::iter::once(4usize).chain(std::iter::repeat(1).take(5_000)) {
+            let (_, total, _) = dsv4_ring_for(&mut kv, pos_base, s, WINDOW);
+            pos_base = total;
+        }
+        // 5004 positions generated; the prefill of 4 is under the window, so the widest
+        // span any call ever asked for is the window itself.
+        assert_eq!(kv.ring(), WINDOW as usize);
+    }
+
+    /// A prefill wider than the window sets the ring, because that one call reads all `S`
+    /// of its own rows. This is the case where the ring's saving comes from generation
+    /// rather than from the prompt — and the reason a long PROMPT still costs full price
+    /// until prefill is chunked.
+    #[test]
+    fn a_prefill_longer_than_the_window_sizes_the_ring_to_the_prompt() {
+        let mut kv = KvCache::new(1, 6, 2, 10_000);
+        dsv4_ring_for(&mut kv, 0, 500, 8);
+        assert_eq!(kv.ring(), 500, "a from-scratch prefill reads every row it wrote");
+        // Decode then runs forever inside that same 500 rows — it never grows again.
+        let mut pos_base = 500usize;
+        for _ in 0..2_000 {
+            let (_, t, _) = dsv4_ring_for(&mut kv, pos_base, 1, 8);
+            pos_base = t;
+        }
+        assert_eq!(kv.ring(), 500);
+    }
 }
 
 // ===================== DeepSeek-V4-Flash =====================
@@ -2378,6 +2468,50 @@ fn dsv4_compress_select(
     out
 }
 
+/// The raw-KV span a DeepSeek-V4 attention call at `pos_base` with `s` tokens touches,
+/// as `(raw_lo, total, win)`. `window` is `cfg.window`; `0` means no sliding window, and
+/// `win` is then the whole sequence.
+///
+/// `raw_lo` is the earliest raw position any query in THIS call can reach: query 0 sits
+/// at `pos_base` and its window opens `win-1` earlier. For decode that is exactly `win`
+/// rows; for a from-scratch prefill it is the whole span, which is what the reference
+/// passes (`kv` = all `seqlen` rows at `start_pos == 0`, the ring buffer only after).
+///
+/// A single function because three things must agree on it — the ring's width, the rows
+/// written, and the rows read back — and it has already been wrong once: slicing from
+/// `total - win` on every call left a long prefill's early rows out of the cache and
+/// underflowed the causal offset `pos_base - raw_from` on `usize`. That was the panic on
+/// any prompt over 128 tokens.
+pub(crate) fn dsv4_raw_span(pos_base: usize, s: usize, window: i32) -> (usize, usize, usize) {
+    let total = pos_base + s;
+    let win = if window > 0 { window as usize } else { total };
+    ((pos_base + 1) - win.min(pos_base + 1), total, win)
+}
+
+/// [`dsv4_raw_span`], with the raw-KV ring widened to hold it.
+///
+/// The pairing is the whole safety argument: the ring maps position `p` to slot
+/// `p % ring`, so a ring narrower than the span being read returns a row belonging to a
+/// different position — in bounds, plausible, and wrong. Sizing from the span in the same
+/// breath as computing it makes that combination unrepresentable, which is why this is one
+/// function rather than two calls a caller has to remember to keep together.
+///
+/// `window == 0` (every arch but V4) leaves the cache linear: `ring_ensure` is skipped and
+/// rows stay indexed by absolute position.
+fn dsv4_ring_for(
+    kv: &mut KvCache,
+    pos_base: usize,
+    s: usize,
+    window: i32,
+) -> (usize, usize, usize) {
+    let (raw_lo, total, win) = dsv4_raw_span(pos_base, s, window);
+    if window > 0 {
+        // Idempotent once wide enough, so decode pays a comparison and returns.
+        kv.ring_ensure(total - raw_lo);
+    }
+    (raw_lo, total, win)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dsv4_attention(
     cfg: &colibri_core::Config,
@@ -2421,6 +2555,13 @@ fn dsv4_attention(
             crate::dsv4::rope_interleaved(&mut q[b..b + hd], c, sn, rd, false);
         }
     }
+
+    // ---- the raw span this call touches, and the ring that has to hold it --
+    //
+    // Derived ONCE, up here, because the write just below and the read further down must
+    // agree about it — see `dsv4_ring_for`.
+    let (raw_lo, total, win) = dsv4_ring_for(kv, pos_base, s, cfg.window);
+    let n_raw = total - raw_lo;
 
     // ---- kv: wkv -> kv_norm -> rope, then into the latent cache ------------
     // ONE `head_dim`-wide latent is both K and V. There is no `kv_b` and no separate value
@@ -2507,26 +2648,15 @@ fn dsv4_attention(
     // rows as the earliest context. Without them attention sees only what fits in the
     // window, which is why context was capped at 128.
     let t_core = std::time::Instant::now();
-    let total = pos_base + s;
-    let win = if cfg.window > 0 { cfg.window as usize } else { total };
-    // The earliest raw position any query in THIS call can reach: query 0 sits at
-    // `pos_base` and its window opens `win-1` earlier. For decode that is exactly `win`
-    // rows; for a from-scratch prefill it is the whole span, which is what the reference
-    // passes (`kv` = all `seqlen` rows at `start_pos == 0`, the ring buffer only after).
-    //
-    // The previous code sliced from `total - win` for every call, so on a prefill longer
-    // than the window the early queries' rows were simply not in the cache, and the causal
-    // offset `pos_base - raw_from` underflowed on `usize`. That is the panic: any prompt
-    // over 128 tokens walked off the end of the cache.
-    let raw_lo = (pos_base + 1) - win.min(pos_base + 1);
-    let n_raw = total - raw_lo;
     let ratio = if dsv4_compress_enabled() { l.comp_ratio as usize } else { 0 };
     let n_comp = if ratio > 0 { kv.comp_rows(li).len() / hd } else { 0 };
 
     // Key space: raw rows first, then compressed — the reference's layout, where the
-    // compressed indices are offset by the raw count.
+    // compressed indices are offset by the raw count. `extend_latent_rows` is the
+    // ring-aware read: `raw_lo..total` is one run until the ring wraps and two after,
+    // which is why this is an append rather than a borrowed slice.
     let mut cache = Vec::with_capacity((n_raw + n_comp) * hd);
-    cache.extend_from_slice(kv.latent_rows(li, raw_lo, total));
+    kv.extend_latent_rows(li, raw_lo, total, &mut cache);
     cache.extend_from_slice(&kv.comp_rows(li)[..n_comp * hd]);
 
     // A compressed row is visible to position `p` once its window has CLOSED:

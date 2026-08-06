@@ -266,11 +266,47 @@ predates the 9-field breakdown, so compare subtotals, not field names: July repo
 `gpu-ffn 9694` (per-expert path), today reports `group 17732` — those are not like-for-like,
 because `group` is timed as one block that also swallows gather/scatter/staging.
 
-The cleanest same-path number: per-expert `gpu-ffn` went **9694 ms (July) → 12241 ms (today)**,
-1.26× on an unchanged dispatch. 750fd10 also wired WSMM into all four expert entry points and
-removed a staging gate — both affect the per-expert AND grouped paths, which fits a regression
-present in *both* arms. Those are hypotheses; the knob matrix (`COLI_NVFP4_U4`,
-`COLI_FFN_DEVCOPY`, `COLI_NVFP4_GROUP`) is what will decide, not this paragraph.
+### It is CPU-side MoE overhead — the GPU kernel is innocent
+
+The knob matrix over the levers 750fd10 flipped (all default-on), m3 prefill, tokens identical:
+
+| arm | prefill | gpu-ffn | group |
+|---|---|---|---|
+| baseline | 38376.8 / 39251.4 | 0 | 18321 |
+| `COLI_NVFP4_U4=0` | 38779.4 | 0 | 18555 |
+| `COLI_FFN_DEVCOPY=0` | 38985.4 | 0 | 18361 |
+| `GROUP=0 DEVCOPY=0` | 37907.1 | **9519** | 2 |
+| `GROUP=0 U4=0` | 40927.6 | 12350 | 2 |
+
+**No knob recovers the time.** But `GROUP=0 DEVCOPY=0` puts `gpu-ffn` at 9519 ms — essentially
+July's 9694 — while total prefill stays ~9.4 s slow. So the earlier "per-expert gpu-ffn
+9694 → 12241, 1.26×" reading was a **red herring**: that delta is entirely `COLI_FFN_DEVCOPY`
+and costs no wall time.
+
+Full breakdown of that arm (same path and same kernel speed as July) against July:
+
+| sub-timer | JULY | TODAY | Δ |
+|---|---|---|---|
+| router | 163 | 162 | 0 |
+| **gather** | 143 | **1030** | **+887 (7.2×)** |
+| gpu-ffn | 9694 | 10452 | +758 |
+| **scatter** | 174 | **2262** | **+2088 (13×)** |
+| shared | 713 | 945 | +232 |
+| **other** (unattributed) | 561 | **6743** | **+6182 (12×)** |
+| *moe compute* | *11448* | *21595* | *+10147* |
+
+`gather` + `scatter` + `other` account for ~9.2 s of the 10.1 s. The GPU kernel contributes
++758 ms. **The regression is CPU-side work inside `moe()`, present in both the grouped and
+per-expert arms.**
+
+`other` is the residual — MoE time no timer claims — at 6.7 s, 20% of the phase. The comment
+above that line (forward.rs) records that it exists because "a 26% residual sat here unnoticed".
+It is unnoticed again.
+
+**NEXT: instrument the untimed region of `moe()` before theorising.** Five hypotheses about this
+regression (grouped path, pointer-keyed cache, WSMM, residency, and the two knobs above) were all
+formed from code reading and all five were wrong. The timers and the bisect have been right every
+time. Add sub-timers to what `other` covers, re-run the same A/B, and let it name itself.
 
 ### ~~Where the regression actually is: a MEMORY REGIME~~ — REFUTED by the same run
 

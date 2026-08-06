@@ -174,34 +174,25 @@ variant + a convert mapping + one registry block — the checklist is in
 
 ### Test suite status
 
-`cargo test --workspace` (CPU) is **389 passing, 0 failing**. Adding `--features cuda` on a
-GB10 brings up the kernel tests: **393 passing, 1 failing** as of **2026-08-05** — now at
-cargo's **default parallelism**, not `--test-threads=1` (see below).
-The one failure is pre-existing — it reproduces on `e4e3f7f`, before the DeepSeek-V4 work —
-and is tracked rather than tolerated silently:
+`cargo test --workspace` (CPU) is **395 passing, 0 failing**. Adding `--features cuda` on a
+GB10 brings up the kernel tests: **400 passing, 0 failing** as of **2026-08-05**, at cargo's
+default parallelism. The suite is fully green — the two long-standing caveats that used to
+live here are both resolved:
 
-| test | symptom | note |
-|---|---|---|
-| `moe::…::shards_provider_loads_gateless_nemotron_expert` | 4.5354114 vs 4.5365667 (2.5e-4) | Nemotron NVFP4 expert reconstruction |
+| was | resolution |
+|---|---|
+| `moe::…::shards_provider_loads_gateless_nemotron_expert` failed by 2.5e-4 | **The test, not the loader.** `matmul_qt` dispatches on `QTensor::gpu_eligible`; the provider sets it for NVFP4 and the in-memory reference did not, so a GPU result was being compared against a CPU one under a 1e-5 tolerance. Same binary passed with `COLI_CUDA=0`. |
+| "run CUDA tests with `--test-threads=1`" | **Per-thread re-initialisation.** `gpu::available()` was a *thread-local* `OnceCell`, so every thread re-ran `coli_cuda_init` — which resets process-global state and recreates the stream underneath threads already launching on it. Init is now idempotent and `AVAIL` process-global. |
 
 Two K3 failures listed here previously — `kimi_stack_runs_end_to_end` ("forward must be
-deterministic") and `kimi_prefill_matches_incremental_decode` — **both pass now**, fixed by
+deterministic") and `kimi_prefill_matches_incremental_decode` — also pass, fixed by
 `1928094`: a device weight cache keyed by *host pointer* served streamed int8/f32 experts the
-wrong weights when the pooled buffer was reused. The second was indeed a consequence of the
-first, as the note here guessed.
+wrong weights when the pooled buffer was reused.
 
-**`--test-threads=1` is no longer needed.** The CUDA suite used to fail intermittently in
-parallel with `invalid resource handle`, a different victim test each run. The cause was not
-the scratch mutex everyone suspected: `gpu::available()` was a *thread-local* `OnceCell`, so
-every thread that first touched the GPU re-ran `coli_cuda_init` — which resets
-process-global state and creates a fresh stream underneath threads already launching on the
-old one. `coli_cuda_init` is now idempotent and `AVAIL` is process-global. Measured after
-the fix: six consecutive parallel runs, byte-identical, zero handle errors.
-
-Two traps worth knowing if you are checking this yourself: cargo **stops at the first failing
-test binary** unless you pass `--no-fail-fast`, so a naive run reports 1 failure and hides the
-other 2; and piping through `head` truncates the per-binary summaries that would have shown
-them.
+One trap worth knowing if you are checking this yourself: cargo **stops at the first failing
+test binary** unless you pass `--no-fail-fast`, so a naive run reports one failure and hides
+any others; and piping through `head` truncates the per-binary summaries that would have
+shown them.
 
 ## Quick start (DGX Spark)
 

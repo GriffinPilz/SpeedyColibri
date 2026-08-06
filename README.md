@@ -174,8 +174,8 @@ variant + a convert mapping + one registry block — the checklist is in
 
 ### Test suite status
 
-`cargo test --workspace` (CPU) is **382 passing, 0 failing**. Adding `--features cuda` on a
-GB10 brings up the kernel tests: **386 passing, 1 failing** as of **2026-08-05 on `c17e15b`**.
+`cargo test --workspace` (CPU) is **385 passing, 0 failing**. Adding `--features cuda` on a
+GB10 brings up the kernel tests: **389 passing, 1 failing** as of **2026-08-05 on `3956dd2`**.
 The one failure is pre-existing — it reproduces on `e4e3f7f`, before the DeepSeek-V4 work —
 and is tracked rather than tolerated silently:
 
@@ -330,7 +330,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `HF_TOKEN` | Hugging Face token for the first download (alt. to the `hf_...` arg) | none |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
-| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): nemotron 262,144 (its own max) · M3 ~400k · GLM ~290k · M2.7 ~190k · **V4 ~40k** (an all-prompt worst case — its raw KV is a ring, so *generation* is nearly free; see the note there) | `32768` |
+| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): nemotron 262,144 (its own max) · M3 ~450k · GLM ~290k · M2.7 ~200k · **V4 ~84k** (an all-prompt worst case — its raw KV is a ring, so *generation* is nearly free; see the note there) | `32768` |
 | `COLI_ALLOW_LONG_CTX` | `1` → serve past the model's advertised `max_position_embeddings`. Meaningful only for a **NoPE** model like Nemotron-3-Super, which has no positional table to overflow (its 262,144 is an advisory default; the model card documents up to 1M). The RAM clamp still applies. Quality past the validated length is not guaranteed — this is a quality decision, not a memory one | off |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
@@ -503,13 +503,24 @@ per kv-head **on the host only** (the GPU reads them over unified memory), plus 
 key that is mirrored. So the cost scales with kv-heads × layers, and M3's 4 kv-heads actually
 make it *lighter* per token than GLM's latent:
 
-| model | attention | KV / token (host + GB10 device shadow) | max `COLI_CTX` on a 121 GB Spark |
+| model | attention | KV / token (`coli capacity`) | max `COLI_CTX` on a 121 GB Spark |
 |---|---|---|---|
-| **Nemotron-3-Super** | hybrid — only **8 of 88** layers cache KV | **24 KB** + 166 MB/seq Mamba2 state | **262,144 — its full architectural max** (measured; 6.2 GB KV) |
-| **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | ~270 KB | **~400k** (measured clamp 402,690) |
-| **GLM-5.2** | MLA (compressed), mirrored | ~350 KB | ~290k |
-| **DeepSeek-V4-Flash** | latent ring + compressed rows | **206.9 KB** worst case (`coli capacity`) | **~40k** at an 8 GB KV budget — see below |
-| **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | ~527 KB | ~190k |
+| **Nemotron-3-Super** | hybrid — only **8 of 88** layers cache KV | **16 KB** + 166 MB/seq Mamba2 state | **262,144 — its full architectural max** (measured; 4.0 GiB KV) |
+| **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | 240 KB | **~450k** (the measured 402,690 clamp, scaled by the corrected per-token figure) |
+| **GLM-5.2** | MLA (compressed), **mirrored on the device** | 351 KB | ~290k |
+| **DeepSeek-V4-Flash** | latent ring + compressed rows | **99.4 KB** worst case | **~84k** at an 8 GB KV budget — see below |
+| **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | 496 KB | ~200k |
+
+**Four of these figures dropped on 2026-08-05, and no model got cheaper — the accounting
+did.** `bytes_per_token` charged every architecture for a `qk_rope` row *and* a GB10 device
+mirror of it. Only the MLA reader (`sync_device`'s sole caller — GLM-5.2 and Kimi-K3's
+gated-MLA layers) actually keeps those, which is why those two are unchanged. The GQA models
+rope the key in place and store it in `k_full`/`v_full`; DeepSeek-V4 writes its latent and
+nothing else. The buffers behind the phantom terms were allocated but never written, so under
+lazy commit they held zero resident bytes the whole time — the charge simply did not match
+the allocation. `mirrors_kv_on_device` is the predicate, and
+`gqa_writes_no_latent_or_roped_key_rows` poisons the rows and watches the poison survive, so
+the claim is executable rather than argued.
 
 **DeepSeek-V4's raw KV is a ring, so generation is nearly free and prompts are not.** V4
 keeps a **128-token sliding window**: a query at `p` can only reach back 127 positions, and
@@ -525,18 +536,16 @@ add no rows at all. Measured on the box, 43 layers at `kv_lora` 512 + `qk_rope` 
 The engine prints the sizing once, so a run that is silently *not* ringed is visible rather
 than merely indistinguishable: `[kv] raw ring 0 -> 512 rows x 43 layers (48.4 MB)`.
 
-**The ~40k ceiling above is unchanged, and that is not an oversight.** It is an all-prompt
-worst case — the reading serve's admission and `context_in_kv_budget` need, since a request
-that is *all prompt* really does pay per token. The ring is sized to the prompt because
+**The ~84k ceiling above is still an all-prompt worst case, and that is not an oversight.**
+It is the reading serve's admission and `context_in_kv_budget` need, since a request that is
+*all prompt* really does pay per token. (It doubled from ~40k only because of the accounting
+fix above — the ring did not move it.) The ring is sized to the prompt because
 prefill is the one call that reads every row it wrote, so the full 1M story needs **chunked
 prefill** on top of this, which would bound the ring by the chunk instead. That is the
 remaining piece, and it is a larger change: V4's per-layer Compressor carries state across
 calls, and a chunk boundary that mis-advances its block index is silent.
 
-Two further caveats. The 206.9 KB/token figure includes a **GB10 device shadow that V4
-never allocates** — only the MLA path (`sync_device`) mirrors rows to the device, so the raw
-term is over-charged ~1.9×; correcting it moves serve's admission and has not been done
-blind. And everything above 2,400 tokens on V4 remains allocator arithmetic: that is still
+One caveat remains: everything above 2,400 tokens on V4 is still allocator arithmetic — that is
 the longest context actually exercised end to end.
 
 **The hybrid is in a different class here.** Nemotron caches KV on 8 attention layers

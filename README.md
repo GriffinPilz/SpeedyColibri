@@ -99,7 +99,7 @@ them, is in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
 colibrì's insight: a 744B Mixture-of-Experts model activates only ~40B parameters
 per token, and only ~11 GB of those (the routed experts) change from token to
 token. So the **dense part** (attention, shared expert, embeddings — ~19 GB at
-int8) stays resident in RAM, and the **19,456 routed experts** (NVFP4, ~436 GB) live
+int8) stays resident in RAM, and the **19,200 routed experts** (NVFP4, ~338 GB) live
 on disk and are **streamed on demand**.
 
 SpeedyColibri takes that design and specializes it for **one box: the DGX Spark**
@@ -315,7 +315,7 @@ To serve a different model, stop it and re-run step 2 with a different `-m` (see
 **How the model is found** — `run-dgx.sh` resolves it in order: a snapshot you
 mount (`COLI_MODEL_DIR=<host-dir> docker/run-dgx.sh serve ...` → `/model`) → the
 Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so the
-358 GB download happens **at most once** and is shared with non-container runs) →
+403 GB download happens **at most once** and is shared with non-container runs) →
 `hf download` of `$COLI_MODEL_REPO` (default
 `nvidia/GLM-5.2-NVFP4`).
 
@@ -341,6 +341,24 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `COLI_RESIDENT_NVFP4` | **converter** knob (`coli requant-nvfp4`): `1` → also re-encode the **resident** weights (attention q/k/v/o, Mamba in/out-proj, fc1/fc2-latent, shared experts) from int8 to NVFP4. Embeddings and `lm_head` are never touched. Cuts Nemotron's decode traffic 8.87 → 6.18 GB/token and measures **+9.4% decode** (10.09 → 11.04 tok/s) at **0 ± 1.5% perplexity** across three corpora. Note the win is far below what the byte count alone suggests: NVFP4 decodes slower per byte than int8, and resident matmuls are only part of a decode step | off |
 | `COLI_NVFP4_GEMV` | resident-NVFP4 decode kernel: `0` original, `1` wide read (one byte/lane), `2` wide read without shared staging of `x`, `3` uint32/lane (full cache line). The original read only **16 B per warp** (lanes 2j and 2j+1 fetched the same byte) and staged `x` in 16–32 KB of shared memory, capping an SM at ~3 blocks. Fixing both is most of the gain above; width stops paying past 32 B/warp | `3` |
 | `COLI_QSIM` | **quality-sweep tool**, not a serving knob. `class:scheme[,…]` (e.g. `mamba:nvfp4`, `resident:6`) round-trips the named resident tensors through a target precision at load time, so `coli ppl` can price a quantization choice without rebuilding a container. Storage is unchanged, so it measures **quality only, never speed**. Each rule reports the RMS perturbation it actually applied and warns below 1% — an arm that perturbs nothing yields a perplexity that reads as "this precision is free" | off |
+
+**DeepSeek-V4 only** — the mechanisms that give it long context. All default on; each is a
+switch because its success case is invisible (correct output either way), so an A/B is the
+only way to tell one apart from a silent no-op:
+
+| variable | meaning | default |
+|---|---|---|
+| `COLI_DSV4_KV_BUDGET_MB` | how much raw KV a prefill may retain before it is chunked. Below the budget the prompt runs in one call; above it, chunks are as coarse as the budget allows. Chunking is **not free** — a 2048-token prompt chunked at 512 measured **1.41× slower prefill** for 133 MB saved — so the budget exists to make sure the cost is only paid when the memory is actually at stake. See [Context & output length](#context--output-length) | `1024` |
+| `COLI_DSV4_CHUNK` | override the above with a fixed token chunk; `0` never chunks (the pre-chunking behaviour, for an A/B) | budget-derived |
+| `COLI_DSV4_COMPRESS` | `0` disables the Compressor. Context past the 128-token sliding window then simply **is not there** — a hard edge, not a graceful degradation | on |
+| `COLI_DSV4_INDEXER` | `0` makes every query attend to all closed compressed rows instead of the Indexer's top-k. The two arms are identical below ~2048 tokens of context and diverge only past it | on |
+
+Diagnostics, any model:
+
+| variable | meaning | default |
+|---|---|---|
+| `COLI_DEBUG_ACT` | `1` → per-layer L2 norm of the residual stream, to localise where a forward pass degenerates. On V4 it also reports the Hyper-Connection copies separately, since an HC failure shows as the copies diverging from each other rather than any one blowing up | off |
+| `COLI_TRACE_STATE` | `1` → FNV-1a hash of the residual stream after every layer. Bitwise, so two states differing in the last ULP hash differently — this is for finding **where** two runs of the same input first diverge, which token identity cannot tell you | off |
 
 Multi-node variables (`COLI_NUM_NODES`, `COLI_PEERS`, …) are in
 [Multi-Spark](#multi-spark-expert-parallel) below.
@@ -471,7 +489,7 @@ pressure **cannot OOM**, which is what lets a fill-RAM policy point at a model o
   hold the whole working set resident, dropping the page-cache double-copy (`fadvise`) so
   `MemAvailable` is honest. Measured **1.94×** over the old static default (median 4.83 vs
   2.49 tok/s, diverse-prompt serving) — the working set stays resident instead of streaming.
-- **≫ RAM** (experts larger than RAM — e.g. MiniMax-M3 ~216 GB, GLM-5.2 ~436 GB): fill RAM
+- **≫ RAM** (experts larger than RAM — e.g. MiniMax-M3 ~193 GB, GLM-5.2 ~338 GB): fill RAM
   with as many experts as fit, keep the OS page cache as a reclaimable second tier, and let
   the monitor evict the LRU tail under pressure. Measured **1.22×** on M3 (2.05 vs 1.68 tok/s)
   — more resident experts, higher hit rate — and, crucially, **no crash**: the same box that
@@ -595,7 +613,7 @@ rather than OOM'd.
 
 ## Where it stands
 
-Running the real 358 GB model on **one** DGX Spark (GB10). The bottleneck is
+Running the real 403 GB model on **one** DGX Spark (GB10). The bottleneck is
 **loading**, not math: every token streams ~180 fresh experts (~3.4 GB) from disk,
 and the model is far larger than RAM, so experts can't all stay resident and load
 can't overlap the per-layer-sequential routing. On this single node, decode ≈ load +
@@ -634,6 +652,14 @@ resource the previous one used. That reframes the remaining work:
   ~190 GB/s against int8's 400–580 on the same shapes — slower in absolute time while
   reading half the bytes. Grouping their dispatches was built and measured **~10% slower**;
   the wins came instead from read width and cheaper dequant.
+- **Long context is a storage problem before it is a compute one.** DeepSeek-V4's raw KV is
+  now a **ring** — a query reaches back only `sliding_window`, so retaining more was dead
+  storage — and prefill is **chunked** above a KV budget, which makes the retained rows
+  constant in context rather than proportional to the prompt. Together: a 512-token prompt
+  plus 40k generated holds 48.4 MiB instead of 3.78 GiB. The chunking is bit-exact, and it
+  is budget-gated because it is *not* free — a fixed 512-token chunk measured **1.41× slower
+  prefill** at 2048 tokens, for memory that was never at stake. See
+  [Context & output length](#context--output-length).
 
 Per-module port status and the milestone order live in **[PORTING.md](PORTING.md)**.
 
@@ -690,9 +716,9 @@ Every model fills RAM and evicts LRU experts under pressure. Measured on a 121 G
 
 | model | routed experts vs RAM | policy (auto) | serving throughput |
 |---|---|---|---|
-| **MiniMax-M2.7** | ~122 GB ≈ 121 GB (near-fit) | fill ~101 GB + fadvise, hold working set | **4.83 tok/s** median — **1.94×** over the old 41 GB static default (2.49) |
-| **MiniMax-M3** | ~216 GB (1.8× RAM) | fill RAM, keep page cache, LRU-evict | **2.05 tok/s** median — **1.22×** over the old static 1.68; box fills to 121 GB used and holds `avail` at the 3 GB floor for the whole run, **no OOM** |
-| **GLM-5.2** | ~436 GB (3.6× RAM) | fill RAM, keep page cache, LRU-evict | not re-run (container offloaded to HF); ≫-RAM, expect a small gain like M3 at most — the page cache already served the hot set |
+| **MiniMax-M2.7** | ~105 GB ≈ 121 GB (near-fit) | fill ~101 GB + fadvise, hold working set | **4.83 tok/s** median — **1.94×** over the old 41 GB static default (2.49) |
+| **MiniMax-M3** | ~193 GB (1.6× RAM) | fill RAM, keep page cache, LRU-evict | **2.05 tok/s** median — **1.22×** over the old static 1.68; box fills to 121 GB used and holds `avail` at the 3 GB floor for the whole run, **no OOM** |
+| **GLM-5.2** | ~338 GB (2.8× RAM) | fill RAM, keep page cache, LRU-evict | not re-run (container offloaded to HF); ≫-RAM, expect a small gain like M3 at most — the page cache already served the hot set |
 
 Takeaway: filling RAM helps whenever more experts fit — a lot when the model fits (~2× on
 M2.7), modestly when it doesn't (~1.2× on M3). The **eviction is what makes it safe**: the
@@ -789,8 +815,8 @@ block-scaled **FP8** [`unsloth/GLM-5.2-FP8`](https://huggingface.co/unsloth/GLM-
 
 | expert format | bytes/wt | experts on disk | build (from source checkpoint) |
 |---|---|---|---|
-| **NVFP4** (e2m1 + per-16 ue4m3 block scale + global) — **default** | **0.5625** | **~436 GB** | `coli convert nvidia/GLM-5.2-NVFP4 <out>` |
-| e4m3 fp8 (per-row) — 8-bit opt-out | 1.0 | ~735 GB | `COLI_XFP8=1 coli convert unsloth/GLM-5.2-FP8 <out>` |
+| **NVFP4** (e2m1 + per-16 ue4m3 block scale + global) — **default** | **0.5625** | **~338 GB** | `coli convert nvidia/GLM-5.2-NVFP4 <out>` |
+| e4m3 fp8 (per-row) — 8-bit opt-out | 1.0 | ~601 GB | `COLI_XFP8=1 coli convert unsloth/GLM-5.2-FP8 <out>` |
 
 **NVFP4 is a 4-bit block-scaled format** — 4-bit weights with a shared scale per 16
 inputs, so it is int4-small while nearly matching e4m3's accuracy. It is the default output
@@ -908,7 +934,7 @@ failure, never a wrong answer.
 **Scaling past 2.** Per-node cache (~5 900 experts at 106 GB) versus 19 200 total
 routed experts means at **4+ Sparks each node's whole shard is resident** and expert
 streaming stops entirely. Sharding does *not* reduce disk footprint — every node
-holds the full 358 GB snapshot and simply reads less of it.
+holds the full 403 GB snapshot and simply reads less of it.
 
 **Next:** the RDMA transport (`colibri-cluster`, stubbed behind the same `Transport`
 trait) would cut the ~27 ms/token of fabric latency — worth ~5%. The larger remaining

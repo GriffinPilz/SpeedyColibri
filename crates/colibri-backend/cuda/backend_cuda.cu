@@ -2112,9 +2112,41 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
 
+/* Serialises init/shutdown against each other. NOT the same lock as `g_scratch_mu`: that
+ * one protects a context's scratch while it is in use, this one protects the existence of
+ * the contexts themselves. */
+static std::mutex g_init_mu;
+
+/* Idempotent by contract, and it has to be.
+ *
+ * The Rust side probes CUDA through a **thread_local** `OnceCell` (`gpu::available`), so
+ * every thread that first touches the GPU calls this — while `g_nctx`, `g_ctx` and the
+ * per-device stream are process-global. Re-running the body would set `g_nctx = 0`, wipe a
+ * live `DeviceContext` with `*ctx = {}` and create a fresh stream, all underneath threads
+ * already launching kernels on the old one. That is the `invalid resource handle` the test
+ * suite has been hitting: deterministic with `--test-threads=1` (one init), flaky in
+ * parallel (one init per thread), with the victim test varying run to run.
+ *
+ * So: initialise once, and afterwards confirm the request matches rather than rebuild. A
+ * DIFFERENT device set is refused instead of honoured — tearing down contexts other threads
+ * hold is exactly the bug, and no caller in this tree asks for it (`coli` initialises once
+ * with the cluster's list; re-init after `coli_cuda_shutdown` works, since that resets
+ * `g_nctx` to 0). */
 extern "C" int coli_cuda_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > COLI_CUDA_MAX_DEVICES) return 0;
+    std::lock_guard<std::mutex> _init_lk(g_init_mu);
+    if (g_nctx > 0) {
+        if (g_nctx == count) {
+            int same = 1;
+            for (int i = 0; i < count; i++) if (g_ctx[i].device != devices[i]) { same = 0; break; }
+            if (same) return 1; // already up, with exactly these devices
+        }
+        std::fprintf(stderr,
+                     "[CUDA] init called with a different device set while %d context(s) are "
+                     "live; refusing to tear them down\n", g_nctx);
+        return 0;
+    }
     if (!cuda_ok(cudaGetDeviceCount(&available), "device discovery")) return 0;
     g_nctx = 0;
     for (int i = 0; i < count; i++) {
@@ -2146,7 +2178,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     return 1;
 }
 
+/* Takes `g_init_mu` for the same reason `coli_cuda_init` does: it destroys the streams and
+ * frees the scratch that other threads may be about to use, so it must not interleave with
+ * an init. (It does NOT take `g_scratch_mu` — a shutdown racing a live kernel launch is a
+ * caller error this cannot paper over, and holding both here would invert the lock order.) */
 extern "C" void coli_cuda_shutdown(void) {
+    std::lock_guard<std::mutex> _init_lk(g_init_mu);
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;

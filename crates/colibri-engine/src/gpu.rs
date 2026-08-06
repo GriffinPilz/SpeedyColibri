@@ -97,8 +97,18 @@ fn ffn_budget() -> u64 {
     }
 }
 
+/// CUDA availability, probed **once per process** — deliberately not thread-local.
+///
+/// `probe()` calls `coli_cuda_init`, which builds process-global state: `g_nctx`, the
+/// `DeviceContext` array, and each device's stream. A thread-local `OnceCell` meant every
+/// thread that first touched the GPU re-ran it, resetting a context other threads were
+/// launching kernels on. That is the `invalid resource handle` the CUDA suite hit under
+/// cargo's default parallelism — deterministic single-threaded, flaky otherwise, with the
+/// victim test varying run to run. `coli_cuda_init` is now idempotent as well, so this is
+/// belt and braces: the FFI is safe however it is called, and callers stop calling twice.
+static AVAIL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 thread_local! {
-    static AVAIL: OnceCell<bool> = const { OnceCell::new() };
     // Whether device 0 can read pageable host memory directly (coherent unified
     // memory). When true, FFN weights are wrapped (zero-copy) instead of copied.
     static PAGEABLE: OnceCell<bool> = const { OnceCell::new() };
@@ -205,9 +215,9 @@ pub fn ffn_cache_stats() -> (usize, u64, u64, u64) {
     })
 }
 
-/// Whether a CUDA device is usable (probed once; honors `COLI_CUDA=0`).
+/// Whether a CUDA device is usable (probed once per PROCESS; honors `COLI_CUDA=0`).
 pub fn available() -> bool {
-    AVAIL.with(|c| *c.get_or_init(|| cuda::CudaBackend::probe().is_some()))
+    *AVAIL.get_or_init(|| cuda::CudaBackend::probe().is_some())
 }
 
 /// Tell the CUDA backend which SwiGLU variant the FFN kernels should apply

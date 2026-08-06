@@ -381,6 +381,30 @@ fn dsv4_indexer_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_DSV4_INDEXER").ok().as_deref() != Some("0"))
 }
 
+/// Tokens per DeepSeek-V4 prefill chunk (`COLI_DSV4_CHUNK`, default 512; `0` disables
+/// chunking and runs the whole prompt in one call).
+///
+/// This is what keeps V4's raw KV constant in context. The ring introduced with the
+/// sliding window holds the widest span a SINGLE call reads back, so an unchunked prefill
+/// sizes it to the whole prompt — generation became free, prompts did not. Chunked, the
+/// ring is `window + chunk - 1` rows however long the prompt is.
+///
+/// 512 rather than something larger: the retained rows and the transient
+/// `[chunk, hc_mult, hidden]` activations both scale with it, and V4's prefill is
+/// expert-load-bound at these sizes, so a bigger chunk buys little and costs memory. It is
+/// a knob because that trade is worth being able to measure, not because the default is in
+/// doubt — and setting it to 0 recovers the exact pre-chunking behaviour for an A/B.
+fn dsv4_prefill_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        match std::env::var("COLI_DSV4_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(0) => usize::MAX, // "never chunk" — the whole prompt is one call
+            Some(n) => n,
+            None => 512,
+        }
+    })
+}
+
 /// How much the Indexer actually pruned: queries that reached the SCORING path, candidate
 /// rows they considered, and rows they kept.
 ///
@@ -1070,7 +1094,15 @@ pub fn forward<P: ExpertProvider>(
     // carry. Gated on `hc_mult` rather than on the arch tag so a V4 variant that ships
     // without HC would take the ordinary path instead of indexing copies it does not have.
     if cfg.arch == Arch::DeepseekV4 && cfg.hc_mult > 0 {
-        return dsv4_forward(model, kv, provider, ids, pos_base, hidden_out);
+        return dsv4_forward_chunked(
+            model,
+            kv,
+            provider,
+            ids,
+            pos_base,
+            hidden_out,
+            dsv4_prefill_chunk(),
+        );
     }
 
     // Small multi-token forwards (the MTP verify / replay) run the routed NVFP4 experts on
@@ -2843,6 +2875,60 @@ impl Dsv4Scratch {
 /// This path keeps the full history and attends densely over it, which is EXACTLY what the
 /// reference computes while the span fits in the window, and diverges past it. That is a
 /// hard edge, so it is reported once rather than left to look like ordinary drift.
+/// [`forward`]'s DeepSeek-V4 arm with an explicit chunk size: run `ids` through
+/// [`dsv4_forward`] in slices of at most `chunk` tokens.
+///
+/// **What chunking buys.** `dsv4_forward` is already position-incremental — it is the same
+/// entry decode uses at `s == 1` — so this is a loop over it, not a second code path. The
+/// win is the raw-KV ring's *width*: [`dsv4_ring_for`] sizes the ring from the widest span
+/// a SINGLE call reads back, which for a whole-prompt prefill is the prompt itself. That is
+/// why the ring made generation free and left prompts at full price. Chunked, the ring is
+/// `window + chunk - 1` rows however long the context — the difference between a 1M-token
+/// prompt retaining 1M raw rows and retaining 639.
+///
+/// It also bounds the transient activations, which matter more here than elsewhere:
+/// Hyper-Connections make the residual `[s, hc_mult, hidden]`, so an unchunked long prefill
+/// materialises `hc_mult` (4 on the real model) times the usual `s x hidden`.
+///
+/// **Equivalence is tested, not assumed.** `dsv4_chunked_prefill_matches_one_shot` runs a
+/// prompt whole and at six chunk sizes and compares every hidden lane. It has teeth: it
+/// fails if the Compressor's per-layer block index restarts on a continuation call — the
+/// bug this file's history already records, whose symptom was every block after the first
+/// roped at twice its spacing — and if the batch-pooling path is taken past the first call.
+///
+/// Exposed (rather than reading the env knob inline) because [`dsv4_prefill_chunk`] is a
+/// `OnceLock` and so cannot be varied in-process — the same reason
+/// [`generate_stream_drafting`] exists alongside [`generate_stream`].
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_forward_chunked<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    ids: &[i32],
+    pos_base: usize,
+    hidden_out: &mut [f32],
+    chunk: usize,
+) -> io::Result<()> {
+    let d = model.cfg.hidden as usize;
+    let s = ids.len();
+    let chunk = chunk.max(1);
+    if s <= chunk {
+        return dsv4_forward(model, kv, provider, ids, pos_base, hidden_out);
+    }
+    for off in (0..s).step_by(chunk) {
+        let n = chunk.min(s - off);
+        dsv4_forward(
+            model,
+            kv,
+            provider,
+            &ids[off..off + n],
+            pos_base + off,
+            &mut hidden_out[off * d..(off + n) * d],
+        )?;
+    }
+    Ok(())
+}
+
 fn dsv4_forward<P: ExpertProvider>(
     model: &Model,
     kv: &mut KvCache,

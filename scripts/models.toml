@@ -9,6 +9,14 @@
 #
 # Paths are joined under `models_root` unless they start with "/". Override the root
 # per host with the COLI_MODELS_ROOT env var (so the same registry works on any box).
+#
+# `source` IS NOT GUARANTEED TO EXIST ON DISK. It records where a re-convert would read
+# from, not what is materialized. Every bench, serve and gen path uses `container`; the
+# source trees are hundreds of GB and get deleted to reclaim disk. Measured on gx10-42b2
+# 2026-08-06: M3, M2.7, GLM and Nemotron sources ABSENT, Kimi-K3 a 2.8 MB stub, only
+# DeepSeek-V4 materialized (156 GB). Re-download from `hf_repo` before any re-convert —
+# and note `hf_repo` now points at the ready-to-run CONTAINER, so a from-scratch convert
+# wants the upstream checkpoint named in the README instead.
 # `prompt` is the canonical benchmark prompt as token ids: either an inclusive range
 # "A..B" (expands to seq A..B) or an explicit space-separated list. `[<name>.convert_env]`
 # holds the COLI_* flags `coli convert` needs for that model (empty = defaults).

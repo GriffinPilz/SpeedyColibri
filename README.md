@@ -32,20 +32,31 @@ performance table that only ever moves one way is not being measured honestly:
 | `minimax-m3` | 16.8 → **13.2** (**0.79×**) | 1.9 → **2.5** (1.32×) | 1.8 → **2.6** (1.42×) |
 | `glm-5.2` | 7.4 → **5.6** (**0.76×**) | 0.6 → **1.0** (1.63×) | 0.6 → **0.8** (1.38×) |
 
-Every decode and serving cell improved. **Prefill regressed on `minimax-m3` and `glm-5.2`** —
-real, reproducible, and now **bisected**. Building the July baseline (`9b49fdd`) and running it
-against today's binary on the same box, same weights and same harness puts m3 at **28812 →
-39115 ms, 1.358× slower**, tokens identical; an automated bisect over the 34 commits since names
-**`750fd10` ("Kimi k3 kv accounting", #49)** as the first bad commit, adjacent to a good parent.
+Every decode and serving cell improved, and **the prefill regression on `minimax-m3` and
+`glm-5.2` has since been bisected and largely fixed** — the table above predates the fix.
+Building the July baseline (`9b49fdd`) and running it against today's binary on the same box,
+weights and harness put m3 at **1.358× slower**; an automated bisect over the 34 commits since
+named `750fd10` as the first bad commit, adjacent to a good parent.
 
-It is **compute, not memory**: MoE compute went 11448 → 19745 ms (+8.3 s of a ~10 s regression)
-while expert-load actually *improved*. `minimax-m2.7` is genuinely unaffected and
-`nemotron-3-super` runs a different expert path — the one that got faster.
+The cause was **`mallopt(M_MMAP_THRESHOLD)`**, which is deliberate and load-bearing — it is what
+makes eviction return memory to the OS. Its price is that expert-sized allocations become `mmap`
+mappings faulted in on first touch, and the MoE per-expert loop allocated two of them per expert
+per layer without ever going through a pool. The page faults were billed to `gather` and
+`scatter`, which is why byte-identical memcpy loops ran 8–13× slower.
 
-Worth recording that four plausible explanations were tested and killed before the bisect
-settled it, including the obvious suspect: the NVFP4 SwiGLU grouped expert path, which an
-in-binary ABBA A/B (`COLI_NVFP4_GROUP`) shows is ~1.04× **faster**, not slower. Full evidence and
-everything eliminated is in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
+Pooling that scratch, and gating the grouped expert path on rows-per-expert, recovers most of it:
+
+| model | prefill was | **now** | July |
+|---|---|---|---|
+| `glm-5.2` | 5.6 tok/s | **7.2** | 7.4 |
+| `minimax-m3` | 13.2 | **15.0** | 16.8 |
+| `minimax-m2.7` | 18.5 | **18.9** | 18.8 |
+
+Serving is unchanged by this and memory is unaffected (swap 0, no OOM) — the workload's prompts
+are short, so **this is a long-prompt prefill result**, which is the regime it was measured in.
+Eight other explanations were tested and killed first, several of them convincing; the bisect
+and the timers were right every time. Full evidence, including every dead end and two retracted
+conclusions, is in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
 
 **Two newer arches**, prefill and decode measured **2026-08-05**, V4 serving **2026-08-06**.
 Deliberately a separate table: the rows above are one dated snapshot taken in a single sweep,

@@ -339,6 +339,58 @@ and residency — and all four died on measurement. The bisect took about an hou
 and answered it outright. When a signal is this wide (10 s against 1.5 s of spread), bisect first
 and theorise afterwards.
 
+### FIXED (2026-08-06): root cause was mallopt's page faults, not any expert kernel
+
+`750fd10` introduced `mallopt(M_MMAP_THRESHOLD, 2 MiB)`. That is deliberate and load-bearing —
+it is what makes eviction actually return memory, and removing it costs nemotron serve 2.4×.
+Its price is that expert-sized allocations go to `mmap` and each fresh mapping faults on **first
+touch**. The MoE per-expert loop allocated `xg`/`hh` per expert per layer (~7680 per M3 prefill)
+and was never routed through any pool, so the faults were billed to whoever wrote first —
+`gather` (143 → 1131 ms) and `scatter` (174 → 2267 ms) on byte-identical code.
+
+Three changes, in the order they were measured:
+
+| commit | change | effect |
+|---|---|---|
+| `5f5e007` | free evicted experts off the cache lock | **neutral on speed** — contention real, not on the critical path. Kept for serve hygiene |
+| `0fefba9` | pool the per-expert `xg`/`hh` scratch | per-expert prefill **1.10×**, `gather` **7.7×** (146 vs July's 140 — fully recovered) |
+| `abb3d64` | gate grouped path on mean rows/expert (=8) | prefill glm **1.28×**, m3 **1.12×**, m2.7 **1.04×** |
+
+| model | prefill before | after | July |
+|---|---|---|---|
+| glm-5.2 | 5.6 tok/s | **7.2** | 7.4 |
+| minimax-m3 | 13.2 | **15.0** | 16.8 |
+| minimax-m2.7 | 18.5 | **18.9** | 18.8 |
+
+**Serve is neutral and memory is safe** (m2.7 5.86→5.89, m3 2.55→2.51, glm 0.83→0.87, all
+within noise; swap 0, avail 9–12 GB, no OOM). Expected: `bench_serve.py` uses short prompts, so
+prefill is a small share of it. **The scope of this work is long-prompt prefill.** GLM was the
+specific memory worry — the grouped path carried the ledger charging that once stopped it being
+OOM-killed — and per-expert allocates strictly less, which the run confirms.
+
+**Still open:** m3 keeps ~5.5 s over July. `scatter` is still 2160 ms vs 173 because it writes
+into `out`, which is `vec![0f32; n_tokens*d]` per layer and faulted during the scatter. Fixing
+it needs a caller-provided buffer — `out` is the return value, so a thread-local will not do.
+
+### Eight hypotheses died. The bisect and the timers were right every time.
+
+Kept as a list because the failure mode was identical each time — a mechanism argued from code
+reading or from an ablation that moved two things at once:
+
+1. **Grouped path** — measured a 1.04× *win* at the time (before pooling changed the balance).
+2. **Residency/coverage** — coverage fell 46%→37% exactly as predicted; `expert-load` did not move.
+3. **Pointer-keyed device cache** (`1928094`) — fmt 0/1 only; shipped containers are 5/6.
+4. **WSMM** — `backend_cuda.cu:2897` records it measured *on M2.7* as a 1.16× win.
+5. **`COLI_NVFP4_U4`** — no effect.
+6. **`COLI_FFN_DEVCOPY`** — explains the `gpu-ffn` timer delta entirely, costs no wall time.
+7. **Eviction volume** — July evicted *more* (5013 vs 3600) and paid ~nothing.
+8. **"The gate breaks glm decode"** — a 24-token bench said 1.05→0.88. Decode was grouped in
+   *both* arms; the knob moved **prefill**, whose extra ~19 s warmed the cache before decode
+   began. At 100 tokens they converge (last-half 1.33/1.23 vs 1.23/1.23).
+
+(8) also retracts the fleet A/B's "grouped wins glm decode 1.19×". **Corollary: glm
+steady-state decode is ~1.23–1.33 tok/s, not the ~1.0 a 24-token window reports.**
+
 ### Two things the re-measurement retired
 
 - **Decode bimodality did not appear.** The old "~25% of decode runs land well below the mode"

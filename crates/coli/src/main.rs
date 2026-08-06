@@ -1360,11 +1360,7 @@ fn cmd_gen_preload_direct(model: &colibri_engine::Model, prompt: &[i32], n_new: 
         }
     };
     let secs = t0.elapsed().as_secs_f64().max(1e-9);
-    let bpe = colibri_engine::capacity::bytes_per_expert(
-        model.cfg.hidden as u64,
-        model.cfg.moe_inter as u64,
-        model.ebits as u32,
-    );
+    let bpe = colibri_engine::capacity::bytes_per_expert_of(&model.cfg, model.ebits as u32);
     let gb = (store.len() as u64 * bpe) as f64 / (1u64 << 30) as f64;
     println!(
         "preload (direct from model, {cores} threads): {} experts in {:.2}s ({:.2} GB, {:.2} GB/s)",
@@ -3070,11 +3066,7 @@ where
     let probe_expert = owned.first().copied().unwrap_or(0) as usize;
     let per = match provider.expert(probe_layer, probe_expert) {
         Ok(e) => (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64,
-        Err(_) => colibri_engine::capacity::bytes_per_expert(
-            cfg.hidden as u64,
-            cfg.moe_inter as u64,
-            ebits,
-        ),
+        Err(_) => colibri_engine::capacity::bytes_per_expert_of(cfg, ebits),
     };
     // Only the experts THIS node owns are ever loaded here, so coverage must be measured
     // against the shard — not `cfg.n_experts`. Using the whole model's count made a 2-rank
@@ -3600,7 +3592,7 @@ fn parse_ctx(s: &str) -> Option<u64> {
 /// Spark hold while keeping N context".
 fn cmd_capacity(args: &[String]) -> ExitCode {
     use colibri_engine::capacity::{
-        bytes_per_expert, context_in_kv_budget, experts_in_budget, kv_bytes_per_token,
+        bytes_per_expert_of, context_in_kv_budget, experts_in_budget, kv_bytes_per_token,
         kv_fixed_bytes,
     };
     let snap = match args.get(2) {
@@ -3621,8 +3613,15 @@ fn cmd_capacity(args: &[String]) -> ExitCode {
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     let gb = |b: u64| b as f64 / gib as f64;
 
-    let bpe = bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, 4);
-    let sparse_layers = (cfg.n_layers - cfg.first_dense).max(0) as u64;
+    // Both of these ask the config rather than assuming GLM's shape. `capacity` reported
+    // Nemotron-H's routed experts as 695 GB inside a 69 GB container by getting all three
+    // wrong at once: expert width (latent, not hidden), tensor count (gateless relu2 has no
+    // gate), and layer count (`n_layers - first_dense` counts Nemotron's Mamba2 and GQA
+    // layers as MoE — `moe_layers()` reads the layer_kind axis, and its own doc notes the
+    // naive form "mis-sizes the expert cache by the entire model").
+    let bpe = bytes_per_expert_of(&cfg, 4);
+    let (sparse_layers, _first_moe) = cfg.moe_layers();
+    let sparse_layers = sparse_layers as u64;
     let total_experts = sparse_layers * cfg.n_experts as u64;
 
     let ram_gb: u64 = args

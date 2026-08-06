@@ -1159,9 +1159,46 @@ pub mod capacity {
 
     /// Resident bytes of one routed expert (gate + up + down) for a model with
     /// the given `hidden`/`moe_inter`, at `bits`.
+    ///
+    /// **Raw-dimension form — prefer [`bytes_per_expert_of`] when a `Config` is in hand.**
+    /// This assumes a *gated SwiGLU expert living at `hidden`*, which is true of GLM and the
+    /// MiniMax models and false of both latent-MoE archs. Callers that pass `cfg.hidden`
+    /// blind over-count Nemotron-H by ~10× (see the wrapper).
     pub fn bytes_per_expert(hidden: u64, moe_inter: u64, bits: u32) -> u64 {
         // gate [moe_inter, hidden], up [moe_inter, hidden], down [hidden, moe_inter]
         2 * qt_bytes(moe_inter, hidden, bits) + qt_bytes(hidden, moe_inter, bits)
+    }
+
+    /// Resident bytes of one routed expert, sized from the model's own shape.
+    ///
+    /// Two things vary across the fleet and both were being ignored, which is how
+    /// `coli capacity` came to report Nemotron-H's routed experts as **695 GB inside a
+    /// 69 GB container**:
+    ///
+    /// - **Where the expert lives.** [`Arch::routed_experts_are_latent`] models
+    ///   (Nemotron-H, Kimi-K3) bottleneck the MoE block, so their expert tensors are
+    ///   `[moe_inter, moe_latent]`, not `[moe_inter, hidden]`. Nemotron's latent is far
+    ///   narrower than its hidden, so using `hidden` inflates every expert.
+    /// - **How many tensors.** A `relu2` expert is *gateless* — `down(relu(up·x)²)`, two
+    ///   matrices. Charging a third for a `gate` that the container does not ship adds 50%.
+    ///
+    /// Both are named predicates that already exist precisely because they must agree in
+    /// several places; this makes the capacity estimate a third place that asks rather than
+    /// assumes. Cross-checked against the real thing: the sharded-cache path probes a live
+    /// expert and recorded Nemotron at **3.1 MB**, against 15.79 MB from the blind estimate.
+    pub fn bytes_per_expert_of(cfg: &colibri_core::Config, bits: u32) -> u64 {
+        let outer = if cfg.arch.routed_experts_are_latent() && cfg.moe_latent > 0 {
+            cfg.moe_latent as u64
+        } else {
+            cfg.hidden as u64
+        };
+        let inter = cfg.moe_inter as u64;
+        let up_down = qt_bytes(inter, outer, bits) + qt_bytes(outer, inter, bits);
+        if cfg.relu2 {
+            up_down // gateless: up + down only
+        } else {
+            up_down + qt_bytes(inter, outer, bits) // + gate
+        }
     }
 
     /// How many experts of `bytes_per_expert` fit in `budget_bytes`.
@@ -1904,5 +1941,69 @@ mod tests {
         // ~110 GB budget (a Spark after dense+overhead) -> a few thousand experts.
         let n = capacity::experts_in_budget(110 * (1 << 30), bpe);
         assert!((5_000..7_000).contains(&n), "experts in 110GB = {n}");
+    }
+
+    /// `bytes_per_expert_of` must read the expert's ACTUAL shape off the config, not
+    /// assume GLM's. Getting this wrong is what made `coli capacity` report Nemotron-H's
+    /// routed experts as 695 GB inside a 69 GB container.
+    ///
+    /// Asserted as *relationships* rather than magic byte counts, so the test says why it
+    /// cares and survives a change to the quantized layout.
+    #[test]
+    fn expert_size_follows_the_arch_not_glms_shape() {
+        // Real parse path, not a hand-built struct — the shape under test comes off the
+        // same JSON a container ships. `hidden` is deliberately much wider than
+        // `moe_latent_size`, which is the whole point on Nemotron-H.
+        let cfg = colibri_core::Config::from_json(
+            &colibri_json::Json::parse(
+                r#"{"model_type":"nemotron_h","hidden_size":512,"num_hidden_layers":4,
+                    "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,"vocab_size":8,
+                    "hybrid_override_pattern":"ME*M","n_routed_experts":4,"num_experts_per_tok":2,
+                    "moe_intermediate_size":64,"moe_latent_size":32,
+                    "moe_shared_expert_intermediate_size":6,"norm_topk_prob":false,
+                    "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
+                    "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
+                    "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.relu2 && cfg.moe_latent == 32 && cfg.hidden == 512);
+
+        // Latent + gateless: charged at `moe_latent` with no gate tensor. The blind form
+        // charges `hidden` AND a gate — that combination is what reported Nemotron-H's
+        // routed experts as 695 GB inside a 69 GB container.
+        let real = capacity::bytes_per_expert_of(&cfg, 4);
+        let blind = capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, 4);
+        assert!(
+            real * 4 < blind,
+            "a latent gateless expert must be several times smaller than the blind \
+             hidden-width gated estimate: {real} vs {blind}"
+        );
+
+        // Each axis on its own, so an edit that fixes one and drops the other still fails.
+        let mut gated = cfg.clone();
+        gated.relu2 = false;
+        assert!(
+            capacity::bytes_per_expert_of(&gated, 4) > real,
+            "the gate tensor must be charged when the arch actually ships one"
+        );
+        let mut no_latent = cfg.clone();
+        no_latent.moe_latent = 0;
+        assert!(
+            capacity::bytes_per_expert_of(&no_latent, 4) > real,
+            "with no latent bottleneck the expert must be sized at `hidden`"
+        );
+
+        // The gated-at-hidden models (GLM / MiniMax) must be untouched by all of this.
+        let mut swiglu = cfg.clone();
+        swiglu.arch = colibri_core::Arch::MinimaxM2;
+        swiglu.relu2 = false;
+        swiglu.moe_latent = 0;
+        assert_eq!(
+            capacity::bytes_per_expert_of(&swiglu, 4),
+            blind,
+            "GLM/MiniMax-shaped experts must match the raw-dimension form exactly"
+        );
     }
 }

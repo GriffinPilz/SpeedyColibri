@@ -19,6 +19,15 @@ faster than the absolutes quoted here:
   hold the whole working set resident, dropping the page-cache double-copy (`fadvise`) so
   `MemAvailable` is honest. Measured **1.94×** over the old static default (median 4.83 vs
   2.49 tok/s, diverse-prompt serving) — the working set stays resident instead of streaming.
+  **Near-fit went through a period of looking unstable, and that was a different bug.** M2.7's
+  throughput swung ~8× run to run, which got blamed on the residency policy, on pack thread
+  count and on the buffer-pool cap before the actual cause was found: the *mmap* gate also
+  fired at 80% coverage, so spans were served from a page cache the heap had already taken,
+  and every non-resident touch became a major fault inside the pack's memcpy. The two
+  thresholds are now separate — `NEARFIT_COVERAGE_PCT` 80, `MMAP_MIN_COVERAGE_PCT` 100 — and
+  the full measurement record lives beside the constant in
+  [`crates/coli/src/main.rs`](../crates/coli/src/main.rs). Two competing memory tiers gated on
+  the same number is the shape to watch for.
 - **≫ RAM** (experts larger than RAM — e.g. MiniMax-M3 ~193 GB, GLM-5.2 ~338 GB): fill RAM
   with as many experts as fit, keep the OS page cache as a reclaimable second tier, and let
   the monitor evict the LRU tail under pressure. Measured **1.22×** on M3 (2.05 vs 1.68 tok/s)

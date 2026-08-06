@@ -331,18 +331,40 @@ impl State {
     /// every decode load enters at `heat = 1`, so a frequency-primary rank evicts
     /// decode's live working set in favour of prefill leftovers that will never be
     /// read again. Measured 5.8% vs 44.8% decode hit rate.
-    fn evict_to(&mut self, budget: u64) {
-        self.evict_to_protecting(budget, &HashSet::new());
+    /// Returns the evicted entries **undropped** — see [`State::evict_to_protecting`].
+    #[must_use = "drop the freed entries AFTER releasing the cache lock, or the \
+                  deallocation blocks every concurrent expert() — that was 5.3 s on M3"]
+    fn evict_to(&mut self, budget: u64) -> Vec<Entry> {
+        self.evict_to_protecting(budget, &HashSet::new())
     }
 
     /// Like [`State::evict_to`] but never evicts a key in `protect` — used when
     /// bulk-inserting a layer's freshly-loaded batch, so the just-loaded experts
     /// (heat = 1, so "cold" to LFRU) survive to the compute loop instead of being
     /// evicted by their own batch and reloaded.
-    fn evict_to_protecting(&mut self, budget: u64, protect: &HashSet<(usize, usize)>) {
+    /// Returns the evicted entries **without dropping them**, so the caller can free them
+    /// after releasing the cache lock.
+    ///
+    /// Freeing is not incidental: an expert is ~21 MB, and a MiniMax-M3 512-token prefill
+    /// evicts ~3600 of them. Measured under the lock that was **5300 ms of `free` against
+    /// 7 ms of `select`** — the ranking this function was once rewritten to optimise is
+    /// noise, and the deallocation is everything. Worse, it is *contended*: the compute
+    /// loop's `expert()` calls took **5136 ms of lock-wait** in the same run, matching the
+    /// free almost exactly, because `munmap`/`free` of the evicted buffers ran while the
+    /// caller still held `state.lock()`.
+    ///
+    /// Handing the vector back changes no policy — same victims, same order, same budget —
+    /// only *where* the pages are returned to the OS.
+    #[must_use = "drop the freed entries AFTER releasing the cache lock, or the \
+                  deallocation blocks every concurrent expert() — that was 5.3 s on M3"]
+    fn evict_to_protecting(
+        &mut self,
+        budget: u64,
+        protect: &HashSet<(usize, usize)>,
+    ) -> Vec<Entry> {
         if self.bytes <= budget {
             self.publish_ram();
-            return;
+            return Vec::new();
         }
         // Rank once, then evict down the list — rather than re-scanning every entry to
         // find each successive victim.
@@ -401,11 +423,15 @@ impl State {
                 freed.push(e);
             }
         }
-        drop(freed);
+        // `EVICT_DROP_US` now measures only unlinking the victims from the map. The
+        // deallocation it used to include moved out to the callers, past the lock — so
+        // after this change a large `free` in the profile means the *caller* is dropping
+        // under the lock, which is the bug returning.
         if let Some(t) = t_drop {
             EVICT_DROP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         self.publish_ram();
+        return freed;
         // Falling off the end means everything left is pinned or protected — the same
         // outcome the old `None => break` arm produced.
     }
@@ -481,10 +507,12 @@ impl<P: ExpertProvider> ExpertCache<P> {
         );
         s.bytes += bytes;
         let budget = self.budget.load(Ordering::Relaxed);
-        s.evict_to(budget);
+        let freed = s.evict_to(budget);
         if prof {
             FETCH_INSERT_US.fetch_add(t_ins.elapsed().as_micros() as u64, rel);
         }
+        drop(s); // release the lock BEFORE returning ~21 MB/victim to the OS
+        drop(freed);
         Ok(ex)
     }
 }
@@ -688,10 +716,12 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
         }
         let t = std::time::Instant::now();
         let budget = self.budget.load(Ordering::Relaxed);
-        s.evict_to_protecting(budget, &batch);
+        let freed = s.evict_to_protecting(budget, &batch);
         if prof {
             CACHE_EVICT_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        drop(s); // release the lock BEFORE returning ~21 MB/victim to the OS
+        drop(freed);
         Ok(())
     }
 }
@@ -896,7 +926,8 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                             .min(cache.budget.load(Ordering::Relaxed))
                             .max(FLOOR_MIN);
                         cache.budget.store(new_budget, Ordering::Relaxed);
-                        cache.state.lock().unwrap().evict_to(new_budget);
+                        let freed = cache.state.lock().unwrap().evict_to(new_budget);
+                        drop(freed); // guard already dropped by the temporary above
                         low_ticks = 0;
                         continue;
                     }
@@ -914,11 +945,12 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                     let reclaim = (floor_now - avail).saturating_add(HARD_SLACK);
                     let new_budget = resident.saturating_sub(reclaim).max(FLOOR_MIN);
                     cache.budget.store(new_budget, Ordering::Relaxed);
-                    let after = {
+                    let (after, freed) = {
                         let mut s = cache.state.lock().unwrap();
-                        s.evict_to(new_budget);
-                        s.bytes
+                        let freed = s.evict_to(new_budget);
+                        (s.bytes, freed)
                     };
+                    drop(freed); // outside the lock
                     if trace {
                         eprintln!(
                             "[guard] FIRE avail={:.2} floor={:.2} (base {:.2} + brake {:.2}) \
@@ -984,7 +1016,8 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 };
                 cache.budget.store(new_budget, Ordering::Relaxed);
                 if new_budget < resident {
-                    cache.state.lock().unwrap().evict_to(new_budget);
+                    let freed = cache.state.lock().unwrap().evict_to(new_budget);
+                    drop(freed); // guard already dropped by the temporary above
                 }
             }
         });
@@ -1050,10 +1083,11 @@ impl<P: ExpertProvider> ExpertCache<P> {
                 after = s.bytes;
                 break; // already at the floor — evicting more is not possible
             }
-            s.evict_to(target);
+            let freed = s.evict_to(target);
             self.budget.store(target, Ordering::Relaxed);
             after = s.bytes;
             drop(s);
+            drop(freed); // outside the lock
             passes += 1;
         }
         // Decide on a FRESH reading, not the one sampled at the top of the last pass — if the
@@ -1541,7 +1575,7 @@ mod tests {
                 evictions: 0,
                 session_usage: HashMap::new(),
             };
-            s.evict_to_protecting(budget, &protect);
+            drop(s.evict_to_protecting(budget, &protect));
 
             // Guard against a vacuous pass: if nothing is ever evicted, every assertion
             // below holds trivially and the test proves nothing about the rewrite.

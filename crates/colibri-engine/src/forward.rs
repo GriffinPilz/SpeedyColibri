@@ -381,28 +381,64 @@ fn dsv4_indexer_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_DSV4_INDEXER").ok().as_deref() != Some("0"))
 }
 
-/// Tokens per DeepSeek-V4 prefill chunk (`COLI_DSV4_CHUNK`, default 512; `0` disables
-/// chunking and runs the whole prompt in one call).
-///
-/// This is what keeps V4's raw KV constant in context. The ring introduced with the
-/// sliding window holds the widest span a SINGLE call reads back, so an unchunked prefill
-/// sizes it to the whole prompt — generation became free, prompts did not. Chunked, the
-/// ring is `window + chunk - 1` rows however long the prompt is.
-///
-/// 512 rather than something larger: the retained rows and the transient
-/// `[chunk, hc_mult, hidden]` activations both scale with it, and V4's prefill is
-/// expert-load-bound at these sizes, so a bigger chunk buys little and costs memory. It is
-/// a knob because that trade is worth being able to measure, not because the default is in
-/// doubt — and setting it to 0 recovers the exact pre-chunking behaviour for an A/B.
-fn dsv4_prefill_chunk() -> usize {
+/// Tokens per DeepSeek-V4 prefill chunk. `None` = derive it from the KV budget below;
+/// `Some(0)` = never chunk; `Some(n)` = a fixed `n`. Set with `COLI_DSV4_CHUNK`.
+fn dsv4_chunk_override() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_DSV4_CHUNK").ok().and_then(|v| v.parse::<usize>().ok())
+    })
+}
+
+/// How much raw KV a V4 prefill may retain before it is chunked, in MiB
+/// (`COLI_DSV4_KV_BUDGET_MB`, default 1024).
+fn dsv4_kv_budget_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        match std::env::var("COLI_DSV4_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
-            Some(0) => usize::MAX, // "never chunk" — the whole prompt is one call
-            Some(n) => n,
-            None => 512,
-        }
+        std::env::var("COLI_DSV4_KV_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1024)
+            << 20
     })
+}
+
+/// The chunk size for a prefill of `s` tokens: **as coarse as the KV budget allows**.
+///
+/// Chunking is what keeps V4's raw KV constant in context — the ring holds the widest span
+/// a SINGLE call reads back, so an unchunked prefill sizes it to the whole prompt. But it
+/// is NOT free, and the cost is not the one a byte count would suggest.
+///
+/// **Measured on the box, 2048-token prompt:** the ring drops 2048 -> 639 rows
+/// (193.5 -> 60.4 MB) with identical tokens, and prefill goes **119.6 s -> 168.7 s, 1.41x
+/// slower**. Smaller `S` means fewer rows per routed expert, so the expert streaming that
+/// dominates V4 prefill is amortised over less work — the same effect already recorded as
+/// the MoE-pipelining negative, where chunking destroyed queue depth faster than the
+/// overlap recovered it.
+///
+/// So a fixed token chunk is the wrong rule: at 2048 tokens it buys 133 MB of a 107 GB
+/// process — nothing — and charges 41% of prefill for it. The budget makes the trade
+/// track what is actually at stake: **do not chunk at all until the retained KV would
+/// exceed `COLI_DSV4_KV_BUDGET_MB`, then chunk exactly as coarsely as that allows.** A
+/// 2048-token prompt runs in one call as before; a 1M-token prompt, which would otherwise
+/// retain ~95 GiB of raw rows and simply not fit, chunks at ~10.8k and retains 1 GiB.
+///
+/// `COLI_DSV4_CHUNK` overrides with a fixed size (`0` = never chunk), which is what makes
+/// the 1.41x above an A/B rather than an assertion.
+fn dsv4_prefill_chunk(cfg: &colibri_core::Config, s: usize) -> usize {
+    match dsv4_chunk_override() {
+        Some(0) => return usize::MAX, // never chunk — the whole prompt is one call
+        Some(n) => return n.max(1),
+        None => {}
+    }
+    let row = crate::KvCache::raw_row_bytes(cfg).max(1);
+    let budget_rows = (dsv4_kv_budget_bytes() / row).max(cfg.window.max(1) as usize);
+    // Under budget: one call, exactly as before chunking existed. This is the common case
+    // and it must stay free.
+    if s <= budget_rows {
+        return usize::MAX;
+    }
+    budget_rows
 }
 
 /// How much the Indexer actually pruned: queries that reached the SCORING path, candidate
@@ -1101,7 +1137,7 @@ pub fn forward<P: ExpertProvider>(
             ids,
             pos_base,
             hidden_out,
-            dsv4_prefill_chunk(),
+            dsv4_prefill_chunk(cfg, s),
         );
     }
 
@@ -2263,6 +2299,85 @@ mod tests {
             pos_base = t;
         }
         assert_eq!(kv.ring(), 500);
+    }
+
+    /// A V4-shaped config for the chunking policy: only `window`, `kv_lora`/`qk_rope` and
+    /// the layer count matter to it.
+    fn chunk_policy_cfg() -> Config {
+        // Every layer full-attention (1-indexed), so all 43 hold KV exactly as V4's do.
+        let all: String =
+            (1..=43).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let json = format!(
+            r#"{{"model_type":"kimi_k3","architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{{"hidden_size":64,"num_hidden_layers":43,
+                "num_attention_heads":8,"num_key_value_heads":8,"num_experts":8,
+                "num_experts_per_token":2,"num_shared_experts":1,"moe_intermediate_size":8,
+                "intermediate_size":16,"routed_expert_hidden_size":16,"first_k_dense_replace":0,
+                "q_lora_rank":8,"kv_lora_rank":512,"qk_nope_head_dim":448,
+                "qk_rope_head_dim":64,"v_head_dim":512,"vocab_size":32,
+                "max_position_embeddings":1048576,"rms_norm_eps":1e-5,"rope_theta":10000.0,
+                "attn_res_block_size":12,
+                "linear_attn_config":{{"head_dim":8,"num_heads":8,"short_conv_kernel_size":2,
+                "full_attn_layers":[{all}]}}}}}}"#
+        );
+        let mut cfg = Config::from_json(&colibri_json::Json::parse(&json).unwrap()).unwrap();
+        cfg.window = 128;
+        // The real V4 geometry, which is what makes the row size — and so the budget's
+        // token count — the one the box actually sees: 43 KV layers at 512 + 64 floats.
+        assert_eq!(KvCache::kv_layers(&cfg), 43, "all 43 layers must hold KV, as V4's do");
+        cfg
+    }
+
+    /// **The policy that decides whether chunking's cost is ever paid.**
+    ///
+    /// Chunking is NOT free: measured on the box, a 2048-token prompt chunked at 512 kept
+    /// 639 raw rows instead of 2048 (193.5 -> 60.4 MB) and took **1.41x longer to prefill**
+    /// — smaller `S` amortises the routed-expert streaming over less work. At that size the
+    /// memory saved is 133 MB of a 107 GB process, i.e. nothing, so a fixed token chunk
+    /// would charge 41% of prefill for no benefit.
+    ///
+    /// Hence: do not chunk until the retained KV would exceed the budget, then chunk
+    /// exactly as coarsely as the budget allows. These assertions are the rule, not the
+    /// implementation restated — each names a prompt size and what should happen to it.
+    #[test]
+    fn v4_prefill_chunks_only_when_the_kv_budget_says_it_must() {
+        let cfg = chunk_policy_cfg();
+        let row = KvCache::raw_row_bytes(&cfg);
+        assert!(row > 0);
+        let budget_rows = dsv4_kv_budget_bytes() / row;
+        assert!(budget_rows > 2048, "1 GiB should hold well past a short prompt");
+
+        // Short and medium prompts: ONE call, exactly as before chunking existed. This is
+        // the assertion that keeps the measured 1.41x off the common path.
+        for s in [1usize, 512, 2048, budget_rows] {
+            assert_eq!(
+                dsv4_prefill_chunk(&cfg, s),
+                usize::MAX,
+                "{s} tokens fits the KV budget and must not be chunked"
+            );
+        }
+        // Past the budget it chunks — and chunks AT the budget, the coarsest size that
+        // still bounds the KV, because every token below that costs prefill throughput.
+        for s in [budget_rows + 1, 100_000, 1_000_000] {
+            assert_eq!(
+                dsv4_prefill_chunk(&cfg, s),
+                budget_rows,
+                "{s} tokens exceeds the budget and must chunk at exactly the budget"
+            );
+        }
+        // And the bound actually holds: retained rows are the chunk plus a window, whatever
+        // the context. 1M tokens would otherwise retain ~95 GiB of raw rows.
+        let retained = (budget_rows + cfg.window as usize) * row;
+        assert!(
+            retained < 2 * dsv4_kv_budget_bytes(),
+            "retained {retained} should stay near the {} budget",
+            dsv4_kv_budget_bytes()
+        );
+        assert!(
+            1_000_000 * row > 40 * retained,
+            "unchunked 1M would be {} — the saving must be large or the policy is pointless",
+            1_000_000 * row
+        );
     }
 }
 

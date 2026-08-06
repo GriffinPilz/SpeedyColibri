@@ -683,7 +683,7 @@ impl KvCache {
     /// Split out from [`Self::bytes_per_token`] because a ring makes "per row" and "per
     /// token" different questions: V4 retains a bounded number of rows however many tokens
     /// go past.
-    fn raw_row_bytes(cfg: &Config) -> usize {
+    pub fn raw_row_bytes(cfg: &Config) -> usize {
         // `latent` needs no predicate: `kv_lora` is already 0 on every arch that does not
         // keep one, and it is the ONE row DeepSeek-V4 writes.
         let latent = cfg.kv_lora as usize;

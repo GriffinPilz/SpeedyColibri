@@ -175,7 +175,8 @@ variant + a convert mapping + one registry block — the checklist is in
 ### Test suite status
 
 `cargo test --workspace` (CPU) is **389 passing, 0 failing**. Adding `--features cuda` on a
-GB10 brings up the kernel tests: **393 passing, 1 failing** as of **2026-08-05 on `0f7dffb`**.
+GB10 brings up the kernel tests: **393 passing, 1 failing** as of **2026-08-05** — now at
+cargo's **default parallelism**, not `--test-threads=1` (see below).
 The one failure is pre-existing — it reproduces on `e4e3f7f`, before the DeepSeek-V4 work —
 and is tracked rather than tolerated silently:
 
@@ -189,9 +190,13 @@ deterministic") and `kimi_prefill_matches_incremental_decode` — **both pass no
 wrong weights when the pooled buffer was reused. The second was indeed a consequence of the
 first, as the note here guessed.
 
-**Run CUDA tests with `-- --test-threads=1`.** The CUDA device context is process-global and
-its scratch is not thread-safe, so a parallel run fails with `invalid resource handle` for
-reasons unrelated to the code under test.
+**`--test-threads=1` is no longer needed.** The CUDA suite used to fail intermittently in
+parallel with `invalid resource handle`, a different victim test each run. The cause was not
+the scratch mutex everyone suspected: `gpu::available()` was a *thread-local* `OnceCell`, so
+every thread that first touched the GPU re-ran `coli_cuda_init` — which resets
+process-global state and creates a fresh stream underneath threads already launching on the
+old one. `coli_cuda_init` is now idempotent and `AVAIL` is process-global. Measured after
+the fix: six consecutive parallel runs, byte-identical, zero handle errors.
 
 Two traps worth knowing if you are checking this yourself: cargo **stops at the first failing
 test binary** unless you pass `--no-fail-fast`, so a naive run reports 1 failure and hides the

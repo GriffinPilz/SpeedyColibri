@@ -223,7 +223,56 @@ The arms provably switched, which is what makes the null trustworthy: `group` we
 and `gpu-ffn` 0 → 12241 ms. **Keep the knob** — it converts a default that could not be
 questioned into one that has been measured.
 
-### Where the regression actually is: a MEMORY REGIME, not a code path
+### BISECTED: first bad commit is 750fd10 "Kimi k3 kv accounting (#49)"
+
+Direct binary A/B against the July baseline **9b49fdd** (the commit that introduced the perf
+table), then an automated `git bisect` over the 34 commits to `a82ecdf`. Harness held constant
+(today's `scripts/`, today's container — M3 weights are byte-identical since 2026-07-22, only
+`.coli_usage` is newer); only the binary changes. Predicate: prefill ms, threshold 34000, which
+sits in a ~10 s gap against ~1.5 s of run-to-run spread.
+
+| | prefill | expert-load | coverage | token |
+|---|---|---|---|---|
+| JUL27 `9b49fdd` | 28057.5 / 29566.3 ms | 12607 / 13634 | 46% | `[67732]` |
+| TODAY `a82ecdf` | 38231.1 / 39998.3 ms | 12441 / 13166 | 37% | `[67732]` |
+
+**1.358× slower** (28812 → 39115 ms mean), tokens identical in all four runs. Bisect path, one
+M3 prefill per step:
+
+```
+ea269a6  README for #46/#47                   28504.3 ms  GOOD   <- 750fd10's parent
+750fd10  Kimi k3 kv accounting (#49)          38793.8 ms  BAD    <- first bad commit
+831b09a  Gqa decode and k3 preflight (#51)    38350.1 ms  BAD
+c1e559d  Deepseek v4 flash (#53)              38332.8 ms  BAD
+cd03e65  docker: run-dgx.sh reads registry    40522.4 ms  BAD
+```
+
+Good and bad are **adjacent** (`750fd10^ == ea269a6`), so the whole regression is inside that
+one squashed PR.
+
+### It is COMPUTE, not memory — expert-load is flat
+
+Full profiles, same prompt, both binaries:
+
+| | JUL27 | TODAY | Δ |
+|---|---|---|---|
+| **moe compute** (moe − expert-load) | **11448 ms** | **19745 ms** | **+8297 (1.72×)** |
+| attn | 4653 | 5486 | +833 |
+| expert-load | 13538 | 12559 | −979 |
+| logits | 171 | 303 | +132 |
+
+MoE compute is +8.3 s of a ~10 s regression. Expert-load *improved*. Note the July binary
+predates the 9-field breakdown, so compare subtotals, not field names: July reports
+`gpu-ffn 9694` (per-expert path), today reports `group 17732` — those are not like-for-like,
+because `group` is timed as one block that also swallows gather/scatter/staging.
+
+The cleanest same-path number: per-expert `gpu-ffn` went **9694 ms (July) → 12241 ms (today)**,
+1.26× on an unchanged dispatch. 750fd10 also wired WSMM into all four expert entry points and
+removed a staging gate — both affect the per-expert AND grouped paths, which fits a regression
+present in *both* arms. Those are hypotheses; the knob matrix (`COLI_NVFP4_U4`,
+`COLI_FFN_DEVCOPY`, `COLI_NVFP4_GROUP`) is what will decide, not this paragraph.
+
+### ~~Where the regression actually is: a MEMORY REGIME~~ — REFUTED by the same run
 
 The A/B's real yield. Today's **per-expert arm** is the same structural path July ran, so it is
 the apples-to-apples comparison:
@@ -234,20 +283,25 @@ the apples-to-apples comparison:
 | minimax-m2.7 | 27.16 s | **26.61 s** | 1.02× *faster* |
 
 m3 is slower on **both** arms ⇒ the cause is shared by both, and is not the grouped path.
-m2.7 is clean on both ⇒ it is a control, not a masked casualty.
+m2.7 is clean on both ⇒ it is a control, not a masked casualty. Both of those still hold.
 
-What m3 (229 GB) and glm (403 GB) share, and m2.7 (122 GB, near-fit) and nemotron (69 GB, fits)
-do not, is being **≫ RAM**. Look at expert residency and expert-load, not at the expert kernels.
-Prime candidates are the residency/ceiling changes that landed after 2026-07-26 — the near-fit
-bar 118→80, the OOM-guard margin 12.88→7.98 GB, and the grouped path's own ledger charging
-(which commits a pinned buffer + device arena as `Class::Scratch` and therefore takes RAM away
-from expert residency on exactly the ≫-RAM models).
+The **memory** reading did not. The theory was that m3 (229 GB) and glm (403 GB), being the two
+≫-RAM models, had lost expert residency — m3 carries a 12 GiB device duplicate and glm 17 GiB,
+and `lib.rs:1427` decides `Upload` vs `ZeroCopy` by asking only whether the duplicate *fits*,
+never whether it is worth more than the experts it displaces. Coverage **did** fall 46% → 37%
+exactly as that predicted. **But expert-load did not move** (13538 → 12559 ms, marginally
+*better*), so the lost coverage costs nothing measurable here and cannot be the mechanism.
 
-Next step: capture m3 expert-load and resident-expert count on an old build vs today — a real
-bisect with built binaries, since no July expert-load figure was ever recorded. Use m3 (2.4×
-faster per rep than glm). Build note: `cargo` is off PATH under plain ssh on the box —
-`export PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH` — and verify the arm with a `strings`
-probe before measuring; the first build here died with exit 127 and left the old binary in place.
+Kept because the observation is still true and still worth acting on independently: that
+`Upload`/`ZeroCopy` test is the one residency decision on this box that is **not** coverage-aware,
+unlike O_DIRECT, mmap and reader threads. Freeing 12–17 GiB for experts on the ≫-RAM models may
+well be a win. It is simply not this bug.
+
+**Method note, worth more than the hypothesis:** four separate stories about this regression were
+built from code reading and commit archaeology — the grouped path, the pointer-keyed cache, WSMM,
+and residency — and all four died on measurement. The bisect took about an hour of an idle box
+and answered it outright. When a signal is this wide (10 s against 1.5 s of spread), bisect first
+and theorise afterwards.
 
 ### Two things the re-measurement retired
 

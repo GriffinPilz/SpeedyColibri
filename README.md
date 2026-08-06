@@ -32,17 +32,20 @@ performance table that only ever moves one way is not being measured honestly:
 | `minimax-m3` | 16.8 → **13.2** (**0.79×**) | 1.9 → **2.5** (1.32×) | 1.8 → **2.6** (1.42×) |
 | `glm-5.2` | 7.4 → **5.6** (**0.76×**) | 0.6 → **1.0** (1.63×) | 0.6 → **0.8** (1.38×) |
 
-Every decode and serving cell improved. **Prefill regressed 21–24% on `minimax-m3` and
-`glm-5.2`** — real and reproducible, not noise: reps span 2–3% and the token gate passes.
-The cause is **not yet identified**, and the two models it hits are the two that are ≫ RAM,
-while the near-fit `minimax-m2.7` measures clean. `nemotron-3-super` is unaffected — it runs a
-different (per-expert MXFP4) expert path, the one that got faster.
+Every decode and serving cell improved. **Prefill regressed on `minimax-m3` and `glm-5.2`** —
+real, reproducible, and now **bisected**. Building the July baseline (`9b49fdd`) and running it
+against today's binary on the same box, same weights and same harness puts m3 at **28812 →
+39115 ms, 1.358× slower**, tokens identical; an automated bisect over the 34 commits since names
+**`750fd10` ("Kimi k3 kv accounting", #49)** as the first bad commit, adjacent to a good parent.
 
-The obvious suspect has already been tested and **cleared**: the NVFP4 SwiGLU grouped expert
-path, which became default-on for these three models after the old snapshot. An in-binary ABBA
-A/B (`COLI_NVFP4_GROUP`) makes it ~1.04× **faster** on both m3 and m2.7, tokens identical. The
-regression is present on *both* arms, so it lies somewhere they share. Full evidence, including
-what has been eliminated, is in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
+It is **compute, not memory**: MoE compute went 11448 → 19745 ms (+8.3 s of a ~10 s regression)
+while expert-load actually *improved*. `minimax-m2.7` is genuinely unaffected and
+`nemotron-3-super` runs a different expert path — the one that got faster.
+
+Worth recording that four plausible explanations were tested and killed before the bisect
+settled it, including the obvious suspect: the NVFP4 SwiGLU grouped expert path, which an
+in-binary ABBA A/B (`COLI_NVFP4_GROUP`) shows is ~1.04× **faster**, not slower. Full evidence and
+everything eliminated is in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
 
 **Two newer arches**, prefill and decode measured **2026-08-05**, V4 serving **2026-08-06**.
 Deliberately a separate table: the rows above are one dated snapshot taken in a single sweep,

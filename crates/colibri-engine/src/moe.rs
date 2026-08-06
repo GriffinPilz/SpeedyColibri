@@ -1219,6 +1219,24 @@ fn union_and_weights(
 /// `moe_sharded()` runs it over the node's own experts; and the transport server
 /// runs it as the handler for a peer's [`ExpertRequest`]. Zero-weight (token,
 /// expert) pairs are skipped, so a token only touches the experts it routes to.
+/// Per-thread gather/result scratch for the per-expert loop in
+/// [`compute_experts_partial`] — see the comment at its use site for why pooling these
+/// two specifically matters under this binary's `mallopt` settings.
+#[derive(Default)]
+struct ExpertScratch {
+    xg: Vec<f32>,
+    hh: Vec<f32>,
+}
+
+thread_local! {
+    static EXPERT_SCRATCH: std::cell::Cell<ExpertScratch> = const {
+        std::cell::Cell::new(ExpertScratch {
+            xg: Vec::new(),
+            hh: Vec::new(),
+        })
+    };
+}
+
 pub fn compute_experts_partial<P: ExpertProvider>(
     provider: &P,
     layer: usize,
@@ -1353,6 +1371,25 @@ pub fn compute_experts_partial<P: ExpertProvider>(
 
     let prof = crate::forward::profile_on();
     let rel = std::sync::atomic::Ordering::Relaxed;
+    // Reuse the per-expert gather/result buffers instead of allocating two fresh ones per
+    // expert per layer. Same contract as `GroupScratch`/`MambaScratch`: single-threaded
+    // forward, grow-only, callers slice to the live length.
+    //
+    // This is not general allocator hygiene, it is specific to what `mallopt` does here.
+    // `M_MMAP_THRESHOLD` is pinned to 2 MiB (main.rs), deliberately, so expert-sized
+    // allocations go straight to `mmap` and every free is a `munmap` — that is load-bearing
+    // for eviction actually returning memory (removing it costs nemotron serve 2.4x). The
+    // cost lands on anything that allocates per call: a fresh mapping is faulted in on
+    // FIRST TOUCH, so the page faults are billed to whoever writes first. On a MiniMax-M3
+    // 512-token prefill that showed up as `gather` 143 -> 1131 ms (7.9x) and `scatter`
+    // 174 -> 2267 ms (12.6x) against byte-identical code, plus 478 ms of raw `alloc`.
+    // Pooled buffers are faulted in once and stay warm.
+    //
+    // Safe to reuse dirty: the gather rewrites all `nr * d` of `xg` before it is read, and
+    // `matmul_qt` asserts `y.len() == s * o` and assigns (never accumulates) every element
+    // of `hh`. Both are sliced to exactly the live length, so the assert also catches any
+    // future drift.
+    let mut sc = EXPERT_SCRATCH.with(|c| c.take());
     for (e, rows, rw) in &per_expert {
         let nr = rows.len();
         // Both of these used to sit outside every timer, in the residual. `expert()` was
@@ -1365,7 +1402,15 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             crate::forward::MOE_EXPGET_US.fetch_add(te.elapsed().as_micros() as u64, rel);
         }
         let ta = std::time::Instant::now();
-        let mut xg = vec![0f32; nr * d];
+        if sc.xg.len() < nr * d {
+            sc.xg.resize(nr * d, 0.0);
+        }
+        if sc.hh.len() < nr * d {
+            sc.hh.resize(nr * d, 0.0);
+        }
+        let ExpertScratch { xg, hh } = &mut sc;
+        let xg = &mut xg[..nr * d];
+        let hh = &mut hh[..nr * d];
         if prof {
             crate::forward::MOE_ALLOC_US.fetch_add(ta.elapsed().as_micros() as u64, rel);
         }
@@ -1379,13 +1424,8 @@ pub fn compute_experts_partial<P: ExpertProvider>(
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        let ta2 = std::time::Instant::now();
-        let mut hh = vec![0f32; nr * d];
-        if prof {
-            crate::forward::MOE_ALLOC_US.fetch_add(ta2.elapsed().as_micros() as u64, rel);
-        }
         let t1 = std::time::Instant::now();
-        ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
+        ffn(&ex.gate, &ex.up, &ex.down, xg, nr, hh);
         if prof {
             crate::forward::GPUFFN_US.fetch_add(
                 t1.elapsed().as_micros() as u64,
@@ -1406,6 +1446,7 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             );
         }
     }
+    EXPERT_SCRATCH.with(|c| c.set(sc));
     Ok(out)
 }
 

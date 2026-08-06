@@ -28,19 +28,30 @@ fails loudly instead of being reported as a win.
 Measured 2026-08-06 on branch `docs-retest-4model-2026-08-06`, which is ahead of `main`.
 K3's row is carried over from an earlier build — its suite takes hours and was not re-run.
 
-**Prefill is what this build moved, and only for GLM and M3** — measured **1.28×** and
-**1.12×** respectively against the previous build, interleaved ABBA on one binary with the
-tokens gated identical. Nemotron, M2.7 and V4 are unchanged, for reasons the profile
-explains: nemotron's experts are fully resident (`expert-load` = 2 ms, so there was no
-CPU-side cost to recover), M2.7 spends 54% of prefill waiting on NVMe, and V4 takes neither
-of the paths the fix touched. Decode and serving are unchanged everywhere.
+**Prefill is what this build moved, and only for M3 and GLM — both ~1.22×.** Measured against
+a freshly built `main`, ABBA-interleaved in one session, tokens gated identical:
 
-Those ratios come from interleaved A/Bs rather than from comparing this table against an
-older one, deliberately: the same unmodified binary measured V4 prefill at 41 s in July and
-36 s today. **Cross-day deltas on this box are worth ~12% before any code changes**, which is
-larger than most of the wins here. The fix itself was pooling per-expert scratch buffers
-whose page faults were being billed to gather and scatter — that story, and the eight wrong
-hypotheses that preceded it, is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+| | `main` | this build | ratio |
+|---|---|---|---|
+| **`minimax-m3`** (n=6/arm) | 38458 ms | 31559 ms | **1.22×** — arm ranges 2.0% and 2.4%, disjoint |
+| **`glm-5.2`** (n=4/arm) | 90497 ms | 73980 ms | **1.22×** — direction certain, magnitude soft |
+
+M3's is as clean as this box gets: 6.3 s separates the slowest new run from the fastest old
+one. GLM's *direction* is equally certain — the ranges don't overlap either — but its new arm
+spans 17% and drifts slower run over run while the `main` arm holds flat, which no
+explanation here accounts for, so read GLM as "roughly 1.2×" rather than 1.223×.
+
+The other three are unchanged, for reasons the profile explains: nemotron's experts are fully
+resident (`expert-load` = 2 ms, so there was no CPU-side cost to recover), M2.7 spends 54% of
+prefill waiting on NVMe, and V4 takes neither of the paths the fix touched (measured 1.35%
+apart at n=6/arm, against a 9.6% spread). Decode and serving are unchanged everywhere.
+
+**These ratios deliberately do not come from comparing this table against an older one.** The
+same unmodified binary measured V4 prefill at 41 s in July and 36 s today: **cross-day drift
+on this box is worth ~12% before any code changes**, which is larger than most of the wins
+here. The fix itself was pooling per-expert scratch buffers whose page faults were being
+billed to gather and scatter — that story, and the eight wrong hypotheses that preceded it,
+is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 **Read the decode column as a disk-streaming ladder, not a quality ranking.** Decode is bound
 by how many expert bytes each token pulls, so it tracks *model size against 121 GB of RAM*

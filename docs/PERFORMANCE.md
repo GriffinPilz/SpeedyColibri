@@ -91,6 +91,23 @@ dominates and grouping wins; at ~25 rows (512-token prefill) the kernel amortise
 the staging is left. Per-expert at large S measured **1.28× on GLM**, 1.12× on M3, 1.04× on
 M2.7, tokens identical. The crossover inside (1, 25.6) is bounded, not measured.
 
+**Net effect of the whole branch**, measured against a freshly built `main` (a82ecdf),
+ABBA-interleaved in one session, one variable — the binary. Provenance was probed rather than
+assumed: the old binary must lack a string only the new one has, and vice versa.
+
+| model | `main` | branch | ratio | |
+|---|---|---|---|---|
+| `minimax-m3` | 38458 ms | 31559 ms | **1.22×** | n=6/arm, ranges 2.0% / 2.4%, disjoint by 6.3 s |
+| `glm-5.2` | 90497 ms | 73980 ms | **~1.22×** | n=4/arm, disjoint, but the branch arm spans 17% |
+| `deepseek-v4-flash` | 36460 ms | 36952 ms | — | n=6/arm, 1.35% apart, *t* = 0.91 — no effect |
+
+GLM's branch arm drifts slower run over run (66.1 → 73.2 → 78.9 → 77.7 s) while its `main`
+arm holds flat at ~90 s across the same interleaved positions. Nothing here explains that, so
+the direction is reported as certain and the magnitude as approximate. V4 was expected to be
+flat and is: it is MXFP4, so the rows-per-expert gate never applies to it, and `dsv4_moe`
+hands its result to `fc2`, so it keeps the owning `compute_experts_partial` and never
+received the out-in-place accumulate.
+
 **Three traps this cost, worth not repeating.** First, an ablation must move exactly one thing:
 freeing evicted experts off the cache lock removed a 5136 ms lock-wait that matched a 5300 ms
 `evict free` almost perfectly, and changed wall time *not at all* — `fetch()` is called by the

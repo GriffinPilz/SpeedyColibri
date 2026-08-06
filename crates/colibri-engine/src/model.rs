@@ -672,7 +672,17 @@ impl KvCache {
     /// [`Self::bytes_for_split`] is the form that knows the prompt/generation split and
     /// can charge the ring for what it really costs.
     pub fn bytes_per_token(cfg: &Config) -> usize {
-        Self::raw_row_bytes(cfg) + Self::compressed_bytes_per_token(cfg)
+        // A RINGED arch charges no raw row here: chunked prefill bounds the retained rows
+        // at `ring_rows`, so they are a per-SEQUENCE cost (see `fixed_bytes`), not a
+        // per-token one. What still scales with context is the compressed tier — which is
+        // the whole point of the Compressor, and for DeepSeek-V4 leaves 13.4 KiB/token
+        // against Nemotron's 16 KB.
+        //
+        // This term was per-token until 2026-08-05 and had to be, because the ring alone
+        // was sized to the prompt. Chunked prefill removed that, and leaving the charge
+        // behind capped V4's advertised context at a fraction of what it can serve.
+        let raw = if cfg.window > 0 { 0 } else { Self::raw_row_bytes(cfg) };
+        raw + Self::compressed_bytes_per_token(cfg)
     }
 
     /// Bytes for ONE raw KV row across every KV-holding layer: latent (`kv_lora`) + roped
@@ -745,10 +755,48 @@ impl KvCache {
     /// not, and they stay expensive until prefill is chunked.
     pub fn raw_rows(cfg: &Config, n_prompt: usize, n_new: usize) -> usize {
         if cfg.window > 0 {
-            n_prompt.max(cfg.window as usize)
+            // Bounded by the CHUNK, not by the prompt. This used to read
+            // `n_prompt.max(window)` — correct when the ring shipped, because an unchunked
+            // prefill reads every row it wrote, and stale the moment prefill was chunked.
+            // Leaving it charged a 1M-token prompt for 1M raw rows that chunking had
+            // already stopped retaining, which is what capped V4's advertised context.
+            let ring = Self::ring_rows(cfg);
+            n_prompt.saturating_add(n_new).min(ring)
         } else {
             n_prompt.saturating_add(n_new)
         }
+    }
+
+    /// Raw KV bytes a **ringed** architecture may retain, whatever the context length —
+    /// `COLI_DSV4_KV_BUDGET_MB` (default 1024 MiB). `0` on every other arch.
+    ///
+    /// Lives here, beside the allocation it describes, and `forward`'s chunk policy reads
+    /// it from here rather than keeping its own copy. The two must agree exactly: the
+    /// policy chunks so the retained rows fit this budget, and this is what the reservation
+    /// charges for them. Every past error in this module came from an accounting figure and
+    /// an allocation drifting apart.
+    pub fn ring_budget_bytes(cfg: &Config) -> usize {
+        if cfg.window <= 0 {
+            return 0;
+        }
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("COLI_DSV4_KV_BUDGET_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1024)
+                << 20
+        })
+    }
+
+    /// Raw rows a ringed arch retains: the budget's worth, plus one window (the widest
+    /// span a continuation call reads is `window + chunk - 1`). `0` when not ringed.
+    pub fn ring_rows(cfg: &Config) -> usize {
+        if cfg.window <= 0 {
+            return 0;
+        }
+        let row = Self::raw_row_bytes(cfg).max(1);
+        (Self::ring_budget_bytes(cfg) / row).max(cfg.window as usize) + cfg.window as usize
     }
 
     /// DeepSeek-V4's compressed KV, per token.
@@ -806,7 +854,11 @@ impl KvCache {
         // KDA (Kimi-K3). Same: zero unless the stack actually has `Kda` layers.
         let n_kda = count(LayerKind::Kda);
         let (kda_conv, kda_state) = Self::kda_state_lens(cfg);
-        (n_mamba * (conv + ssm) + n_kda * (kda_conv + kda_state)) * 4
+        // The raw-KV ring (DeepSeek-V4): bounded by `COLI_DSV4_KV_BUDGET_MB` however long
+        // the context, so it belongs here with the other O(1)-in-context state rather than
+        // in the per-token figure. Zero on every other arch.
+        let ring = Self::ring_rows(cfg).saturating_mul(Self::raw_row_bytes(cfg));
+        (n_mamba * (conv + ssm) + n_kda * (kda_conv + kda_state)) * 4 + ring
     }
 
     /// Total resident bytes for a sequence of `n_tokens`: the per-token KV plus the
@@ -826,13 +878,17 @@ impl KvCache {
     /// worth it actually holds. Over-charging here is not free: `gen` reports this figure
     /// as `Class::Kv`, and every byte of it is subtracted from the expert cache's budget.
     pub fn bytes_for_split(cfg: &Config, n_prompt: usize, n_new: usize) -> usize {
-        let rows = Self::raw_rows(cfg, n_prompt, n_new);
-        Self::raw_row_bytes(cfg)
-            .saturating_mul(rows)
-            .saturating_add(
-                Self::compressed_bytes_per_token(cfg)
-                    .saturating_mul(n_prompt.saturating_add(n_new)),
-            )
+        // One term per concept, each charged exactly once. `bytes_per_token` already
+        // carries the raw rows for an UNRINGED arch and omits them for a ringed one (where
+        // chunking bounds them); `fixed_bytes` carries the ring and the recurrent state.
+        // Re-deriving the raw term here — which an earlier revision did — double-charges a
+        // ringed arch the moment the ring moves into `fixed_bytes`.
+        //
+        // `n_prompt`/`n_new` no longer differ for a ringed arch: chunked prefill bounds the
+        // raw rows whichever they are. The split is kept because it is the honest signature
+        // for a caller that knows it, and because an unringed arch could want it again.
+        Self::bytes_per_token(cfg)
+            .saturating_mul(n_prompt.saturating_add(n_new))
             .saturating_add(Self::fixed_bytes(cfg))
     }
 
@@ -1916,6 +1972,23 @@ mod kv_accounting_tests {
         let mut cfg = kimi_k3_cfg();
         assert!(!KvCache::allocates_gqa_kv(&cfg), "must reach the window clause");
         cfg.window = window;
+        if window > 0 {
+            // **A Compressor is not optional here.** K3 ships none, so `compress_ratios` is
+            // empty and `compressed_bytes_per_token` is 0 — which makes a ringed config's
+            // per-token cost ZERO and every assertion about it vacuously true. (It caught me:
+            // "the compressed tier dominates a 1M context" passed against a config that had
+            // no compressed tier at all.) V4's real pattern is a compressor on 41 of 43
+            // layers, ratio 4 on the 21 that also carry an Indexer and 128 on the rest.
+            let n = KvCache::kv_layers(&cfg);
+            cfg.compress_ratios = (0..n)
+                .map(|i| if i < 2 { 0 } else if i % 2 == 0 { 4 } else { 128 })
+                .collect();
+            cfg.index_hd = 128;
+            assert!(
+                KvCache::compressed_bytes_per_token(&cfg) > 0,
+                "a ringed fixture must have a real compressed tier"
+            );
+        }
         cfg
     }
 
@@ -1933,62 +2006,125 @@ mod kv_accounting_tests {
         )
     }
 
-    /// The point of the ring, in the ledger: generated tokens add no raw rows.
+    /// The point of the ring, in the ledger: generated tokens add no RAW rows.
     ///
-    /// The residual growth is the COMPRESSED tier, which is what carries context past the
-    /// window and genuinely is per-token — so the assertion is "grows far slower", not
-    /// "does not grow".
+    /// They do still add COMPRESSED rows — that tier is what carries context past the
+    /// 128-token window and is genuinely per-token. So the claim is about the ratio: a
+    /// ringed arch grows far slower than an unringed one over the same tokens, not that it
+    /// stops growing. (An earlier revision asserted equality, which only held because the
+    /// fixture had no Compressor at all — see `ringed_cfg`.)
     #[test]
     fn generated_tokens_stop_adding_raw_kv_rows_under_a_ring() {
         let ring = ringed_cfg(128);
         let flat = ringed_cfg(0);
+        let (fx_r, fx_f) = (KvCache::fixed_bytes(&ring), KvCache::fixed_bytes(&flat));
 
-        // Same prompt, 100x the generation.
-        let (short, long) = (
-            KvCache::bytes_for_split(&ring, 512, 400),
-            KvCache::bytes_for_split(&ring, 512, 40_000),
-        );
-        assert_eq!(short, long, "no compressor on this cfg: generation is free");
+        // Same prompt, 100x the generation. Net of the per-sequence terms, which are
+        // constant in both arms and would otherwise dilute the comparison.
+        let short = KvCache::bytes_for_split(&ring, 512, 400) - fx_r;
+        let long = KvCache::bytes_for_split(&ring, 512, 40_000) - fx_r;
+        let flat_short = KvCache::bytes_for_split(&flat, 512, 400) - fx_f;
+        let flat_long = KvCache::bytes_for_split(&flat, 512, 40_000) - fx_f;
 
-        // Without a ring the same pair scales with every token. Net of `fixed_bytes`, which
-        // is the per-sequence recurrent state and constant in both arms — leaving it in
-        // would dilute the ratio with a term that has nothing to do with the ring.
-        let fx = KvCache::fixed_bytes(&flat);
-        let flat_short = KvCache::bytes_for_split(&flat, 512, 400) - fx;
-        let flat_long = KvCache::bytes_for_split(&flat, 512, 40_000) - fx;
-        assert_eq!(flat_long, flat_short * 40_512 / 912, "unringed: linear in total tokens");
-        // And the ring is the whole reason: same prompt, same generation, ~79x apart.
+        // Both are linear in total tokens — the ring changes the SLOPE, not the shape.
+        assert_eq!(long, short * 40_512 / 912, "ringed: linear in total tokens");
+        assert_eq!(flat_long, flat_short * 40_512 / 912, "unringed: linear too");
+
+        // ...and the slope is the whole point: the ringed arch pays only the compressed
+        // tier per token, the unringed one pays the raw rows as well.
         assert!(
-            flat_long > (long - KvCache::fixed_bytes(&ring)) * 40,
-            "ring should be far cheaper: {long} vs {flat_long}"
+            flat_long > long * 5,
+            "ringed {long} should be far below unringed {flat_long} over the same tokens"
+        );
+        assert_eq!(
+            long / 40_512,
+            KvCache::compressed_bytes_per_token(&ring),
+            "the ringed per-token cost IS the compressed tier"
         );
     }
 
-    /// Prompts are NOT cheaper. The ring holds `max(window, prompt)` rows, so a long
-    /// prompt costs the same *rows* it did — the honest limit until prefill is chunked, and
-    /// the reason `bytes_per_token` stays at its all-prompt worst case.
+    /// **Long prompts are bounded too, now that prefill is chunked.**
     ///
-    /// Stated in ROWS, not bytes: a ringed arch also drops the device shadow (it cannot
-    /// carry one — see `mirrors_kv_on_device`), so comparing bytes against an unringed
-    /// config would fold that separate saving in and stop testing this claim.
+    /// This test used to assert the opposite — `a_long_prompt_still_costs_full_price` —
+    /// and it was right when the ring shipped alone: the ring held the widest span a
+    /// single call reads, and an unchunked prefill reads every row it wrote. Chunked
+    /// prefill removed that, and the accounting was not revisited, so a 1M-token prompt
+    /// was still charged 1M raw rows that nothing retained. That stale charge is what
+    /// capped V4's advertised context.
     #[test]
-    fn a_long_prompt_still_costs_full_price_under_a_ring() {
+    fn a_long_prompt_is_bounded_by_the_chunk_not_the_prompt() {
         let ring = ringed_cfg(128);
         let flat = ringed_cfg(0);
-        for n in [512usize, 4_096, 40_000] {
-            assert_eq!(KvCache::raw_rows(&ring, n, 0), n, "all-prompt {n}: every row kept");
-            assert_eq!(KvCache::raw_rows(&flat, n, 0), n);
-            // ...and the charge is linear in those rows, so doubling the prompt doubles it.
+        let cap = KvCache::ring_rows(&ring);
+        assert!(cap > 0 && cap < 100_000, "ring should be a bounded row count, got {cap}");
+        for n in [512usize, 4_096, 40_000, 1_000_000] {
             assert_eq!(
-                KvCache::bytes_for(&ring, 2 * n) - KvCache::fixed_bytes(&ring),
-                2 * (KvCache::bytes_for(&ring, n) - KvCache::fixed_bytes(&ring)),
-                "all-prompt cost is linear in n at {n}"
+                KvCache::raw_rows(&ring, n, 0),
+                n.min(cap),
+                "all-prompt {n}: raw rows stop at the ring"
             );
+            // Unringed still tracks the prompt exactly — the control.
+            assert_eq!(KvCache::raw_rows(&flat, n, 0), n);
         }
-        // Below the window the ring rounds UP to it — it cannot hold fewer rows than the
-        // span every decode step reads.
-        assert_eq!(KvCache::raw_rows(&ring, 10, 0), 128);
-        assert_eq!(KvCache::raw_rows(&flat, 10, 0), 10);
+        // And the consequence that matters: per-token cost stops carrying the raw rows,
+        // so context is limited by the compressed tier instead.
+        assert_eq!(
+            KvCache::bytes_per_token(&ring),
+            KvCache::compressed_bytes_per_token(&ring),
+            "a ringed arch charges only the compressed tier per token"
+        );
+        assert!(
+            KvCache::bytes_per_token(&flat) > KvCache::bytes_per_token(&ring),
+            "unringed must still charge the raw rows per token"
+        );
+    }
+
+
+    /// **The context ceiling a ringed arch can actually reach.** Real V4 geometry: 43 KV
+    /// layers, and the compressed tier is what scales.
+    ///
+    /// Pinned because this is the number the README quotes and the one that was wrong: with
+    /// the raw rows charged per token, a 1M-token context priced at ~95 GiB and the ceiling
+    /// came out a fraction of the truth. The invariant is that a full-length context fits in
+    /// a sane fraction of the box — if a future change puts the raw rows back into the
+    /// per-token figure, this fails loudly instead of quietly capping the model again.
+    #[test]
+    fn a_ringed_arch_can_serve_its_full_architectural_context() {
+        let ring = ringed_cfg(128);
+        // The per-token term must be the compressed tier and nothing else.
+        assert_eq!(KvCache::bytes_per_token(&ring), KvCache::compressed_bytes_per_token(&ring));
+
+        const ONE_M: usize = 1_048_576;
+        let at_1m = KvCache::bytes_for(&ring, ONE_M);
+        // Generous but decisive: a 121 GiB box reserves 18 GiB, so anything under ~40 GiB
+        // leaves the model and its expert cache room. The pre-fix charge was ~95 GiB.
+        assert!(
+            at_1m < 40 * (1usize << 30),
+            "1M-token context should fit comfortably, got {:.1} GiB",
+            at_1m as f64 / (1u64 << 30) as f64
+        );
+        // ...and it is dominated by the compressed tier, not the ring.
+        let ring_bytes = KvCache::ring_rows(&ring) * KvCache::raw_row_bytes(&ring);
+        assert!(
+            ring_bytes < at_1m / 2,
+            "the ring ({ring_bytes}) should not dominate a 1M context ({at_1m})"
+        );
+        // Doubling the context roughly doubles the cost — i.e. it really is per-token now,
+        // with a bounded constant, rather than capped or quadratic.
+        let at_2m = KvCache::bytes_for(&ring, 2 * ONE_M);
+        assert!(at_2m > at_1m && at_2m < 3 * at_1m, "{at_1m} -> {at_2m} should be ~2x");
+
+        // **The ring must be CHARGED, not merely bounded.** Moving it out of the per-token
+        // figure only helps if it lands in the per-sequence one; dropping it instead would
+        // under-reserve by ~1 GiB per sequence, and under-charging KV is how a request is
+        // admitted into memory that cannot hold it. Exact, because only `window` differs
+        // between these two configs, so the recurrent terms cancel.
+        let flat = ringed_cfg(0);
+        assert_eq!(
+            KvCache::fixed_bytes(&ring) - KvCache::fixed_bytes(&flat),
+            ring_bytes,
+            "fixed_bytes must carry the ring the per-token figure stopped charging"
+        );
     }
 
     /// Exactly one family syncs KV to the device, and it is the one whose reader calls
@@ -2016,8 +2152,12 @@ mod kv_accounting_tests {
         );
 
         // And what was dropped is exactly the two phantom terms — `k_rot` and its mirror —
-        // not some other quantity that happens to make the arithmetic work. Shown on V4,
-        // where flipping `window` back to 0 reproduces the old charge on the same config.
+        // not some other quantity that happens to make the arithmetic work.
+        //
+        // Asserted on `raw_row_bytes`, NOT on `bytes_per_token`: since chunked prefill
+        // landed, the per-token figure omits the raw rows entirely for a ringed arch, so
+        // flipping `window` there moves two things at once and isolates nothing. The
+        // row-level term is the one that answers "is the shadow charged".
         let mut charged = v4.clone();
         charged.window = 0;
         let shadow = if cfg!(feature = "cuda") {
@@ -2026,7 +2166,7 @@ mod kv_accounting_tests {
             0
         };
         assert_eq!(
-            KvCache::bytes_per_token(&charged) - KvCache::bytes_per_token(&v4),
+            KvCache::raw_row_bytes(&charged) - KvCache::raw_row_bytes(&v4),
             KvCache::kv_layers(&v4) * (v4.qk_rope as usize + shadow) * 4,
             "the delta must be k_rot + its device mirror, exactly"
         );

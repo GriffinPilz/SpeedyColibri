@@ -28,7 +28,7 @@ baseline turns into a wrong delta.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`deepseek-v4-flash`** | 144 GB | **12.5 tok/s** (41 s) | **4.8 tok/s** | not measured |
+| **`deepseek-v4-flash`** | 145 GB | **12.5 tok/s** (41 s) | **4.8 tok/s** | not measured |
 | **`kimi-k3`** (1.5T) | 1.4 TB | **~1.1 tok/s** (~8 min) | **~0.4 tok/s** | not measured |
 
 V4 decode is n=8, range 4.67–4.93, steady-state timer at 512-token context. K3's figures are
@@ -174,8 +174,8 @@ variant + a convert mapping + one registry block — the checklist is in
 
 ### Test suite status
 
-`cargo test --workspace` (CPU) is **395 passing, 0 failing**. Adding `--features cuda` on a
-GB10 brings up the kernel tests: **400 passing, 0 failing** as of **2026-08-05**, at cargo's
+`cargo test --workspace` (CPU) is **396 passing, 0 failing**. Adding `--features cuda` on a
+GB10 brings up the kernel tests: **401 passing, 0 failing** as of **2026-08-05**, at cargo's
 default parallelism. The suite is fully green — the two long-standing caveats that used to
 live here are both resolved:
 
@@ -326,7 +326,7 @@ Hugging Face cache (the launcher mounts the host's `~/.cache/huggingface`, so th
 | `HF_TOKEN` | Hugging Face token for the first download (alt. to the `hf_...` arg) | none |
 | `COLI_PORT` | listen port (a positional `port` arg overrides it) | `8080` |
 | `COLI_WARMUP` | warm-up prompts, `\|`-separated | none |
-| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): nemotron 262,144 (its own max) · M3 ~450k · GLM ~290k · M2.7 ~200k · **V4 ~84k** (an all-prompt worst case — its raw KV is a ring, so *generation* is nearly free; see the note there) | `32768` |
+| `COLI_CTX` | served context length (prompt + completion), e.g. `64k`. Clamped to what RAM can hold as KV and printed at startup; a request whose KV won't fit is rejected (507), never an OOM. Memory-bound on one node — see [Context & output length](#context--output-length): nemotron 262,144 (its own max) · **V4 1,048,576 (its own max)** · M3 ~450k · GLM ~290k · M2.7 ~200k. V4 and nemotron are the two whose ceiling is the *model's* limit rather than the box's | `32768` |
 | `COLI_ALLOW_LONG_CTX` | `1` → serve past the model's advertised `max_position_embeddings`. Meaningful only for a **NoPE** model like Nemotron-3-Super, which has no positional table to overflow (its 262,144 is an advisory default; the model card documents up to 1M). The RAM clamp still applies. Quality past the validated length is not guaranteed — this is a quality decision, not a memory one | off |
 | `COLI_MODEL_DIR` | host path to a pre-downloaded snapshot → mounted at `/model` | none |
 | `COLI_MODEL_REPO` | HF repo to download when nothing is mounted/cached | `nvidia/GLM-5.2-NVFP4` |
@@ -522,11 +522,13 @@ make it *lighter* per token than GLM's latent:
 | **Nemotron-3-Super** | hybrid — only **8 of 88** layers cache KV | **16 KB** + 166 MB/seq Mamba2 state | **262,144 — its full architectural max** (measured; 4.0 GiB KV) |
 | **MiniMax-M3** | GQA, 4 kv-heads × 60 layers | 240 KB | **~450k** (the measured 402,690 clamp, scaled by the corrected per-token figure) |
 | **GLM-5.2** | MLA (compressed), **mirrored on the device** | 351 KB | ~290k |
-| **DeepSeek-V4-Flash** | latent ring + compressed rows | **99.4 KB** worst case | **~84k** at an 8 GB KV budget — see below |
+| **DeepSeek-V4-Flash** | latent ring + compressed rows | **13.4 KB** | **1,048,576 — its full architectural max** (measured; 13.4 GB KV) |
 | **MiniMax-M2.7** | GQA, 8 kv-heads × 62 layers | 496 KB | ~200k |
 
-**Four of these figures dropped on 2026-08-05, and no model got cheaper — the accounting
-did.** `bytes_per_token` charged every architecture for a `qk_rope` row *and* a GB10 device
+**Five of these figures dropped on 2026-08-05, and no model got cheaper — the accounting
+did.** V4's fell twice, for two different reasons: the phantom device shadow below, and then
+a per-token raw charge that chunked prefill had already made a per-*sequence* one (206.9 →
+99.4 → 13.4 KB). The second is why its ceiling reads 1,048,576 rather than a memory limit. `bytes_per_token` charged every architecture for a `qk_rope` row *and* a GB10 device
 mirror of it. Only the MLA reader (`sync_device`'s sole caller — GLM-5.2 and Kimi-K3's
 gated-MLA layers) actually keeps those, which is why those two are unchanged. The GQA models
 rope the key in place and store it in `k_full`/`v_full`; DeepSeek-V4 writes its latent and
@@ -584,12 +586,28 @@ FP noise in an RMSNorm'd stack; a structural error would keep growing or jump. O
 tiny fixture cannot see this — 3 layers at hidden 8 never reach the tiled kernels — which is
 why the claim is split in two here rather than blurred into one tolerance.
 
-The **~84k ceiling** above is unaffected by any of this, and that is not an oversight: it is
-an all-prompt worst case, the reading serve's admission and `context_in_kv_budget` need. (It
-doubled from ~40k because of the accounting fix, not the ring.)
+**Together, the ring and the chunking make the per-token cost the compressed tier alone —
+13.4 KB.** The raw rows are bounded by the KV budget however long the context runs, so they
+are a per-*sequence* cost, not a per-token one. That is what puts V4's ceiling at its
+architectural **1,048,576** rather than at a memory limit, and it makes V4 **cheaper per
+token than Nemotron-3-Super** (13.4 KB vs 16 KB) despite caching KV on all 43 layers where
+Nemotron caches on 8 of 88. Measured — `coli serve` was asked for 2,000,000 and clamped to
+the model's own max, with RAM not binding:
 
-One caveat remains: everything above 2,400 tokens on V4 is still allocator arithmetic — that is
-the longest context actually exercised end to end.
+```
+[serve] context length: 1048576 tokens (model max 1048576; up to 13.4 GB KV)
+```
+
+**This was wrong here until 2026-08-05, and the error is worth naming.** The ring shipped
+first, and while it was alone the raw rows really were sized to the prompt — so charging them
+per token was correct, and this section said so. Chunked prefill removed that, and the
+accounting was not revisited. A stale per-token charge is the only thing that had V4 listed at
+a fraction of what it can serve.
+
+One caveat remains, and it is a real one: **everything above 2,400 tokens on V4 is still
+arithmetic.** The memory now permits 1M and the mechanisms are verified at small scale
+(bit-exact chunking, the ring bounded under a forced budget), but the longest context actually
+exercised end to end is ~2,400 tokens.
 
 **The hybrid is in a different class here.** Nemotron caches KV on 8 attention layers
 instead of all 88, so it costs **~11–22× less per token** than the GQA/MLA models — the

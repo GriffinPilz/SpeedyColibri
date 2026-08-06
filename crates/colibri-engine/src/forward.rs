@@ -390,19 +390,6 @@ fn dsv4_chunk_override() -> Option<usize> {
     })
 }
 
-/// How much raw KV a V4 prefill may retain before it is chunked, in MiB
-/// (`COLI_DSV4_KV_BUDGET_MB`, default 1024).
-fn dsv4_kv_budget_bytes() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("COLI_DSV4_KV_BUDGET_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1024)
-            << 20
-    })
-}
-
 /// The chunk size for a prefill of `s` tokens: **as coarse as the KV budget allows**.
 ///
 /// Chunking is what keeps V4's raw KV constant in context — the ring holds the widest span
@@ -431,8 +418,11 @@ fn dsv4_prefill_chunk(cfg: &colibri_core::Config, s: usize) -> usize {
         Some(n) => return n.max(1),
         None => {}
     }
+    // The budget lives in `KvCache` beside the reservation that charges for it —
+    // `ring_rows` is what `fixed_bytes` bills, so the policy and the accounting cannot drift.
     let row = crate::KvCache::raw_row_bytes(cfg).max(1);
-    let budget_rows = (dsv4_kv_budget_bytes() / row).max(cfg.window.max(1) as usize);
+    let budget_rows =
+        (crate::KvCache::ring_budget_bytes(cfg) / row).max(cfg.window.max(1) as usize);
     // Under budget: one call, exactly as before chunking existed. This is the common case
     // and it must stay free.
     if s <= budget_rows {
@@ -2344,7 +2334,7 @@ mod tests {
         let cfg = chunk_policy_cfg();
         let row = KvCache::raw_row_bytes(&cfg);
         assert!(row > 0);
-        let budget_rows = dsv4_kv_budget_bytes() / row;
+        let budget_rows = KvCache::ring_budget_bytes(&cfg) / row;
         assert!(budget_rows > 2048, "1 GiB should hold well past a short prompt");
 
         // Short and medium prompts: ONE call, exactly as before chunking existed. This is
@@ -2369,9 +2359,9 @@ mod tests {
         // the context. 1M tokens would otherwise retain ~95 GiB of raw rows.
         let retained = (budget_rows + cfg.window as usize) * row;
         assert!(
-            retained < 2 * dsv4_kv_budget_bytes(),
+            retained < 2 * KvCache::ring_budget_bytes(&cfg),
             "retained {retained} should stay near the {} budget",
-            dsv4_kv_budget_bytes()
+            KvCache::ring_budget_bytes(&cfg)
         );
         assert!(
             1_000_000 * row > 40 * retained,

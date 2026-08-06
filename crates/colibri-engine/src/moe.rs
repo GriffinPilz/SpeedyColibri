@@ -1709,10 +1709,21 @@ pub fn moe_sharded<P: ExpertProvider, T: Transport + ?Sized>(
     }
 
     if with_shared {
-        let mut sh = vec![0f32; s_len * d];
-        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
-        for (o, &s) in out.iter_mut().zip(sh.iter()) {
-            *o += s;
+        // Pooled, same as the two latent paths above. #98 established that a fresh
+        // multi-MB `vec![0f32; …]` per layer costs a page fault under memory pressure and
+        // hoisted this exact buffer — but only in `nemotron_moe`/`kimi_moe`, leaving the
+        // three SwiGLU paths (M3 / M2.7 / GLM / V4) on the raw allocation. Measured here:
+        // `shared` 656 ms on the pre-mallopt baseline vs 1088-1234 ms today.
+        let mut add_shared = |sh: &mut [f32]| {
+            ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, sh);
+            for (o, &s) in out.iter_mut().zip(sh.iter()) {
+                *o += s;
+            }
+        };
+        if shared_scratch_reuse() {
+            SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+        } else {
+            add_shared(&mut vec![0f32; s_len * d]);
         }
     }
     Ok(())
@@ -1792,10 +1803,21 @@ pub fn moe<P: ExpertProvider>(
     // ---- shared expert (weight 1.0, all positions) ------------------------
     if with_shared {
         let _st = std::time::Instant::now();
-        let mut sh = vec![0f32; s_len * d];
-        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
-        for (o, &s) in out.iter_mut().zip(sh.iter()) {
-            *o += s;
+        // Pooled, same as the two latent paths above. #98 established that a fresh
+        // multi-MB `vec![0f32; …]` per layer costs a page fault under memory pressure and
+        // hoisted this exact buffer — but only in `nemotron_moe`/`kimi_moe`, leaving the
+        // three SwiGLU paths (M3 / M2.7 / GLM / V4) on the raw allocation. Measured here:
+        // `shared` 656 ms on the pre-mallopt baseline vs 1088-1234 ms today.
+        let mut add_shared = |sh: &mut [f32]| {
+            ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, sh);
+            for (o, &s) in out.iter_mut().zip(sh.iter()) {
+                *o += s;
+            }
+        };
+        if shared_scratch_reuse() {
+            SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+        } else {
+            add_shared(&mut vec![0f32; s_len * d]);
         }
         if crate::forward::profile_on() {
             crate::forward::SHARED_US.fetch_add(
@@ -3696,10 +3718,21 @@ pub fn dsv4_moe<P: ExpertProvider>(
     // expert to the CPU.
     if cfg.n_shared > 0 {
         let _st = std::time::Instant::now();
-        let mut sh = vec![0f32; s_len * d];
-        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
-        for (o, &v) in out.iter_mut().zip(sh.iter()) {
-            *o += v;
+        // Pooled, same as the two latent paths above. #98 established that a fresh
+        // multi-MB `vec![0f32; …]` per layer costs a page fault under memory pressure and
+        // hoisted this exact buffer — but only in `nemotron_moe`/`kimi_moe`, leaving the
+        // three SwiGLU paths (M3 / M2.7 / GLM / V4) on the raw allocation. Measured here:
+        // `shared` 656 ms on the pre-mallopt baseline vs 1088-1234 ms today.
+        let mut add_shared = |sh: &mut [f32]| {
+            ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, sh);
+            for (o, &v) in out.iter_mut().zip(sh.iter()) {
+                *o += v;
+            }
+        };
+        if shared_scratch_reuse() {
+            SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+        } else {
+            add_shared(&mut vec![0f32; s_len * d]);
         }
         if crate::forward::profile_on() {
             crate::forward::SHARED_US

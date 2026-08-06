@@ -1338,6 +1338,8 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         } else if nvfp4_group_moe()
             && !active.is_empty()
             && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5)
+            && active.iter().map(|(_, r, _)| r.len()).sum::<usize>() / active.len()
+                <= nvfp4_group_rows_max()
         {
             // NVFP4 SwiGLU (M2.7 / M3 / GLM-5.2). Until this arm existed these models were
             // offered the fp8 group, which declines on fmt 5, so every one of them fell
@@ -3487,6 +3489,60 @@ fn dsv4_group_moe() -> bool {
 fn nvfp4_group_moe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_NVFP4_GROUP").ok().as_deref() != Some("0"))
+}
+
+/// Mean rows-per-expert at or below which the NVFP4 SwiGLU **grouped** path is used;
+/// above it, the per-expert path. `COLI_NVFP4_GROUP_ROWS` overrides.
+///
+/// **The two regimes want opposite paths, measured on all three NVFP4 models** (ABBA,
+/// tokens identical, one binary):
+///
+/// | | prefill 512 tok | decode (S=1) |
+/// |---|---|---|
+/// | glm-5.2 | per-expert **1.28×** (90.0 → 70.4 s) | grouped **1.19×** (1.05 vs 0.88 tok/s) |
+/// | minimax-m3 | per-expert **1.12×** (38.3 → 34.2 s) | tied (2.50 vs 2.57) |
+/// | minimax-m2.7 | per-expert 1.04× (28.2 → 27.2 s) | tied (5.10 vs 5.31) |
+///
+/// GLM is the model that decides this and it points both ways, so a flat default is wrong
+/// whichever way it is set: shipping grouped costs 28% of its prefill, flipping to
+/// per-expert costs 19% of its decode. The mechanism is legible — grouping trades a
+/// per-expert H2D/D2H round-trip for staging every routed expert through a pinned buffer
+/// (148.6 GB on one m3 prefill, pack 4.80 s + H2D 2.77 s). At one row per expert the
+/// round-trip dominates and grouping wins; at tens of rows the kernel work amortises the
+/// round-trip anyway and only the staging is left.
+///
+/// **Rows-per-expert, not a phase flag**, deliberately: this repo has shipped three expert
+/// path defaults chosen on prefill and silently wrong in decode, and the fix each time was
+/// to gate on the quantity at the decision point. Rows also carries the model (top_k /
+/// n_experts), the batch, and the cluster shape — under expert parallelism a node owns
+/// fewer experts so each sees proportionally more rows, and slides toward per-expert on its
+/// own. Same axis `nvfp4_wsmm_launch` uses when it declines above 32.
+///
+/// **8 is bounded, not derived.** The two regimes' actual means, from a threshold sweep on
+/// GLM (the flip lands between 16 and 32): **decode = 1** row/expert, **512-token prefill =
+/// 25.6** (512 tokens × top_k 8 / ~160 routed experts). 8 sits between them with room on
+/// both sides and keeps small batched decode grouped. The crossover *within* (1, 25.6) is
+/// **not** measured — re-measure before trusting it for a batch size or a model that lands
+/// in there.
+///
+/// **The decode half of this was nearly gated on a measurement artifact.** A 24-token bench
+/// showed grouped "winning" GLM decode 1.05 vs 0.88 tok/s, which looked like a reason not to
+/// touch the default. It was not decode at all: GLM's decode mean is 1, so decode takes the
+/// grouped path either way — the knob was changing *prefill*, and the grouped prefill's extra
+/// ~19 s simply gave the background prefetcher longer to warm the cache before decode began.
+/// Run out to 100 tokens the arms converge (last-half median 1.33/1.23 vs 1.23/1.23). One
+/// knob, two effects: the ablation was not isolating what it appeared to.
+///
+/// Corollary worth knowing: **GLM steady-state decode is ~1.23–1.33 tok/s**, not the ~1.0 a
+/// 24-token run reports. At ~1 tok/s that window is nearly all warm-up.
+fn nvfp4_group_rows_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_NVFP4_GROUP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
 }
 
 

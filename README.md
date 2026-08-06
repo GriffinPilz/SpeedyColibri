@@ -554,13 +554,21 @@ allows.** A 2048-token prompt runs in one call, byte-for-byte as before (measure
 one ring sizing, 2048 rows). A 1M-token prompt — which would otherwise retain ~95 GiB of raw
 rows and simply not fit — chunks at ~10.8k and retains 1 GiB.
 
-A chunked prefill is **not bit-identical** to a single call, and cannot be: a different `S`
-means a different matmul tiling and accumulation order. `COLI_DEBUG_ACT=1` on the V4 driver
-measures it instead of leaving it to argument — at the last prefill position the divergence
-starts at 8.7e-6 after layer 0 and **plateaus around 5e-3 by layer 14**, flat for the
-remaining 28 layers. A plateau is bounded FP noise in an RMSNorm'd residual stack; a wrong
-Compressor block position or a mis-mapped ring slot would keep growing or jump. On a
-512-token prompt it changed 1 of 16 generated tokens; at 2048 tokens, 4 of 4 matched.
+**The chunking itself is bit-exact.** On the tiny V4 fixture every chunk of 2 or more
+reproduces the single call *to the bit*, on the CPU build and the CUDA build alike — the
+Compressor's cross-call carry, the ring's `pos % R` mapping and the causal span arithmetic
+all compose exactly. (Chunk 1 differs on CUDA only, because `S == 1` dispatches the decode
+kernel family; that arm compares prefill kernels against decode kernels, not two chunkings.)
+
+What is *not* bit-exact on the real model is **kernel selection**: at 43 layers, `S = 128`
+and `S = 512` cross tiling thresholds and pick different kernels, whose accumulation orders
+differ. `COLI_DEBUG_ACT=1` on the V4 driver measures that rather than leaving it to
+argument — at the last prefill position the divergence starts at 8.7e-6 after layer 0 and
+**plateaus around 5e-3 by layer 14**, flat for the remaining 28 layers. A plateau is bounded
+FP noise in an RMSNorm'd stack; a structural error would keep growing or jump. On a
+512-token prompt it changed 1 of 16 generated tokens; at 2048 tokens, 4 of 4 matched. The
+tiny fixture cannot see this — 3 layers at hidden 8 never reach the tiled kernels — which is
+why the claim is split in two here rather than blurred into one tolerance.
 
 The **~84k ceiling** above is unaffected by any of this, and that is not an oversight: it is
 an all-prompt worst case, the reading serve's admission and `context_in_kv_budget` need. (It

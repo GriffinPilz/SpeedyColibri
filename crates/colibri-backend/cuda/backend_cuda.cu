@@ -4217,7 +4217,20 @@ static int attention_absorb_sparse_run(ColiCudaTensor *w,ColiCudaTensor *proj,fl
         const float *q,const float *latent,const float *rope,
         const int *sel_idx,const int *sel_cnt,int maxsel,
         int H0,int HC,int S,int H,int Q,int R,int V,int K,int T,float scale){
-    if(!w||!out||!q||!latent||!rope||!sel_idx||!sel_cnt||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
+    // `S>65535` is the REAL hardware bound, and it was missing. Both launches below use
+    // `dim3(HC, S)`, and `gridDim.y` maxes at 65535 — but `T<=65536` with `T>=S` admits
+    // S==65536, one past it. That one value reached the launch and failed with "invalid
+    // configuration argument", which `cuda_ok` reports before falling back: correct output,
+    // spurious error on stderr. Same shape as the gridDim.y cap fixed in 82ca53a.
+    //
+    // `T>65536` stays for now and is deliberately conservative. It is over-broad for the
+    // tensor-core path — `tc_sparse_attn` tiles S by ATC_QT and its shared memory is
+    // independent of both T and S — but lifting it needs `tc_build_qa` (also `dim3(HC,S)`)
+    // and the fused o-proj chunked over S first, and then a >65k-token GLM prefill to
+    // validate. Above the cap today the CPU core runs: slow but CORRECT. A half-lifted
+    // path would be fast and WRONG, which is the worse failure. See task #58 for the order
+    // of operations if it is ever picked up.
+    if(!w||!out||!q||!latent||!rope||!sel_idx||!sel_cnt||S<1||S>65535||H<1||Q<1||R<1||V<1||K<1||K>512||
        T<S||T>65536||maxsel<1||maxsel>T||w->I!=K||w->O!=H*(Q+V))return 0;
     // Head slice [H0, H0+HC) of the full H heads (tensor-parallel attention). Full
     // range is H0=0, HC=H. A partial slice writes only its ctx columns, so zero the

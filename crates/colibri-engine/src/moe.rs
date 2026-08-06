@@ -1237,6 +1237,12 @@ thread_local! {
     };
 }
 
+/// Owning form: allocates the `[n_tokens, hidden]` result and returns it.
+///
+/// Kept for the callers that genuinely need ownership — expert parallelism collects one
+/// `partial` per node before combining them, and the two latent-MoE paths hand the result
+/// to `fc2`. Callers that already have a destination should use
+/// [`compute_experts_partial_into`], which avoids this allocation entirely.
 pub fn compute_experts_partial<P: ExpertProvider>(
     provider: &P,
     layer: usize,
@@ -1246,11 +1252,52 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     n_tokens: usize,
     hidden: usize,
 ) -> io::Result<Vec<f32>> {
+    let mut out = vec![0f32; n_tokens * hidden];
+    compute_experts_partial_into(
+        provider,
+        layer,
+        experts,
+        weights,
+        activations,
+        n_tokens,
+        hidden,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// Routed-expert FFN, **accumulating** the weighted result into `out`.
+///
+/// `out` is `[n_tokens, hidden]` and is added to, never cleared — every write on both the
+/// grouped and per-expert paths is `out[t*d+dd] += weight * y[..]`. The caller owns the
+/// initial state, which is what lets `moe()` pass the layer's own output buffer straight
+/// through instead of allocating a second one and adding it back.
+///
+/// **Why this exists.** The owning form allocated `[n_tokens, hidden]` per call — ~8 MB per
+/// layer on a MiniMax-M3 512-token prefill, ~500 MB per prefill across 60 layers. Under this
+/// binary's `mallopt` (`M_MMAP_THRESHOLD` pinned to 2 MiB, deliberately) that is a fresh
+/// `mmap` faulted in on first touch, and the faults land on whoever writes first — the
+/// scatter, which measured **2160 ms against a July baseline's 173 ms** on byte-identical
+/// code. Passing a reused buffer removes the mapping and the fault, and also removes a full
+/// `out += partial` pass over 2 M floats per layer.
+///
+/// See `ExpertScratch` at the per-expert loop for the same fix applied to `xg`/`hh`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_experts_partial_into<P: ExpertProvider>(
+    provider: &P,
+    layer: usize,
+    experts: &[u32],
+    weights: &[f32],
+    activations: &[f32],
+    n_tokens: usize,
+    hidden: usize,
+    out: &mut [f32],
+) -> io::Result<()> {
     let d = hidden;
     let ne = experts.len();
-    let mut out = vec![0f32; n_tokens * d];
+    debug_assert_eq!(out.len(), n_tokens * d, "out must be [n_tokens, hidden]");
     if ne == 0 {
-        return Ok(out);
+        return Ok(());
     }
     let eids: Vec<usize> = experts.iter().map(|&e| e as usize).collect();
 
@@ -1315,7 +1362,7 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         // Gateless ReLU² (Nemotron-H) has its own grouped kernel — the fp8 one is SwiGLU
         // and would read a gate tensor these experts don't ship.
         let grouped = if activation().relu2 {
-            crate::gpu::try_expert_group_relu2(&active, activations, d, &mut out)
+            crate::gpu::try_expert_group_relu2(&active, activations, d, out)
         } else if dsv4_group_moe() && !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 6) {
             // MXFP4 SwiGLU (DeepSeek-V4) — MEASURED NEGATIVE, so opt-in only.
             //
@@ -1334,7 +1381,7 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             // chunking and per-call tensor wrapping. **Dispatch count was the wrong
             // target.** A real win needs fewer BYTES or a fused kernel that keeps the
             // weights resident across experts, not fewer launches.
-            crate::gpu::try_expert_group_packed(&active, activations, d, &mut out, 6)
+            crate::gpu::try_expert_group_packed(&active, activations, d, out, 6)
         } else if nvfp4_group_moe()
             && !active.is_empty()
             && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5)
@@ -1354,9 +1401,9 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             // differ in the thing that actually changed: grouped staging through a pinned
             // host buffer + device arena (~0.74 GB/s measured) versus per-expert ZERO-COPY,
             // which the RAM work elsewhere records as load-bearing to the tune of 22.7x.
-            crate::gpu::try_expert_group_nvfp4(&active, activations, d, &mut out)
+            crate::gpu::try_expert_group_nvfp4(&active, activations, d, out)
         } else if crate::gpu::expert_group_enabled() {
-            crate::gpu::try_expert_group(&active, activations, d, &mut out)
+            crate::gpu::try_expert_group(&active, activations, d, out)
         } else {
             false
         };
@@ -1367,7 +1414,7 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             );
         }
         if grouped {
-            return Ok(out);
+            return Ok(());
         }
     }
 
@@ -1449,7 +1496,7 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         }
     }
     EXPERT_SCRATCH.with(|c| c.set(sc));
-    Ok(out)
+    Ok(())
 }
 
 /// Sub-column a `[S, n_uniq]` weight matrix down to the experts in `cols` (their
@@ -1735,10 +1782,12 @@ pub fn moe<P: ExpertProvider>(
     // ---- routed experts (all local on a single node) ----------------------
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
     let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
-    let partial = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, x, s_len, d)?;
-    for (o, p) in out.iter_mut().zip(partial.iter()) {
-        *o += *p;
-    }
+    // Straight into the layer's own buffer, which was zeroed just above. The routed path
+    // only ever accumulates (`out[t*d+dd] += w * y[..]` on both the grouped and per-expert
+    // arms), so this is the same arithmetic as allocating a `partial` and adding it back —
+    // minus an ~8 MB/layer allocation (a fresh `mmap` under this binary's mallopt, faulted
+    // in during the scatter) and minus a full add pass over `s_len * d`.
+    compute_experts_partial_into(provider, layer, &uniq_u32, &w_mat, x, s_len, d, out)?;
 
     // ---- shared expert (weight 1.0, all positions) ------------------------
     if with_shared {
@@ -3614,10 +3663,12 @@ pub fn dsv4_moe<P: ExpertProvider>(
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
     let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
 
-    let partial = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, x, s_len, d)?;
-    for (o, p) in out.iter_mut().zip(partial.iter()) {
-        *o += *p;
-    }
+    // Straight into the layer's own buffer, which was zeroed just above. The routed path
+    // only ever accumulates (`out[t*d+dd] += w * y[..]` on both the grouped and per-expert
+    // arms), so this is the same arithmetic as allocating a `partial` and adding it back —
+    // minus an ~8 MB/layer allocation (a fresh `mmap` under this binary's mallopt, faulted
+    // in during the scatter) and minus a full add pass over `s_len * d`.
+    compute_experts_partial_into(provider, layer, &uniq_u32, &w_mat, x, s_len, d, out)?;
 
     // Shared expert (weight 1.0, every position), same SwiGLU triple as the routed ones.
     //

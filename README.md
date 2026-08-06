@@ -174,8 +174,8 @@ variant + a convert mapping + one registry block — the checklist is in
 
 ### Test suite status
 
-`cargo test --workspace` (CPU) is **385 passing, 0 failing**. Adding `--features cuda` on a
-GB10 brings up the kernel tests: **389 passing, 1 failing** as of **2026-08-05 on `3956dd2`**.
+`cargo test --workspace` (CPU) is **389 passing, 0 failing**. Adding `--features cuda` on a
+GB10 brings up the kernel tests: **393 passing, 1 failing** as of **2026-08-05 on `0f7dffb`**.
 The one failure is pre-existing — it reproduces on `e4e3f7f`, before the DeepSeek-V4 work —
 and is tracked rather than tolerated silently:
 

@@ -3077,6 +3077,19 @@ mod tests {
         );
 
         // In-memory reference expert built straight from the same NVFP4 blobs.
+        //
+        // `gpu_eligible: true` is NOT decoration — it is what makes this an apples-to-apples
+        // comparison. The provider calls `mark_gpu_eligible()`, which sets it for fmt 5, and
+        // `matmul_qt` dispatches on exactly that flag. Left at the `Default` (false), the
+        // reference ran the CPU NVFP4 dequant while the loaded expert ran the GPU kernel, so
+        // the assertion below was measuring GPU-vs-CPU dequant agreement — which is ~2.5e-4,
+        // wider than its 1e-5 tolerance. That is the whole of the long-standing failure:
+        // the same binary passed with `COLI_CUDA=0` and failed with the GPU enabled, and the
+        // byte-equality asserts just above had already proved the load itself was exact.
+        //
+        // Matching the flag makes both arms take whichever path the build has, so the test
+        // measures what it claims — that the loaded bytes reconstruct the same function —
+        // on the CPU build and the CUDA build alike.
         let ref_qt = |o: usize, i: usize, nib: &[u8], bsc: &[u8], g: f32| QTensor {
             fmt_code: 5,
             o: o as i32,
@@ -3084,6 +3097,7 @@ mod tests {
             q4: Bytes::Owned(nib.to_vec()),
             bs: Bytes::Owned(bsc.to_vec()),
             g,
+            gpu_eligible: true,
             ..Default::default()
         };
         let up_ref = ref_qt(MOE_INTER, LATENT, &nib_u, &bsc_u, g_u);

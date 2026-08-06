@@ -3017,6 +3017,28 @@ fn dsv4_forward<P: ExpertProvider>(
         }
     });
 
+    // COLI_DEBUG_ACT=1: the residual stream's L2 norm at the last position, per layer. The
+    // other two drivers have had this; V4 was the only one without, which is precisely why
+    // the first chunked-vs-unchunked disagreement could only be argued about rather than
+    // measured. Reports copy 0 of `hc_mult` and the whole `[hc, d]` row, because a
+    // Hyper-Connection failure typically shows as the copies diverging from one another
+    // rather than as any single one blowing up.
+    let dbg_act = std::env::var("COLI_DEBUG_ACT").ok().as_deref() == Some("1");
+    let pnorm = |tag: &str, x: &[f32]| {
+        if !dbg_act || s == 0 {
+            return;
+        }
+        let n = |r: &[f32]| r.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let last = (s - 1) * hc * d;
+        eprintln!(
+            "[act] {tag}: pos={} |copy0|={:.6e} |row|={:.6e}",
+            pos_base + s - 1,
+            n(&x[last..last + d]),
+            n(&x[last..last + hc * d]),
+        );
+    };
+    pnorm("embed", &x);
+
     let mut sc = Dsv4Scratch::new(s, hc, d);
     for (li, l) in model.layers.iter().enumerate() {
         // A layer WITH a Compressor ropes everything — q, kv, its blocks, its Indexer —
@@ -3027,6 +3049,8 @@ fn dsv4_forward<P: ExpertProvider>(
         let compressed = cfg.compress_ratios.get(li).copied().unwrap_or(0) > 0;
         let (mcos, msin) = if compressed { (&ccos, &csin) } else { (&ncos, &nsin) };
         dsv4_layer_forward(model, kv, provider, l, li, &mut x, s, ids, pos_base, mcos, msin, &ccos, &csin, &mut sc)?;
+        pnorm(&format!("layer{li}"), &x);
+        trace_state(li, s, pos_base, &x);
     }
 
     // Collapse `[hc, d] -> [d]` with the model-level head: a plain sigmoid gate, NO

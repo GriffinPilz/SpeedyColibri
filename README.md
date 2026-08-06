@@ -33,13 +33,16 @@ performance table that only ever moves one way is not being measured honestly:
 | `glm-5.2` | 7.4 → **5.6** (**0.76×**) | 0.6 → **1.0** (1.63×) | 0.6 → **0.8** (1.38×) |
 
 Every decode and serving cell improved. **Prefill regressed 21–24% on `minimax-m3` and
-`glm-5.2`** — a real, reproducible loss, not noise: reps span 2–3%, expert-load is unchanged,
-and the growth is all in MoE *compute*. The size of the loss tracks how much of each model's
-prefill is MoE compute rather than expert I/O (m2.7 ~48%, m3 ~54%, glm ~70%), so `minimax-m2.7`
-is very likely carrying the same per-unit regression with its share merely diluted by I/O —
-read its "flat" as *masked*, not *unaffected*. `nemotron-3-super` is untouched because it runs
-the per-expert MXFP4 path, which is the one that got faster. Tracked, with the profile evidence
-and a bisect plan, in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
+`glm-5.2`** — real and reproducible, not noise: reps span 2–3% and the token gate passes.
+The cause is **not yet identified**, and the two models it hits are the two that are ≫ RAM,
+while the near-fit `minimax-m2.7` measures clean. `nemotron-3-super` is unaffected — it runs a
+different (per-expert MXFP4) expert path, the one that got faster.
+
+The obvious suspect has already been tested and **cleared**: the NVFP4 SwiGLU grouped expert
+path, which became default-on for these three models after the old snapshot. An in-binary ABBA
+A/B (`COLI_NVFP4_GROUP`) makes it ~1.04× **faster** on both m3 and m2.7, tokens identical. The
+regression is present on *both* arms, so it lies somewhere they share. Full evidence, including
+what has been eliminated, is in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
 
 **Two newer arches**, prefill and decode measured **2026-08-05**, V4 serving **2026-08-06**.
 Deliberately a separate table: the rows above are one dated snapshot taken in a single sweep,

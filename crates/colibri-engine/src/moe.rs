@@ -1309,10 +1309,23 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             // target.** A real win needs fewer BYTES or a fused kernel that keeps the
             // weights resident across experts, not fewer launches.
             crate::gpu::try_expert_group_packed(&active, activations, d, &mut out, 6)
-        } else if !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5) {
+        } else if nvfp4_group_moe()
+            && !active.is_empty()
+            && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5)
+        {
             // NVFP4 SwiGLU (M2.7 / M3 / GLM-5.2). Until this arm existed these models were
             // offered the fp8 group, which declines on fmt 5, so every one of them fell
             // through to a per-expert call — the path that pays per-expert weight staging.
+            //
+            // `COLI_NVFP4_GROUP=0` restores that per-expert arm. This is a MEASUREMENT
+            // CONTROL, not a tuning knob, and it exists because making this path
+            // unconditional deleted the only in-binary comparison against the path it
+            // replaced — the commit that did so says as much, and offered chunk=1 as a
+            // "nearest stand-in", which it is not: chunk=1 is still the grouped call, so it
+            // varies transfer size while holding the staging design fixed. The two arms
+            // differ in the thing that actually changed: grouped staging through a pinned
+            // host buffer + device arena (~0.74 GB/s measured) versus per-expert ZERO-COPY,
+            // which the RAM work elsewhere records as load-bearing to the tune of 22.7x.
             crate::gpu::try_expert_group_nvfp4(&active, activations, d, &mut out)
         } else if crate::gpu::expert_group_enabled() {
             crate::gpu::try_expert_group(&active, activations, d, &mut out)
@@ -3394,6 +3407,20 @@ mod tests {
 fn dsv4_group_moe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_DSV4_GROUP_MOE").ok().as_deref() == Some("1"))
+}
+
+/// The NVFP4 SwiGLU grouped expert path (M2.7 / M3 / GLM-5.2). Default **ON**, matching
+/// shipped behaviour — `COLI_NVFP4_GROUP=0` falls back to the per-expert path it replaced.
+///
+/// This is a measurement control, not a tuning knob. The change that made the grouped path
+/// unconditional removed the only same-binary comparison against the per-expert arm, and
+/// said so; without a way back there is no way to attribute a prefill delta to it. The
+/// difference is not cosmetic — grouped stages every routed expert through a pinned host
+/// buffer and a device arena (measured ~0.74 GB/s), where per-expert runs zero-copy, and
+/// zero-copy is recorded elsewhere in this repo as worth 22.7x.
+fn nvfp4_group_moe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_NVFP4_GROUP").ok().as_deref() != Some("0"))
 }
 
 

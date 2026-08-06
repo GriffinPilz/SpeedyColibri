@@ -179,17 +179,17 @@ expert-load is a small and roughly unchanged share of both, so the growth is in 
 and decode rose on the same build. Prefill is large-S, decode is S==1 ⇒ implicates the
 **large-S grouped-expert path** specifically.
 
-**Why m2.7 looks flat — it is masked, not unaffected.** The loss tracks each model's
-MoE-compute share of prefill:
+**~~Why m2.7 looks flat — it is masked, not unaffected~~ — RETRACTED, see the A/B below.**
+The first reading here was that the loss scaled with each model's MoE-compute share of prefill
+(m2.7 ~48%, m3 ~54%, glm ~70%), so m2.7 was carrying the same per-unit regression diluted by
+I/O. **The A/B refutes it**: on the per-expert arm — the same structural path July used —
+m2.7 measures 26.61 s against July's 27.16 s, i.e. slightly *faster*. m2.7 is genuinely
+unaffected and IS a usable control. A companion claim, "expert-load is unchanged", is also
+withdrawn: no July expert-load figure was ever in hand to support it.
 
-| model | expert-load / prefill | ⇒ moe-compute share | observed |
-|---|---|---|---|
-| m2.7 | 11.4 / 27.7 s = 41% | ~48% | flat |
-| m3 | 12.4 / 38.8 s = 32% | ~54% | −21% |
-| glm | 9.5 / 91.6 s = 10% | ~70% | −24% |
-
-All three run the grouped NVFP4 SwiGLU kernel; nemotron runs the per-expert MXFP4 path, which
-is the one that got faster. Do not record m2.7 as a control.
+What the two affected models share is not a compute share but a **memory regime** — m3 (229 GB)
+and glm (403 GB) are the two that are ≫ RAM; m2.7 (122 GB) is near-fit and clean; nemotron
+(69 GB) fits outright. That correlation, not the compute share, is where to look next.
 
 **RULED OUT — `gpu-ffn = 0ms` is a bench REPORTING gap, not a dispatch failure.**
 `scripts/bench.sh:50` prints only the `gpu-ffn(+sync)` field of the nine-field breakdown at
@@ -200,9 +200,54 @@ this bug: it disables the "phase total ≫ sum of GPU sub-timers" tell for exact
 that need it. **Side fix worth doing: widen the bench prefill summary to print `group` and
 `fc1+fc2`.**
 
-Next step: one m3 prefill under `COLI_PROFILE=1`, read the *full* moe-compute breakdown to see
-which sub-timer grew, then bisect commits since 2026-07-26 (candidates touch WSMM, grouped
-NVFP4 SwiGLU, shared-scratch pooling). Use m3 not glm — same signal, 2.4× faster per rep.
+### CLEARED: the NVFP4 SwiGLU grouped path is a ~1.04× WIN, not the regression
+
+The strongest-looking suspect, tested and eliminated. `try_expert_group_nvfp4` (moe.rs) became
+default-on for M2.7/M3/GLM in 750fd10 (#49, 2026-08-03) — *after* the old snapshot — and
+everything about it read like a defect waiting to be found. Its own commit body says the
+scaffolding was "DELIBERATELY NOT WIRED, because the repo has already measured this lever twice
+and it does not win"; that it was then flipped on with all measurements taken on **M2.7 at a
+128-token prefill**; that doing so "removes the A/B control along with the gate"; and that
+staging runs at **0.74 GB/s against a ~51 GB/s zero-copy ceiling**. The MXFP4 twin of the same
+idea is opt-in *because* it measured negative. None of that survived contact with a measurement.
+
+`COLI_NVFP4_GROUP` was added to restore the control the commit removed (default 1 = shipped;
+0 = the per-expert arm). ABBA ×4, one binary, warmup discarded, tokens identical throughout:
+
+| model | arm=1 grouped (ms) | arm=0 per-expert (ms) | result |
+|---|---|---|---|
+| minimax-m3 | 38782.9 / 38148.5 | 39950.0 / 40327.8 | grouped **1.043×** faster |
+| minimax-m2.7 | 25639.7 / 25476.1 | 26436.8 / 26775.3 | grouped **1.041×** faster |
+
+The arms provably switched, which is what makes the null trustworthy: `group` went 17833 → 2 ms
+and `gpu-ffn` 0 → 12241 ms. **Keep the knob** — it converts a default that could not be
+questioned into one that has been measured.
+
+### Where the regression actually is: a MEMORY REGIME, not a code path
+
+The A/B's real yield. Today's **per-expert arm** is the same structural path July ran, so it is
+the apples-to-apples comparison:
+
+| model | July 2026-07-26 | today, per-expert arm | |
+|---|---|---|---|
+| minimax-m3 | 30.40 s | **40.14 s** | **1.32× slower** |
+| minimax-m2.7 | 27.16 s | **26.61 s** | 1.02× *faster* |
+
+m3 is slower on **both** arms ⇒ the cause is shared by both, and is not the grouped path.
+m2.7 is clean on both ⇒ it is a control, not a masked casualty.
+
+What m3 (229 GB) and glm (403 GB) share, and m2.7 (122 GB, near-fit) and nemotron (69 GB, fits)
+do not, is being **≫ RAM**. Look at expert residency and expert-load, not at the expert kernels.
+Prime candidates are the residency/ceiling changes that landed after 2026-07-26 — the near-fit
+bar 118→80, the OOM-guard margin 12.88→7.98 GB, and the grouped path's own ledger charging
+(which commits a pinned buffer + device arena as `Class::Scratch` and therefore takes RAM away
+from expert residency on exactly the ≫-RAM models).
+
+Next step: capture m3 expert-load and resident-expert count on an old build vs today — a real
+bisect with built binaries, since no July expert-load figure was ever recorded. Use m3 (2.4×
+faster per rep than glm). Build note: `cargo` is off PATH under plain ssh on the box —
+`export PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH` — and verify the arm with a `strings`
+probe before measuring; the first build here died with exit 127 and left the old binary in place.
 
 ### Two things the re-measurement retired
 

@@ -12,29 +12,56 @@ add a second Spark and the experts split across both.
 
 ### How fast is it?
 
-One Spark (GB10, 121.7 GiB), single sequence, greedy, 512-token prompt, **2026-07-26**.
+One Spark (GB10, 121.7 GiB), single sequence, greedy, 512-token prompt, **2026-08-06**.
 Every figure is a median of repeated runs on one build, token-identity gated.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`nemotron-3-super`** | 69 GB | **16.5 tok/s** (31.0 s) | **8.3 tok/s** | **5.5 tok/s** |
-| **`minimax-m2.7`** | 122 GB | **18.8 tok/s** (27.2 s) | **4.0 tok/s** | **4.4 tok/s** |
-| **`minimax-m3`** | 229 GB | **16.8 tok/s** (30.4 s) | **1.9 tok/s** | **1.8 tok/s** |
-| **`glm-5.2`** (744B) | 403 GB | **7.4 tok/s** (69.5 s) | **0.6 tok/s** | **0.6 tok/s** |
+| **`nemotron-3-super`** | 69 GB | **40.3 tok/s** (12.7 s) | **12.8 tok/s** | **10.0 tok/s** |
+| **`minimax-m2.7`** | 122 GB | **18.5 tok/s** (27.7 s) | **5.1 tok/s** | **5.9 tok/s** |
+| **`minimax-m3`** | 229 GB | **13.2 tok/s** (38.8 s) | **2.5 tok/s** | **2.6 tok/s** |
+| **`glm-5.2`** (744B) | 403 GB | **5.6 tok/s** (91.6 s) | **1.0 tok/s** | **0.8 tok/s** |
 
-**Two newer arches**, measured **2026-08-05** on a different build. Deliberately a separate
-table: the rows above are one dated snapshot, and quietly appending to them is how a stale
-baseline turns into a wrong delta.
+**Against the previous run of this same table (2026-07-26)**, kept visible because a
+performance table that only ever moves one way is not being measured honestly:
+
+| model | prefill | decode | serving |
+|---|---|---|---|
+| `nemotron-3-super` | 16.5 → **40.3** (2.44×) | 8.3 → **12.8** (1.54×) | 5.5 → **10.0** (1.81×) |
+| `minimax-m2.7` | 18.8 → **18.5** (flat) | 4.0 → **5.1** (1.28×) | 4.4 → **5.9** (1.33×) |
+| `minimax-m3` | 16.8 → **13.2** (**0.79×**) | 1.9 → **2.5** (1.32×) | 1.8 → **2.6** (1.42×) |
+| `glm-5.2` | 7.4 → **5.6** (**0.76×**) | 0.6 → **1.0** (1.63×) | 0.6 → **0.8** (1.38×) |
+
+Every decode and serving cell improved. **Prefill regressed 21–24% on `minimax-m3` and
+`glm-5.2`** — a real, reproducible loss, not noise: reps span 2–3%, expert-load is unchanged,
+and the growth is all in MoE *compute*. The size of the loss tracks how much of each model's
+prefill is MoE compute rather than expert I/O (m2.7 ~48%, m3 ~54%, glm ~70%), so `minimax-m2.7`
+is very likely carrying the same per-unit regression with its share merely diluted by I/O —
+read its "flat" as *masked*, not *unaffected*. `nemotron-3-super` is untouched because it runs
+the per-expert MXFP4 path, which is the one that got faster. Tracked, with the profile evidence
+and a bisect plan, in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
+
+**Two newer arches**, prefill and decode measured **2026-08-05**, V4 serving **2026-08-06**.
+Deliberately a separate table: the rows above are one dated snapshot taken in a single sweep,
+and quietly appending to them is how a stale baseline turns into a wrong delta.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`deepseek-v4-flash`** | 145 GB | **12.5 tok/s** (41 s) | **4.8 tok/s** | not measured |
-| **`kimi-k3`** (1.5T) | 1.4 TB | **~1.1 tok/s** (~8 min) | **~0.4 tok/s** | not measured |
+| **`deepseek-v4-flash`** | 145 GB | **12.5 tok/s** (41 s) | **4.8 tok/s** | **4.5 tok/s** |
+| **`kimi-k3`** (1.5T) | 1.4 TB | **~1.1 tok/s** (~8 min) | **~0.4 tok/s** | see below |
 
-V4 decode is n=8, range 4.67–4.93, steady-state timer at 512-token context. K3's figures are
-coarser — decode from a short-prompt run and prefill from a single 512-token rep — because a
-K3 bench rep costs ~8 minutes and it streams a 1.4 TB container against 121 GB of RAM. Treat
-K3 as "it runs and is correct", not as a tuned number.
+V4 decode is n=8, range 4.67–4.93, steady-state timer at 512-token context; V4 serving is the
+same 12-prompt HTTP suite as the table above (median 4.5, mean 4.3, range 3.3–4.9, the low being
+the cold first request). K3's figures are coarser — decode from a short-prompt run and prefill
+from a single 512-token rep — because a K3 bench rep costs ~8 minutes and it streams a 1.4 TB
+container against 121 GB of RAM. Treat K3 as "it runs and is correct", not as a tuned number.
+
+**K3 serving has no number because one box cannot reach a serving state.** `coli serve` was
+given 22 minutes and never bound its port: it read steadily at 4.5 GiB/s the whole time — about
+5.7 TB, four times the container — with RSS flat at 108 GB. Nothing is hung or broken; a 1.4 TB
+model against 121 GB of RAM simply streams and evicts instead of converging on a working set.
+This is a hardware limit, not a defect, and it is the same conclusion the multi-node sizing
+reaches independently: K3 needs roughly a dozen boxes for residency.
 
 **Serve any row with one command** — `docker/run-dgx.sh -h <hf_token> -p 8080 -m nemotron`
 (or `-m m2.7` / `-m m3` / `-m glm`). See [Quick start](#quick-start-dgx-spark).
@@ -45,15 +72,21 @@ bound by how many expert bytes each token pulls, so throughput tracks *model siz
 streams every token from NVMe.
 
 - **prefill** — one-shot `coli gen`, which refills the in-process expert cache on every
-  invocation. A **server pays that once**: under `coli serve` nemotron's warm prefill is
-  **21.5 s / 25.9 tok/s**, reproducible to 2.6%. Use the warm number when comparing against
-  another server.
+  invocation. A **server pays that once**, so a warm server prefills faster than this column
+  suggests; the warm figure that used to sit here was from the 2026-07-26 build and is not
+  re-measured, so it has been removed rather than carried forward stale.
 - **decode** — steady-state `tok/s`, median over 8 reps (4 for GLM). The best single token
-  is meaningfully higher (nemotron 9.4, m2.7 4.8, m3 2.9, GLM 0.79) since expert-cache
-  misses spike individual steps.
+  is higher (nemotron 13.0, m2.7 6.6, m3 4.5, GLM 1.4) since expert-cache misses spike
+  individual steps. That gap is now very model-dependent: on m3 and GLM the best token is
+  ~1.4–1.8× the median, but on **nemotron best ≈ median** (13.0 vs 12.8) — it no longer
+  misses often enough for the spread to show.
 - **serving** — `scripts/bench.sh <model> serve`: real HTTP, twelve **diverse** prompts.
   Deliberately not one prompt repeated, which warms the cache on a tiny working set and
-  flatters throughput ~2×.
+  flatters throughput ~2×. **The median includes each model's warm-up**, and how much that
+  costs depends on whether the model converges on a resident working set: `minimax-m2.7`
+  ramps hard (2.0 tok/s on request 1 → a ~7.4 plateau by request 6, so its 5.9 median
+  understates the warm state), `minimax-m3` ramps mildly, and `nemotron-3-super` barely
+  ramps at all because 69 GB simply fits. Compare medians across models with that in mind.
 
 **Reproduce any cell** — these are the exact commands the table came from. Each suite
 gates on token identity across reps, so a "faster" number that changed the output fails
@@ -67,8 +100,12 @@ scripts/bench.sh nemotron-3-super all                    # all of it, plus batch
 ```
 
 Swap in `minimax-m2.7`, `minimax-m3`, or `glm-5.2` for the other rows; `scripts/model.py
-list` prints what's registered. **8 reps is not decoration** — ~25% of decode runs on this
-box land well below the mode, so a 3-rep median has a ~16% chance of being wrong. Full
+list` prints what's registered. The rep counts above are what these figures were taken at, so
+use them to reproduce the table. They used to be justified by decode bimodality — ~25% of runs
+landing well below the mode — but **that did not appear in this sweep**: all 28 decode reps
+(8/8/8/4) sat within 1.3%, 2.8%, 4.4% and 1.0% of their model's median respectively. On this
+build the reps are cheap insurance rather than a necessity; treat the old bimodality as
+unobserved here, not as proven gone. Full
 per-lever history, including the negative results and the measurement traps that produced
 them, is in [docs/MODEL-TEST-MATRIX.md](docs/MODEL-TEST-MATRIX.md).
 
@@ -271,8 +308,8 @@ environment-variable table below, and the `docker/run-dgx.sh` header comments.
 **3 — Query it**
 
 Any OpenAI client works. Streaming (`"stream": true`) sends tokens as they are
-produced — worth using at sub-1 tok/s so output appears live instead of after the
-whole completion. Current measured throughput and long-context prefill costs are in
+produced — worth using on the larger models, where a reply arrives at ~1 tok/s, so output
+appears live instead of after the whole completion. Current measured throughput and long-context prefill costs are in
 the [Performance & quality record](#performance--quality-record); a short prompt's
 first token lands in a few seconds, but a long prompt pays a large prefill first.
 
@@ -281,7 +318,8 @@ first token lands in a few seconds, but a long prompt pays a large prefill first
 curl http://localhost:8080/health
 curl http://localhost:8080/v1/models
 
-# Chat, streamed as Server-Sent Events (a 64-token reply ≈ 2+ min at ~0.5 tok/s)
+# Chat, streamed as Server-Sent Events (a 64-token reply ≈ 80 s on glm-5.2 at ~0.8 tok/s,
+# ≈ 6 s on nemotron-3-super at ~10 tok/s)
 curl -N http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "stream": true, "max_tokens": 64,
   "messages": [{"role": "user", "content": "Explain MoE routing in one sentence."}]
@@ -483,7 +521,10 @@ The expert cache **fills RAM and defends it** — no flag, for every model. A ba
 monitor polls `MemAvailable` every 100 ms and evicts LRU experts the moment free memory
 approaches a hard floor (~3 GB), *whatever* consumed it — more experts, a longer KV cache,
 the GPU's own working set on GB10's unified pool. A cache that gives memory back under
-pressure **cannot OOM**, which is what lets a fill-RAM policy point at a model of any size:
+pressure **cannot OOM**, which is what lets a fill-RAM policy point at a model of any size.
+The two figures below are a **2026-07-23 A/B of this policy** — the *ratio* is the result; for
+current absolute throughput see [How fast is it?](#how-fast-is-it), where these models now serve
+faster than the absolutes quoted here:
 
 - **Near-fit** (experts ≈ RAM — e.g. MiniMax-M2.7, ~122 GB on a 121 GB Spark): fill RAM and
   hold the whole working set resident, dropping the page-cache double-copy (`fadvise`) so

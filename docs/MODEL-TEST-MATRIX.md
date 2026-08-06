@@ -148,6 +148,87 @@ I/O-oriented work (prefetch-ahead, eviction policy, autopin, RAM sweeps) was dev
 this model, and **those conclusions are regime-specific — re-measure before assuming they hold
 for a model whose experts fit in RAM.**
 
+## Full four-model re-measurement, and a prefill REGRESSION on the grouped path (2026-08-06)
+
+The README headline table was re-taken end to end because its figures had drifted from the
+build. Twelve suites, all exit 0, all token-identity gated PASS. Prompt 512 tokens (every
+prefill figure divides out to exactly 512, so the basis is unchanged from 2026-07-26).
+Command per cell: `BENCH_REPS=3 scripts/bench.sh <m> prefill`, `BENCH_REPS=8 … decode`
+(4 for glm), `scripts/bench.sh <m> serve`.
+
+| model | prefill 07-26 → 08-06 | decode 07-26 → 08-06 | serve 07-26 → 08-06 |
+|---|---|---|---|
+| nemotron-3-super | 16.5 → **40.3** (2.44×) | 8.3 → **12.8** (1.54×) | 5.5 → **10.0** (1.81×) |
+| minimax-m2.7 | 18.8 → **18.5** (flat) | 4.0 → **5.1** (1.28×) | 4.4 → **5.9** (1.33×) |
+| minimax-m3 | 16.8 → **13.2** (**0.79×**) | 1.9 → **2.5** (1.32×) | 1.8 → **2.6** (1.42×) |
+| glm-5.2 | 7.4 → **5.6** (**0.76×**) | 0.6 → **1.0** (1.63×) | 0.6 → **0.8** (1.38×) |
+
+### The regression (open — bisect not yet run)
+
+**`minimax-m3` −21% and `glm-5.2` −24% on prefill**, on a build where their decode went *up*.
+
+```
+m3:  38794.0 / 39162.8 / 37984.9 ms → MEDIAN 38794.0 = 13.2 tok/s   gate PASS [67732]
+     attn 5139 | moe 33528 (expert-load 12411) | proj 2387
+glm: 90240.8 / 91568.6 / 92239.2 ms → MEDIAN 91568.6 =  5.6 tok/s   gate PASS [374]
+     attn 16983 | moe 74014 (expert-load 9562) | proj 2682
+```
+
+Why this is not noise and not a stale baseline: reps span 3.1% (m3) and 2.2% (glm);
+expert-load is a small and roughly unchanged share of both, so the growth is in MoE **compute**;
+and decode rose on the same build. Prefill is large-S, decode is S==1 ⇒ implicates the
+**large-S grouped-expert path** specifically.
+
+**Why m2.7 looks flat — it is masked, not unaffected.** The loss tracks each model's
+MoE-compute share of prefill:
+
+| model | expert-load / prefill | ⇒ moe-compute share | observed |
+|---|---|---|---|
+| m2.7 | 11.4 / 27.7 s = 41% | ~48% | flat |
+| m3 | 12.4 / 38.8 s = 32% | ~54% | −21% |
+| glm | 9.5 / 91.6 s = 10% | ~70% | −24% |
+
+All three run the grouped NVFP4 SwiGLU kernel; nemotron runs the per-expert MXFP4 path, which
+is the one that got faster. Do not record m2.7 as a control.
+
+**RULED OUT — `gpu-ffn = 0ms` is a bench REPORTING gap, not a dispatch failure.**
+`scripts/bench.sh:50` prints only the `gpu-ffn(+sync)` field of the nine-field breakdown at
+`forward.rs:1796` (`router | select | fc1+fc2 | group | gather | gpu-ffn | scatter | shared |
+other`). `GPUFFN_US` times the *per-expert* path; the grouped kernel records into `group` /
+`fc1+fc2`. So every grouped-path model reads `gpu-ffn=0` and always has. This matters beyond
+this bug: it disables the "phase total ≫ sum of GPU sub-timers" tell for exactly the models
+that need it. **Side fix worth doing: widen the bench prefill summary to print `group` and
+`fc1+fc2`.**
+
+Next step: one m3 prefill under `COLI_PROFILE=1`, read the *full* moe-compute breakdown to see
+which sub-timer grew, then bisect commits since 2026-07-26 (candidates touch WSMM, grouped
+NVFP4 SwiGLU, shared-scratch pooling). Use m3 not glm — same signal, 2.4× faster per rep.
+
+### Two things the re-measurement retired
+
+- **Decode bimodality did not appear.** The old "~25% of decode runs land well below the mode"
+  claim justified 8 reps. All 28 reps here sat within 1.3% / 2.8% / 4.4% / 1.0% of their
+  model's median (nemotron / m2.7 / m3 / glm). Unobserved on this build — not proven gone.
+- **Best-token vs median is now model-dependent.** m3 and glm still spike (best ≈ 1.4–1.8×
+  median), but **nemotron's best ≈ its median** (13.00 vs 12.8): it no longer misses the
+  expert cache often enough to show a spread.
+
+### Serve warm-up is a real confound in the serve column
+
+The 12-request median contains each model's ramp, and the ramp size depends on whether the
+model converges on a resident working set: m2.7 goes 2.02 → ~7.4 by request 6 (stdev 2.17, so
+its 5.86 median materially understates warm), m3 ramps mildly (1.88 → ~2.7, stdev 0.37, at
+229 GB it never converges), nemotron barely ramps (9.18 → ~10.0, stdev 0.32, 69 GB fits).
+Cross-model comparison of serve medians is therefore not apples-to-apples.
+
+### kimi-k3 serving: not measurable on one box
+
+`coli serve` ran 22 minutes without binding its port, reading steadily at 4.5 GiB/s — ~5.7 TB,
+four times the container — with RSS flat at 108.4 GB. Verified progressing (not hung) via
+`/sys/block/nvme0n1/stat` and `/proc/<pid>/io`. A 1.4 TB model against 121 GB RAM streams and
+evicts rather than converging. Hardware limit, consistent with the ~12-box residency estimate.
+**Do not re-attempt single-box K3 serve without a residency change.**
+
 ## DeepSeek-V4-Flash: first sound measurements (2026-08-04)
 
 Deliberately NOT a column in the Coverage grid above — most levers are untested on V4, and

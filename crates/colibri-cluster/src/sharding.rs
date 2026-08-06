@@ -108,6 +108,78 @@ impl ExpertSharding {
         ExpertSharding { num_nodes, n_experts, table: Some(Arc::new(table)) }
     }
 
+    /// **Capacity-weighted** sharding: node `i` owns a share of the experts proportional
+    /// to `capacity[i]`, and within that quota the hot experts are still spread by load.
+    ///
+    /// [`balanced`](Self::balanced) equalises *load* and so hands every node roughly the
+    /// same NUMBER of experts. That is right when the nodes are alike and wrong when they
+    /// are not: a cluster whose members have very different free space cannot store an even
+    /// split at all, and the small node ends up streaming its half from a disk that cannot
+    /// hold it. Kimi-K3 is the live case — 1446 GB of experts against two boxes with a few
+    /// hundred GB free each — where the point of sharding is to AGGREGATE NVMe bandwidth,
+    /// which requires each node to actually hold what it owns.
+    ///
+    /// Quotas use the largest-remainder method, so they sum to exactly `n_experts` and no
+    /// expert is dropped. Assignment is then LPT (as in `balanced`) restricted to nodes
+    /// still under quota: heaviest expert onto the lightest node that can still take one.
+    /// Deterministic — ties break by node id — so every node computes the same table.
+    ///
+    /// A node with zero capacity owns zero experts and simply serves none. If the total
+    /// capacity is zero (or a single node), this falls back to `balanced`, since there is
+    /// no capacity signal to weight by.
+    pub fn capacity_weighted(
+        num_nodes: u32,
+        n_experts: u32,
+        capacity: &[u64],
+        weights: &[u64],
+    ) -> ExpertSharding {
+        assert!(num_nodes >= 1, "num_nodes must be >= 1");
+        assert!(n_experts >= 1, "n_experts must be >= 1");
+        let cap = |n: usize| capacity.get(n).copied().unwrap_or(0);
+        let total: u128 = (0..num_nodes as usize).map(|n| cap(n) as u128).sum();
+        if num_nodes == 1 || total == 0 {
+            return ExpertSharding::balanced(num_nodes, n_experts, weights);
+        }
+        // Largest-remainder quotas: floor first, then hand the leftovers to the biggest
+        // fractional parts. Guarantees sum == n_experts without a rounding drift that
+        // would silently orphan an expert.
+        let mut quota = vec![0u32; num_nodes as usize];
+        let mut rem: Vec<(u128, usize)> = Vec::with_capacity(num_nodes as usize);
+        let mut assigned = 0u32;
+        for n in 0..num_nodes as usize {
+            let exact = cap(n) as u128 * n_experts as u128;
+            let q = (exact / total) as u32;
+            quota[n] = q;
+            assigned += q;
+            rem.push((exact % total, n));
+        }
+        // Biggest remainder first; ties by node id for determinism.
+        rem.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for &(_, n) in rem.iter().take((n_experts - assigned) as usize) {
+            quota[n] += 1;
+        }
+
+        let w = |e: u32| weights.get(e as usize).copied().unwrap_or(0);
+        let mut order: Vec<u32> = (0..n_experts).collect();
+        order.sort_by(|&a, &b| w(b).cmp(&w(a)).then(a.cmp(&b)));
+
+        let mut load = vec![0u64; num_nodes as usize];
+        let mut used = vec![0u32; num_nodes as usize];
+        let mut table = vec![0u32; n_experts as usize];
+        for e in order {
+            // Lightest node that still has quota left. One always exists: the quotas sum
+            // to `n_experts` and we place exactly that many.
+            let node = (0..num_nodes as usize)
+                .filter(|&i| used[i] < quota[i])
+                .min_by(|&i, &j| load[i].cmp(&load[j]).then(i.cmp(&j)))
+                .expect("quotas sum to n_experts, so one node is always under quota");
+            table[e as usize] = node as u32;
+            used[node] += 1;
+            load[node] += w(e);
+        }
+        ExpertSharding { num_nodes, n_experts, table: Some(Arc::new(table)) }
+    }
+
     pub fn num_nodes(&self) -> u32 {
         self.num_nodes
     }
@@ -338,5 +410,101 @@ mod tests {
             ExpertSharding::new(2, 256).fingerprint(),
             ExpertSharding::new(3, 256).fingerprint()
         );
+    }
+
+    /// Expert counts track free space, not node count. The K3 case: two boxes with very
+    /// different room, where an even split cannot be stored at all.
+    #[test]
+    fn capacity_weighted_counts_are_proportional_to_capacity() {
+        const E: u32 = 896; // K3's experts per layer
+        // 296 GB vs 243 GB free, the actual figures on 42b2 and 5a4f.
+        let cap = [296u64 << 30, 243u64 << 30];
+        let sh = ExpertSharding::capacity_weighted(2, E, &cap, &[]);
+        let (a, b) = (sh.count_for(NodeId(0)), sh.count_for(NodeId(1)));
+        assert_eq!(a + b, E, "every expert must be owned exactly once");
+        // Within one expert of the exact proportion — largest-remainder's guarantee.
+        let want_a = (E as u64 * cap[0] / (cap[0] + cap[1])) as u32;
+        assert!(
+            a.abs_diff(want_a) <= 1,
+            "node 0 got {a}, proportional share is {want_a}"
+        );
+        assert!(a > b, "the roomier node must own more");
+    }
+
+    /// Quotas sum exactly, for awkward ratios that expose a floor-and-hope rounding.
+    #[test]
+    fn capacity_weighted_never_drops_or_duplicates_an_expert() {
+        for (nodes, e, cap) in [
+            (3u32, 10u32, vec![1u64, 1, 1]),   // 10/3 — no exact split
+            (3, 7, vec![5u64, 3, 1]),
+            (4, 5, vec![7u64, 0, 2, 1]),       // a zero-capacity node
+            (2, 897, vec![u64::MAX / 2, 1]),   // extreme skew
+        ] {
+            let sh = ExpertSharding::capacity_weighted(nodes, e, &cap, &[]);
+            let total: u32 = (0..nodes).map(|n| sh.count_for(NodeId(n))).sum();
+            assert_eq!(total, e, "nodes={nodes} e={e}: counts must sum to n_experts");
+            for x in 0..e {
+                assert!(sh.owner(x).0 < nodes, "owner out of range");
+            }
+        }
+    }
+
+    /// The leftover expert goes to the node the floor short-changed MOST (largest
+    /// remainder), not to whichever node happens to be checked first.
+    ///
+    /// Pinned because it is the one part of the quota rule that "sums correctly and is
+    /// within one of proportional" does NOT determine: capacities 2:1 over 4 experts give
+    /// exact shares 2.67 and 1.33, so the spare belongs to node 0. Handing it to node 1
+    /// instead yields 2:2 — still exact, still within one, and wrong. A mutation run found
+    /// that gap; this closes it.
+    #[test]
+    fn the_leftover_expert_goes_to_the_largest_remainder() {
+        let sh = ExpertSharding::capacity_weighted(2, 4, &[2, 1], &[]);
+        assert_eq!(
+            (sh.count_for(NodeId(0)), sh.count_for(NodeId(1))),
+            (3, 1),
+            "2:1 capacity over 4 experts must be 3:1, not 2:2"
+        );
+    }
+
+    /// A zero-capacity node stores nothing — it cannot serve what it cannot hold.
+    #[test]
+    fn a_node_with_no_space_owns_no_experts() {
+        let sh = ExpertSharding::capacity_weighted(3, 64, &[10, 0, 6], &[]);
+        assert_eq!(sh.count_for(NodeId(1)), 0);
+        assert_eq!(sh.count_for(NodeId(0)) + sh.count_for(NodeId(2)), 64);
+    }
+
+    /// Within its quota it still spreads the hot experts — otherwise the roomier node
+    /// would own the whole hot set and the split would balance bytes while unbalancing
+    /// work. Compared against the worst case (hottest experts contiguous on one node).
+    #[test]
+    fn capacity_weighted_still_spreads_load_within_quota() {
+        const E: u32 = 64;
+        // A steep popularity curve: expert 0 is by far the hottest.
+        let w: Vec<u64> = (0..E).map(|e| 1u64 << (31 - (e % 32))).collect();
+        let sh = ExpertSharding::capacity_weighted(2, E, &[3, 1], &w);
+        let nw = sh.node_weights(&w);
+        assert_eq!(sh.count_for(NodeId(0)), 48, "3:1 capacity → 3:1 counts");
+        assert_eq!(sh.count_for(NodeId(1)), 16);
+        // The light node is only a quarter of the storage but carries real load — far
+        // more than the ~0 it would get if experts were handed out coldest-first.
+        assert!(
+            nw[1] > 0 && nw[1] * 20 > nw[0],
+            "load {nw:?} is too lopsided for a 3:1 storage split"
+        );
+    }
+
+    /// No capacity signal ⇒ this is exactly `balanced`, not a silently different map.
+    #[test]
+    fn capacity_weighted_falls_back_to_balanced_without_capacities() {
+        let w: Vec<u64> = (0..32u32).map(|e| (e as u64 * 7) % 13).collect();
+        for cap in [vec![0u64, 0], vec![]] {
+            let a = ExpertSharding::capacity_weighted(2, 32, &cap, &w);
+            let b = ExpertSharding::balanced(2, 32, &w);
+            for e in 0..32 {
+                assert_eq!(a.owner(e), b.owner(e), "cap={cap:?} expert {e}");
+            }
+        }
     }
 }

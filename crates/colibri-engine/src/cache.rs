@@ -138,6 +138,28 @@ struct State {
     session_usage: HashMap<(usize, usize), u64>,
 }
 
+/// Where time goes inside [`ExpertCache::fetch`], split three ways because the whole
+/// call was invisible: `compute_experts_partial` annotated it "cache hit (prefetched);
+/// not timed here" and it measured **5209 ms** of a MiniMax-M3 512-token prefill.
+///
+/// The miss *count* is not the problem — July 2026 and today issue the same ~6.4k misses
+/// — but the per-miss cost went from ≤0.09 ms to ~0.8 ms while resident entries doubled
+/// (1367 → 2772). These three separate the candidates: waiting for the lock, the inner
+/// provider's load, and the insert+evict bookkeeping that scales with entry count.
+static FETCH_LOCK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FETCH_LOAD_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FETCH_INSERT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(lock_wait_us, inner_load_us, insert_evict_us)` — see the statics above.
+pub fn fetch_profile() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        FETCH_LOCK_US.load(Relaxed),
+        FETCH_LOAD_US.load(Relaxed),
+        FETCH_INSERT_US.load(Relaxed),
+    )
+}
+
 /// Cache statistics snapshot.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheStats {
@@ -411,9 +433,15 @@ impl<P: ExpertProvider> ExpertCache<P> {
     /// session usage (true for real MoE routing, false for warm-up/pin loads).
     fn fetch(&self, layer: usize, eid: usize, record: bool) -> io::Result<Arc<Expert>> {
         let key = (layer, eid);
+        let prof = crate::forward::profile_on();
+        let rel = Ordering::Relaxed;
         // Fast path: resident hit.
         {
+            let t_lock = std::time::Instant::now();
             let mut s = self.state.lock().unwrap();
+            if prof {
+                FETCH_LOCK_US.fetch_add(t_lock.elapsed().as_micros() as u64, rel);
+            }
             s.clock = s.clock.wrapping_add(1);
             let clock = s.clock;
             if record {
@@ -429,8 +457,13 @@ impl<P: ExpertProvider> ExpertCache<P> {
             s.misses += 1;
         }
         // Miss: load outside the lock (disk I/O), then insert + evict.
+        let t_load = std::time::Instant::now();
         let ex = self.inner.expert(layer, eid)?;
+        if prof {
+            FETCH_LOAD_US.fetch_add(t_load.elapsed().as_micros() as u64, rel);
+        }
         let bytes = ex.bytes();
+        let t_ins = std::time::Instant::now();
         let mut s = self.state.lock().unwrap();
         // Another thread may have inserted it while we loaded.
         if let Some(e) = s.entries.get(&key) {
@@ -449,6 +482,9 @@ impl<P: ExpertProvider> ExpertCache<P> {
         s.bytes += bytes;
         let budget = self.budget.load(Ordering::Relaxed);
         s.evict_to(budget);
+        if prof {
+            FETCH_INSERT_US.fetch_add(t_ins.elapsed().as_micros() as u64, rel);
+        }
         Ok(ex)
     }
 }

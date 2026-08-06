@@ -1250,6 +1250,8 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     }
 
     // Per-expert row lists: the tokens routing to each expert, with their weights.
+    // O(experts × tokens) over a stride-`ne` read of `weights`, and it was untimed.
+    let t_prep = std::time::Instant::now();
     let mut per_expert: Vec<(usize, Vec<usize>, Vec<f32>)> = Vec::new();
     for (ei, &e) in eids.iter().enumerate() {
         let mut rows = Vec::new();
@@ -1264,6 +1266,12 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         if !rows.is_empty() {
             per_expert.push((e, rows, rw));
         }
+    }
+    if crate::forward::profile_on() {
+        crate::forward::MOE_PREP_US.fetch_add(
+            t_prep.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     // Batched grouped path (`COLI_EXPERT_GROUP`): one H2D/D2H per ≤64-expert chunk
@@ -1344,10 +1352,23 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     }
 
     let prof = crate::forward::profile_on();
+    let rel = std::sync::atomic::Ordering::Relaxed;
     for (e, rows, rw) in &per_expert {
         let nr = rows.len();
-        let ex = provider.expert(layer, *e)?; // cache hit (prefetched); not timed here
+        // Both of these used to sit outside every timer, in the residual. `expert()` was
+        // annotated "cache hit (prefetched); not timed here" — a claim worth checking
+        // rather than trusting — and `xg`/`hh` are a fresh heap allocation per expert per
+        // layer, which is the shape of a fault-under-pressure cost this repo has hit before.
+        let te = std::time::Instant::now();
+        let ex = provider.expert(layer, *e)?;
+        if prof {
+            crate::forward::MOE_EXPGET_US.fetch_add(te.elapsed().as_micros() as u64, rel);
+        }
+        let ta = std::time::Instant::now();
         let mut xg = vec![0f32; nr * d];
+        if prof {
+            crate::forward::MOE_ALLOC_US.fetch_add(ta.elapsed().as_micros() as u64, rel);
+        }
         let t0 = std::time::Instant::now();
         for (r, &t) in rows.iter().enumerate() {
             xg[r * d..(r + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
@@ -1358,7 +1379,11 @@ pub fn compute_experts_partial<P: ExpertProvider>(
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        let ta2 = std::time::Instant::now();
         let mut hh = vec![0f32; nr * d];
+        if prof {
+            crate::forward::MOE_ALLOC_US.fetch_add(ta2.elapsed().as_micros() as u64, rel);
+        }
         let t1 = std::time::Instant::now();
         ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
         if prof {

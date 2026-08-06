@@ -81,6 +81,25 @@ pub(crate) static SHARED_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MOE_FC_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MOE_SEL_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MOE_GRP_US: AtomicU64 = AtomicU64::new(0);
+/// Third round of sub-totals, for the same reason as the second: the residual came
+/// back. On a MiniMax-M3 512-token prefill `other` was **6743 ms of a 21595 ms**
+/// moe-compute phase (20% of it, and 6.2 s more than the July-2026 baseline), which
+/// is the whole of a measured 1.358× prefill regression — invisible because nothing
+/// timed it. These three cover everything `compute_experts_partial` does outside the
+/// gather/ffn/scatter it already measured:
+///
+/// - `MOE_ALLOC_US`  — the per-call CPU scratch: `out`, and `xg`/`hh` allocated
+///   **once per expert per layer** (~7680 visits × 2 × ~256 KB on M3). This repo has
+///   already been bitten once by per-call scratch faulting under a full expert cache
+///   (pooling it was worth 1.32× prefill), so it gets its own timer rather than
+///   sitting in a residual again.
+/// - `MOE_EXPGET_US` — `provider.expert()` inside the per-expert loop. Was annotated
+///   "cache hit (prefetched); not timed here" — an assumption, now measured.
+/// - `MOE_PREP_US`   — building the per-expert row/weight lists, which is
+///   O(experts × tokens) over a stride-`ne` read of the router weights.
+pub(crate) static MOE_ALLOC_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MOE_EXPGET_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MOE_PREP_US: AtomicU64 = AtomicU64::new(0);
 /// Sub-totals of `ATTN_US`: q/kv projections, RoPE + latent-cache write, the DSA
 /// lightning indexer, the attention core (sparse/dense), and the output projection.
 /// Incremented from `attention_with`.
@@ -1771,6 +1790,16 @@ where
                 "[profile] page-lock: {pok} ok / {pfail} failed / {pcap} capped | {:.1} GB locked",
                 pbytes as f64 / 1e9,
             );
+            // Splits `expert-get` in the moe breakdown below. Same-count misses got ~9×
+            // more expensive between two builds, so the question is which third: waiting
+            // on the cache lock, the inner provider's load, or insert+evict.
+            let (flock, fload, fins) = crate::cache::fetch_profile();
+            eprintln!(
+                "[profile] expert fetch: lock-wait {:.0} ms | inner-load {:.0} ms | insert+evict {:.0} ms",
+                flock as f64 / 1e3,
+                fload as f64 / 1e3,
+                fins as f64 / 1e3,
+            );
             let (calls, threads, spawn) = colibri_safetensors::batch_pool_profile();
             eprintln!(
                 "[profile] drain pool: {} batches, {} OS threads created ({:.0}/batch) | spawn-issue {:.0} ms",
@@ -1791,13 +1820,19 @@ where
             + ms(&LOAD_US)
             + ms(&MOE_FC_US)
             + ms(&MOE_SEL_US)
-            + ms(&MOE_GRP_US);
+            + ms(&MOE_GRP_US)
+            + ms(&MOE_ALLOC_US)
+            + ms(&MOE_EXPGET_US)
+            + ms(&MOE_PREP_US);
         eprintln!(
-            "[profile] moe-compute breakdown: router {:.0} ms | select {:.0} ms | fc1+fc2 {:.0} ms | group {:.0} ms | gather {:.0} ms | gpu-ffn(+sync) {:.0} ms | scatter {:.0} ms | shared {:.0} ms | other {:.0} ms",
+            "[profile] moe-compute breakdown: router {:.0} ms | select {:.0} ms | fc1+fc2 {:.0} ms | group {:.0} ms | prep {:.0} ms | expert-get {:.0} ms | alloc {:.0} ms | gather {:.0} ms | gpu-ffn(+sync) {:.0} ms | scatter {:.0} ms | shared {:.0} ms | other {:.0} ms",
             ms(&ROUTER_US),
             ms(&MOE_SEL_US),
             ms(&MOE_FC_US),
             ms(&MOE_GRP_US),
+            ms(&MOE_PREP_US),
+            ms(&MOE_EXPGET_US),
+            ms(&MOE_ALLOC_US),
             ms(&GATHER_US),
             ms(&GPUFFN_US),
             ms(&SCATTER_US),

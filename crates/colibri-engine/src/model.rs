@@ -881,6 +881,15 @@ impl KvCache {
         let (kvl, r) = (self.kv_lora, self.qk_rope);
         let n_rows = self.latent.len();
         let old = self.ring;
+        // Say once, out loud, that the ring engaged. Its success case is "tokens
+        // unchanged" — identical output is equally consistent with the ring working and
+        // with it never being reached — so an A/B alone cannot tell the two apart. The
+        // Indexer needed the same line for the same reason.
+        eprintln!(
+            "[kv] raw ring {old} -> {rows} rows x {n_rows} layers ({:.1} MB); \
+             generated tokens add none",
+            (n_rows * rows * (kvl + r) * 4) as f64 / (1024.0 * 1024.0),
+        );
         if old == 0 {
             // First call: the buffers still hold nothing (V4 sizes the ring before its
             // first write), so there is no live data to carry — just re-allocate small.

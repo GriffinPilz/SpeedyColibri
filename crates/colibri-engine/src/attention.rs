@@ -1228,6 +1228,48 @@ mod tests {
         assert_eq!(topk_blocks(&[2.0f32, 2.0, 1.0], 1), vec![0]);
     }
 
+    /// GQA touches `k_full`/`v_full` and **nothing else** — no `latent`, no `k_rot`, no
+    /// device shadow. `attention_gqa` ropes the key in place and stores the whole thing.
+    ///
+    /// This is not a style point: `KvCache::bytes_per_token` charged `qk_rope` for those
+    /// rows and again for a device mirror of them, ~12% of the fleet's per-token figure,
+    /// for buffers that stay lazily uncommitted and cost nothing. `mirrors_kv_on_device`
+    /// now excludes GQA, and this test is the executable form of the claim it rests on.
+    ///
+    /// Poisoned rather than checked-for-zero: a written zero and an untouched row are
+    /// indistinguishable, and "the accounting matches because both are zero" is exactly
+    /// the kind of agreement that stops being true silently.
+    #[test]
+    fn gqa_writes_no_latent_or_roped_key_rows() {
+        let c = gqa_cfg();
+        assert_eq!(c.kv_lora, 0, "GQA keeps no latent; there is nothing to poison");
+        assert!(c.qk_rope > 0, "...but it IS charged a roped-key row");
+        let l = make_gqa_layer(&c);
+        let (d, t) = (c.hidden as usize, 4usize);
+
+        let mut kv = KvCache::new(1, c.kv_lora as usize, c.qk_rope as usize, 8);
+        kv.enable_gqa(c.n_kv_heads as usize * c.qk_head as usize);
+        const POISON: f32 = -12345.5;
+        for p in 0..8 {
+            for v in kv.krot_row_mut(0, p).iter_mut() {
+                *v = POISON;
+            }
+        }
+
+        let x = vecf(t * d, 7);
+        let mut out = vec![0f32; t * d];
+        attention_gqa(&c, &l, 0, &mut kv, &x, t, 0, &mut out);
+
+        // It really ran: a no-op would leave `out` at zero and pass the survival check.
+        assert!(out.iter().all(|v| v.is_finite()));
+        assert!(out.iter().any(|v| *v != 0.0), "attention produced nothing");
+
+        assert!(
+            kv.krot_rows(0, 0, 8).iter().all(|v| *v == POISON),
+            "attention_gqa wrote a roped-key row — the accounting fix assumes it does not"
+        );
+    }
+
     #[test]
     fn gqa_attention_is_causal() {
         let c = gqa_cfg();

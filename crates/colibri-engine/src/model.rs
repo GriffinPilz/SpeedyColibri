@@ -684,14 +684,54 @@ impl KvCache {
     /// token" different questions: V4 retains a bounded number of rows however many tokens
     /// go past.
     fn raw_row_bytes(cfg: &Config) -> usize {
-        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize; // mirrored on device
+        // `latent` needs no predicate: `kv_lora` is already 0 on every arch that does not
+        // keep one, and it is the ONE row DeepSeek-V4 writes.
+        let latent = cfg.kv_lora as usize;
+        // `k_rot` and the device shadow do: both exist only on the MLA reader.
+        let mla = if Self::mirrors_kv_on_device(cfg) {
+            cfg.qk_rope as usize
+        } else {
+            0
+        };
         let gqa_full = if Self::allocates_gqa_kv(cfg) {
             2 * cfg.n_kv_heads as usize * cfg.qk_head as usize // k_full + v_full: host only
         } else {
             0
         };
-        let device_shadow = if cfg!(feature = "cuda") { mla } else { 0 };
-        Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4
+        let device_shadow = if cfg!(feature = "cuda") && Self::mirrors_kv_on_device(cfg) {
+            latent + mla
+        } else {
+            0
+        };
+        Self::kv_layers(cfg) * (latent + mla + gqa_full + device_shadow) * 4
+    }
+
+    /// Does this architecture keep the MLA-style `latent` + `k_rot` rows on the **device**
+    /// as well as the host — the [`DeviceKv`](crate::gpu::DeviceKv) shadow that
+    /// [`Self::sync_device`] uploads?
+    ///
+    /// Only the weight-absorption reader (`attention_with_heads`, i.e. GLM-5.2 and Kimi-K3's
+    /// gated-MLA layers) syncs; it is the sole caller. Two architectures were being charged
+    /// for a shadow they never allocate, and for the host `k_rot` rows behind it:
+    ///
+    /// * **GQA** (MiniMax-M3/M2.7, Nemotron-H's attention layers) — `attention_gqa` ropes
+    ///   the key in place and stores the whole thing in `k_full`/`v_full`. It never touches
+    ///   `latent` or `k_rot`, so both buffers stay lazily uncommitted and cost nothing. Worth
+    ///   ~12% of their per-token figure.
+    /// * **DeepSeek-V4** — `dsv4_attention` builds its key block on the host and hands it
+    ///   straight to the sparse kernel. It writes `latent` and nothing else. Worth ~1.9x on
+    ///   its raw term, the single largest error this accounting has carried.
+    ///
+    /// **A deny-list on purpose.** An allow-list (`matches!(arch, Glm | KimiK3)`) would
+    /// silently *under*-charge a future MLA architecture, and under-charging KV is how a
+    /// request gets admitted into memory that cannot hold it. Charging is the safe default,
+    /// so a new arch has to opt out here deliberately.
+    ///
+    /// The `window` clause is mechanism, not a proxy for "is V4": a ringed raw tier
+    /// **cannot** carry this shadow, because the shadow is absolute-indexed and uploads
+    /// incrementally — which is exactly what `sync_device` asserts.
+    fn mirrors_kv_on_device(cfg: &Config) -> bool {
+        !Self::allocates_gqa_kv(cfg) && cfg.window == 0
     }
 
     /// How many raw KV rows a sequence of `n_prompt` prompt tokens and `n_new` generated
@@ -1478,10 +1518,15 @@ mod kv_accounting_tests {
             "for_model calls enable_gqa for NemotronH"
         );
 
-        // per attn layer: mla(kv_lora 0 + qk_rope 4) + k_full/v_full(2*2*4=16) + shadow(mla)
-        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
-        let shadow = if cfg!(feature = "cuda") { mla } else { 0 };
-        assert_eq!(KvCache::bytes_per_token(&cfg), (mla + 16 + shadow) * 4);
+        // per attn layer: k_full/v_full (2*2*4 = 16) and NOTHING ELSE.
+        //
+        // `attention_gqa` ropes the key in place and stores the whole thing in
+        // `k_full`/`v_full`; it never touches `latent` or `k_rot`, and never calls
+        // `sync_device`. Those buffers are allocated but stay lazily uncommitted, so
+        // charging `qk_rope` for them — and again for a device shadow of them — was two
+        // phantom terms, ~12% of the real fleet figure. See `mirrors_kv_on_device`.
+        assert!(!KvCache::mirrors_kv_on_device(&cfg), "GQA keeps no latent/rope rows");
+        assert_eq!(KvCache::bytes_per_token(&cfg), 16 * 4);
 
         // Counting all 4 layers — the old behaviour — would be 4x too big.
         assert!(
@@ -1519,10 +1564,15 @@ mod kv_accounting_tests {
         assert!(fx > 0, "a hybrid model must report non-zero fixed state");
     }
 
-    /// Non-hybrid models keep their previous accounting exactly: all layers hold KV and
-    /// there is no fixed state. Guards the refactor against changing GLM/M3/M2.7 figures.
+    /// A uniform GQA transformer: every layer holds KV, there is no fixed state, and the
+    /// per-token cost is `k_full` + `v_full` and nothing else.
+    ///
+    /// This used to be named `..._is_unchanged` and assert the older formula, which added
+    /// `qk_rope` plus a device mirror of it. Both were phantom — `attention_gqa` writes
+    /// neither (`gqa_writes_no_latent_or_roped_key_rows` poisons the rows and watches them
+    /// survive) — so "unchanged" was guarding the wrong number.
     #[test]
-    fn uniform_transformer_accounting_is_unchanged() {
+    fn uniform_gqa_charges_k_full_and_v_full_only() {
         let cfg = cfg_from(
             r#"{"model_type":"minimax_m2","hidden_size":8,"intermediate_size":6,
                 "num_hidden_layers":3,"num_attention_heads":4,"num_key_value_heads":2,
@@ -1546,13 +1596,15 @@ mod kv_accounting_tests {
             KvCache::bytes_per_token(&cfg) * 7
         );
 
-        // Matches the long-standing formula for a GQA transformer.
-        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
-        let shadow = if cfg!(feature = "cuda") { mla } else { 0 };
-        let expect = cfg.n_layers as usize
-            * (mla + 2 * cfg.n_kv_heads as usize * cfg.qk_head as usize + shadow)
-            * 4;
+        // A GQA transformer's KV is `k_full` + `v_full`, full stop — no latent, no roped-key
+        // row, no device shadow (`attention_gqa` writes neither and never syncs).
+        assert!(!KvCache::mirrors_kv_on_device(&cfg));
+        let expect =
+            cfg.n_layers as usize * (2 * cfg.n_kv_heads as usize * cfg.qk_head as usize) * 4;
         assert_eq!(KvCache::bytes_per_token(&cfg), expect);
+        // The `qk_rope` term this used to add is not zero on this config, so its removal is
+        // a real change and not a no-op the test could pass through inattention.
+        assert!(cfg.qk_rope > 0, "the dropped term was non-zero here");
     }
 
     /// The real Kimi-K3 geometry (93 layers = 69 KDA + 24 gated-MLA), so the figures the
@@ -1850,12 +1902,26 @@ mod kv_accounting_tests {
         let _ = kv.latent_rows(0, 0, 4);
     }
 
-    /// A ringed config: GLM's shape (so the non-ring arms of the accounting are exercised
-    /// unchanged) with V4's `sliding_window` set. `window` is the only field the raw-row
-    /// accounting keys off, which is exactly why the ring can be reasoned about without a
-    /// V4 checkpoint.
+    /// V4's accounting shape: a **latent** attention stack (so `allocates_gqa_kv` is false,
+    /// as it is for the real V4) with `sliding_window` set. K3's real geometry is the base
+    /// because `window` and `arch` are the only fields these figures key off, which is what
+    /// lets the ring be reasoned about without a V4 checkpoint.
+    ///
+    /// **Must not be GQA-based.** It was, briefly, and that silently disarmed the whole
+    /// point: `allocates_gqa_kv` was already true, so the `window` clause in
+    /// `mirrors_kv_on_device` became redundant and deleting it broke nothing. A mutation
+    /// run caught it. Any config used to test the ring's *accounting* has to reach the
+    /// window clause to exercise it.
     fn ringed_cfg(window: i32) -> Config {
-        let mut cfg = cfg_from(
+        let mut cfg = kimi_k3_cfg();
+        assert!(!KvCache::allocates_gqa_kv(&cfg), "must reach the window clause");
+        cfg.window = window;
+        cfg
+    }
+
+    /// The GQA/hybrid shape, for the arm of the accounting that has no latent rows at all.
+    fn gqa_cfg_for_accounting() -> Config {
+        cfg_from(
             r#"{"model_type":"nemotron_h","hidden_size":8,"num_hidden_layers":4,
                 "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,"vocab_size":8,
                 "hybrid_override_pattern":"ME*M","n_routed_experts":4,"num_experts_per_tok":2,
@@ -1864,9 +1930,7 @@ mod kv_accounting_tests {
                 "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
                 "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
                 "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
-        );
-        cfg.window = window;
-        cfg
+        )
     }
 
     /// The point of the ring, in the ledger: generated tokens add no raw rows.
@@ -1886,38 +1950,100 @@ mod kv_accounting_tests {
         );
         assert_eq!(short, long, "no compressor on this cfg: generation is free");
 
-        // Without a ring the same pair scales with every token.
-        let flat_short = KvCache::bytes_for_split(&flat, 512, 400);
-        let flat_long = KvCache::bytes_for_split(&flat, 512, 40_000);
+        // Without a ring the same pair scales with every token. Net of `fixed_bytes`, which
+        // is the per-sequence recurrent state and constant in both arms — leaving it in
+        // would dilute the ratio with a term that has nothing to do with the ring.
+        let fx = KvCache::fixed_bytes(&flat);
+        let flat_short = KvCache::bytes_for_split(&flat, 512, 400) - fx;
+        let flat_long = KvCache::bytes_for_split(&flat, 512, 40_000) - fx;
+        assert_eq!(flat_long, flat_short * 40_512 / 912, "unringed: linear in total tokens");
+        // And the ring is the whole reason: same prompt, same generation, ~79x apart.
         assert!(
-            flat_long > flat_short * 40,
-            "unringed: {flat_long} should be ~80x {flat_short}"
-        );
-        // And the ring is the whole reason: same prompt, same generation, ~80x apart.
-        assert!(
-            flat_long > long * 40,
+            flat_long > (long - KvCache::fixed_bytes(&ring)) * 40,
             "ring should be far cheaper: {long} vs {flat_long}"
         );
     }
 
     /// Prompts are NOT cheaper. The ring holds `max(window, prompt)` rows, so a long
-    /// prompt costs exactly what it did — the honest limit until prefill is chunked, and
+    /// prompt costs the same *rows* it did — the honest limit until prefill is chunked, and
     /// the reason `bytes_per_token` stays at its all-prompt worst case.
+    ///
+    /// Stated in ROWS, not bytes: a ringed arch also drops the device shadow (it cannot
+    /// carry one — see `mirrors_kv_on_device`), so comparing bytes against an unringed
+    /// config would fold that separate saving in and stop testing this claim.
     #[test]
     fn a_long_prompt_still_costs_full_price_under_a_ring() {
         let ring = ringed_cfg(128);
         let flat = ringed_cfg(0);
         for n in [512usize, 4_096, 40_000] {
+            assert_eq!(KvCache::raw_rows(&ring, n, 0), n, "all-prompt {n}: every row kept");
+            assert_eq!(KvCache::raw_rows(&flat, n, 0), n);
+            // ...and the charge is linear in those rows, so doubling the prompt doubles it.
             assert_eq!(
-                KvCache::bytes_for(&ring, n),
-                KvCache::bytes_for(&flat, n),
-                "all-prompt sequence of {n}: the ring saves nothing"
+                KvCache::bytes_for(&ring, 2 * n) - KvCache::fixed_bytes(&ring),
+                2 * (KvCache::bytes_for(&ring, n) - KvCache::fixed_bytes(&ring)),
+                "all-prompt cost is linear in n at {n}"
             );
         }
         // Below the window the ring rounds UP to it — it cannot hold fewer rows than the
         // span every decode step reads.
         assert_eq!(KvCache::raw_rows(&ring, 10, 0), 128);
         assert_eq!(KvCache::raw_rows(&flat, 10, 0), 10);
+    }
+
+    /// Exactly one family syncs KV to the device, and it is the one whose reader calls
+    /// `sync_device`. Pinned per-arch because the predicate is a deny-list: if a new
+    /// architecture is added and left un-audited it lands in the CHARGED arm, which
+    /// over-reserves — the safe direction — and this test says so out loud.
+    #[test]
+    fn only_the_mla_reader_is_charged_for_a_device_shadow() {
+        // Charged: the weight-absorption reader, the sole caller of `sync_device`.
+        assert!(KvCache::mirrors_kv_on_device(&kimi_k3_cfg()), "K3's gated-MLA layers sync");
+
+        // Not charged, for two independent reasons — and BOTH arms must be exercised by a
+        // config that actually reaches them, or one clause of the predicate is untested.
+        let gqa = gqa_cfg_for_accounting();
+        assert!(KvCache::allocates_gqa_kv(&gqa));
+        assert!(
+            !KvCache::mirrors_kv_on_device(&gqa),
+            "GQA writes k_full/v_full only — no latent, no rope row, no shadow"
+        );
+        let v4 = ringed_cfg(128);
+        assert!(!KvCache::allocates_gqa_kv(&v4), "V4 is latent, not GQA: the GQA clause misses it");
+        assert!(
+            !KvCache::mirrors_kv_on_device(&v4),
+            "a ringed raw tier cannot carry an absolute-indexed shadow — sync_device asserts it"
+        );
+
+        // And what was dropped is exactly the two phantom terms — `k_rot` and its mirror —
+        // not some other quantity that happens to make the arithmetic work. Shown on V4,
+        // where flipping `window` back to 0 reproduces the old charge on the same config.
+        let mut charged = v4.clone();
+        charged.window = 0;
+        let shadow = if cfg!(feature = "cuda") {
+            v4.kv_lora as usize + v4.qk_rope as usize
+        } else {
+            0
+        };
+        assert_eq!(
+            KvCache::bytes_per_token(&charged) - KvCache::bytes_per_token(&v4),
+            KvCache::kv_layers(&v4) * (v4.qk_rope as usize + shadow) * 4,
+            "the delta must be k_rot + its device mirror, exactly"
+        );
+    }
+
+    /// The MLA models must be UNCHANGED by that fix. They are the ones that really do
+    /// mirror, so any movement in their figure would be the fix over-reaching.
+    #[test]
+    fn the_mla_models_keep_their_full_latent_rope_and_shadow_charge() {
+        let cfg = kimi_k3_cfg();
+        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
+        let shadow = if cfg!(feature = "cuda") { mla } else { 0 };
+        assert_eq!(
+            KvCache::bytes_per_token(&cfg),
+            KvCache::kv_layers(&cfg) * (mla + shadow) * 4,
+            "K3: latent + rope on host, mirrored on device"
+        );
     }
 
     /// `bytes_for` is the split-free form and must stay the all-prompt worst case: it

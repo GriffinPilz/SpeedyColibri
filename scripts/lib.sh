@@ -121,7 +121,13 @@ bench_lock_held() {
 median() {
   printf "%s\n" "$@" | sort -n | awk '
     {a[NR]=$1}
-    END{ if(NR==0){print "NA"} else if(NR%2){print a[(NR+1)/2]} else {printf "%.1f",(a[NR/2]+a[NR/2+1])/2} }'
+    END{ if(NR==0){print "NA"} else if(NR%2){print a[(NR+1)/2]}
+         # EVEN count averages the middle pair, and %.1f throws away real precision below
+         # 1 tok/s: two K3 decode reps of 0.35 printed as "0.3", a 14% misreport that reads
+         # as a regression against the recorded ~0.4. GLM (~0.9) is in the same range. The
+         # ODD path prints verbatim, which is why per-run medians (23 rates) looked right
+         # and only the 2-rep median was wrong. Two decimals below 1, unchanged above.
+         else {v=(a[NR/2]+a[NR/2+1])/2; printf (v<1)?"%.2f":"%.1f", v} }'
 }
 
 # Token-identity gate: all args must be equal and non-empty. Prints PASS/FAIL, returns nonzero on FAIL.

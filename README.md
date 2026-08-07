@@ -23,10 +23,23 @@ fails loudly instead of being reported as a win.
 | **`deepseek-v4-flash`** | 145 GB | **13.6 tok/s** (37.6 s) | **4.7 tok/s** | **4.3 tok/s** |
 | **`minimax-m3`** | 229 GB | **16.1 tok/s** (31.8 s) | **2.6 tok/s** | **2.6 tok/s** |
 | **`glm-5.2`** (744B) | 403 GB | **6.6 tok/s** (78.1 s) | **0.9 tok/s** | **0.8 tok/s** |
-| **`kimi-k3`** (1.5T) | 1.4 TB | ~1.1 tok/s (~8 min) | ~0.4 tok/s | — |
+| **`kimi-k3`** (1.5T) | 1.4 TB | **1.8 tok/s** (4.6 min) | **0.35 tok/s** | — |
 
 Measured 2026-08-06 on branch `docs-retest-4model-2026-08-06`, which is ahead of `main`.
-K3's row is carried over from an earlier build — its suite takes hours and was not re-run.
+
+**The five rows above predate the coverage-gated FFN staging** (`ffn-devcopy-coverage-gate`).
+That change measures **nemotron −10.0%, M2.7 −6.5%, M3 −2.4% on prefill** against exactly
+this build, so those three prefill figures are conservative until the suite is re-run. Decode,
+serving and GLM are unaffected. K3 is MXFP4 and the MXFP4 expert paths never staged, so its
+row is current either way.
+
+K3's row *was* the stale one — carried over at "~1.1 tok/s (~8 min) / ~0.4" from a build
+nobody had re-measured because the suite takes hours. Re-run 2026-08-06: **1.8 tok/s**
+(median of 3, 1.6% spread, token gate PASS) and **0.35 tok/s** decode (two reps, both
+0.35 median / 0.45 best). Prefill is far better than the old figure; decode is unchanged
+once a reporting bug is undone — `median()` printed `%.1f` on even-count inputs, rendering
+0.35 as "0.3" and making a flat result look like a 12% regression. Fixed in `scripts/lib.sh`.
+K3 remains the SSD-bound model: `expert-load` is 126.8 s of its 278.6 s prefill.
 
 **Prefill is what this build moved, and only for M3 and GLM — both ~1.22×.** Measured against
 a freshly built `main`, ABBA-interleaved in one session, tokens gated identical:

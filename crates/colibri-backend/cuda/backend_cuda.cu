@@ -2358,6 +2358,45 @@ static int g_weight_zerocopy = 0;
  * 6.8x slower on nemotron decode. */
 extern "C" void coli_cuda_set_weight_zerocopy(int on) { g_weight_zerocopy = on ? 1 : 0; }
 
+/* Expert-weight STAGING gate, set from the host off the same coverage number that already
+ * picks O_DIRECT, mmap and the reader-thread count. -1 = host has not spoken.
+ *
+ * Staging costs GPU time and buys I/O DECOUPLING, and only the second half depends on the
+ * model. Measured 2026-08-06, one binary, env only, ABBA, tokens identical:
+ *
+ *   model      coverage   staging OFF vs ON
+ *   nemotron   ~155%      -10.3%   (expert-load 2 ms — nothing to decouple from)
+ *   m2.7        ~97%       -8.6%
+ *   m3          ~37%       -2.5%
+ *   glm         ~18%      +11.5%   WORSE — gpu-ffn -1.5 s but expert-load +10.4 s
+ *
+ * Monotonic in coverage. At 18% nearly every expert streams from NVMe DURING the forward
+ * pass, so a zero-copy kernel reads the very host pages the loader is writing; the H2D copy
+ * separates them and is worth far more than it costs. At 97-155% there is no live streaming
+ * to collide with and the copy is pure waste.
+ *
+ * CUDA events make the trap explicit (COLI_NVFP4_EVT=1, m3, 4000 calls @ ~24 rows):
+ *   staging ON   stage 2.06 s (107.43 GB @ 52.2 GB/s)  kernel 6.70 s
+ *   staging OFF  stage 0.00 s                          kernel 6.21 s
+ * The kernel is FASTER without the copy — on unified memory there is no faster tier to copy
+ * into. A compute-only benchmark therefore says "always disable" and regresses GLM 11.5%.
+ * The benefit is invisible to any measurement that does not include the loader.
+ *
+ * Decode is unaffected either way: row_path (S==1) skips staging by construction, and both
+ * nemotron (12.65 -> 12.75 tok/s) and m3 (2.39 -> 2.49) measured flat. */
+static int g_ffn_devcopy_host = -1;
+extern "C" void coli_cuda_set_ffn_devcopy(int on) { g_ffn_devcopy_host = on ? 1 : 0; }
+
+/* Precedence: explicit COLI_FFN_DEVCOPY wins (it is the A/B control), then the host's
+ * coverage gate, then the legacy always-on default for callers that never set either. */
+static bool ffn_devcopy_on() {
+    static int s_env = -2;                       // -2 unresolved, -1 unset, 0/1 explicit
+    if (s_env == -2) { const char *e = getenv("COLI_FFN_DEVCOPY"); s_env = e ? (atoi(e) ? 1 : 0) : -1; }
+    if (s_env >= 0) return s_env != 0;
+    if (g_ffn_devcopy_host >= 0) return g_ffn_devcopy_host != 0;
+    return true;
+}
+
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
@@ -2622,8 +2661,7 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
     static int s_gemv_pre=-1;
     if(s_gemv_pre<0){const char*e=getenv("COLI_FFN_GEMV");s_gemv_pre=e&&atoi(e);}
     const bool row_path=(s_gemv_pre&&S==1);
-    static int s_dc=-1;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    const bool s_dc=ffn_devcopy_on();
     if(s_dc&&!row_path){
         size_t gwb=(size_t)I*D,dwb=(size_t)D*I;
         if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gwb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gwb)&&
@@ -2865,8 +2903,7 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     const bool row_path=(S==1&&!s_tiled);
-    static int s_dc=-1;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    const bool s_dc=ffn_devcopy_on();
     if(s_dc&&!row_path){
         size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (gate/up, down)
         size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
@@ -2995,8 +3032,7 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
     static int s_tiled=-1;
     if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     const bool row_path=((S==1&&!s_tiled)||exact);
-    static int s_dc=-1;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    const bool s_dc=ffn_devcopy_on();
     if(s_dc&&!row_path){
         size_t unb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (up, down)
         size_t usb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes

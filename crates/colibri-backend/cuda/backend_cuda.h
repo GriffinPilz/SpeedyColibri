@@ -53,6 +53,9 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
  * copy of every weight), 1 = wrap the host buffer and read it in place (free, slower
  * reads). See the definition for why Kimi-K3 forces the choice. */
 COLI_CUDA_DLLEXPORT void coli_cuda_set_weight_zerocopy(int on);
+/* Expert-weight staging gate, driven from the host's coverage number. COLI_FFN_DEVCOPY
+ * still overrides it. See the definition for the fleet measurements. */
+COLI_CUDA_DLLEXPORT void coli_cuda_set_ffn_devcopy(int on);
 
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap_mxfp4(ColiCudaTensor **tensor,
         const void *weights, const void *bscale, float gscale, int I, int O, int device);

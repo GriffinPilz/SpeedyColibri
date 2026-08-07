@@ -2896,6 +2896,36 @@ const NEARFIT_COVERAGE_PCT: u64 = 80;
 /// nearly double today's 379 GB, i.e. a different coverage entirely).
 const O_DIRECT_MAX_COVERAGE_PCT: u64 = 35;
 
+/// Coverage **at or above** which the expert FFN stops staging its weights host→device.
+/// `COLI_FFN_DEVCOPY` overrides. The fourth decision off the coverage axis, and like the
+/// others it has its own measurement and its own threshold.
+///
+/// Staging costs GPU time and buys I/O decoupling; only the second half is model-dependent.
+/// Measured 2026-08-06, one binary, env only, ABBA, tokens identical in every arm:
+///
+/// | model | coverage | staging OFF vs ON | n/arm |
+/// |---|---|---|---|
+/// | nemotron-3-super | ~155% | **−10.3%** | 4 |
+/// | minimax-m2.7 | ~97% | **−8.6%** | 4 |
+/// | minimax-m3 @512 | ~37% | −2.5% | 6 |
+/// | minimax-m3 @128 | ~37% | −1.45% | 4 |
+/// | **glm-5.2** | **~18%** | **+11.5% WORSE** | 2 |
+///
+/// Monotonic in coverage. At 18% nearly every expert streams from NVMe *during* the forward
+/// pass, so a zero-copy kernel reads the very host pages the loader is writing — GLM pays
+/// `expert-load` +10.4 s to save `gpu-ffn` 1.5 s. At 97–155% there is no live streaming to
+/// collide with, and the copy is pure waste.
+///
+/// **BOUNDED, NOT DERIVED.** The crossover lies somewhere in (18%, 37%); 35 is the existing
+/// neighbour threshold and both measured points fall on the correct side of it. Do not read
+/// it as a measured optimum — the same caveat the rows-per-expert gate carries.
+///
+/// The trap worth remembering: CUDA events show the kernel is *faster* without the copy
+/// (6.21 s vs 6.70 s — unified memory has no faster tier to copy into), so a compute-only
+/// benchmark concludes "always disable" and regresses GLM by 11.5%. The benefit is invisible
+/// to any measurement that excludes the loader.
+const FFN_DEVCOPY_MAX_COVERAGE_PCT: u64 = 35;
+
 /// Coverage below which the expert reader uses a **narrow** thread pool
 /// ([`DISK_BOUND_READ_THREADS`]) instead of `2 x cores`. `COLI_LOAD_THREADS` overrides.
 ///
@@ -3107,6 +3137,11 @@ where
     // separately and the crossovers do not coincide (see each constant).
     colibri_safetensors::set_o_direct(covers_pct < O_DIRECT_MAX_COVERAGE_PCT);
     colibri_safetensors::set_mmap_experts(covers_pct >= MMAP_MIN_COVERAGE_PCT);
+    // Fourth decision off the same axis: stage expert weights H2D only while the model is
+    // genuinely streaming them, because staging's whole value is decoupling the kernel from
+    // pages the loader is still writing. See `FFN_DEVCOPY_MAX_COVERAGE_PCT`.
+    #[cfg(feature = "cuda")]
+    colibri_backend::cuda::set_ffn_devcopy(covers_pct < FFN_DEVCOPY_MAX_COVERAGE_PCT);
     // Third decision off the same axis, with its own threshold and its own measurement.
     // A model whose experts genuinely stream off the drive saturates the NVMe at a low
     // queue depth, and every reader thread past that only adds spawn cost (the drain
@@ -3116,6 +3151,27 @@ where
     if covers_pct < DISK_BOUND_COVERAGE_PCT {
         colibri_engine::moe::set_disk_bound_read_threads(DISK_BOUND_READ_THREADS);
     }
+    // Print what the coverage number actually decided. Four path choices now hang off it and
+    // every one of them is silent when it goes the wrong way — the failure mode that has
+    // cost this project the most time is a dispatch that quietly picks the slow arm. One
+    // line, so a profile can be read against the paths it actually ran.
+    // Report the EFFECTIVE state, not the coverage-derived one: `COLI_FFN_DEVCOPY` overrides
+    // the gate, and a line that still printed the gate's opinion would be actively wrong in
+    // exactly the runs someone is debugging. Mirrors `ffn_devcopy_on()` in backend_cuda.cu.
+    let staging_gate = covers_pct < FFN_DEVCOPY_MAX_COVERAGE_PCT;
+    let staging = match std::env::var("COLI_FFN_DEVCOPY").ok().as_deref() {
+        Some("0") => "off (COLI_FFN_DEVCOPY)",
+        Some(_) => "on (COLI_FFN_DEVCOPY)",
+        None if staging_gate => "on",
+        None => "off",
+    };
+    eprintln!(
+        "[cache] coverage {covers_pct}% → o_direct {} | mmap-experts {} | reader-pool {} | \
+         ffn-staging {staging}",
+        if covers_pct < O_DIRECT_MAX_COVERAGE_PCT { "on" } else { "off" },
+        if covers_pct >= MMAP_MIN_COVERAGE_PCT { "on" } else { "off" },
+        if covers_pct < DISK_BOUND_COVERAGE_PCT { "narrow" } else { "wide" },
+    );
     // Fill target by regime — **fully derived, no manual override**. Near-fit: fill to
     // `natural_fill`, the whole set nearly fits and the fadvise below keeps MemAvailable
     // honest. ≫-RAM: hold the settled `MemTotal / CACHE_CAP_DIVISOR` ceiling and let the

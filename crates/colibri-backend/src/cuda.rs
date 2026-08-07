@@ -70,6 +70,7 @@ extern "C" {
     fn coli_cuda_host_register(p: *mut c_void, bytes: usize) -> c_int;
     fn coli_cuda_host_unregister(p: *mut c_void);
     fn coli_cuda_set_weight_zerocopy(on: c_int);
+    fn coli_cuda_set_ffn_devcopy(on: c_int);
     fn coli_cuda_tensor_wrap_mxfp4(
         tensor: *mut *mut ColiCudaTensor,
         weights: *const c_void,
@@ -416,6 +417,19 @@ pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
 /// at load, before any matmul: an already-cached tensor keeps whichever form it got.
 pub fn set_weight_zerocopy(on: bool) {
     unsafe { coli_cuda_set_weight_zerocopy(on as c_int) }
+}
+
+/// Whether the expert FFN stages its weights host→device before running the kernels.
+///
+/// Staging costs GPU time and buys I/O decoupling, so the answer is the caller's COVERAGE,
+/// not anything the kernel can see. Measured on this hardware: **−10.3% nemotron (155%
+/// coverage) / −8.6% M2.7 (97%) / −2.5% M3 (37%) with staging OFF, but +11.5% on GLM (18%)
+/// — where turning it off costs 10.4 s of `expert-load` to save 1.5 s of `gpu-ffn`.
+///
+/// `COLI_FFN_DEVCOPY` still overrides this; it is the A/B control. Decode is unaffected
+/// either way — the S==1 row path skips staging by construction.
+pub fn set_ffn_devcopy(on: bool) {
+    unsafe { coli_cuda_set_ffn_devcopy(on as c_int) }
 }
 
 pub fn pageable_access(device: i32) -> bool {

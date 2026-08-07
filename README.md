@@ -18,58 +18,70 @@ fails loudly instead of being reported as a win.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`nemotron-3-super`** | 69 GB | **41.0 tok/s** (12.5 s) | **12.8 tok/s** | **10.0 tok/s** |
-| **`minimax-m2.7`** | 122 GB | **18.3 tok/s** (28.0 s) | **5.1 tok/s** | **5.9 tok/s** |
-| **`deepseek-v4-flash`** | 145 GB | **13.6 tok/s** (37.6 s) | **4.7 tok/s** | **4.3 tok/s** |
-| **`minimax-m3`** | 229 GB | **16.1 tok/s** (31.8 s) | **2.6 tok/s** | **2.6 tok/s** |
-| **`glm-5.2`** (744B) | 403 GB | **6.6 tok/s** (78.1 s) | **0.9 tok/s** | **0.8 tok/s** |
+| **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **10.0 tok/s** |
+| **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **5.9 tok/s** |
+| **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
+| **`minimax-m3`** | 229 GB | **16.7 tok/s** (30.6 s) | **2.5 tok/s** | **2.6 tok/s** |
+| **`glm-5.2`** (744B) | 403 GB | **6.9 tok/s** (74.6 s) | **0.9 tok/s** | **0.84 tok/s** |
 | **`kimi-k3`** (1.5T) | 1.4 TB | **1.8 tok/s** (4.6 min) | **0.35 tok/s** | — |
 
-Measured 2026-08-06 on branch `docs-retest-4model-2026-08-06`, which is ahead of `main`.
+Measured 2026-08-07 on branch `ffn-devcopy-coverage-gate`, which is ahead of `main`. All 15
+suites exited 0 and every token gate passed. K3 was measured separately on 2026-08-06 — its
+suite alone takes ~1.5 h — and is unaffected by anything that changed since.
 
-**The five rows above predate the coverage-gated FFN staging** (`ffn-devcopy-coverage-gate`).
-That change measures **nemotron −10.0%, M2.7 −6.5%, M3 −2.4% on prefill** against exactly
-this build, so those three prefill figures are conservative until the suite is re-run. Decode,
-serving and GLM are unaffected. K3 is MXFP4 and the MXFP4 expert paths never staged, so its
-row is current either way.
+**Prefill moved; decode and serving did not.** That split is the point, not a coincidence:
+the change behind it gates expert-weight staging on coverage, and the S==1 decode path skips
+staging by construction. Had decode moved, the mechanism would be wrong. See
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-K3's row *was* the stale one — carried over at "~1.1 tok/s (~8 min) / ~0.4" from a build
-nobody had re-measured because the suite takes hours. Re-run 2026-08-06: **1.8 tok/s**
-(median of 3, 1.6% spread, token gate PASS) and **0.35 tok/s** decode (two reps, both
-0.35 median / 0.45 best). Prefill is far better than the old figure; decode is unchanged
-once a reporting bug is undone — `median()` printed `%.1f` on even-count inputs, rendering
-0.35 as "0.3" and making a flat result look like a 12% regression. Fixed in `scripts/lib.sh`.
-K3 remains the SSD-bound model: `expert-load` is 126.8 s of its 278.6 s prefill.
+**Do not read the whole prefill gain as that change.** Isolated by an A/B on one binary it is
+worth **−10.0% nemotron, −6.5% M2.7, −2.4% M3, and nothing on V4 or GLM**; the table also
+shows V4 +1.5% and GLM +4.5%, which the mechanism says must be ~0 — that residue is this
+box's day-to-day drift, independently measured at ~12% on an unmodified binary. The A/B
+ratios are the attributable part; these absolutes are simply what the machine does today.
 
-**Prefill is what this build moved, and only for M3 and GLM — both ~1.22×.** Measured against
-a freshly built `main`, ABBA-interleaved in one session, tokens gated identical:
+Two separate changes account for it, each isolated by its own A/B on one binary,
+ABBA-interleaved in a single session with tokens gated identical.
 
-| | `main` | this build | ratio |
+**1 — Pooled scratch + a rows-per-expert dispatch gate**, against a freshly built `main`:
+
+| | `main` | with the fix | ratio |
 |---|---|---|---|
 | **`minimax-m3`** (n=6/arm) | 38458 ms | 31559 ms | **1.22×** — arm ranges 2.0% and 2.4%, disjoint |
-| **`glm-5.2`** (n=4/arm) | 90497 ms | 73980 ms | **1.22×** — direction certain, magnitude soft |
+| **`glm-5.2`** (n=4/arm) | 90497 ms | 73980 ms | **~1.22×** — direction certain, magnitude soft |
 
 M3's is as clean as this box gets: 6.3 s separates the slowest new run from the fastest old
 one. GLM's *direction* is equally certain — the ranges don't overlap either — but its new arm
-spans 17% and drifts slower run over run while the `main` arm holds flat, which no
-explanation here accounts for, so read GLM as "roughly 1.2×" rather than 1.223×.
+spans 17% and drifts slower run over run while the `main` arm holds flat, which nothing here
+explains, so read it as "roughly 1.2×". Nemotron, M2.7 and V4 are untouched by this one: the
+first two never took the affected path and V4 measured 1.35% apart at n=6/arm against a 9.6%
+spread. The fix was pooling per-expert scratch buffers whose page faults were being billed to
+`gather` and `scatter`.
 
-The other three are unchanged, for reasons the profile explains: nemotron's experts are fully
-resident (`expert-load` = 2 ms, so there was no CPU-side cost to recover), M2.7 spends 54% of
-prefill waiting on NVMe, and V4 takes neither of the paths the fix touched (measured 1.35%
-apart at n=6/arm, against a 9.6% spread). Decode and serving are unchanged everywhere.
+**2 — Coverage-gated expert-weight staging**, `COLI_FFN_DEVCOPY=1` (the old always-on
+behaviour) against the gate, same binary:
 
-**These ratios deliberately do not come from comparing this table against an older one.** The
-same unmodified binary measured V4 prefill at 41 s in July and 36 s today: **cross-day drift
-on this box is worth ~12% before any code changes**, which is larger than most of the wins
-here. The fix itself was pooling per-expert scratch buffers whose page faults were being
-billed to gather and scatter — that story, and the eight wrong hypotheses that preceded it,
-is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+| | coverage | old | gated | |
+|---|---|---|---|---|
+| **`nemotron-3-super`** | ~155% | 12504 ms | 11254 ms | **−10.0%** |
+| **`minimax-m2.7`** | ~84% | 27012 ms | 25269 ms | **−6.5%** |
+| **`minimax-m3`** | ~37% | 32306 ms | 31529 ms | **−2.4%** |
+| **`glm-5.2`** | ~18% | 81850 ms | 84311 ms | +3.0% = noise; both arms run identical code |
+
+Staging costs GPU time and buys I/O decoupling, so the answer is coverage. At 18% GLM streams
+nearly every expert *during* the forward pass and the copy earns its keep; at 155% nemotron
+has nothing to decouple from and it is pure waste. GLM's arms are behaviourally identical
+under the gate, which makes its +3.0% a calibration of this box's noise rather than a result.
+
+**Neither ratio comes from comparing this table against an older one, deliberately.** The same
+unmodified binary measured V4 prefill at 41 s in July and 36 s in August. Both stories, and
+the eight wrong hypotheses that preceded the first, are in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 **Read the decode column as a disk-streaming ladder, not a quality ranking.** Decode is bound
 by how many expert bytes each token pulls, so it tracks *model size against 121 GB of RAM*
 almost perfectly. Prefill does not — M3 beats the smaller V4 there, because V4's attention
-costs 14.7 s to M3's 6.8 s (Hyper-Connections, the Compressor and the Indexer are not cheap),
+costs 14.2 s to M3's 7.3 s (Hyper-Connections, the Compressor and the Indexer are not cheap),
 which more than pays back the expert bytes it saves.
 
 - **prefill** — one-shot `coli gen`, which refills the in-process expert cache every

@@ -1992,6 +1992,7 @@ fn cmd_gpubench(args: &[String]) -> ExitCode {
     // generated token and not at all per prompt token — so it is reported at S=1 whatever
     // `s` the caller asked for, rather than silently timing a shape the model never runs.
     colibri_engine::gpubench::io_report(reps.min(50));
+    colibri_engine::gpubench::expert_group_report(reps.min(200));
     ExitCode::SUCCESS
 }
 

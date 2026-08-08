@@ -1621,6 +1621,12 @@ where
         kv.has_mamba() && std::env::var("COLI_MTP_ROLLBACK").map_or(true, |v| v != "0");
     let mut mamba_snap = crate::model::MambaSnapshot::default();
 
+    // Phase counters as of the end of prefill. The `[profile] totals` line at the bottom is
+    // cumulative, and at a 512-token prompt prefill is ~3.4 s against ~13 ms per decode
+    // step — so those totals are a prefill measurement wearing a decode label, and
+    // differencing two runs at different NGEN cannot rescue them when the constant term is
+    // 11x the thing being measured. Snapshotting here gives the decode window directly.
+    let prof0 = profile_snapshot();
     let mut decode_ms: Vec<f64> = Vec::with_capacity(n_new);
     let mut emitted = 0usize;
     while emitted < n_new {
@@ -1817,6 +1823,20 @@ where
             mean + head_ms,
             1e3 / (mean + head_ms),
         );
+        // Per-decode-step phase split, prefill excluded. Only meaningful with
+        // COLI_PROFILE=1; without it the counters never moved and this prints zeros.
+        if profile_on() && !decode_ms.is_empty() {
+            let dp = profile_snapshot().since(&prof0);
+            let n = decode_ms.len() as f64;
+            let ms = |us: u64| us as f64 / 1e3 / n;
+            eprintln!(
+                "[timing] decode phases per token: attn {:.2} ms | moe {:.2} ms (expert-load {:.2}) | dense {:.2} ms | logits {:.2} ms | accounted {:.2} of {:.1} ms",
+                ms(dp.attn_us), ms(dp.moe_us), ms(dp.expert_load_us), ms(dp.dense_us),
+                ms(dp.logits_us),
+                ms(dp.attn_us + dp.moe_us + dp.dense_us + dp.logits_us),
+                mean + head_ms,
+            );
+        }
     }
     if profile_on() {
         // Totals across prefill + all decode steps (microseconds -> ms).

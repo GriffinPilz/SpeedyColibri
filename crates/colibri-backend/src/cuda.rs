@@ -42,6 +42,7 @@ extern "C" {
         best_ms: *mut f64,
     ) -> c_int;
     fn coli_cuda_device_sync(device: c_int) -> c_int;
+    fn coli_cuda_h2d_bandwidth(device: c_int, bytes: usize, reps: c_int, best_ms: *mut f64) -> c_int;
 
     fn coli_cuda_tensor_upload(
         tensor: *mut *mut ColiCudaTensor,
@@ -379,6 +380,20 @@ extern "C" {
 /// Number of usable CUDA devices (0 if none / driver missing).
 pub fn device_count() -> i32 {
     unsafe { coli_cuda_device_count() }
+}
+
+/// Pageable host->device copy bandwidth, GB/s (best of `reps`). `None` if unavailable.
+///
+/// Reported beside the device read ceiling because they are different tiers, and the
+/// attention path lives on this one: it re-uploads the whole K/V history per call.
+pub fn h2d_gbs(bytes: usize, reps: i32) -> Option<f64> {
+    let mut ms = 0f64;
+    // SAFETY: `ms` is a live local; the callee owns both its host and device buffers.
+    let ok = unsafe { coli_cuda_h2d_bandwidth(0, bytes, reps, &mut ms as *mut f64) };
+    if ok == 0 || ms <= 0.0 {
+        return None;
+    }
+    Some(bytes as f64 / (ms / 1e3) / 1e9)
 }
 
 /// Block until every queued GPU op has finished. **Measurement only.**

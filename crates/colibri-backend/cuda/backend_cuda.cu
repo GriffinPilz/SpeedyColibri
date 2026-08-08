@@ -590,6 +590,39 @@ extern "C" int coli_cuda_device_sync(int device) {
     return cuda_ok(cudaDeviceSynchronize(), "device sync");
 }
 
+/* Best-of-`reps` wall time for a PAGEABLE host->device copy of `bytes`.
+ *
+ * Separate from the device streaming read because they are different tiers and the gap
+ * decides real designs: `coli_cuda_gqa_attn` re-uploads the whole K and V history on every
+ * call, so a 512-token context costs ~52.7 MB of H2D per decoded token. Whether that is
+ * 0.2 ms or 3+ ms is the difference between "fine" and "two thirds of the token". */
+extern "C" int coli_cuda_h2d_bandwidth(int device, size_t bytes, int reps, double *best_ms) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx) || bytes < (1u << 10) || reps < 1 || !best_ms) return 0;
+    void *dev = nullptr;
+    if (!cuda_ok(cudaMalloc(&dev, bytes), "h2d alloc")) return 0;
+    /* Deliberately PAGEABLE (plain malloc), because that is what the attention path hands
+     * cudaMemcpyAsync — a pinned buffer would measure a tier the engine does not use. */
+    void *host = std::malloc(bytes);
+    if (!host) { cudaFree(dev); return 0; }
+    std::memset(host, 1, bytes);
+    double best = 1e30;
+    for (int r = 0; r < reps + 1; r++) {
+        cudaDeviceSynchronize();
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = cuda_ok(cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice), "h2d copy");
+        cudaDeviceSynchronize();
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+        if (!ok) { std::free(host); cudaFree(dev); return 0; }
+        if (r && ms < best) best = ms;
+    }
+    std::free(host);
+    cudaFree(dev);
+    *best_ms = best;
+    return 1;
+}
+
 extern "C" int coli_cuda_bandwidth(int device, size_t bytes, int reps, double *best_ms) {
     DeviceContext *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx) || bytes < (1u << 20) || reps < 1 || !best_ms) return 0;

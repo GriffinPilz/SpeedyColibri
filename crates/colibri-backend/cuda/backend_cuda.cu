@@ -263,6 +263,31 @@ __global__ static void int2_matmul(float *y, const float *x, const void *weights
     if (!threadIdx.x) y[(size_t)s * O + o] = partial[0] * scales[o];
 }
 
+/* int2 decode GEMV (S==1): one warp per output row, `x` staged once per block.
+ *
+ * Same fix as `int2_group_gate_up_w`, applied to the dense int2 weights — Maple's attention
+ * projections. `int2_matmul` gives a 256-thread block to a row that is only ceil(I/4) bytes
+ * long: at I=2048 that is 512 bytes, so each thread decodes TWO bytes and then the block
+ * runs an 8-round shared tree reduction with a barrier at every level. maple-o measured
+ * 83 GB/s and maple-qkv 61 against a 257 GB/s ceiling, and the gap is the reduction, not
+ * the read.
+ *
+ * Reduction order differs from `int2_matmul` (32 partials, not 256); f32 addition is not
+ * associative, so the token gate is the acceptance test. */
+__global__ static void int2_gemv(float *y, const float *x, const void *w,
+                                 const float *scales, int I, int O, size_t rb) {
+    extern __shared__ float xs[];
+    for (int k = threadIdx.x; k < I; k += blockDim.x) xs[k] = x[k];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * (int)(blockDim.x >> 5) + warp;
+    if (o >= O) return;
+    float s = int2_partial(static_cast<const uint8_t *>(w) + (size_t)o * rb, xs, I, lane, 32);
+    #pragma unroll
+    for (int n = 16; n > 0; n >>= 1) s += __shfl_down_sync(0xffffffffu, s, n);
+    if (!lane) y[o] = s * scales[o];
+}
+
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
                                     const float *scales, int fmt, int S, int I, int O,
                                     size_t rb, int off) {
@@ -2786,21 +2811,22 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
         { std::lock_guard<std::mutex> lk(seen_mu); fresh = seen.insert(key).second; }
         if (fresh) {
             const char *k = "quant_matmul";
-            if (s_i8gemv && S == 1 && (fmt == 1 || fmt == 4 || fmt == 2) &&
+            if (s_i8gemv && S == 1 && (fmt == 1 || fmt == 4 || fmt == 2 || fmt == 3) &&
                 ctx->compute_major >= 7 && gemv_shmem <= 48u * 1024u)
                 k = (fmt == 2)
                         ? ((((uintptr_t)t->weights % 16u) == 0 && (I % 8) == 0)
                                ? "bf16_gemv_v8"
                                : "bf16_gemv")
-                        : (fmt == 1 ? "i8a16_gemv" : "fp8a16_gemv");
+                        : (fmt == 3 ? "int2_gemv"
+                                    : (fmt == 1 ? "i8a16_gemv" : "fp8a16_gemv"));
             else if (tile && (fmt == 1 || fmt == 4)) k = "tiled";
             else if (fmt == 3) k = "int2_matmul";
             fprintf(stderr, "[matmul] fmt=%d S=%d I=%d O=%d -> %s%s\n",
                     fmt, S, I, O, k, t->wrapped ? " (zerocopy)" : " (device)");
         }
     }
-    if (s_i8gemv && S == 1 && (fmt == 1 || fmt == 4 || fmt == 2) && ctx->compute_major >= 7 &&
-        gemv_shmem <= 48u * 1024u) {
+    if (s_i8gemv && S == 1 && (fmt == 1 || fmt == 4 || fmt == 2 || fmt == 3) &&
+        ctx->compute_major >= 7 && gemv_shmem <= 48u * 1024u) {
         /* Threads per block = rows per block * 32, and it decides how much `x` traffic each
          * weight byte carries. Every block stages the whole `x` row (I floats) into shared
          * before its warps read their weight rows, so at tpb=128 a block moves 8 KB of `x`
@@ -2821,6 +2847,9 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
         if (fmt == 1)
             i8a16_gemv<<<blocks, tpb, gemv_shmem>>>(ctx->y, ctx->x,
                 (const uint8_t *)t->weights, t->scales, I, O);
+        else if (fmt == 3)
+            int2_gemv<<<blocks, tpb, gemv_shmem>>>(ctx->y, ctx->x, t->weights,
+                                                   t->scales, I, O, rb);
         else if (fmt == 2) {
             // Vectorised read when the layout allows it. Both preconditions are hard
             // correctness requirements for `uint4`, so they are checked rather than
@@ -3051,6 +3080,68 @@ __global__ static void int2_group_gate_up(float *gate_out, float *up_out, const 
     }
 }
 
+/* WARP-per-row twins of the two kernels above. Same math, same `int2_partial`, different
+ * thread->row mapping — and on Maple's expert shapes the mapping is most of the cost.
+ *
+ * `int2_partial` strides `for (b = tid; b < nb; b += nthreads)`, so a 256-thread block on a
+ * SHORT row starves. Maple's expert intermediate is 512, the smallest in the fleet:
+ *
+ *   down   row = ceil(512/4)  = 128 bytes vs 256 threads -> threads 128-255 do NOTHING and
+ *                                the rest do ONE byte each (4 MACs)
+ *   gate/up row = ceil(2048/4) = 512 bytes vs 256 threads -> 2 bytes per thread
+ *
+ * and then every one of those blocks runs an 8-round shared tree reduction with 8
+ * `__syncthreads`. The reduction costs far more than the arithmetic it is reducing. A token
+ * moves ~151 MB of expert weight; at the box's measured 257 GB/s ceiling that is 0.59 ms,
+ * and the grouped path was spending ~10.7 ms — about 5% of the roof.
+ *
+ * One warp per row instead: all 32 lanes busy, five `__shfl_down_sync` steps, no shared
+ * memory and no block-wide barrier, and 8 rows in flight per 256-thread block instead of 1.
+ *
+ * This is NOT the 16-weights-per-thread read that measured 38% WORSE and was reverted. That
+ * one kept block-per-row and widened the per-thread READ, which emptied the block. This
+ * keeps the read granularity that won (one byte, 4 ternary weights) and changes only which
+ * threads cooperate on a row.
+ *
+ * `i`/`o` derive from the warp index, never the lane, so the early `return` is
+ * warp-uniform and the full-mask shuffles below are safe.
+ *
+ * Reduction order differs from the block version (32 partials, not 256), and f32 addition is
+ * not associative — so the token gate is the acceptance test, not a byte compare. */
+__global__ static void int2_group_gate_up_w(float *gate_out, float *up_out, const float *x,
+                                            Int2Grp grp, int K, int D, int I) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int i = blockIdx.x * (int)(blockDim.x >> 5) + warp, k = blockIdx.y;
+    if (k >= K || i >= I) return;
+    Int2Ref r = grp.e[k];
+    size_t rb = (size_t)((D + 3) / 4), row = (size_t)i * rb;
+    float sg = int2_partial(static_cast<const uint8_t *>(r.gw) + row, x, D, lane, 32);
+    float su = int2_partial(static_cast<const uint8_t *>(r.uw) + row, x, D, lane, 32);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        sg += __shfl_down_sync(0xffffffffu, sg, o);
+        su += __shfl_down_sync(0xffffffffu, su, o);
+    }
+    if (!lane) {
+        gate_out[(size_t)k * I + i] = sg * r.gs[i];
+        up_out[(size_t)k * I + i]   = su * r.us[i];
+    }
+}
+
+__global__ static void int2_group_down_w(float *y, const float *h, Int2Grp grp,
+                                         int K, int D, int I) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * (int)(blockDim.x >> 5) + warp, k = blockIdx.y;
+    if (k >= K || o >= D) return;
+    Int2Ref r = grp.e[k];
+    size_t rb = (size_t)((I + 3) / 4), row = (size_t)o * rb;
+    float s = int2_partial(static_cast<const uint8_t *>(r.dw) + row, h + (size_t)k * I, I,
+                           lane, 32);
+    #pragma unroll
+    for (int n = 16; n > 0; n >>= 1) s += __shfl_down_sync(0xffffffffu, s, n);
+    if (!lane) y[(size_t)k * D + o] = s * r.ds[o];
+}
+
 /* down for every expert in one launch. grid = (D, K). Writes y[k][d]; the caller applies
  * the routing weights and accumulates, exactly as it does for the per-expert path. */
 __global__ static void int2_group_down(float *y, const float *h, Int2Grp grp,
@@ -3096,11 +3187,23 @@ extern "C" int coli_cuda_expert_group_int2(int device, float *y, const float *x,
         !reserve(&ctx->up, &ctx->up_cap, hb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpyAsync(ctx->x, x, xb, cudaMemcpyHostToDevice, ctx->stream),
                  "int2 group input upload")) return 0;
-    int2_group_gate_up<<<dim3((unsigned)I, (unsigned)K), 256, 0, ctx->stream>>>(
-        ctx->gate, ctx->up, ctx->x, grp, K, D, I);
-    act_mul(ctx->gate, ctx->up, (size_t)K * I, ctx->stream);
-    int2_group_down<<<dim3((unsigned)D, (unsigned)K), 256, 0, ctx->stream>>>(
-        ctx->y, ctx->gate, grp, K, D, I);
+    // Warp-per-row by default; COLI_INT2_WARP=0 restores the block-per-row kernels for A/B.
+    static int s_warp = -1;
+    if (s_warp < 0) { const char *e = getenv("COLI_INT2_WARP"); s_warp = !e || strcmp(e, "0") != 0; }
+    const int tpb = 256, rpb = tpb / 32;   // 8 rows per block
+    if (s_warp) {
+        int2_group_gate_up_w<<<dim3((unsigned)((I + rpb - 1) / rpb), (unsigned)K), tpb, 0,
+                               ctx->stream>>>(ctx->gate, ctx->up, ctx->x, grp, K, D, I);
+        act_mul(ctx->gate, ctx->up, (size_t)K * I, ctx->stream);
+        int2_group_down_w<<<dim3((unsigned)((D + rpb - 1) / rpb), (unsigned)K), tpb, 0,
+                            ctx->stream>>>(ctx->y, ctx->gate, grp, K, D, I);
+    } else {
+        int2_group_gate_up<<<dim3((unsigned)I, (unsigned)K), 256, 0, ctx->stream>>>(
+            ctx->gate, ctx->up, ctx->x, grp, K, D, I);
+        act_mul(ctx->gate, ctx->up, (size_t)K * I, ctx->stream);
+        int2_group_down<<<dim3((unsigned)D, (unsigned)K), 256, 0, ctx->stream>>>(
+            ctx->y, ctx->gate, grp, K, D, I);
+    }
     if (!cuda_ok(cudaGetLastError(), "int2 group launch") ||
         !cuda_ok(cudaMemcpyAsync(y, ctx->y, yb, cudaMemcpyDeviceToHost, ctx->stream),
                  "int2 group output download") ||

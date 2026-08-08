@@ -18,7 +18,7 @@ fails loudly instead of being reported as a win.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`maple-preview`** (20B-A1B) | 5.9 GB | **144.7 tok/s** (3.5 s) | **64.2 tok/s** (55.5 e2e) | **60.2 tok/s** |
+| **`maple-preview`** (20B-A1B) | 5.9 GB | **148.1 tok/s** (3.5 s) | **76.9 tok/s** (64.5 e2e) | **69.1 tok/s** |
 | **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **10.0 tok/s** |
 | **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **5.9 tok/s** |
 | **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
@@ -36,11 +36,11 @@ because there isn't one.
 timer brackets `forward()` and stops before the `lm_head` matmul, so every decode figure in
 this table excludes the output projection. On the streaming models that is a rounding error
 (GLM spends ~1100 ms/token, the head is single-digit ms). **On Maple it is not**: the head is
-2.5 ms of an 18.0 ms token, so Maple's honest end-to-end decode is **55.5 tok/s** against the
-64.2 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
-print the pair for every model, so the omission is visible rather than inferred. Maple's
-`serving` and `on disk` figures were re-measured with the BF16 IO tier (2026-08-08); the
-other six rows are unchanged from 2026-08-07.
+2.5 ms of a 15.4 ms token, so Maple's honest end-to-end decode is **64.5 tok/s** against the
+76.9 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
+print the pair for every model, so the omission is visible rather than inferred. Maple's row
+was re-measured in full on 2026-08-08 (BF16 IO tier + warp-per-row expert kernels); the other
+six rows are unchanged from 2026-08-07.
 
 This is also why `serving` sits below `decode` for every row. The column is left as-is
 rather than silently re-baselined, because every historical measurement in this repo is
@@ -117,6 +117,44 @@ of this change, a `uint32` per lane (16 weights), measured **38% WORSE**: at 16 
 thread an I=2048 row leaves half the block idle and the expert down-projection (I=512)
 leaves 7 of 8 threads idle. An int2 row is only 512 bytes; a wide read empties the block
 faster than it fills the bus.
+
+**And the reason that failed was the real bug: the block was the wrong unit, not the read.**
+The grouped expert kernels gave one **256-thread block** to each output row. Maple's expert
+intermediate is 512, the smallest in the fleet, so:
+
+| projection | row bytes | threads | work per thread |
+|---|---|---|---|
+| down | `ceil(512/4)` = **128** | 256 | threads 128–255 do **nothing**; the rest do ONE byte |
+| gate/up | `ceil(2048/4)` = 512 | 256 | 2 bytes |
+
+…and each of those blocks then ran an **8-round shared tree reduction with a barrier at
+every level**. The reduction cost more than the arithmetic it was reducing.
+
+The arithmetic that made this worth checking: a token routes top-8 over 24 layers = 192
+experts × 786 KB = **151 MB of expert weight**. At the measured 257 GB/s ceiling that is
+**0.59 ms**; the path was spending ~10.7 ms — about **5% of the roof**. A number that far
+off is a kernel-shape bug, not a bandwidth story.
+
+**One warp per row** — all 32 lanes busy, five `__shfl_down_sync`, no shared memory, no
+block barrier, 8 rows in flight per block. ABBA, one binary, one knob, `lm_head` flat at
+2.5 ms as the control, tokens identical in all four runs:
+
+| | block-per-row | warp-per-row |
+|---|---|---|
+| decode (forward-only) | 63.95 | **76.91 tok/s** (1.20×) |
+| decode (end-to-end) | 55.14 | **64.51 tok/s** (1.17×) |
+
+So the check to run before calling any GEMV kernel ALU-bound is **`row_bytes / blockDim`**.
+If it is single digits, the kernel is starving and the reduction dominates. That also
+retires this repo's earlier "int2 is ALU-bound" conclusion: it was **occupancy**, and the
+lever was the thread→row mapping.
+
+The same kernel shape applies to the dense int2 attention projections, and there it is a
+real but *small* win: isolated in `gpubench`, `maple-qkv` [3072,2048] goes **34.8 → 21.0 µs
+(1.66×, 59 → 125 GB/s)** while `maple-o` [2048,2048] is unchanged. But qkv is 24 calls of a
+15.6 ms token — worth ~2%, which is **below what the decode harness resolves**, and the
+end-to-end A/B duly came back neutral. It is kept because the kernel is strictly better in
+isolation, not because the headline moved.
 
 Two things this is *not*. It is not the existing grouped arm — that one stages weights host
 to device at ~0.74 GB/s and measured **10% worse on DeepSeek-V4** while cutting 301

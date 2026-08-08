@@ -321,6 +321,40 @@ fits the cache, so every step still streams ~the whole expert set. The real leve
 **RAM-resident experts across a cluster**, which lifts the whole curve; a continuous-batching
 scheduler pairs with that, not with a single node.
 
+### Short rows starve block-per-row kernels — 2026-08-08
+
+**Check `row_bytes / blockDim` before concluding a GEMV is ALU-bound.** The grouped int2
+expert kernels gave one 256-thread block to each output row, and `int2_partial` strides
+`for (b = tid; b < nb; b += nthreads)`. On Maple's expert shapes that starves: the down
+projection's row is `ceil(512/4)` = **128 bytes against 256 threads**, so half the block did
+nothing and the rest decoded one byte each — followed by an 8-round shared tree reduction
+with a barrier per level.
+
+A token routes top-8 over 24 layers = 192 experts × 786 KB = **151 MB of expert weight**,
+which at the measured 257 GB/s ceiling is **0.59 ms**. The path was spending ~10.7 ms, about
+**5% of the roof** — the signature of a kernel-shape bug, not a bandwidth story.
+
+One warp per row: every lane busy, five `__shfl_down_sync`, no shared memory, no block
+barrier, 8 rows per block. ABBA, one knob (`COLI_INT2_WARP`), `lm_head` flat at 2.5 ms as the
+control, tokens identical in all four runs:
+
+| | block-per-row | warp-per-row |
+|---|---|---|
+| decode (forward-only) | 63.95 | **76.91 tok/s** (1.20×) |
+| decode (end-to-end) | 55.14 | **64.51 tok/s** (1.17×) |
+| serving | 60.2 | **69.1 tok/s** |
+
+This **retires the earlier "int2 is ALU-bound" conclusion**. It was occupancy, and the lever
+was the thread→row mapping — which is also why the earlier 16-weights-per-thread read
+measured 38% worse: it kept block-per-row and widened the read, emptying the block further.
+Read granularity (one byte, 4 ternary weights) was already right.
+
+The dense int2 attention projections have the same shape, and there the win is real but
+small: isolated, `maple-qkv` [3072,2048] goes **34.8 → 21.0 µs (1.66×, 59 → 125 GB/s)** and
+`maple-o` is unchanged. qkv is 24 calls of a 15.6 ms token — ~2%, below what the decode
+harness resolves, and the end-to-end A/B came back neutral. Kept on the isolated result, not
+claimed as a headline.
+
 ### The BF16 IO tier
 
 **`fmt 2`, shipped 2026-08-08.** The embeddings and `lm_head` are the "IO tier" — genuinely

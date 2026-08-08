@@ -41,6 +41,12 @@ resource the previous one used. That reframes the remaining work:
   running the shared expert during the routed experts' disk wait — hides 100% of its cost
   and is still a **15× loss**, because concurrent GPU work from a second thread takes an
   illegal memory access and a sticky CUDA error drops every expert to the CPU.
+- **The bandwidth ceiling is MEASURED, not quoted.** `coli gpubench` streams a 1 GiB device
+  buffer with a do-nothing read kernel and gets **257 GB/s** — 94% of the GB10's 273 GB/s
+  paper figure. Compare every achieved GB/s to that, not to the spec sheet. It also times
+  `lm_head` [151936, 2048] in isolation: **bf16 250 GB/s (98% of ceiling)**, f32 262, int8
+  199. The output projection has no kernel headroom left; see
+  [the BF16 IO tier](#the-bf16-io-tier).
 - **4-bit experts are dequant-bound, not bandwidth-bound.** `coli gpubench` puts 4-bit at
   ~190 GB/s against int8's 400–580 on the same shapes — slower in absolute time while
   reading half the bytes. The wins came instead from read width and cheaper dequant.
@@ -95,6 +101,33 @@ Practical rules:
 Three conclusions in this repo were corrected by these rules rather than by new code: a
 "branch-introduced attention regression" that was a dispatch difference, a "1.09× V4 speedup"
 that was cross-day drift, and a "3.3× attention-core regression" that was phase attribution.
+
+### A fourth: a fixed cost hiding inside a rate — 2026-08-08
+
+Add one more rule, because it cost four A/Bs. **A per-unit figure must not be a running total
+divided by a step count when the total contains a one-time term.**
+
+Maple's `lm_head` read 4.4 ms/token while `gpubench` timed the identical matmul at 2.5 ms.
+The 1.9 ms gap was chased through a warp-per-row GEMV, `uint4` vectorised reads, a
+rows-per-block sweep, and the removal of a 608 KB per-token allocation — **all four measured
+neutral**, because none of them touched anything that was slow. Two arithmetic faults:
+
+1. The running total included the **prefill** logits call, which is the first touch of
+   `lm_head` and therefore pays a one-time **~38 ms device upload** of the whole 622 MB
+   weight. Spread over 24 steps that is +1.6 ms/token of fiction.
+2. It was then averaged over **every** decode step while the `mean` it was added to used only
+   the **warm half** — a cold number added to a warm one.
+
+**The tell was visible from the start and is worth memorising: the figure went UP when the
+run got SHORTER** — 6.3 ms over 11 steps against 4.4 over 24. No genuine per-token cost can
+do that. Two runs at different N also solve for both terms directly (`c + F/N`), which gave
+F = 38.6 ms and c = 2.79 ms — and c matched the isolated kernel, confirming the diagnosis
+before a line was changed. `head_ms` is now the warm-window mean of per-step samples and
+holds at 2.5 ms across NGEN 11/24/48.
+
+So: **vary the denominator and check the rate holds still**, and confirm any phase timer
+against an isolated measurement before optimising what it points at. `coli gpubench` now
+prints a measured bandwidth ceiling and an isolated `lm_head` table for exactly this.
 
 ## Prefill: the `mallopt` regression and its fix — 2026-08-06
 
@@ -287,6 +320,45 @@ ceiling is set by disk bandwidth: even at saturation the union (~all 256 experts
 fits the cache, so every step still streams ~the whole expert set. The real lever is
 **RAM-resident experts across a cluster**, which lifts the whole curve; a continuous-batching
 scheduler pairs with that, not with a single node.
+
+### The BF16 IO tier
+
+**`fmt 2`, shipped 2026-08-08.** The embeddings and `lm_head` are the "IO tier" — genuinely
+dense weights with no structure to exploit — so a model that wants exactness ships them
+unquantized. On Maple that is worth 31/32 teacher-forced top-1 against the reference instead
+of 29/32.
+
+Exact used to mean F32, and for a BF16 checkpoint that is **2× the bytes for zero extra
+information**: every stored f32 carried 16 zero mantissa bits. `lm_head` alone is 311M
+parameters read once per generated token — the largest single per-token read in any
+fits-RAM model here. Storing bf16 and widening in-kernel is the *same arithmetic* (f32
+accumulation either way), so logits are bit-identical; the token gate confirms it end to end
+rather than the claim resting on unit tests.
+
+| | `lm_head`/token | e2e decode | serving | container |
+|---|---|---|---|---|
+| F32 IO tier | 5.1 ms | 48.59 / 48.49 tok/s | 52.4 tok/s | 7.1 GB |
+| **BF16 IO tier** | **2.5 ms** | **55.48 / 55.57 tok/s** | **60.2 tok/s** | **5.9 GB** |
+
+ABBA, one binary, non-overlapping arms. `lm_head` **2.04×** against a byte ratio of exactly
+2.00 — the kernel was already at the memory ceiling in both tiers, so halving the bytes
+halved the time and nothing else changed.
+
+Forward-only decode is unchanged across the two, which is the control: the effect is confined
+to the phase that reads the weight. Two design notes worth carrying:
+
+- **The safetensors dtype is the format tag.** No `.qs` sidecar and no byte-length inference
+  (the int8-vs-int2 branch has to guess from a length; BF16 and F32 are self-describing).
+  Gated on `bits >= 16`, so loading a raw HF checkpoint at 8 bits still runtime-quantizes.
+- **The converter verifies the round trip per tensor** and falls back to F32 rather than
+  round a genuinely-f32 source. Exactness is checked, not assumed.
+
+It also flushed out a latent crash. `coli_cuda_tensor_upload`/`_update` decided whether to
+`cudaMemcpy` a per-row scale array with `if (fmt)` — "everything except f32 is scaled". bf16
+has no scale vector, and an **empty Rust `Vec` yields a dangling non-null pointer**, so that
+test would have sailed past its own null check and copied `O*4` bytes of garbage. Replaced
+with an explicit `has_row_scale(fmt)` at ~15 sites; any `fmt != 0` / `fmt > 4` test is a
+closed set with a dangerous default.
 
 ### Expert quantization: NVFP4 (default), e4m3 opt-out, MXFP4 passthrough
 

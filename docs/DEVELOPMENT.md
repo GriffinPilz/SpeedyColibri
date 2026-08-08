@@ -55,6 +55,9 @@ scripts/model.py list                     # name + arch notes (abbreviated here)
 #   minimax-m2.7      GQA (48Q/8KV, head_dim 128, partial rope 64), 256 experts top-8…
 #   minimax-m3        GQA (64Q/4KV, head_dim 128, partial rope 64), 128 experts top-4…
 #   nemotron-3-super  Hybrid: 88 layers = 40 Mamba2 + 40 latent-MoE + 8 GQA…
+#   maple-preview     GQA (16Q/4KV, head_dim 128, partial rope 64), 256 exp top-8,
+#                     softmax router, 3:1 sliding(512)/full interleave, NoPE on the
+#                     global layers; ternary experts stored as bit-exact int2…
 
 # Where a model comes from and where it lands on this host:
 scripts/model.py env nemotron-3-super     # CONTAINER / SOURCE / HF_REPO / convert flags
@@ -110,7 +113,7 @@ COLI_BATCH_VERIFY=1 ./target/release/coli genbatch /path/to/container 64 16 785 
 ## Switching models
 
 One `coli` process serves one model — the model *is* the container you point it at. Beyond
-the six registered short names, `-m` also takes an arbitrary HF repo, and `COLI_MODEL_DIR`
+the seven registered short names, `-m` also takes an arbitrary HF repo, and `COLI_MODEL_DIR`
 takes a container you already have on disk:
 
 ```bash

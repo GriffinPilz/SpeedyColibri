@@ -32,6 +32,12 @@ COLI_CUDA_DLLEXPORT void coli_cuda_set_activation(int oai, float alpha, float li
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
+/* Best-of-`reps` wall time for a pure streaming read of a freshly-allocated `bytes` device
+ * buffer. The ceiling any weight-reading kernel is measured against: it does no arithmetic
+ * and reuses nothing, so it isolates the memory system from kernel design. */
+COLI_CUDA_DLLEXPORT int coli_cuda_bandwidth(int device, size_t bytes, int reps, double *best_ms);
+/* Drain queued GPU work. A measurement aid for phase attribution — not a fast path. */
+COLI_CUDA_DLLEXPORT int coli_cuda_device_sync(int device);
 /* device < 0 returns aggregate statistics for all configured devices. */
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
 /* Live DeviceContext scratch (device + pinned host), EXCLUDING the weight cache that
@@ -160,10 +166,20 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,fl
                                      const float *latent,const float *rope,int S,
                                      int H,int Q,int R,int V,int K,int T,
                                      float attention_scale);
+/* Grouped int2 (ternary) experts: run K experts over ONE shared input row x[D] in a
+ * single launch triple, writing y[K][D]. Weights stay ZERO-COPY (nothing is staged) and
+ * the expert pointers ride as a by-value kernel parameter. Decode shape only. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_int2(int device,float *y,const float *x,
+                                     const void **gw,const void **uw,const void **dw,
+                                     const float **gs,const float **us,const float **ds,
+                                     int K,int D,int I);
+
 /* Standard GQA prefill (MiniMax-M3): q[S,H,D], full k/v[T,Hkv,D], ctx[S,H,D] out.
- * mode 0 = scalar gqa_attn_kernel; mode 1 = WMMA flash tc_gqa_attn (D%16==0). */
+ * mode 0 = scalar gqa_attn_kernel; mode 1 = WMMA flash tc_gqa_attn (D%16==0).
+ * win > 0 = sliding attention over the last `win` keys (Maple); win <= 0 = unwindowed. */
 COLI_CUDA_DLLEXPORT int coli_cuda_gqa_attn(int device,float *ctx,const float *q,const float *k,
-                                     const float *v,int S,int H,int Hkv,int D,int T,float scale,int mode);
+                                     const float *v,int S,int H,int Hkv,int D,int T,float scale,
+                                     int mode,int win);
 
 /* Nemotron-H Mamba2 selective-scan for one decode token (S==1). Per (head, head_dim),
  * loops d_state updating ssm[h,p,n] = ssm*dA_h + dt_h*B[g,n]*x and y[h,p] = sum_n ssm*C[g,n]

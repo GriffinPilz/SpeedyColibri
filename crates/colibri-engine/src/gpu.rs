@@ -230,6 +230,9 @@ pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
 /// `[S, H, D]`; `k`/`v` are the full causal cache `[T, Hkv, D]`. `mode` picks the
 /// kernel: 0 = scalar (f32, reference), 1 = WMMA flash (fp16, ~faster). Returns false
 /// (→ the CPU core) when CUDA is unavailable or the dims are outside the kernel's range.
+///
+/// `win > 0` restricts each query to the last `win` keys — Maple's sliding layers. Pass 0
+/// for the unwindowed causal core every other model uses.
 #[allow(clippy::too_many_arguments)]
 pub fn try_gqa_attn(
     ctx: &mut [f32],
@@ -243,6 +246,7 @@ pub fn try_gqa_attn(
     t: usize,
     scale: f32,
     mode: u32,
+    win: usize,
 ) -> bool {
     if !available() {
         return false;
@@ -261,6 +265,7 @@ pub fn try_gqa_attn(
             t as i32,
             scale,
             mode as i32,
+            win as i32,
         )
     }
 }
@@ -1447,6 +1452,112 @@ pub fn try_expert_group_nvfp4(
     try_expert_group_packed(active, activations, d, out, 5)
 }
 
+/// `COLI_INT2_GROUP=0` restores the per-expert path for int2 experts.
+///
+/// A MEASUREMENT CONTROL, not a tuning knob — the same reason `COLI_NVFP4_GROUP` exists.
+/// Making a grouped path unconditional deletes the only in-binary comparison against the
+/// path it replaced, and the arms differ in the thing that actually changed (one launch
+/// triple per layer versus one per expert), with the zero-copy weight read held fixed.
+pub fn int2_group_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_INT2_GROUP").ok().as_deref() != Some("0"))
+}
+
+/// Grouped int2 (ternary) experts for the DECODE shape: every active expert consumes the
+/// same single token row, so one launch triple serves the whole layer.
+///
+/// Declines — leaving the caller on its per-expert path — unless every expert is a
+/// gpu-eligible three-tensor int2 SwiGLU of the right shape AND every one of them has
+/// exactly one row, all the same token. That row test is the gate, deliberately: it is the
+/// quantity at the decision point rather than a phase flag, and prefill (where each expert
+/// sees a different row set, and where the per-dispatch overhead is ~12% rather than ~69%)
+/// is simply not modelled here.
+///
+/// Nothing is staged. The weights are read in place exactly as the per-expert path reads
+/// them, and the routed-weight combine below is byte-for-byte the loop the per-expert path
+/// runs — same expert order, same `+=` — so the result is bit-identical.
+pub fn try_expert_group_int2_decode(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !int2_group_enabled() || active.is_empty() || active.len() > 16 {
+        return false;
+    }
+    // Decode shape only: one row per expert, and the same row for all of them.
+    let t = match active[0].1.first() {
+        Some(&t) => t,
+        None => return false,
+    };
+    if !active
+        .iter()
+        .all(|(_, rows, _)| rows.len() == 1 && rows[0] == t)
+    {
+        return false;
+    }
+    let inter = active[0].0.gate.o as usize;
+    if !active.iter().all(|(ex, _, _)| {
+        ex.gate.fmt_code == 3
+            && ex.up.fmt_code == 3
+            && ex.down.fmt_code == 3
+            && ex.gate.gpu_eligible
+            && ex.up.gpu_eligible
+            && ex.down.gpu_eligible
+            && ex.gate.i as usize == d
+            && ex.up.i as usize == d
+            && ex.down.o as usize == d
+            && ex.gate.o as usize == inter
+            && ex.up.o as usize == inter
+            && ex.down.i as usize == inter
+            && ex.gate.s.len() == inter
+            && ex.up.s.len() == inter
+            && ex.down.s.len() == d
+    }) {
+        return false;
+    }
+    let k = active.len();
+    let (mut gw, mut uw, mut dw) = (Vec::with_capacity(k), Vec::with_capacity(k), Vec::with_capacity(k));
+    let (mut gs, mut us, mut ds) = (Vec::with_capacity(k), Vec::with_capacity(k), Vec::with_capacity(k));
+    for (ex, _, _) in active {
+        gw.push(ex.gate.q4.as_ptr() as *const c_void);
+        uw.push(ex.up.q4.as_ptr() as *const c_void);
+        dw.push(ex.down.q4.as_ptr() as *const c_void);
+        gs.push(ex.gate.s.as_ptr());
+        us.push(ex.up.s.as_ptr());
+        ds.push(ex.down.s.as_ptr());
+    }
+    let mut y = vec![0f32; k * d];
+    // SAFETY: x is the token's `[d]` activation row; y is `[k, d]`; the six arrays each
+    // hold `k` pointers into the experts' live weight/scale buffers, which outlive the call.
+    let ok = unsafe {
+        cuda::expert_group_int2_raw(
+            y.as_mut_ptr(),
+            activations[t * d..(t + 1) * d].as_ptr(),
+            &gw,
+            &uw,
+            &dw,
+            &gs,
+            &us,
+            &ds,
+            k as i32,
+            d as i32,
+            inter as i32,
+        )
+    };
+    if !ok {
+        return false;
+    }
+    // Identical to the per-expert scatter: same expert order, same accumulation.
+    for (kk, (_, _, rw)) in active.iter().enumerate() {
+        let wgt = rw[0];
+        for dd in 0..d {
+            out[t * d + dd] += wgt * y[kk * d + dd];
+        }
+    }
+    true
+}
+
 /// Grouped SwiGLU experts for a packed 4-bit format — NVFP4 (`fmt` 5) or MXFP4 (`fmt` 6).
 ///
 /// Parameterised rather than duplicated: the gather/scatter, the chunking, and the RAM
@@ -1844,6 +1955,25 @@ pub fn try_matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) -> bool {
     let (wptr, key): (*const c_void, usize) = match w.fmt_code {
         0 => (w.qf.as_ptr() as *const c_void, w.qf.as_ptr() as usize),
         1 => (w.q8.as_ptr() as *const c_void, w.q8.as_ptr() as usize),
+        // int2 (fmt 3) — Maple's ternary attention projections. This arm was missing, and
+        // the omission is the `gpu_eligible` trap in its quietest form: the weight IS
+        // marked eligible, so nothing looks wrong, and `matmul_qt` just falls through to
+        // the single-threaded CPU int2 loop. Same failure shape as the M3 q/k/v
+        // projections (84% of a prefill) and V4's O-LoRA (58% of decode).
+        //
+        // Safe despite the "packed formats read out of bounds" note above, which is about
+        // NVFP4 specifically: the C side sizes both the alloc and the copy by
+        // `row_bytes(fmt, I) * O`, and `row_bytes` already returns `ceil(I/4)` for fmt 3.
+        // What actually disqualifies NVFP4 here is its SEPARATE block-scale array, which
+        // `coli_cuda_matmul` has no parameter for — hence its own entry point above. int2
+        // has no sidecar: its scales are the same per-row f32 vector int8 passes, and
+        // `weight_at`/`quant_matmul` have decoded fmt 3 all along.
+        3 => (w.q4.as_ptr() as *const c_void, w.q4.as_ptr() as usize),
+        // bf16 (fmt 2) — the IO tier. Same reasoning as int2 above: the C side sizes the
+        // alloc and the copy by `row_bytes(fmt, I) * O`, and `row_bytes` returns `I*2`
+        // here. Unlike int2 there is no scale sidecar at all, which is why the upload
+        // path's scale copy had to stop testing `fmt != 0`.
+        2 => (w.q4.as_ptr() as *const c_void, w.q4.as_ptr() as usize),
         _ => return false,
     };
     let sptr = w.s.as_ptr();

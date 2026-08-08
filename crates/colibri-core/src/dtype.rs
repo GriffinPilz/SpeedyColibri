@@ -168,6 +168,31 @@ pub fn bf16_to_f32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
+/// Round an f32 to the nearest bf16 bit pattern, ties-to-even — the inverse of
+/// [`bf16_to_f32`], and **exact** for any value that came from a bf16 in the first place.
+///
+/// That exactness is the whole point: a checkpoint stored in BF16 loses nothing by being
+/// kept in BF16 rather than widened to F32, so the round trip
+/// `bf16_to_f32(f32_to_bf16(v)) == v` is what lets the BF16 IO tier claim bit-identical
+/// logits while reading half the bytes. Callers that depend on that should *verify* the
+/// round trip rather than assume it — an f32 source with real low mantissa bits will not
+/// survive, and silently rounding it would be a quality regression disguised as a
+/// storage win.
+///
+/// NaN is preserved as a NaN (the payload may be truncated, never promoted to infinity).
+#[inline]
+pub fn f32_to_bf16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if v.is_nan() {
+        // Keep it a NaN: truncation alone could clear every mantissa bit and turn this
+        // into an infinity.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    // Round-to-nearest-even on the 16 bits being discarded.
+    let rounded = bits + 0x7fff + ((bits >> 16) & 1);
+    (rounded >> 16) as u16
+}
+
 /// Convert an IEEE float16 bit pattern to f32. Handles subnormals, inf, and nan
 /// exactly as `f16_to_f32` in `c/st.h`.
 #[inline]
@@ -206,6 +231,44 @@ mod tests {
         assert_eq!(bf16_to_f32(0x3F80), 1.0);
         assert_eq!(bf16_to_f32(0x0000), 0.0);
         assert_eq!(bf16_to_f32(0xBF80), -1.0);
+    }
+
+    #[test]
+    fn f32_to_bf16_round_trips_every_bf16() {
+        // Exhaustive over all 65536 bit patterns: widening to f32 and narrowing back must
+        // be the identity. This is the property the BF16 IO tier rests on — a checkpoint
+        // stored in bf16 loses nothing by staying in bf16 — so it is checked in full
+        // rather than sampled.
+        for h in 0u32..=0xFFFF {
+            let h = h as u16;
+            let v = bf16_to_f32(h);
+            if v.is_nan() {
+                assert!(bf16_to_f32(f32_to_bf16(v)).is_nan(), "NaN {h:#06x} lost");
+            } else {
+                assert_eq!(f32_to_bf16(v), h, "round trip failed for {h:#06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn f32_to_bf16_rounds_to_nearest_even() {
+        // Exactly halfway between two bf16s (low half = 0x8000) goes to the EVEN
+        // neighbour. Truncation instead of rounding would bias every converted weight
+        // toward zero — small per weight, systematic across 311M of them.
+        let up = f32::from_bits((0x3F80u32 << 16) | 0x8000); // 1.0 + half a ulp
+        assert_eq!(f32_to_bf16(up), 0x3F80); // ties to even -> stays 1.0
+        let dn = f32::from_bits((0x3F81u32 << 16) | 0x8000); // next bf16 + half a ulp
+        assert_eq!(f32_to_bf16(dn), 0x3F82); // ties to even -> rounds up
+        assert_eq!(f32_to_bf16(f32::INFINITY), 0x7F80);
+        assert_eq!(f32_to_bf16(-0.0), 0x8000);
+    }
+
+    #[test]
+    fn f32_to_bf16_refuses_nothing_but_reports_loss() {
+        // A value with real low mantissa bits does NOT survive, which is exactly why the
+        // converter verifies the round trip per tensor instead of assuming it.
+        let v = f32::from_bits((0x3F80u32 << 16) | 0x1234);
+        assert_ne!(bf16_to_f32(f32_to_bf16(v)), v);
     }
 
     #[test]

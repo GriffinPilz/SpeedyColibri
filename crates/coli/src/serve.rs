@@ -862,6 +862,7 @@ fn build_chat_prompt(tok: &Tokenizer, messages: &[Json], arch: colibri_core::Arc
     match arch {
         colibri_core::Arch::MinimaxM2 => build_chat_prompt_minimax(tok, messages),
         colibri_core::Arch::NemotronH => build_chat_prompt_nemotron(tok, messages),
+        colibri_core::Arch::Maple => build_chat_prompt_maple(tok, messages),
         // GLM-5.2 / MiniMax-M3: GLM-style chat markers.
         _ => {
             let mut s = String::from("[gMASK]<sop>");
@@ -948,6 +949,44 @@ fn build_chat_prompt_minimax(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
     tok.encode(&s)
 }
 
+/// Maple ChatML (`chat_template.jinja`): `<|im_start|>{role}\n{content}<|im_end|>\n` per
+/// message, ending with `<|im_start|>assistant\n<think>\n`.
+///
+/// Two details that are easy to get wrong and produce plausible output either way:
+///
+/// - The generation prompt **opens** a `<think>` block rather than closing an empty one.
+///   Maple is a reasoning model, so a completion begins mid-reasoning and emits `</think>`
+///   before its answer. GLM's template does the opposite (`<think></think>` to suppress
+///   reasoning), and the shared fallthrough here is GLM's — so a Maple served by the
+///   default arm gets GLM's control tokens, which are not even in its vocabulary.
+/// - A **uniform** loop is correct here even though the template has two branches for
+///   `system`. A leading system message is emitted by the preamble and skipped by the
+///   loop (`'user' or (system and not loop.first)` is false for it); a later one is
+///   emitted by the loop. Both spell it `<|im_start|>system\n…<|im_end|>\n`, so each
+///   system turn renders exactly once, identically, either way.
+///
+/// Tools are not rendered: this server has no tool-call path, and emitting the tools
+/// preamble with nothing to fill it would change the prompt for no benefit.
+fn build_chat_prompt_maple(tok: &Tokenizer, messages: &[Json]) -> Vec<i32> {
+    let mut s = String::new();
+    for m in messages {
+        let o = match m.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let role = o.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let content = o.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        // The template renders only these three roles and drops anything else; mirror
+        // that rather than silently relabelling an unknown role as `user`.
+        if !matches!(role, "system" | "user" | "assistant") {
+            continue;
+        }
+        s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+    }
+    s.push_str("<|im_start|>assistant\n<think>\n");
+    tok.encode(&s)
+}
+
 /// Non-streaming: generate everything, then send one JSON object.
 #[allow(clippy::too_many_arguments)]
 fn block_completion(
@@ -963,6 +1002,16 @@ fn block_completion(
     chat: bool,
     kv: &mut KvCache,
 ) {
+    // `COLI_PROFILE=1`: per-REQUEST phase breakdown. The engine's counters are global
+    // running totals, which suits `gen` (one run per process) and tells the server nothing
+    // — so snapshot around the request and print the difference.
+    //
+    // This existed nowhere until now, and its absence is exactly why the f32-IO serve
+    // regression could be bounded by A/B (per-token, not the forward math, not the KV size,
+    // not threading) without ever being NAMED. `serve` is the production path; it should
+    // not be the one path with no instrument.
+    let prof0 = colibri_engine::profile_snapshot();
+    let wall0 = std::time::Instant::now();
     let seq = match colibri_engine::generate_greedy(model, kv, provider, prompt, max_tokens) {
         Ok(s) => s,
         Err(e) => {
@@ -977,6 +1026,22 @@ fn block_completion(
             return;
         }
     };
+    if std::env::var("COLI_PROFILE").ok().as_deref() == Some("1") {
+        let d = colibri_engine::profile_snapshot().since(&prof0);
+        let ms = |u: u64| u as f64 / 1e3;
+        let n = seq.len().max(1) as f64;
+        eprintln!(
+            "[serve-profile] {} tok in {:.0} ms | attn {:.0} | moe {:.0} (load {:.0}) | dense {:.0} \
+             | embed {:.0} | logits {:.0} || per-tok {:.2} ms (attn {:.2} moe {:.2} logits {:.2})",
+            seq.len(),
+            wall0.elapsed().as_secs_f64() * 1e3,
+            ms(d.attn_us), ms(d.moe_us), ms(d.expert_load_us), ms(d.dense_us),
+            ms(d.embed_us), ms(d.logits_us),
+            wall0.elapsed().as_secs_f64() * 1e3 / n,
+            ms(d.attn_us) / n, ms(d.moe_us) / n, ms(d.logits_us) / n,
+        );
+    }
+
     // Drop the trailing stop token (e.g. GLM's `<|user|>`) from the visible text —
     // generation halts right after emitting it, so it's always the last token. The
     // streaming path already excludes it; keep the two consistent.

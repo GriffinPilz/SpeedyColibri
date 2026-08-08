@@ -1047,6 +1047,59 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
 pub fn route(cfg: &Config, logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32>) {
     let e_n = logits.len();
     let k = (cfg.topk as usize).min(e_n);
+
+    // Maple scores with a SOFTMAX over all experts and carries no routing bias
+    // (`MapleGate.forward`). Handled first so the sigmoid path below is untouched — it is
+    // shared by five shipped models and reproduces them bit-for-bit.
+    //
+    // Selection is by the softmax probability, which is order-identical to selecting on
+    // the raw logits (softmax is monotone) — the difference that matters is the WEIGHT.
+    // The reference softmaxes over all `e_n`, takes the top-k, then divides by their sum,
+    // which is algebraically a softmax restricted to the chosen set. It is written out in
+    // both steps here rather than collapsed to the second, so that `norm_topk == false`
+    // still means what it says: the unrenormalised probabilities.
+    if cfg.router_score == colibri_core::RouterScore::Softmax {
+        // Subtract the max before exponentiating. The router runs in f32 on logits that
+        // are unbounded; `exp` of a large positive logit overflows to inf and turns the
+        // whole distribution into NaN, which shows up as a routing choice of "expert 0,
+        // always" rather than as an error.
+        let mx = logits.iter().fold(f32::NEG_INFINITY, |m, &z| m.max(z));
+        let mut p: Vec<f32> = logits.iter().map(|&z| (z - mx).exp()).collect();
+        let tot: f32 = p.iter().sum::<f32>();
+        if tot > 0.0 {
+            for v in p.iter_mut() {
+                *v /= tot;
+            }
+        }
+        let mut idx = vec![0usize; k];
+        let mut w = vec![0f32; k];
+        let mut chosen = vec![false; e_n];
+        for kk in 0..k {
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for e in 0..e_n {
+                if !chosen[e] && p[e] > bv {
+                    bv = p[e];
+                    best = e;
+                }
+            }
+            chosen[best] = true;
+            idx[kk] = best;
+            w[kk] = p[best];
+        }
+        if cfg.norm_topk {
+            // `+ 1e-20` matches the reference's guard exactly.
+            let sm: f32 = w.iter().sum::<f32>() + 1e-20;
+            for x in w.iter_mut() {
+                *x /= sm;
+            }
+        }
+        for x in w.iter_mut() {
+            *x *= cfg.routed_scale;
+        }
+        return (idx, w);
+    }
+
     let logit: Vec<f32> = logits.iter().map(|&z| crate::math::sigmoid(z)).collect();
     let choice: Vec<f32> = (0..e_n).map(|e| logit[e] + bias[e]).collect();
 
@@ -1361,7 +1414,14 @@ pub fn compute_experts_partial_into<P: ExpertProvider>(
         }
         // Gateless ReLU² (Nemotron-H) has its own grouped kernel — the fp8 one is SwiGLU
         // and would read a gate tensor these experts don't ship.
-        let grouped = if activation().relu2 {
+        let grouped = if !active.is_empty()
+            && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 3)
+            && crate::gpu::try_expert_group_int2_decode(&active, activations, d, out)
+        {
+            // Grouped int2 (Maple). Declines on anything but the decode shape, so prefill
+            // and every other format fall through to the arms below unchanged.
+            true
+        } else if activation().relu2 {
             crate::gpu::try_expert_group_relu2(&active, activations, d, out)
         } else if dsv4_group_moe() && !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 6) {
             // MXFP4 SwiGLU (DeepSeek-V4) — MEASURED NEGATIVE, so opt-in only.
@@ -2161,6 +2221,70 @@ mod tests {
         )
         .unwrap();
         Config::from_json(&json).unwrap()
+    }
+
+    /// A Maple-shaped config: softmax routing, no expert bias, `norm_topk_prob`.
+    fn maple_cfg() -> Config {
+        let json = colibri_json::Json::parse(
+            r#"{"architectures":["MapleForCausalLM"],"hidden_size":4,
+                "num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":1,
+                "head_dim":2,"partial_rotary_factor":0.5,"num_experts":4,
+                "num_experts_per_tok":2,"moe_intermediate_size":3,"intermediate_size":4,
+                "num_shared_experts":0,"vocab_size":8,"norm_topk_prob":true,
+                "rms_norm_eps":1e-6,"rope_theta":10000,"use_qk_norm":true,
+                "sliding_window":4,"nope_on_global_attention":true,
+                "layer_types":["sliding_attention"],"max_position_embeddings":128,
+                "eos_token_id":7}"#,
+        )
+        .unwrap();
+        Config::from_json(&json).unwrap()
+    }
+
+    /// Maple routing: softmax over ALL experts, top-k, renormalise over the chosen set.
+    ///
+    /// Selection is order-identical to the sigmoid path (both are monotone in the logit),
+    /// so a wrong scorer picks the same experts and differs only in their weights — the
+    /// output stays fluent and is quietly wrong. This checks the weights.
+    #[test]
+    fn route_softmax_topk_renormalized() {
+        let cfg = maple_cfg();
+        assert_eq!(cfg.router_score, colibri_core::RouterScore::Softmax);
+        let logits = [0.0f32, 2.0, -1.0, 0.3];
+        // Maple has no `e_score_correction_bias`. A non-zero bias is passed here on
+        // purpose: the softmax path must IGNORE it, where the sigmoid path would let it
+        // decide the selection outright.
+        let bias = [5.0f32, 0.0, 0.0, 0.0];
+        let (idx, w) = route(&cfg, &logits, &bias);
+        assert_eq!(idx, vec![1, 3], "top-2 by logit, bias ignored");
+
+        // Weights: softmax over all four, restricted to {1,3} and renormalised — which is
+        // exactly a softmax over those two logits.
+        let e: Vec<f32> = logits.iter().map(|z| z.exp()).collect();
+        let want1 = e[1] / (e[1] + e[3]);
+        let want3 = e[3] / (e[1] + e[3]);
+        assert!((w[0] - want1).abs() < 1e-6, "got {} want {want1}", w[0]);
+        assert!((w[1] - want3).abs() < 1e-6, "got {} want {want3}", w[1]);
+        assert!((w[0] + w[1] - 1.0).abs() < 1e-6, "renormalised weights sum to 1");
+
+        // And it is genuinely NOT the sigmoid answer — otherwise this test would pass
+        // against the old code.
+        let s = crate::math::sigmoid(2.0) / (crate::math::sigmoid(2.0) + crate::math::sigmoid(0.3));
+        assert!((w[0] - s).abs() > 1e-3, "softmax must differ from sigmoid here");
+    }
+
+    /// Large logits must not overflow `exp`. Without the max-subtraction the whole
+    /// distribution becomes NaN, and the top-k scan then picks expert 0 every time —
+    /// a plausible-looking routing collapse rather than a crash.
+    #[test]
+    fn route_softmax_survives_large_logits() {
+        let cfg = maple_cfg();
+        let logits = [200.0f32, 195.0, -300.0, 100.0];
+        let (idx, w) = route(&cfg, &logits, &[0.0; 4]);
+        assert_eq!(idx, vec![0, 1]);
+        assert!(w.iter().all(|x| x.is_finite()), "weights {w:?}");
+        assert!((w[0] + w[1] - 1.0).abs() < 1e-6);
+        let want = 1.0 / (1.0 + (-5.0f32).exp());
+        assert!((w[0] - want).abs() < 1e-6, "got {} want {want}", w[0]);
     }
 
     // MiniMax-M3 (and GLM) routing: sigmoid scoring, additive selection bias,

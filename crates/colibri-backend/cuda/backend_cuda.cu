@@ -13,6 +13,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <set>
 
 struct ColiCudaTensor {
     void *weights;
@@ -125,9 +126,24 @@ static int select_ctx(DeviceContext *ctx) {
     return 1;
 }
 
+/* Does format `fmt` carry a PER-ROW f32 scale?
+ *
+ * fmt 0 (f32) and fmt 2 (bf16) store real values and have none; 1/3/4 store codes and do.
+ * This used to be written inline as `fmt ? scale : 1.f` at a dozen call sites — i.e.
+ * "everything except f32 is scaled" — which was true only while f32 was the sole unscaled
+ * format. Adding bf16 would have silently multiplied it by uninitialised scale memory at
+ * every one of those sites, with no compile error and no crash. Named predicate so the
+ * next unscaled format cannot repeat it.
+ *
+ * (5/6 are block-scaled and never reach these sites — `weight_at` cannot decode them.) */
+__host__ __device__ __forceinline__ static bool has_row_scale(int fmt) {
+    return fmt == 1 || fmt == 3 || fmt == 4;
+}
+
 __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 0) return (size_t)I * sizeof(float);
     if (fmt == 1) return (size_t)I;
+    if (fmt == 2) return (size_t)I * 2;       // bf16: raw 2-byte values
     if (fmt == 3) return (size_t)(I + 3) / 4;
     if (fmt == 4) return (size_t)I;          // e4m3 fp8: 1 byte/weight
     if (fmt == 5) return (size_t)(I + 1) / 2; // nvfp4: packed e2m1 nibbles, 2/byte
@@ -150,11 +166,101 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
+    // bf16: widen the 16 stored bits into the high half of an f32. Exact — and exactly the
+    // f32 the fmt-0 path would have loaded had the same weight been widened at convert
+    // time, which is why a BF16 IO tier produces bit-identical logits at half the bytes.
+    if (fmt == 2) {
+        uint32_t h = reinterpret_cast<const uint16_t *>(base)[i];
+        return __uint_as_float(h << 16);
+    }
     if (fmt == 4) return e4m3f(base[i]);      // e4m3 fp8; per-row scale applied by caller
     const uint8_t *q = base;
     // int2 (fmt 3): 4 values/byte, value = field − 2
     uint8_t v = q[i >> 2];
     return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
+}
+
+/* ==== int2 (ternary): why the obvious optimisation is NOT here ======================
+ *
+ * `weight_at` decodes fmt 3 one ELEMENT at a time (`q[i >> 2]`), so with the strided loop
+ * in `quant_matmul` four consecutive lanes load the SAME byte. `coli gpubench` (S=1,
+ * reps=200) makes that look damning — int2 moves 4x FEWER bytes than int8 and takes 1.6x
+ * LONGER:
+ *
+ *   maple-qkv 3072x2048   int8 20.6 us / 6.3 MB / 506 GB/s
+ *                         int2 34.1 us / 1.6 MB /  61 GB/s
+ *   maple-o   2048x2048   int8 20.9 us / 4.2 MB / 329 GB/s
+ *                         int2 32.2 us / 1.1 MB /  44 GB/s
+ *
+ * TRIED, MEASURED WORSE, REVERTED (2026-08-08): a uint32-per-lane reader (16 ternary
+ * weights per thread, unpacked in registers), the fix that worked for MXFP4 in 97e8b86.
+ * Reproducible across runs:
+ *
+ *   maple-qkv     34.1 -> 46.9 / 47.1 us   (+38%)
+ *   maple-o       32.2 -> 34.6 / 35.7 us   (+8%)
+ *   maple-expert  39.4 -> 48.1 / 45.6 us   (+19%)
+ *
+ * The reason is occupancy, and it kills the diagnosis with it. At 16 weights per thread
+ * and blockDim 256, I=2048 gives 128 blocks of work — **half the threads idle** — and the
+ * expert down-projection (I=512) gives 32, leaving **7 of 8 threads idle**. A row of
+ * int2 is simply too small to feed a 256-thread block once each thread swallows 16
+ * weights: maple-o is 512 BYTES per output row.
+ *
+ * So int2 is NOT read-bound, and the low GB/s figure is a consequence rather than a cause:
+ * these GEMVs never move enough bytes to stall on memory. What int2 actually pays is ALU —
+ * shift, mask, subtract, int->float per element, roughly 4x int8's work per element, which
+ * matches the 1.54x it loses to int8 at equal element counts. Anything aimed at this should
+ * cut UNPACK COST or raise occupancy, not widen the load. Do not re-derive the wide read
+ * from the byte count; the byte count is the wrong model here. */
+/* One BYTE (4 ternary weights) per thread-iteration.
+ *
+ * `weight_at` decodes fmt 3 per ELEMENT, so with `quant_matmul`'s strided loop four
+ * consecutive lanes load the SAME byte — 4x the loads for the same data, plus a full
+ * shift/mask/subtract/convert each.
+ *
+ * The obvious fix — a uint32 per lane, 16 weights — was tried and measured WORSE
+ * (maple-qkv 34.1 -> 46.9 us). At 16 weights/thread with blockDim 256, I=2048 leaves half
+ * the threads idle and the expert down-projection (I=512) leaves 7 of 8 idle: an int2 row
+ * is only 512 bytes, so a wide read empties the block faster than it fills the bus.
+ *
+ * 4 weights/thread is the balance point. I=2048 gives 512 byte-blocks over 256 threads —
+ * two iterations each, FULL occupancy — while still cutting loads 4x. Granularity, not
+ * width, is the knob.
+ *
+ * Reduction order differs from the per-element loop, so cross-build token comparisons will
+ * differ; within a build it is deterministic (no pointer-dependent path — cf. the MXFP4
+ * u32 mode, which picked a kernel on alignment and gave two answers on two runs). */
+__device__ __forceinline__ static float int2_partial(const uint8_t *wrow, const float *xs,
+                                                     int I, int tid, int nthreads) {
+    int nb = (I + 3) >> 2;                       /* bytes in the row */
+    float sum = 0.f;
+    for (int b = tid; b < nb; b += nthreads) {
+        uint32_t w = wrow[b];
+        int i0 = b << 2;
+        int n = I - i0; if (n > 4) n = 4;
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            if (k < n) sum += xs[i0 + k] * (float)((int)((w >> (2 * k)) & 3u) - 2);
+        }
+    }
+    return sum;
+}
+
+/* Dense int2 matmul — the fmt-3 replacement for `quant_matmul`. Same launch geometry and
+ * same shared-memory tree reduction; only the per-thread read granularity differs. */
+__global__ static void int2_matmul(float *y, const float *x, const void *weights,
+                                   const float *scales, int S, int I, int O, size_t rb) {
+    int o = blockIdx.x, s = blockIdx.y;
+    const uint8_t *wrow = static_cast<const uint8_t *>(weights) + (size_t)o * rb;
+    float sum = int2_partial(wrow, x + (size_t)s * I, I, threadIdx.x, blockDim.x);
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) {
+        if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
+        __syncthreads();
+    }
+    if (!threadIdx.x) y[(size_t)s * O + o] = partial[0] * scales[o];
 }
 
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
@@ -176,7 +282,7 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         __syncthreads();
     }
     if (!threadIdx.x)
-        y[(size_t)s * O + o] = partial[0] * (fmt ? scales[o] : 1.0f);
+        y[(size_t)s * O + o] = partial[0] * (has_row_scale(fmt) ? scales[o] : 1.0f);
 }
 
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
@@ -345,6 +451,152 @@ __global__ static void fp8a16_gemv(float *y,const float *x,const uint8_t *w,
     #pragma unroll
     for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
     if(lane==0) y[n]=acc*scale[n];
+}
+
+/* BF16 decode GEMV (S==1): one warp per output row, mirroring `fp8a16_gemv`.
+ *
+ * Without this, a bf16 weight at S==1 falls to the generic `quant_matmul`, which spends one
+ * 256-thread BLOCK per output row: 8 elements of work per thread, then an 8-round shared
+ * tree reduction with a `__syncthreads` at every level. A warp per row instead: 64 elements
+ * per lane, five `__shfl_down_sync` steps, no shared reduction and no block-wide sync, `x`
+ * staged once per block and shared by its rows.
+ *
+ * MEASURED NEUTRAL against `quant_matmul` on lm_head — see the note on `bf16_gemv_v8` for
+ * the numbers and for why the gap it was built to close did not exist.
+ *
+ * NOT bit-identical to the `quant_matmul` path — assigning k to lanes by 32 rather than by
+ * 256 changes the order of an f32 sum, which is not associative. Same weights, same inputs,
+ * same precision, ~2 ULP of difference in the logits. That is why the token gate is the
+ * acceptance test here rather than a byte compare. (No per-row scale: bf16 stores values.) */
+__global__ static void bf16_gemv(float *y,const float *x,const uint16_t *w,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    const uint16_t *wr=w+(size_t)n*K; float acc=0.f;
+    for(int k=lane;k<K;k+=32) acc+=xs[k]*__uint_as_float((uint32_t)wr[k]<<16);
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc;
+}
+
+/* Vectorised twin of `bf16_gemv`: each lane loads a `uint4` (16 B = 8 bf16) instead of one
+ * `uint16_t`, so a warp moves 512 B per load instruction rather than 64 B.
+ *
+ * MEASURED NEUTRAL (2026-08-08), like `bf16_gemv` before it. Both are kept because they are
+ * the S==1 shape int8/fp8 already use and neither is slower, NOT because either bought
+ * anything. The honest result:
+ *
+ *   quant_matmul (block reduction)   4.3-4.8 ms      <- all three within each other's noise
+ *   bf16_gemv    (warp, 2 B/lane)    4.3-4.7 ms
+ *   bf16_gemv_v8 (warp, 16 B/lane)   4.3-4.4 ms
+ *
+ * The premise was wrong, not the kernel. lm_head looked like it ran at ~140 GB/s (51% of
+ * this box's 257 GB/s measured ceiling) because the per-token figure it was judged by
+ * divided a one-time weight upload across the decode steps. Timed in isolation by
+ * `coli gpubench`, this matmul does 250 GB/s — 98% of ceiling — and always did. There is no
+ * kernel headroom here; see the note on `logits_into` in forward.rs.
+ *
+ * A second confirmation of an existing rule fell out of it: read WIDTH stops paying past
+ * ~32 B/warp. That was already known for dequant-bound NVFP4; it now also holds in a
+ * genuinely bandwidth-bound kernel, so it is about the memory system, not the decode cost.
+ * (This is not the wide-read that failed for int2 at +38% — that one lost on occupancy,
+ * 16 weights/thread against I=512 rows. Here a warp still needs 8 iterations per row.)
+ *
+ * ALIGNMENT is a correctness precondition, not a preference: `uint4` loads fault or are UB
+ * when misaligned. The caller checks both the base pointer and `I % 8`, and a row's stride
+ * is `I*2` bytes, so `I % 8 == 0` makes every row start 16 B aligned given an aligned base. */
+__global__ static void bf16_gemv_v8(float *y,const float *x,const uint16_t *w,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    const uint4 *wr=reinterpret_cast<const uint4 *>(w+(size_t)n*K);
+    int nv=K>>3; float acc=0.f;
+    for(int v=lane;v<nv;v+=32){
+        uint4 q=wr[v];
+        uint32_t p[4]={q.x,q.y,q.z,q.w};
+        int k0=v<<3;
+        #pragma unroll
+        for(int j=0;j<4;j++){
+            acc+=xs[k0+2*j]  *__uint_as_float(p[j]<<16);
+            acc+=xs[k0+2*j+1]*__uint_as_float(p[j]&0xffff0000u);
+        }
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc;
+}
+
+/* Pure streaming read: sum a device buffer with 16 B per lane and no reuse, no shared
+ * memory, no cross-thread reduction beyond a warp shuffle. Nothing here is model-shaped —
+ * it exists to answer "what will this box's memory system actually give a kernel that does
+ * nothing but read", so that an achieved GB/s figure can be reported as a FRACTION of a
+ * measured ceiling instead of a spec sheet number. */
+__global__ static void stream_read(float *out, const uint4 *__restrict__ buf, size_t n4,
+                                   uint32_t sentinel) {
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    uint32_t acc = 0;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += stride) {
+        uint4 v = buf[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    /* `acc` must be able to reach memory or nvcc deletes the loads and this measures an
+     * empty loop. `sentinel` is a RUNTIME argument for that reason: the first version of
+     * this guarded on `threadIdx.x == 1025`, which the compiler can prove false at
+     * blockDim 256, so it removed the branch, the reads with it, and reported 133,950
+     * GB/s — 1 GiB in 8 us, exactly the launch floor. A dead-code eliminator will always
+     * win against a condition it can evaluate. */
+    if (acc == sentinel) out[0] = (float)acc;
+}
+
+/* Drain every queued GPU op on `device`. Purely a MEASUREMENT tool: the engine's phase
+ * timers bracket CPU time, so any GPU work still in flight when a phase's last CPU call
+ * returns is charged to whichever phase next touches CUDA and blocks. Calling this at a
+ * phase boundary moves that tail back to the phase that created it. It does not make
+ * anything faster and must not be on a hot path. */
+extern "C" int coli_cuda_device_sync(int device) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    return cuda_ok(cudaDeviceSynchronize(), "device sync");
+}
+
+extern "C" int coli_cuda_bandwidth(int device, size_t bytes, int reps, double *best_ms) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx) || bytes < (1u << 20) || reps < 1 || !best_ms) return 0;
+    size_t n4 = bytes / sizeof(uint4);
+    void *buf = nullptr;
+    if (!cuda_ok(cudaMalloc(&buf, n4 * sizeof(uint4)), "bandwidth alloc")) return 0;
+    /* Touch it so the pages are real — on unified memory an untouched allocation would
+     * measure first-touch faulting rather than streaming bandwidth. Every byte is 0x01, so
+     * each uint4 XORs to 0 and `acc` stays 0; the sentinel below is chosen so the store
+     * never fires. */
+    if (!cuda_ok(cudaMemset(buf, 1, n4 * sizeof(uint4)), "bandwidth fill")) {
+        cudaFree(buf);
+        return 0;
+    }
+    int tpb = 256, blocks = 4096;
+    double best = 1e30;
+    for (int r = 0; r < reps + 1; r++) {
+        cudaDeviceSynchronize();
+        auto t0 = std::chrono::steady_clock::now();
+        stream_read<<<blocks, tpb>>>((float *)buf, (const uint4 *)buf, n4, 0xFFFFFFFFu);
+        if (!cuda_ok(cudaDeviceSynchronize(), "bandwidth run")) {
+            cudaFree(buf);
+            return 0;
+        }
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+        if (r && ms < best) best = ms; // r == 0 is the warm-up
+    }
+    cudaFree(buf);
+    *best_ms = best;
+    return 1;
 }
 
 /* ==== NVFP4 (e2m1 nibbles + ue4m3 per-16 block scale + f32 global) expert kernels ====
@@ -1526,7 +1778,7 @@ __global__ static void grouped_hidden(float *y,const float *x,const GroupDesc *d
     float sum=0; for(int i=threadIdx.x;i<D;i+=blockDim.x) sum+=xs[i]*weight_at(w,fmt,row,i);
     __shared__ float p[256]; p[threadIdx.x]=sum; __syncthreads();
     for(int n=128;n;n>>=1){ if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n]; __syncthreads(); }
-    if(!threadIdx.x) y[(size_t)(d.offset+s)*I+o]=p[0]*(fmt?sc[o]:1.f);
+    if(!threadIdx.x) y[(size_t)(d.offset+s)*I+o]=p[0]*(has_row_scale(fmt)?sc[o]:1.f);
 }
 
 __global__ static void grouped_down(float *y,const float *x,const GroupDesc *desc,int D,int I){
@@ -1550,7 +1802,7 @@ __global__ static void attention_absorb_kernel(float *ctx,const float *q,const f
     int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);extern __shared__ float sm[];
     float *qa=sm,*cl=qa+K,*scores=cl+K;
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
-        a+=q[(size_t)h*(Q+R)+d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*(fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+        a+=q[(size_t)h*(Q+R)+d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*(has_row_scale(fmt)?wscale[rbase+d]:1.f);qa[k]=a;}
     __syncthreads();
     for(int t=tid;t<T;t+=blockDim.x){float a=0;const float *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
         for(int k=0;k<K;k++)a+=qa[k]*lt[k];for(int d=0;d<R;d++)a+=q[(size_t)h*(Q+R)+Q+d]*rt[d];scores[t]=a*scale;}
@@ -1561,7 +1813,7 @@ __global__ static void attention_absorb_kernel(float *ctx,const float *q,const f
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<T;t++)a+=scores[t]*latent[(size_t)t*K+k];cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
-        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);ctx[(size_t)h*V+v]=a*(has_row_scale(fmt)?wscale[row]:1.f);}
 }
 
 __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
@@ -1573,7 +1825,7 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     const float *qs=q+((size_t)s*H+h)*(Q+R);
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
         a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
-          (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+          (has_row_scale(fmt)?wscale[rbase+d]:1.f);qa[k]=a;}
     __syncthreads();
     for(int t=tid;t<nt;t+=blockDim.x){float a=0;const float *lt=latent+(size_t)t*K;
         const float *rt=rope+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
@@ -1592,7 +1844,7 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
-        ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+        ctx[((size_t)s*H+h)*V+v]=a*(has_row_scale(fmt)?wscale[row]:1.f);}
 }
 
 /* Nemotron-H Mamba2 selective-scan, one decode token (S==1). One block per head, one
@@ -1718,35 +1970,44 @@ __global__ static void mamba2_scan_seq_kernel(float *state, float *y, const floa
  * (no MLA absorption). One block per (query s, head h); a query head maps to KV head
  * h/(H/Hkv). Causal over [0, T-S+s]. Shared-mem softmax, mirroring the absorb batch
  * kernel's reductions. sm = qs[D] ++ scores[T] ++ red[ATTN_TPB]. */
+/* `win` > 0 restricts each query to the last `win` keys (Maple's sliding attention,
+ * 512). `win <= 0` is unwindowed and every loop starts at 0, byte-identical to before —
+ * which is what keeps the five shipped models on exactly the path they had.
+ *
+ * The window is a LOWER bound on the key index, applied to every loop that walks `t`.
+ * Missing it on any one of them is not a crash: the max/sum reductions would simply
+ * include keys the query cannot see, and the model would emit fluent, subtly wrong text.
+ * `scores[0, t0)` is left untouched and never read. */
 __global__ static void gqa_attn_kernel(float *ctx, const float *Q, const float *K,
-        const float *V, int S, int H, int Hkv, int D, int T, float scale) {
+        const float *V, int S, int H, int Hkv, int D, int T, float scale, int win) {
     int s = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, nt = T - S + s + 1;
     if (s >= S || nt < 1) return;
+    int t0 = (win > 0 && nt > win) ? nt - win : 0;
     int kvh = h / (H / Hkv);
     extern __shared__ float sm[];
     float *qs = sm, *scores = qs + D, *red = scores + T;
     const float *qrow = Q + ((size_t)s * H + h) * D;
     for (int d = tid; d < D; d += blockDim.x) qs[d] = qrow[d];
     __syncthreads();
-    for (int t = tid; t < nt; t += blockDim.x) {
+    for (int t = t0 + tid; t < nt; t += blockDim.x) {
         const float *kt = K + ((size_t)t * Hkv + kvh) * D;
         float a = 0; for (int d = 0; d < D; d++) a += qs[d] * kt[d];
         scores[t] = a * scale;
     }
     __syncthreads();
     float local = -3.402823466e+38F;
-    for (int t = tid; t < nt; t += blockDim.x) local = fmaxf(local, scores[t]);
+    for (int t = t0 + tid; t < nt; t += blockDim.x) local = fmaxf(local, scores[t]);
     red[tid] = local; __syncthreads();
     for (int n = blockDim.x >> 1; n; n >>= 1) { if (tid < n) red[tid] = fmaxf(red[tid], red[tid + n]); __syncthreads(); }
     float mx = red[0];
-    local = 0; for (int t = tid; t < nt; t += blockDim.x) { float e = expf(scores[t] - mx); scores[t] = e; local += e; }
+    local = 0; for (int t = t0 + tid; t < nt; t += blockDim.x) { float e = expf(scores[t] - mx); scores[t] = e; local += e; }
     red[tid] = local; __syncthreads();
     for (int n = blockDim.x >> 1; n; n >>= 1) { if (tid < n) red[tid] += red[tid + n]; __syncthreads(); }
     float inv = 1.f / red[0];
     __syncthreads();
     for (int d = tid; d < D; d += blockDim.x) {
         float a = 0;
-        for (int t = 0; t < nt; t++) a += scores[t] * V[((size_t)t * Hkv + kvh) * D + d];
+        for (int t = t0; t < nt; t++) a += scores[t] * V[((size_t)t * Hkv + kvh) * D + d];
         ctx[((size_t)s * H + h) * D + d] = a * inv;
     }
 }
@@ -1763,7 +2024,7 @@ __global__ static void gqa_attn_kernel(float *ctx, const float *Q, const float *
  * Requires D % 16 == 0. Launch 256 threads (8 warps); shared = GQA_QT*8*D bytes. */
 #define GQA_QT 16
 __global__ static void tc_gqa_attn(float *ctx, const float *Q, const float *K,
-        const float *V, int S, int H, int Hkv, int D, int T, float scale) {
+        const float *V, int S, int H, int Hkv, int D, int T, float scale, int win) {
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     int h = blockIdx.x, qt = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -1782,7 +2043,14 @@ __global__ static void tc_gqa_attn(float *ctx, const float *Q, const float *K,
     for (int z = tid; z < GQA_QT * D; z += blockDim.x) acc[z] = 0.f;
     __syncthreads();
     int ktmax = base + q0 + GQA_QT; if (ktmax > T) ktmax = T;     // last valid row's causal bound
-    for (int kt = 0; kt < ktmax; kt += GQA_QT) {
+    /* Sliding attention: the earliest key ANY query in this tile may see is
+     * `base + q0 - win + 1` (the tile's first query). Whole key tiles below that are
+     * skipped, so a windowed layer does strictly LESS work than a dense one rather than
+     * paying a mask over keys it then discards. The per-element bound below still has to
+     * be applied — the boundary tile is partially visible. */
+    int ktmin = 0;
+    if (win > 0) { int lo = base + q0 - win + 1; if (lo > 0) ktmin = (lo / GQA_QT) * GQA_QT; }
+    for (int kt = ktmin; kt < ktmax; kt += GQA_QT) {
         // Scores[16,16] = QA @ K_tile^T, split-K over D across warps.
         for (int z = tid; z < GQA_QT * D; z += blockDim.x) { int r = z / D, c = z % D; int t = kt + r;
             KB[z] = (t < T) ? __float2half(K[((size_t)t * Hkv + kvh) * D + c]) : __float2half(0.f); }
@@ -1804,7 +2072,7 @@ __global__ static void tc_gqa_attn(float *ctx, const float *Q, const float *K,
         for (int r = warp; r < GQA_QT; r += nwarp) { int s = q0 + r; int pos = base + s;
             float tmax = -3.4e38f;
             for (int c = lane; c < GQA_QT; c += 32) { int t = kt + c;
-                int keep = (s < S && t < T && t <= pos);
+                int keep = (s < S && t < T && t <= pos && (win <= 0 || t > pos - win));
                 float v = keep ? sc[r * GQA_QT + c] : -3.4e38f; sc[r * GQA_QT + c] = v; tmax = fmaxf(tmax, v); }
             for (int o = 16; o; o >>= 1) tmax = fmaxf(tmax, __shfl_down_sync(0xffffffff, tmax, o));
             tmax = __shfl_sync(0xffffffff, tmax, 0);
@@ -1862,7 +2130,7 @@ __global__ static void attention_absorb_sparse_kernel(float *ctx,const float *q,
     const float *qs=q+((size_t)s*H+h)*(Q+R);
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
         a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
-          (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+          (has_row_scale(fmt)?wscale[rbase+d]:1.f);qa[k]=a;}
     __syncthreads();
     for(int j=tid;j<n;j+=blockDim.x){int t=dense?j:sidx[j];float a=0;
         const float *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
@@ -1881,7 +2149,7 @@ __global__ static void attention_absorb_sparse_kernel(float *ctx,const float *q,
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
-        ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+        ctx[((size_t)s*H+h)*V+v]=a*(has_row_scale(fmt)?wscale[row]:1.f);}
 }
 
 /* ==== DSA lightning-indexer scores ===========================================
@@ -1937,7 +2205,7 @@ __global__ static void tc_build_qa(__half *QA,const float *q,const void *weights
     const float *qs=q+((size_t)s*H+h)*(Q+R);
     __half *dst=QA+((size_t)s*H+h)*KR; size_t rb=row_bytes(fmt,K);
     for(int k=tid;k<K;k+=blockDim.x){float a=0;
-        for(int d=0;d<Q;d++)a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*rb,k)*(fmt?wscale[rbase+d]:1.f);
+        for(int d=0;d<Q;d++)a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*rb,k)*(has_row_scale(fmt)?wscale[rbase+d]:1.f);
         dst[k]=__float2half(a*scale);}
     for(int d=tid;d<R;d+=blockDim.x)dst[K+d]=__float2half(qs[Q+d]*scale);
 }
@@ -2028,7 +2296,7 @@ __global__ static void tc_sparse_attn(float *ctx,const __half *QAh,const __half 
     for(int r=0;r<ATC_QT;r++){int s=q0+r;if(s>=S)continue;float inv=1.f/lrow[r];
         for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;
             for(int k=0;k<K;k++)a+=(acc[r*K+k]*inv)*weight_at(weights,fmt,(size_t)row*rb,k);
-            ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
+            ctx[((size_t)s*H+h)*V+v]=a*(has_row_scale(fmt)?wscale[row]:1.f);}
         __syncthreads(); }
 #endif
 }
@@ -2046,7 +2314,7 @@ __global__ static void flash_qabs(float *qabs,const float *q,const void *weights
     int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);size_t rb=row_bytes(fmt,K);
     const float *qs=q+(size_t)h*(Q+R);
     for(int k=tid;k<K;k+=blockDim.x){float a=0;
-        for(int d=0;d<Q;d++)a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*rb,k)*(fmt?wscale[rbase+d]:1.f);
+        for(int d=0;d<Q;d++)a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*rb,k)*(has_row_scale(fmt)?wscale[rbase+d]:1.f);
         qabs[(size_t)h*K+k]=a;}
 }
 
@@ -2091,7 +2359,7 @@ __global__ static void flash_combine(float *ctx,const float *partials,const void
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;
         for(int k=0;k<K;k++)a+=clat[k]*weight_at(weights,fmt,(size_t)row*rb,k);
-        ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
+        ctx[(size_t)h*V+v]=a*(has_row_scale(fmt)?wscale[row]:1.f);}
 }
 
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
@@ -2419,7 +2687,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if (g_weight_zerocopy && !*tensor)
         return coli_cuda_tensor_wrap(tensor, weights, scales, fmt, I, O, device);
     size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    if (!rb || (has_row_scale(fmt) && !scales)) return 0;
     if (*tensor) {
         ColiCudaTensor *t = *tensor;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
@@ -2432,7 +2700,11 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         coli_cuda_tensor_free(t);
         return 0;
     }
-    if (fmt) {
+    /* Only the scaled formats have a scale array to copy. An unscaled tensor's host-side
+     * `s` vector is EMPTY, and an empty Rust Vec yields a dangling (non-null) pointer — so
+     * a `fmt != 0` test here would sail past its own null check and hand cudaMemcpy O*4
+     * bytes of nothing. */
+    if (has_row_scale(fmt)) {
         if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
             !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
@@ -2441,7 +2713,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     }
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + (fmt ? (size_t)O * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + (has_row_scale(fmt) ? (size_t)O * sizeof(float) : 0);
     *tensor = t;
     return 1;
 }
@@ -2449,12 +2721,12 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
-    if (!tensor || !weights || (tensor->fmt && !scales)) return 0;
+    if (!tensor || !weights || (has_row_scale(tensor->fmt) && !scales)) return 0;
     DeviceContext *ctx=find_ctx(tensor->device);
     if (!select_ctx(ctx)) return 0;
     if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
                             cudaMemcpyHostToDevice),"tensor refresh")) return 0;
-    return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
+    return !has_row_scale(tensor->fmt) || cuda_ok(cudaMemcpy(tensor->scales,scales,
         (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
 }
 
@@ -2494,13 +2766,75 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     static int s_i8gemv = -1;
     if (s_i8gemv < 0) { const char *e = getenv("COLI_I8_GEMV"); s_i8gemv = !e || strcmp(e, "0") != 0; }
     size_t gemv_shmem = (size_t)I * sizeof(float);
-    if (s_i8gemv && S == 1 && (fmt == 1 || fmt == 4) && ctx->compute_major >= 7 &&
+    // fmt 2 (bf16) is in this set as of the BF16 IO tier. It was NOT, and the omission is
+    // the closed-set dispatch trap in its usual shape: `lm_head` is the single largest
+    // per-token read in the whole model, and it silently took the generic block-reduction
+    // `quant_matmul` while int8 got a purpose-built GEMV. Nothing errors — it is just
+    // ~2x slower than the same bytes deserve.
+    /* COLI_DEBUG_MATMUL=1 names the kernel each distinct (fmt,S,I,O) actually lands on.
+     * An A/B whose two arms quietly run the same code path reads as "no effect", which is
+     * indistinguishable from a real negative — and that has cost whole investigations here.
+     * One line per shape, so it is readable in a decode run that does thousands. */
+    static int s_dbg = -1;
+    if (s_dbg < 0) { const char *e = getenv("COLI_DEBUG_MATMUL"); s_dbg = e && strcmp(e, "0") != 0; }
+    if (s_dbg) {
+        static std::set<long long> seen;
+        static std::mutex seen_mu;
+        long long key = ((long long)fmt << 48) ^ ((long long)(S > 1) << 47) ^
+                        ((long long)I << 24) ^ (long long)O;
+        bool fresh;
+        { std::lock_guard<std::mutex> lk(seen_mu); fresh = seen.insert(key).second; }
+        if (fresh) {
+            const char *k = "quant_matmul";
+            if (s_i8gemv && S == 1 && (fmt == 1 || fmt == 4 || fmt == 2) &&
+                ctx->compute_major >= 7 && gemv_shmem <= 48u * 1024u)
+                k = (fmt == 2)
+                        ? ((((uintptr_t)t->weights % 16u) == 0 && (I % 8) == 0)
+                               ? "bf16_gemv_v8"
+                               : "bf16_gemv")
+                        : (fmt == 1 ? "i8a16_gemv" : "fp8a16_gemv");
+            else if (tile && (fmt == 1 || fmt == 4)) k = "tiled";
+            else if (fmt == 3) k = "int2_matmul";
+            fprintf(stderr, "[matmul] fmt=%d S=%d I=%d O=%d -> %s%s\n",
+                    fmt, S, I, O, k, t->wrapped ? " (zerocopy)" : " (device)");
+        }
+    }
+    if (s_i8gemv && S == 1 && (fmt == 1 || fmt == 4 || fmt == 2) && ctx->compute_major >= 7 &&
         gemv_shmem <= 48u * 1024u) {
-        const int tpb = 128, wpb = tpb / 32;
+        /* Threads per block = rows per block * 32, and it decides how much `x` traffic each
+         * weight byte carries. Every block stages the whole `x` row (I floats) into shared
+         * before its warps read their weight rows, so at tpb=128 a block moves 8 KB of `x`
+         * to serve 4 rows x 4 KB = 16 KB of weights — a 1.5x traffic multiplier on the
+         * kernel this repo's largest per-token read goes through. Raising it amortises the
+         * staging over more rows; the shared allocation does not grow with tpb.
+         *
+         * Measured against the 257 GB/s streaming-read ceiling rather than guessed:
+         * COLI_GEMV_TPB sweeps it. */
+        static int s_tpb = -1;
+        if (s_tpb < 0) {
+            const char *e = getenv("COLI_GEMV_TPB");
+            s_tpb = e ? atoi(e) : 128;
+            if (s_tpb < 32 || s_tpb > 1024 || (s_tpb & 31)) s_tpb = 128;
+        }
+        const int tpb = s_tpb, wpb = tpb / 32;
         unsigned blocks = (unsigned)((O + wpb - 1) / wpb);
         if (fmt == 1)
             i8a16_gemv<<<blocks, tpb, gemv_shmem>>>(ctx->y, ctx->x,
                 (const uint8_t *)t->weights, t->scales, I, O);
+        else if (fmt == 2) {
+            // Vectorised read when the layout allows it. Both preconditions are hard
+            // correctness requirements for `uint4`, so they are checked rather than
+            // assumed — lm_head's I=2048 satisfies them, a K not divisible by 8 would not.
+            static int s_v8 = -1;
+            if (s_v8 < 0) { const char *e = getenv("COLI_BF16_V8"); s_v8 = !e || strcmp(e, "0") != 0; }
+            bool aligned = ((uintptr_t)t->weights % 16u) == 0 && (I % 8) == 0;
+            if (s_v8 && aligned)
+                bf16_gemv_v8<<<blocks, tpb, gemv_shmem>>>(ctx->y, ctx->x,
+                    (const uint16_t *)t->weights, I, O);
+            else
+                bf16_gemv<<<blocks, tpb, gemv_shmem>>>(ctx->y, ctx->x,
+                    (const uint16_t *)t->weights, I, O);
+        }
         else
             fp8a16_gemv<<<blocks, tpb, gemv_shmem>>>(ctx->y, ctx->x,
                 (const uint8_t *)t->weights, t->scales, I, O);
@@ -2526,8 +2860,13 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
             int sc = S - s0;
             if (sc > (int)YMAX) sc = (int)YMAX;
             dim3 grid((unsigned)O, (unsigned)sc);
-            quant_matmul<<<grid, 256>>>(ctx->y + (size_t)s0 * O, ctx->x + (size_t)s0 * I,
-                                        t->weights, t->scales, fmt, sc, I, O, rb, t->wrapped);
+            if (fmt == 3) {
+                int2_matmul<<<grid, 256>>>(ctx->y + (size_t)s0 * O, ctx->x + (size_t)s0 * I,
+                                           t->weights, t->scales, sc, I, O, rb);
+            } else {
+                quant_matmul<<<grid, 256>>>(ctx->y + (size_t)s0 * O, ctx->x + (size_t)s0 * I,
+                                            t->weights, t->scales, fmt, sc, I, O, rb, t->wrapped);
+            }
         }
     }
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
@@ -2591,7 +2930,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
         gate->I != up->I || gate->O != up->O ||
         down->I != gate->O || down->O != gate->I) return 0;
     /* FORMAT GUARD. This path reads scales as a per-ROW f32 array (`quant_matmul` ->
-     * `weight_at`), which is only true for fmt 0/1/3/4. NVFP4 (5) and MXFP4 (6) keep
+     * `weight_at`), which is only true for fmt 0-4. NVFP4 (5) and MXFP4 (6) keep
      * BLOCK scales in a separate array this entry point does not even take a parameter
      * for, so launching for them dereferences a pointer that is empty or wrongly strided.
      *
@@ -2612,6 +2951,36 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     size_t yb=(size_t)S*D*sizeof(float);
     if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
         !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+    /* WHERE THIS PATH'S TIME ACTUALLY GOES — measured on Maple 2026-08-07, and NOT where
+     * the obvious fixes point. Maple is the first model whose experts are small enough for
+     * per-call overhead to dominate this entry point: 24 layers x top-8 = **192 expert
+     * dispatches per decode token**, each moving only 0.80 MB of int2 weights.
+     *
+     *   gpu-ffn is 69% of a decode step   (10.5 ms of 15.3 ms/token)
+     *   per dispatch                       54.7 us
+     *   effective rate                     14.6 GB/s = ~6% of this box's DRAM
+     *
+     * Splitting fixed cost from per-row cost across the two row counts this path actually
+     * sees (S=1 decode, S=16 at a 512-token prefill: 310 us/dispatch) gives roughly
+     * **38 us fixed + 17 us/row** — so about 69% of every decode dispatch is overhead that
+     * does no work, ~7.3 ms of each 15.3 ms token.
+     *
+     * TRIED AND MEASURED NEUTRAL (2026-08-07): converting the two pageable, blocking
+     * `cudaMemcpy`s here into pinned + `cudaMemcpyAsync` on `ctx->stream`, mirroring
+     * `coli_cuda_expert_mlp_nvfp4`. Decode 44.38 -> 43.94 tok/s (3 reps x 3, ranges
+     * 43.90-44.43 vs 43.85-44.45 — fully overlapping), tokens identical. REVERTED.
+     * The mechanism says why it could never have worked: on GB10 "device" memory IS the
+     * same LPDDR5X as host memory, so there is no PCIe transfer for pinning to accelerate
+     * — the same reason staging here measures 1-2 GB/s. **Do not retry it.**
+     *
+     * What the 38 us IS: four kernel launches plus the sync, per expert. So the lever is
+     * fewer DISPATCHES — but note `moe.rs`'s grouped MXFP4 arm measured 10% WORSE on
+     * DeepSeek-V4 while cutting 301 dispatches to 43. That is not a contradiction, it is a
+     * different regime: V4's experts are 13.37 MB and run this shape at 190 us = 70 GB/s,
+     * where launches are noise and the grouped path's weight STAGING (~0.74 GB/s) is pure
+     * loss. Maple is 17x smaller per expert. A grouped path here is only worth building if
+     * it keeps the weights ZERO-COPY and batches launches alone — staging would lose here
+     * for the same reason it lost there. */
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
     dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
     quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
@@ -2624,6 +2993,118 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
         down->fmt,S,I,D,row_bytes(down->fmt,I),down->wrapped);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
+    return 1;
+}
+
+/* ==== GROUPED int2 (ternary) experts, ONE launch for the whole layer ==============
+ *
+ * Maple's decode step routes to top-8 experts on each of 24 layers and, before this,
+ * paid a separate `coli_cuda_expert_mlp` call for every one: 192 dispatches per token,
+ * 4 kernels + 2 blocking copies each, at 54.7 us apiece to move 0.80 MB of weights
+ * (14.6 GB/s, ~6% of this box's DRAM). Splitting fixed from per-row cost across S=1 and
+ * S=16 put ~38 us of every dispatch in launch+sync overhead doing no work — ~7.3 ms of a
+ * 15.3 ms token. This collapses a layer's K experts into 3 kernels and 2 copies.
+ *
+ * WHY THIS IS NOT THE GROUPED PATH THAT LOST ON V4. `try_expert_group_packed` STAGES the
+ * expert weights host->device (~0.74 GB/s) and measured 10% WORSE on DeepSeek-V4 even
+ * while cutting 301 dispatches to 43. Two differences: V4's experts are 13.37 MB and
+ * already run at 70 GB/s, where launch overhead is noise; and staging is exactly what
+ * zero-copy expert weights exist to avoid (COLI_NO_ZEROCOPY=1 is a measured 22.7x).
+ * Nothing here copies a weight. The weights stay where the loader put them and the
+ * kernels read them in place.
+ *
+ * The expert pointers are passed BY VALUE as a kernel parameter, never through a device
+ * array. That is not a style choice: a zero-copy host pointer *read out of a device
+ * buffer* measured 13.52 -> 4.02 tok/s on the same kernel (~2.8x) — the compiler cannot
+ * see the access pattern through the indirection.
+ *
+ * BIT-IDENTICAL to the per-expert path by construction: same `weight_at` decode, same
+ * thread-strided accumulate into a 256-wide shared tree reduction, same per-row scale
+ * applied last, same `act_mul` (so the activation stays defined in exactly one place),
+ * and the routed-weight combine is left on the host untouched. Only the launch geometry
+ * changes. */
+#define INT2_GRP_MAX 16
+struct Int2Ref { const void *gw,*uw,*dw; const float *gs,*us,*ds; };
+struct Int2Grp { Int2Ref e[INT2_GRP_MAX]; };
+
+/* gate/up for every expert in one launch. grid = (I, K): block (i,k) produces the i-th
+ * hidden unit of expert k. Both projections share the x reads. */
+__global__ static void int2_group_gate_up(float *gate_out, float *up_out, const float *x,
+                                          Int2Grp grp, int K, int D, int I) {
+    int i = blockIdx.x, k = blockIdx.y;
+    if (k >= K || i >= I) return;
+    Int2Ref r = grp.e[k];
+    size_t rb = (size_t)((D + 3) / 4), row = (size_t)i * rb;
+    float sg = int2_partial(static_cast<const uint8_t *>(r.gw) + row, x, D, threadIdx.x, blockDim.x);
+    float su = int2_partial(static_cast<const uint8_t *>(r.uw) + row, x, D, threadIdx.x, blockDim.x);
+    __shared__ float pg[256], pu[256];
+    pg[threadIdx.x] = sg; pu[threadIdx.x] = su;
+    __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) {
+        if (threadIdx.x < n) { pg[threadIdx.x] += pg[threadIdx.x + n];
+                               pu[threadIdx.x] += pu[threadIdx.x + n]; }
+        __syncthreads();
+    }
+    if (!threadIdx.x) {
+        gate_out[(size_t)k * I + i] = pg[0] * r.gs[i];
+        up_out[(size_t)k * I + i]   = pu[0] * r.us[i];
+    }
+}
+
+/* down for every expert in one launch. grid = (D, K). Writes y[k][d]; the caller applies
+ * the routing weights and accumulates, exactly as it does for the per-expert path. */
+__global__ static void int2_group_down(float *y, const float *h, Int2Grp grp,
+                                       int K, int D, int I) {
+    int o = blockIdx.x, k = blockIdx.y;
+    if (k >= K || o >= D) return;
+    Int2Ref r = grp.e[k];
+    size_t rb = (size_t)((I + 3) / 4), row = (size_t)o * rb;
+    const float *hk = h + (size_t)k * I;
+    float s = int2_partial(static_cast<const uint8_t *>(r.dw) + row, hk, I, threadIdx.x, blockDim.x);
+    __shared__ float p[256];
+    p[threadIdx.x] = s;
+    __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) {
+        if (threadIdx.x < n) p[threadIdx.x] += p[threadIdx.x + n];
+        __syncthreads();
+    }
+    if (!threadIdx.x) y[(size_t)k * D + o] = p[0] * r.ds[o];
+}
+
+/* Run K int2 experts over ONE shared input row `x[D]`, writing `y[K][D]`.
+ *
+ * Single-row only — the decode shape, and the one where the per-dispatch overhead is 69%
+ * rather than 12%. Gated on the row count at the decision point, not on a phase flag:
+ * prefill hands each expert a different row set, which this deliberately does not model. */
+extern "C" int coli_cuda_expert_group_int2(int device, float *y, const float *x,
+        const void **gw, const void **uw, const void **dw,
+        const float **gs, const float **us, const float **ds,
+        int K, int D, int I) {
+    if (!y || !x || K < 1 || K > INT2_GRP_MAX || D < 1 || I < 1) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    Int2Grp grp{};
+    for (int k = 0; k < K; k++) {
+        if (!gw[k] || !uw[k] || !dw[k] || !gs[k] || !us[k] || !ds[k]) return 0;
+        grp.e[k] = Int2Ref{ gw[k], uw[k], dw[k], gs[k], us[k], ds[k] };
+    }
+    size_t xb = (size_t)D * sizeof(float);
+    size_t hb = (size_t)K * I * sizeof(float);
+    size_t yb = (size_t)K * D * sizeof(float);
+    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->gate, &ctx->gate_cap, hb) ||
+        !reserve(&ctx->up, &ctx->up_cap, hb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(ctx->x, x, xb, cudaMemcpyHostToDevice, ctx->stream),
+                 "int2 group input upload")) return 0;
+    int2_group_gate_up<<<dim3((unsigned)I, (unsigned)K), 256, 0, ctx->stream>>>(
+        ctx->gate, ctx->up, ctx->x, grp, K, D, I);
+    act_mul(ctx->gate, ctx->up, (size_t)K * I, ctx->stream);
+    int2_group_down<<<dim3((unsigned)D, (unsigned)K), 256, 0, ctx->stream>>>(
+        ctx->y, ctx->gate, grp, K, D, I);
+    if (!cuda_ok(cudaGetLastError(), "int2 group launch") ||
+        !cuda_ok(cudaMemcpyAsync(y, ctx->y, yb, cudaMemcpyDeviceToHost, ctx->stream),
+                 "int2 group output download") ||
+        !cuda_ok(cudaStreamSynchronize(ctx->stream), "int2 group synchronize")) return 0;
     return 1;
 }
 
@@ -4029,9 +4510,12 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
 
 /* Standard GQA prefill on the GPU (MiniMax-M3): q[S,H,D], full k/v[T,Hkv,D], ctx[S,H,D]
  * out. Reuses the attention scratch (aq=q, al=k, ar=v, ac=ctx). Caller's layouts match
- * directly (q is [S,H,D]; a KV cache row is [Hkv*D]; ctx is [S,H,D]). */
+ * directly (q is [S,H,D]; a KV cache row is [Hkv*D]; ctx is [S,H,D]).
+ *
+ * `win` > 0 makes each query attend only to the last `win` keys (Maple's sliding layers);
+ * `win <= 0` is the unwindowed causal core every other model uses. Both kernels honour it. */
 extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const float *k,
-        const float *v, int S, int H, int Hkv, int D, int T, float scale, int mode) {
+        const float *v, int S, int H, int Hkv, int D, int T, float scale, int mode, int win) {
     if (!ctx || !q || !k || !v || S < 1 || H < 1 || Hkv < 1 || D < 1 || D > 1024 ||
         H % Hkv || T < S)
         return 0;
@@ -4067,10 +4551,10 @@ extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const 
     if (flash) {
         size_t shW = (size_t)GQA_QT * 8 * D;   // QA+KB (fp16, 4D) + acc (f32, 4D) per 16 rows
         if (!cuda_ok(cudaFuncSetAttribute(tc_gqa_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shW), "gqa flash shared attr")) return 0;
-        tc_gqa_attn<<<dim3(H, (S + GQA_QT - 1) / GQA_QT), 256, shW, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale);
+        tc_gqa_attn<<<dim3(H, (S + GQA_QT - 1) / GQA_QT), 256, shW, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale, win);
     } else {
         size_t shared = (size_t)(D + T + ATTN_TPB) * sizeof(float);
-        gqa_attn_kernel<<<dim3(H, S), ATTN_TPB, shared, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale);
+        gqa_attn_kernel<<<dim3(H, S), ATTN_TPB, shared, dc->stream>>>(dc->ac, dc->aq, dc->al, dc->ar, S, H, Hkv, D, T, scale, win);
     }
     if (!cuda_ok(cudaGetLastError(), "gqa launch")) return 0;
     if (!cuda_ok(cudaMemcpyAsync(ctx, dc->ac, qb, cudaMemcpyDeviceToHost, dc->stream), "gqa ctx download") ||
@@ -4360,7 +4844,7 @@ extern "C" int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
                                      int fmt, int I, int O, int device) {
     if (!tensor || !weights || I < 1 || O < 1) return 0;
     size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    if (!rb || (has_row_scale(fmt) && !scales)) return 0;
     if (*tensor) {
         ColiCudaTensor *t = *tensor;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device;

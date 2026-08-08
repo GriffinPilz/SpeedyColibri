@@ -27,13 +27,71 @@ fn tp_attn_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_TP_ATTN").ok().as_deref() == Some("1"))
 }
 
+/// A snapshot of the phase counters, in microseconds.
+///
+/// The counters are process-global running totals, which suits `gen` (one run per process)
+/// and is useless to `serve`, which handles many requests in one. Snapshot before and after
+/// a window and subtract — see [`Profile::since`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Profile {
+    pub attn_us: u64,
+    pub moe_us: u64,
+    pub expert_load_us: u64,
+    pub dense_us: u64,
+    pub embed_us: u64,
+    pub logits_us: u64,
+}
+
+impl Profile {
+    /// This snapshot minus an earlier one — the phase costs of the window between them.
+    /// Saturating, so a counter that did not move (or a reordered pair) reads 0 rather
+    /// than underflowing into a nonsense total.
+    pub fn since(&self, earlier: &Profile) -> Profile {
+        Profile {
+            attn_us: self.attn_us.saturating_sub(earlier.attn_us),
+            moe_us: self.moe_us.saturating_sub(earlier.moe_us),
+            expert_load_us: self.expert_load_us.saturating_sub(earlier.expert_load_us),
+            dense_us: self.dense_us.saturating_sub(earlier.dense_us),
+            embed_us: self.embed_us.saturating_sub(earlier.embed_us),
+            logits_us: self.logits_us.saturating_sub(earlier.logits_us),
+        }
+    }
+}
+
+/// Read the phase counters. Cheap (six relaxed loads) and safe to call when
+/// `COLI_PROFILE` is off — the counters simply will not have moved.
+pub fn profile_snapshot() -> Profile {
+    let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    Profile {
+        attn_us: g(&ATTN_US),
+        moe_us: g(&MOE_US),
+        expert_load_us: g(&LOAD_US),
+        dense_us: g(&DENSE_US),
+        embed_us: g(&EMBED_US),
+        logits_us: g(&LOGITS_US),
+    }
+}
+
 /// COLI_PROFILE=1 accumulates per-section wall time (microseconds) across the
 /// forward pass so `generate_greedy` can print a breakdown. Off by default.
+/// COLI_SYNC_PHASES=1 — drain the GPU queue at phase boundaries so a phase's async tail is
+/// charged to the phase that created it rather than to the next one that blocks. A
+/// diagnostic: it moves time between counters and adds none, at the cost of serialising
+/// CPU and GPU. Off by default.
+fn sync_phases() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_SYNC_PHASES").ok().as_deref() == Some("1"))
+}
+
 pub(crate) fn profile_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_PROFILE").ok().as_deref() == Some("1"))
 }
 static ATTN_US: AtomicU64 = AtomicU64::new(0);
+/// `lm_head` wall time. Previously a LOCAL in `generate_greedy`, which meant the one
+/// caller that is not `gen` — the server — had no way to see it. That gap is why the
+/// f32-IO serve regression could be narrowed by black-box A/B but never named.
+static LOGITS_US: AtomicU64 = AtomicU64::new(0);
 static MOE_US: AtomicU64 = AtomicU64::new(0);
 static DENSE_US: AtomicU64 = AtomicU64::new(0);
 /// Nemotron-H Mamba2 mixer wall time (its analog of `ATTN_US` for attention layers).
@@ -1168,6 +1226,12 @@ pub fn forward<P: ExpertProvider>(
     // COLI_DEBUG_ACT=1: print the hidden-state L2 norm (first + last position) after
     // embedding and the first few layers, to localize where a forward pass degenerates.
     let dbg_act = std::env::var("COLI_DEBUG_ACT").ok().as_deref() == Some("1");
+    // `COLI_DEBUG_ACT_LAYERS=N` prints the first N layers (default 5, `all` for every one).
+    let dbg_layers: usize = match std::env::var("COLI_DEBUG_ACT_LAYERS").ok().as_deref() {
+        Some("all") => usize::MAX,
+        Some(v) => v.parse().unwrap_or(5),
+        None => 5,
+    };
     let pnorm = |tag: &str, x: &[f32]| {
         if s == 0 {
             return;
@@ -1205,7 +1269,10 @@ pub fn forward<P: ExpertProvider>(
             &mut tmp,
             &mut dsa_sel,
         )?;
-        if dbg_act && li < 5 {
+        // Depth is configurable because 5 layers cannot localise anything on a 24- or
+        // 78-layer stack — the point of this trace is "which layer did the two runs stop
+        // agreeing at". Default stays 5 so existing use is unchanged.
+        if dbg_act && li < dbg_layers {
             pnorm(&format!("layer{li}"), &x);
         }
     }
@@ -1378,13 +1445,32 @@ pub fn forward_batched<P: ExpertProvider>(
 /// Logits for a single hidden-state row: final RMSNorm then `lm_head`. Port of
 /// the tail of `forward_all`.
 pub fn logits(model: &Model, hidden_row: &[f32]) -> Vec<f32> {
+    let mut lo = vec![0f32; model.cfg.vocab as usize];
+    logits_into(model, hidden_row, &mut lo);
+    lo
+}
+
+/// `logits` into a caller-owned buffer, so a decode loop can reuse one allocation.
+///
+/// The allocation is not incidental. `vocab` is 151,936 on Maple, so the returned `Vec` is
+/// 608 KB — far above glibc's mmap threshold — and the version of this that returned a
+/// fresh one paid an `mmap`, a 608 KB zero-fill, ~148 first-touch page faults and a
+/// `munmap` on EVERY decoded token. `matmul_qt` then overwrote every element it had just
+/// zeroed.
+///
+/// It hid well. `gpubench` allocates its output once outside the timing loop and measured
+/// this same matmul at 250 GB/s — 98% of the box's streaming-read ceiling — while the
+/// decode phase timer charged `lm_head` 4.4 ms against the kernel's 2.5 ms. The ~1.9 ms
+/// gap was never the kernel, and no amount of kernel work would have found it: three
+/// rewrites (warp-per-row, vectorised reads, a rows-per-block sweep) all measured within
+/// noise of each other, because none of them touched the part that was actually slow.
+pub fn logits_into(model: &Model, hidden_row: &[f32], out: &mut [f32]) {
     let d = model.cfg.hidden as usize;
     let v = model.cfg.vocab as usize;
+    assert_eq!(out.len(), v, "logits_into: out must be [vocab]");
     let mut row = vec![0f32; d];
     rmsnorm(&mut row, hidden_row, &model.final_norm, model.cfg.eps);
-    let mut lo = vec![0f32; v];
-    matmul_qt(&mut lo, &row, &model.lm_head, 1);
-    lo
+    matmul_qt(out, &row, &model.lm_head, 1);
 }
 
 /// Greedy generation: prefill the prompt, then decode up to `n_new` tokens by
@@ -1489,10 +1575,32 @@ where
         );
     }
     let mut logits_us = 0u64;
+    // Decode-step `lm_head` time ONLY. Kept apart from `logits_us` because the prefill call
+    // below is not a per-token cost and is not even the same kind of work: it is the FIRST
+    // touch of `lm_head`, so it pays the one-time device upload of the whole weight —
+    // measured at ~38 ms for Maple's 622 MB (~16 GB/s, a pageable H2D copy).
+    //
+    // Dividing the combined total by the decode-step count smeared that one-time upload
+    // across every token and inflated the reported per-token head cost by `upload / ngen`.
+    // The tell was that the figure went UP when the run got SHORTER — 6.3 ms over 11 steps
+    // against 4.4 ms over 24 — which no genuine per-token cost can do. Solving the pair
+    // gives a 38.6 ms fixed cost and a 2.79 ms per-token one, and the latter agrees with
+    // `gpubench`'s isolated 2.5 ms for the same matmul.
+    // Per-decode-step `lm_head` time, parallel to `decode_ms`, so the two can be averaged
+    // over the SAME window. They were not: `mean` drops the cold first half and `head_ms`
+    // divided a running total by every step, so the end-to-end line added a warm number to
+    // a cold one. With the warm-up included the head figure fell 3.8 -> 2.9 -> 2.5 ms as
+    // the run got longer and only settled near 2.1; over the warm half it is just 2.1.
+    let mut logits_ms: Vec<f64> = Vec::new();
+    // Reused across every decode step — see the note at the `logits_into` call below.
+    let v = model.cfg.vocab as usize;
+    let mut los: Vec<Vec<f32>> = Vec::new();
     let mut logit = {
         let t = std::time::Instant::now();
         let l = logits(model, &hidden[(s - 1) * d..s * d]);
-        logits_us += t.elapsed().as_micros() as u64;
+        let e = t.elapsed().as_micros() as u64;
+        logits_us += e;
+        LOGITS_US.fetch_add(e, Ordering::Relaxed);
         l
     };
     let mut pos = s;
@@ -1578,11 +1686,48 @@ where
         }
         decode_ms.push(ms);
 
+        // COLI_SYNC_PHASES=1 drains the GPU queue BEFORE the logits timer starts, so the
+        // forward pass's async tail is attributed to the forward pass.
+        //
+        // `forward()` above is timed on the CPU and returns once the last kernel is
+        // ENQUEUED, so whatever is still in flight is paid by whoever next blocks on the
+        // queue — the `lm_head` H2D copy a few lines down. That is an attribution error,
+        // not lost throughput: the token total is identical either way. Diagnosing it cost
+        // four neutral A/Bs (warp-per-row GEMV, vectorised reads, a rows-per-block sweep,
+        // and killing a 608 KB per-token allocation), every one of them aimed at a kernel
+        // `gpubench` times at 2.5 ms while this timer reported 4.4.
+        //
+        // Off by default: a device sync per token serialises CPU and GPU and costs real
+        // time. It exists so the split can be CHECKED, not shipped on.
+        if sync_phases() {
+            let ts = std::time::Instant::now();
+            #[cfg(feature = "cuda")]
+            colibri_backend::cuda::device_sync();
+            if timing {
+                eprintln!(
+                    "[timing]   forward async tail: {:.1} ms (was charged to lm_head)",
+                    ts.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
         let tl = std::time::Instant::now();
-        let los: Vec<Vec<f32>> = (0..sb)
-            .map(|i| logits(model, &h_all[i * d..(i + 1) * d]))
-            .collect();
-        logits_us += tl.elapsed().as_micros() as u64;
+        // `los` is hoisted out of the loop and reused. At Maple's 151,936-entry vocab each
+        // row is 608 KB, so allocating one per decoded token cost an mmap, a zero-fill the
+        // matmul immediately overwrote, and ~148 first-touch page faults.
+        //
+        // MEASURED NEUTRAL on Maple decode (4.6/4.4/4.3 ms against a 4.3-4.8 baseline) —
+        // kept because it removes real per-token work and cannot be slower, NOT because it
+        // bought throughput. Grown, never shrunk: `sb` is 1 without MTP, small with it.
+        while los.len() < sb {
+            los.push(vec![0f32; v]);
+        }
+        for i in 0..sb {
+            logits_into(model, &h_all[i * d..(i + 1) * d], &mut los[i]);
+        }
+        let e = tl.elapsed().as_micros() as u64;
+        logits_us += e;
+        logits_ms.push(e as f64 / 1e3);
+        LOGITS_US.fetch_add(e, Ordering::Relaxed);
 
         // Accept the longest prefix that matches what the model itself would
         // have produced — this is why speculation cannot change the output.
@@ -1643,12 +1788,34 @@ where
         let warm = &decode_ms[decode_ms.len() / 2..];
         let mean = warm.iter().sum::<f64>() / warm.len() as f64;
         let min = warm.iter().cloned().fold(f64::INFINITY, f64::min);
+        // `decode_ms` times `forward()` ONLY — the `logits` (lm_head) call is deliberately
+        // outside it, a few lines below. That makes this a FORWARD-PASS rate, not a token
+        // rate, and the gap is not always small: on Maple with an f32 lm_head the head is
+        // 4.4 ms of a 14.7 ms token (30%), so the forward-only figure overstates tok/s by
+        // ~43%. It is invisible in this line unless said out loud, and it hid an entire
+        // regression — an f32-vs-int8 IO A/B measured IDENTICAL here while the server
+        // showed 1.18x, because the one weight that differed was the one excluded.
+        //
+        // Both numbers are printed rather than the metric being redefined: every recorded
+        // decode figure in this repo is forward-only, and silently re-baselining would
+        // make new runs incomparable to all of them without anyone noticing.
+        // Same warm window as `mean` above, so the two are addable.
+        let head_ms = {
+            let w = &logits_ms[logits_ms.len() / 2..];
+            if w.is_empty() {
+                0.0
+            } else {
+                w.iter().sum::<f64>() / w.len() as f64
+            }
+        };
         eprintln!(
-            "[timing] decode steady-state (last {} of {} tok): mean {mean:.1} ms ({:.2} tok/s), best {min:.1} ms ({:.2} tok/s)",
+            "[timing] decode steady-state (last {} of {} tok): mean {mean:.1} ms ({:.2} tok/s), best {min:.1} ms ({:.2} tok/s)              [forward only; + lm_head {head_ms:.1} ms => {:.1} ms/token, {:.2} tok/s end-to-end]",
             warm.len(),
             decode_ms.len(),
             1e3 / mean,
             1e3 / min,
+            mean + head_ms,
+            1e3 / (mean + head_ms),
         );
     }
     if profile_on() {

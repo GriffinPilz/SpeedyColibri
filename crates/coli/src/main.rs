@@ -501,7 +501,20 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     // the config (env COLI_NLAYERS still overrides for GLM), and Gemma-norm folding is
     // per-model (M3 yes, M2 no — read from the config). Missing config → falls back to GLM.
     let src_cfg = colibri_core::Config::load(indir).ok();
-    let minimax = src_cfg.as_ref().map(|c| c.arch.is_gqa()).unwrap_or(false);
+    // Name the two MiniMax variants explicitly. This used to ask `c.arch.is_gqa()` as a
+    // stand-in for "is MiniMax", which was true only while they were the entire GQA
+    // family. Adding Maple to that family made this flag turn on for Maple too — and
+    // since `process_one` tests `opts.minimax` before `opts.maple`, Maple would have
+    // silently taken the `block_sparse_moe`/`w1w2w3` remapping and never reached its own
+    // branch. A predicate borrowed as a proxy stops being one the moment the set grows.
+    let minimax = src_cfg
+        .as_ref()
+        .map(|c| matches!(c.arch, colibri_core::Arch::MinimaxM3 | colibri_core::Arch::MinimaxM2))
+        .unwrap_or(false);
+    let maple = src_cfg
+        .as_ref()
+        .map(|c| c.arch == colibri_core::Arch::Maple)
+        .unwrap_or(false);
     let nemotron = src_cfg
         .as_ref()
         .map(|c| c.arch == colibri_core::Arch::NemotronH)
@@ -515,7 +528,7 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         .map(|c| c.arch == colibri_core::Arch::DeepseekV4)
         .unwrap_or(false);
     let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
-    let n_layers = if minimax || nemotron || kimi || deepseek_v4 {
+    let n_layers = if minimax || nemotron || kimi || deepseek_v4 || maple {
         src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)
     } else {
         env_u32("COLI_NLAYERS", 78) as usize
@@ -550,6 +563,10 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // single sparse block, 2 for Nemotron-H's `"*E"` attention+latent-MoE pair. Read
         // from the SOURCE config's `mtp_hybrid_override_pattern`; falls back to 1.
         mtp_layers: src_cfg.as_ref().map(|c| c.mtp_head_layers()).unwrap_or(1),
+        // Maple: expert + attention weights are already ternary, so they re-encode to
+        // int2 bit-exactly instead of being quantized. `ebits`/`xfp8` do not apply to
+        // them — the format is decided by what the weights ARE, not by a knob.
+        maple,
     };
 
     eprintln!(
@@ -1971,6 +1988,10 @@ fn cmd_gpubench(args: &[String]) -> ExitCode {
     }
     colibri_engine::gpubench::report(s, reps);
     colibri_engine::gpubench::report_experts(s, reps);
+    // The IO tier only has a decode regime worth measuring — `lm_head` is read once per
+    // generated token and not at all per prompt token — so it is reported at S=1 whatever
+    // `s` the caller asked for, rather than silently timing a shape the model never runs.
+    colibri_engine::gpubench::io_report(reps.min(50));
     ExitCode::SUCCESS
 }
 

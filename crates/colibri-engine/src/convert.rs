@@ -121,6 +121,14 @@ pub struct ConvertOpts {
     /// then a latent-MoE one). Everything at `n_layers + mtp_layers` and above is not part
     /// of the architecture and is dropped. Defaults to 1 so the GLM path is unchanged.
     pub mtp_layers: usize,
+    /// source is Maple (`maple`): a GQA MoE whose expert and attention weights are
+    /// **already ternary** in the released BF16 checkpoint. Those tensors are re-encoded
+    /// to `fmt 3` int2 **bit-exactly** (see [`pack_ternary_int2`]) rather than quantized,
+    /// so the 8x size reduction carries no accuracy cost at all. A tensor that ought to be
+    /// ternary and is not ABORTS the conversion rather than silently falling back to a
+    /// lossy format — the whole quality claim for this model rests on that, so it is
+    /// enforced instead of assumed. See `process_one`.
+    pub maple: bool,
 }
 
 impl Default for ConvertOpts {
@@ -138,6 +146,7 @@ impl Default for ConvertOpts {
             kimi: false,
             deepseek_v4: false,
             mtp_layers: 1,
+            maple: false,
         }
     }
 }
@@ -431,6 +440,25 @@ fn layer_idx(name: &str) -> i64 {
         }
     }
     -1
+}
+
+/// Map a Maple source tensor name to its colibrì-container name, or `None` to drop it.
+///
+/// Almost a no-op, which is the point worth recording: Maple already names its experts
+/// `model.layers.<l>.mlp.experts.<e>.{gate,up,down}_proj.weight`, byte-identical to what
+/// [`ExpertLayout::weight_name`] looks up, and its attention/norm/router names match the
+/// container's too. Exactly one tensor needs renaming:
+///
+/// * `model.word_embeddings.weight` → `model.embed_tokens.weight`. Left alone it does not
+///   merely load under a different name — it misses [`classify_head`]'s `Kind::Io` arm
+///   (which tests the name literally), falls through to the generic `.weight` rule, and
+///   is emitted as an int8 *resident* tensor. The loader then cannot find the embedding
+///   table at all. Two failures from one unmapped name.
+fn maple_container_name(name: &str) -> Option<String> {
+    if name == "model.word_embeddings.weight" {
+        return Some("model.embed_tokens.weight".to_string());
+    }
+    Some(name.to_string())
 }
 
 /// Tensor classification — port of `classify(name, n_layers)`. `keep_idx` mirrors the
@@ -824,6 +852,117 @@ struct OutTensor {
     dtype: &'static str, // "U8" | "F32"
     shape: Vec<i64>,
     bytes: Vec<u8>,
+}
+
+/// Per-row ternary scales for `w[o, i]`, or `None` if any row is not exactly
+/// `{-s, 0, +s}` for a single `s > 0`.
+///
+/// "Exactly" is meant literally: the check is on the f32 bit patterns, not on a
+/// tolerance. Maple's released checkpoint is a ternary-QAT master stored at BF16, so
+/// every weight in an expert or attention projection really is one of three values, and
+/// the row's scale is simply its magnitude. A row of all zeros is legal and gets scale
+/// 0 (it dequantizes back to zeros whatever the scale is).
+///
+/// `-0.0` counts as zero: it compares equal to `+0.0` and reconstructs as `0.0 * s`,
+/// which is the same value the source holds. The checkpoint contains both signs of zero
+/// in roughly equal numbers, so treating them as distinct would reject every tensor.
+pub(crate) fn ternary_row_scales(w: &[f32], o: usize, i: usize) -> Option<Vec<f32>> {
+    let mut scales = vec![0f32; o];
+    for r in 0..o {
+        let row = &w[r * i..(r + 1) * i];
+        let mut s = 0f32;
+        for &v in row {
+            if v == 0.0 {
+                continue; // covers -0.0 too
+            }
+            if !v.is_finite() {
+                return None;
+            }
+            let a = v.abs();
+            if s == 0.0 {
+                s = a;
+            } else if a != s {
+                return None; // a second distinct magnitude: not ternary
+            }
+        }
+        scales[r] = s;
+    }
+    Some(scales)
+}
+
+/// Pack per-row-ternary `w[o, i]` into the container's **int2** form (`fmt 3`): 4 values
+/// per byte, each a 2-bit field holding `value + 2`, times a per-row f32 scale.
+///
+/// This is a **re-encoding, not a quantization**. `fmt 3` decodes as `field - 2`, i.e.
+/// `{-2, -1, 0, +1}`; ternary uses `{-1, 0, +1}` and simply never emits the `-2` code. So
+/// `dequant(pack(w)) == w` bit-for-bit, and the returned bool says so having actually
+/// checked rather than having argued it. 2 bits/weight against the source's 16 is an 8x
+/// reduction with no accuracy question attached.
+///
+/// Returns `None` when `w` is not per-row ternary — the caller decides whether that is a
+/// fallback or an error, because for Maple it is an error.
+fn pack_ternary_int2(name: &str, w: &[f32], o: usize, i: usize) -> Option<(OutTensor, OutTensor)> {
+    let scales = ternary_row_scales(w, o, i)?;
+    let rb = i.div_ceil(4);
+    let mut codes = vec![0u8; o * rb];
+    for r in 0..o {
+        let row = &w[r * i..(r + 1) * i];
+        let s = scales[r];
+        let dst = &mut codes[r * rb..(r + 1) * rb];
+        for (c, &v) in row.iter().enumerate() {
+            // value ∈ {-1, 0, +1}; stored as value + 2 ∈ {1, 2, 3}. An all-zero row has
+            // s == 0 and every field is the zero code, which is correct for any scale.
+            let t: i32 = if v == 0.0 {
+                0
+            } else if v > 0.0 {
+                1
+            } else {
+                -1
+            };
+            // Only the NON-zero entries carry the row's magnitude. `v == 0.0` also
+            // matches `-0.0`, whose `abs()` is `0.0` and equals no nonzero scale.
+            debug_assert!(v == 0.0 || v.abs() == s);
+            dst[c >> 2] |= ((t + 2) as u8) << ((c & 3) * 2);
+        }
+    }
+
+    // Prove the round trip rather than trusting it. This is the whole quality claim for
+    // Maple — 96% of the model's parameters go through this function — and it costs one
+    // linear pass over a tensor the converter has already paid to materialize.
+    for r in 0..o {
+        let s = scales[r];
+        let src = &w[r * i..(r + 1) * i];
+        let packed = &codes[r * rb..(r + 1) * rb];
+        for (c, &want) in src.iter().enumerate() {
+            let field = (packed[c >> 2] >> ((c & 3) * 2)) & 3;
+            let got = (field as i32 - 2) as f32 * s;
+            // Numeric equality, deliberately: the one difference this permits is a
+            // source `-0.0` reconstructing as `+0.0`. That is sound — the two are equal,
+            // and a weight of either sign of zero contributes the same to every dot
+            // product the engine computes (`x * ±0.0` summed into an accumulator cannot
+            // change it). Every NON-zero weight must match to the bit, and does, because
+            // it is `±s` reconstructed from the same `s`.
+            if got != want {
+                debug_assert!(false, "{name}: int2 round trip differs at [{r},{c}]");
+                return None;
+            }
+        }
+    }
+
+    Some((
+        OutTensor {
+            name: name.to_string(),
+            dtype: "U8",
+            shape: vec![codes.len() as i64],
+            bytes: codes,
+        },
+        OutTensor {
+            name: format!("{name}.qs"),
+            dtype: "F32",
+            shape: vec![scales.len() as i64],
+            bytes: f32_bytes(&scales),
+        },
+    ))
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -1599,6 +1738,14 @@ fn dequantize_qtensor(t: &QTensor) -> Vec<f32> {
                 }
             }
         }
+        2 => {
+            for (k, dst) in out.iter_mut().enumerate() {
+                *dst = colibri_core::bf16_to_f32(u16::from_le_bytes([
+                    t.q4[2 * k],
+                    t.q4[2 * k + 1],
+                ]));
+            }
+        }
         _ => {} // int2 unused for resident weights; leave zeroed rather than lie
     }
     out
@@ -1769,7 +1916,10 @@ pub struct ConvertStats {
 /// quantize (the CPU-bound work) can run in parallel and be reassembled in order.
 enum TensorOut {
     Skip,
-    F32(OutTensor),
+    /// One self-describing tensor with no scale sidecar — an F32 norm/router, or a BF16
+    /// IO-tier weight. Named for the shard bucket it lands in (written after the code
+    /// block), not for its dtype, which the `OutTensor` itself carries.
+    Plain(OutTensor),
     Quant(OutTensor, OutTensor),
 }
 
@@ -1807,6 +1957,12 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
             _ => return Ok(TensorOut::Skip),
         }
+    } else if opts.maple {
+        // No MTP head in this checkpoint, so the plain `n_layers` ceiling applies.
+        match maple_container_name(name) {
+            Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
+            _ => return Ok(TensorOut::Skip),
+        }
     } else if opts.nemotron {
         // Unlike the M3 branch above (whose head is dropped by name), Nemotron's MTP head
         // is KEPT and remapped into `model.layers.{n_layers..n_layers+mtp_layers}`, so the
@@ -1829,6 +1985,32 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
         shape,
         bytes: f32_bytes(w),
     };
+    // BF16 output, emitted only when every value survives the round trip exactly. The
+    // caller falls back to F32 on `None` rather than accepting a rounded weight: this
+    // tier exists to remove bytes that carry no information, not to trade quality for
+    // size, and an f32 source with real low mantissa bits would do the latter silently.
+    let bf16_out = |nm: &str, shape: Vec<i64>, w: &[f32]| -> Option<OutTensor> {
+        let mut bytes = Vec::with_capacity(w.len() * 2);
+        for &v in w {
+            let h = colibri_core::f32_to_bf16(v);
+            // NaN never compares equal, so check its bit pattern is preserved instead.
+            let ok = if v.is_nan() {
+                colibri_core::bf16_to_f32(h).is_nan()
+            } else {
+                colibri_core::bf16_to_f32(h) == v
+            };
+            if !ok {
+                return None;
+            }
+            bytes.extend_from_slice(&h.to_le_bytes());
+        }
+        Some(OutTensor {
+            name: nm.to_string(),
+            dtype: "BF16",
+            shape,
+            bytes,
+        })
+    };
     match classify_head(
         &out_name,
         opts.n_layers,
@@ -1846,7 +2028,7 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
                     *v += 1.0;
                 }
             }
-            Ok(TensorOut::F32(f32_out(&out_name, shape, &w)))
+            Ok(TensorOut::Plain(f32_out(&out_name, shape, &w)))
         }
         kind @ (Kind::Io | Kind::X | Kind::Q) => {
             // An already-MXFP4 routed expert is COPIED, not requantized. This has to come
@@ -1862,9 +2044,41 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             let (w, shape) = dequant(shards, name)?;
             // Only 2D weights quantize; anything else stays F32.
             if shape.len() != 2 {
-                return Ok(TensorOut::F32(f32_out(&out_name, shape, &w)));
+                return Ok(TensorOut::Plain(f32_out(&out_name, shape, &w)));
             }
             let (o, i) = (shape[0] as usize, shape[1] as usize);
+
+            // Maple: the experts (`X`) and the attention projections (`Q`) are ternary in
+            // the source, so they re-encode to int2 EXACTLY — 2 bits/weight against BF16's
+            // 16, with `dequant(pack(w)) == w`. This is checked per tensor, not asserted
+            // from the arch: `pack_ternary_int2` returns `None` for anything that is not
+            // per-row `{-s, 0, +s}`.
+            //
+            // `Kind::Io` is deliberately NOT included. The embeddings and `lm_head` are
+            // genuinely dense (measured: ~4-6k distinct values per sampled row, against 3
+            // for an expert), and forcing them through here would either refuse or, worse,
+            // succeed on a degenerate row and destroy the output layer.
+            //
+            // A tensor that reaches here and is not ternary is an ERROR, not a fallback.
+            // Falling back would produce a container that loads, generates fluent text,
+            // and is quietly worse than the checkpoint — with the size on disk as the only
+            // hint. Better to fail with the tensor's name and let a human decide.
+            if opts.maple && matches!(kind, Kind::X | Kind::Q) {
+                return match pack_ternary_int2(&out_name, &w, o, i) {
+                    Some((codes_t, scale_t)) => Ok(TensorOut::Quant(codes_t, scale_t)),
+                    None => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{out_name}: expected per-row ternary ({{-s, 0, +s}}) weights for \
+                             Maple, but this [{o},{i}] tensor is not. Refusing to convert: \
+                             falling back to a lossy format here would silently degrade the \
+                             model. If this checkpoint genuinely ships dense weights for this \
+                             tensor, classify it explicitly rather than relaxing this check."
+                        ),
+                    )),
+                };
+            }
+
             let (codes_t, scale_t) = if matches!(kind, Kind::X) {
                 // Routed experts are **NVFP4** by default (4-bit block-scaled, ~2× faster
                 // than e4m3 at <1% perplexity); `COLI_XFP8=1` opts into 8-bit e4m3.
@@ -1882,6 +2096,34 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
                 } else {
                     opts.ebits
                 };
+                // `COLI_IO_BITS=16` (or more) ships the embeddings and `lm_head` at an
+                // EXACT IO tier instead of per-row int8.
+                //
+                // The loader already asks for these at `io_bits = 16`, and
+                // `qtensor_from_f32` keeps `bits >= 16` as `fmt 0`, so a container that
+                // simply stores them full-precision loads exactly. Only the converter
+                // could not emit that: `quantize()` asserts `bits >= 8` and produces int8
+                // whatever it is handed, so raising `COLI_IO_BITS` silently did nothing.
+                //
+                // It costs real bytes and is off by default. `lm_head` alone is 311M
+                // params — 311 MB at int8, 622 MB at bf16, 1.24 GB at f32 — and it is read
+                // once per decoded token, so on a model whose weights all fit RAM it is the
+                // single largest per-token read. Worth it only where the output layer's
+                // quantisation is measurably changing tokens.
+                //
+                // BF16 is preferred over F32 whenever it round-trips, which for a BF16
+                // checkpoint means always. That is not a precision compromise — the stored
+                // f32 of a bf16 source has 16 zero mantissa bits, so dropping them removes
+                // bytes and nothing else, and the kernels widen back to the identical f32
+                // before an f32 accumulation. Measured on Maple: `lm_head` at f32 is 7.2 ms
+                // of a 22.8 ms end-to-end token, and this halves that read. F32 remains the
+                // fallback for a genuinely-f32 source, where the low bits are real.
+                if matches!(kind, Kind::Io) && bits >= 16 {
+                    if let Some(t) = bf16_out(&out_name, shape.clone(), &w) {
+                        return Ok(TensorOut::Plain(t));
+                    }
+                    return Ok(TensorOut::Plain(f32_out(&out_name, shape, &w)));
+                }
                 quantize(&out_name, &w, o, i, bits)
             };
             Ok(TensorOut::Quant(codes_t, scale_t))
@@ -2006,7 +2248,7 @@ pub fn convert_snapshot(
         for out in process_names_parallel(names, &shards, &opts)? {
             match out {
                 TensorOut::Skip => stats.tensors_skipped += 1,
-                TensorOut::F32(t) => {
+                TensorOut::Plain(t) => {
                     floats.push(t);
                     stats.tensors_f32 += 1;
                 }
@@ -2058,6 +2300,161 @@ pub fn convert_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a per-row-ternary `[o, i]` tensor: row `r` uses scale `scales[r]` and cycles
+    /// through `-s, 0, +s, 0` so every code and both zero signs appear.
+    fn ternary_tensor(o: usize, i: usize, scales: &[f32]) -> Vec<f32> {
+        let mut w = vec![0f32; o * i];
+        for r in 0..o {
+            let s = scales[r % scales.len()];
+            for c in 0..i {
+                w[r * i + c] = match c % 4 {
+                    0 => -s,
+                    1 => 0.0,
+                    2 => s,
+                    _ => -0.0,
+                };
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn ternary_detection_accepts_ternary_and_rejects_everything_else() {
+        // Per-row ternary with a DIFFERENT scale per row — the scale is per row, so two
+        // rows disagreeing is fine; two magnitudes within one row is not.
+        let w = ternary_tensor(4, 8, &[0.25, 0.5, 1.0, 0.125]);
+        let s = ternary_row_scales(&w, 4, 8).expect("per-row ternary");
+        assert_eq!(s, vec![0.25, 0.5, 1.0, 0.125]);
+
+        // An all-zero row is legal and scores scale 0.
+        let z = vec![0f32; 16];
+        assert_eq!(ternary_row_scales(&z, 2, 8), Some(vec![0.0, 0.0]));
+
+        // Two distinct magnitudes in one row: not ternary.
+        let mut bad = ternary_tensor(2, 8, &[0.5]);
+        bad[3] = 0.25;
+        assert_eq!(ternary_row_scales(&bad, 2, 8), None);
+
+        // Non-finite is not ternary either, however few distinct values it has.
+        let mut nan = ternary_tensor(1, 8, &[0.5]);
+        nan[0] = f32::NAN;
+        assert_eq!(ternary_row_scales(&nan, 1, 8), None);
+    }
+
+    /// The claim the whole Maple quality story rests on: int2 is a RE-ENCODING of these
+    /// weights, so the round trip is exact — not "within tolerance".
+    #[test]
+    fn ternary_packs_to_int2_bit_exactly() {
+        let (o, i) = (8usize, 20usize);
+        // Scales chosen as exact binary fractions AND as awkward ones; both must survive,
+        // because the reconstruction multiplies by the very same f32 that was stored.
+        let w = ternary_tensor(o, i, &[0.25, 0.0234375, 1.0, 0.1, 3.7, 1e-8, 0.5, 7.0]);
+        let (codes, scales) = pack_ternary_int2("t", &w, o, i).expect("ternary");
+
+        // Layout the LOADER expects: `o * ceil(i/4)` code bytes and `o` f32 scales. The
+        // loader picks int2-vs-int8 purely from this byte count (`nb == o*i` -> int8), so
+        // getting the size wrong does not fail loudly, it changes the format silently.
+        assert_eq!(codes.bytes.len(), o * i.div_ceil(4));
+        assert_ne!(codes.bytes.len(), o * i, "must not collide with the int8 length");
+        assert_eq!(scales.bytes.len(), o * 4);
+        assert_eq!(codes.dtype, "U8");
+        assert_eq!(scales.name, "t.qs");
+
+        // Decode exactly as `linear.rs` fmt 3 does: value = field - 2, times the row scale.
+        let sc: Vec<f32> = scales
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let rb = i.div_ceil(4);
+        for r in 0..o {
+            for c in 0..i {
+                let byte = codes.bytes[r * rb + (c >> 2)];
+                let got = (((byte >> ((c & 3) * 2)) & 3) as i32 - 2) as f32 * sc[r];
+                assert_eq!(got, w[r * i + c], "[{r},{c}]");
+            }
+        }
+    }
+
+    /// Only `{-1, 0, +1}` are emitted — the `-2` code that int2 can represent is never
+    /// used. That is what makes the mapping injective and the round trip exact.
+    #[test]
+    fn ternary_never_emits_the_minus_two_code() {
+        let (o, i) = (4usize, 16usize);
+        let w = ternary_tensor(o, i, &[0.5, 2.0, 0.0625, 1.0]);
+        let (codes, _) = pack_ternary_int2("t", &w, o, i).unwrap();
+        for b in &codes.bytes {
+            for k in 0..4 {
+                assert_ne!((b >> (k * 2)) & 3, 0, "field 0 decodes to -2, which ternary never uses");
+            }
+        }
+    }
+
+    #[test]
+    fn non_ternary_is_refused_rather_than_approximated() {
+        let w: Vec<f32> = (0..64).map(|k| (k as f32) * 0.01 - 0.3).collect();
+        assert!(
+            pack_ternary_int2("dense", &w, 4, 16).is_none(),
+            "a dense tensor must NOT be silently packed into 2 bits"
+        );
+    }
+
+    #[test]
+    fn maple_container_name_renames_only_the_embedding() {
+        let m = |s: &str| maple_container_name(s);
+        // The one rename. Without it the tensor misses `classify`'s Io arm (which tests
+        // the name literally), is emitted as an int8 resident weight, and the loader
+        // cannot find the embedding table.
+        assert_eq!(
+            m("model.word_embeddings.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        // Everything else already matches the container's names — in particular the
+        // experts, byte-for-byte with `ExpertLayout::weight_name`.
+        for n in [
+            "model.layers.3.mlp.experts.17.gate_proj.weight",
+            "model.layers.3.mlp.experts.17.down_proj.weight",
+            "model.layers.3.self_attn.q_proj.weight",
+            "model.layers.3.self_attn.q_norm.weight",
+            "model.layers.3.mlp.gate.weight",
+            "model.layers.3.input_layernorm.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ] {
+            assert_eq!(m(n).as_deref(), Some(n), "{n} should pass through unchanged");
+        }
+        let layout = crate::moe::ExpertLayout::for_arch(colibri_core::Arch::Maple);
+        assert_eq!(
+            layout.weight_name(3, 17, "gate_proj"),
+            "model.layers.3.mlp.experts.17.gate_proj.weight",
+            "convert must WRITE exactly what the expert loader LOOKS UP"
+        );
+    }
+
+    /// Maple's names must land in the right `Kind`s under the shared classifier — the
+    /// experts streamed, the projections resident, the router and every norm exact.
+    #[test]
+    fn maple_names_classify_correctly() {
+        let k = |n: &str| classify(n, 24, false, false);
+        assert_eq!(k("model.layers.3.mlp.experts.17.gate_proj.weight"), Kind::X);
+        assert_eq!(k("model.layers.3.mlp.experts.255.down_proj.weight"), Kind::X);
+        assert_eq!(k("model.layers.3.self_attn.q_proj.weight"), Kind::Q);
+        assert_eq!(k("model.layers.3.self_attn.o_proj.weight"), Kind::Q);
+        // The router is `mlp.gate`, NOT `gate_proj` — kept exact, and never confused for
+        // an expert gate projection.
+        assert_eq!(k("model.layers.3.mlp.gate.weight"), Kind::F32);
+        // QK-norm and the block norms stay f32.
+        assert_eq!(k("model.layers.3.self_attn.q_norm.weight"), Kind::F32);
+        assert_eq!(k("model.layers.3.self_attn.k_norm.weight"), Kind::F32);
+        assert_eq!(k("model.layers.3.input_layernorm.weight"), Kind::F32);
+        assert_eq!(k("model.layers.3.post_attention_layernorm.weight"), Kind::F32);
+        assert_eq!(k("model.norm.weight"), Kind::F32);
+        // Embeddings/lm_head are Io — dense, and deliberately NOT run through the ternary
+        // packer, which would either refuse or wreck the output layer.
+        assert_eq!(k("model.embed_tokens.weight"), Kind::Io);
+        assert_eq!(k("lm_head.weight"), Kind::Io);
+    }
 
     #[test]
     fn m3_container_name_maps_and_drops() {

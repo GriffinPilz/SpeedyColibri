@@ -35,6 +35,13 @@ extern "C" {
     fn coli_cuda_set_activation(oai: c_int, alpha: f32, limit: f32);
     fn coli_cuda_device_count() -> c_int;
     fn coli_cuda_mem_info(device: c_int, free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
+    fn coli_cuda_bandwidth(
+        device: c_int,
+        bytes: usize,
+        reps: c_int,
+        best_ms: *mut f64,
+    ) -> c_int;
+    fn coli_cuda_device_sync(device: c_int) -> c_int;
 
     fn coli_cuda_tensor_upload(
         tensor: *mut *mut ColiCudaTensor,
@@ -225,6 +232,21 @@ extern "C" {
         t: c_int,
         scale: f32,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn coli_cuda_expert_group_int2(
+        device: c_int,
+        y: *mut f32,
+        x: *const f32,
+        gw: *const *const c_void,
+        uw: *const *const c_void,
+        dw: *const *const c_void,
+        gs: *const *const f32,
+        us: *const *const f32,
+        ds: *const *const f32,
+        k: c_int,
+        d: c_int,
+        i: c_int,
+    ) -> c_int;
     fn coli_cuda_gqa_attn(
         device: c_int,
         ctx: *mut f32,
@@ -238,6 +260,7 @@ extern "C" {
         t: c_int,
         scale: f32,
         mode: c_int,
+        win: c_int,
     ) -> c_int;
     // Nemotron-H Mamba2 selective-scan for one decode token (S==1).
     #[allow(clippy::too_many_arguments)]
@@ -356,6 +379,36 @@ extern "C" {
 /// Number of usable CUDA devices (0 if none / driver missing).
 pub fn device_count() -> i32 {
     unsafe { coli_cuda_device_count() }
+}
+
+/// Block until every queued GPU op has finished. **Measurement only.**
+///
+/// The phase timers in `forward.rs` measure CPU wall time, so GPU work still in flight when
+/// a phase's last CPU call returns lands on whichever phase next issues a CUDA call and
+/// blocks on the queue. That is how `lm_head` came to be charged 4.4 ms for a matmul that
+/// measures 2.5 ms in isolation. Calling this at a phase boundary attributes the tail
+/// correctly; it moves time between counters and adds none.
+pub fn device_sync() {
+    unsafe {
+        coli_cuda_device_sync(0);
+    }
+}
+
+/// Streaming-read bandwidth of device memory, GB/s (best of `reps`). `None` if CUDA is
+/// unavailable or the run failed.
+///
+/// The point of reference for every "we achieve N GB/s" claim in this repo. A spec sheet
+/// says 273 GB/s for this box; what a kernel can actually reach is an empirical question,
+/// and reporting an achieved figure against the spec instead of against this overstates
+/// how much headroom is left.
+pub fn bandwidth_gbs(bytes: usize, reps: i32) -> Option<f64> {
+    let mut ms = 0f64;
+    // SAFETY: `ms` is a live local; the callee allocates and frees its own device buffer.
+    let ok = unsafe { coli_cuda_bandwidth(0, bytes, reps, &mut ms as *mut f64) };
+    if ok == 0 || ms <= 0.0 {
+        return None;
+    }
+    Some(bytes as f64 / (ms / 1e3) / 1e9)
 }
 
 /// Live CUDA scratch across every device: activation/GEMM buffers, expert staging, the
@@ -994,6 +1047,9 @@ pub unsafe fn attention_absorb_batch_raw(
 /// `q[S,H,D]` and the full KV cache `k`/`v` `[T,Hkv,D]`, causal. Twin of the CPU core in
 /// `attention_gqa`.
 ///
+/// `win > 0` restricts each query to the last `win` keys (Maple's sliding layers);
+/// `win <= 0` is the unwindowed causal core.
+///
 /// # Safety
 /// `ctx`/`q`/`k`/`v` must be sized per the dims; `H % Hkv == 0`.
 #[allow(clippy::too_many_arguments)]
@@ -1009,8 +1065,46 @@ pub unsafe fn gqa_attn_raw(
     t: i32,
     scale: f32,
     mode: i32,
+    win: i32,
 ) -> bool {
-    coli_cuda_gqa_attn(0, ctx, q, k, v, s, h, hkv, d, t, scale, mode) != 0
+    coli_cuda_gqa_attn(0, ctx, q, k, v, s, h, hkv, d, t, scale, mode, win) != 0
+}
+
+/// Grouped int2 (ternary) experts: `K` experts over one shared input row `x[D]`, writing
+/// `y[K][D]` in a single launch triple. Weights are read ZERO-COPY in place — nothing is
+/// staged — and the routed-weight combine stays with the caller.
+///
+/// # Safety
+/// `x` must be `[D]`, `y` must be `[K, D]`, and each pointer array must hold `K` live
+/// entries pointing at the experts' weight/scale buffers.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn expert_group_int2_raw(
+    y: *mut f32,
+    x: *const f32,
+    gw: &[*const c_void],
+    uw: &[*const c_void],
+    dw: &[*const c_void],
+    gs: &[*const f32],
+    us: &[*const f32],
+    ds: &[*const f32],
+    k: i32,
+    d: i32,
+    i: i32,
+) -> bool {
+    coli_cuda_expert_group_int2(
+        0,
+        y,
+        x,
+        gw.as_ptr(),
+        uw.as_ptr(),
+        dw.as_ptr(),
+        gs.as_ptr(),
+        us.as_ptr(),
+        ds.as_ptr(),
+        k,
+        d,
+        i,
+    ) != 0
 }
 
 /// Nemotron-H Mamba2 selective-scan for one decode token (`seq == 1`) on the GPU.

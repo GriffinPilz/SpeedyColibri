@@ -49,7 +49,8 @@ pub use convert::{
 };
 pub use forward::{
     forward, forward_batched, generate_greedy, generate_stream, generate_stream_drafting,
-    kimi_forward, layer_forward, layer_forward_kind, logits, mamba2_mixer, DecodeStats,
+    kimi_forward, layer_forward, layer_forward_kind, logits, mamba2_mixer, profile_snapshot,
+    DecodeStats, Profile,
 };
 pub use linear::{embed_row, matmul_f32, matmul_qt};
 pub use loader::{ld, qt_load, two_dims_of};
@@ -502,7 +503,14 @@ fn load_layer(
             .or_else(|_| ld(shards, &p("mlp.e_score_correction_bias")))
             .or_else(|_| ld(shards, &p("mlp.gate.bias")))
             .or_else(|e| {
-                if cfg.arch == colibri_core::Arch::DeepseekV4 {
+                // Maple has NO routing bias by construction, not by omission: its config
+                // says `moe_router_enable_expert_bias: false` and `MapleGate` carries only
+                // a weight. Its softmax router never reads this vector (see `moe::route`),
+                // so zeros are not a stand-in for a missing tensor here — they are the
+                // absence itself, made concrete for a struct field that is not an Option.
+                if cfg.arch == colibri_core::Arch::DeepseekV4
+                    || cfg.arch == colibri_core::Arch::Maple
+                {
                     Ok(vec![0f32; cfg.n_experts as usize])
                 } else {
                     Err(e)

@@ -8,7 +8,7 @@
 //! for the matmuls that tolerate it; attention projections must keep this exact
 //! path (IDOT there costs ~+12% perplexity, measured — see the C comment).
 
-use colibri_core::QTensor;
+use colibri_core::{bf16_to_f32, QTensor};
 
 /// `y[S, O] = x[S, I] @ W^T`, exact (f32 activations). Ports `matmul` /
 /// `matmul_q` / `matmul_i2` under `matmul_qt_ex(..., allow_idot=0)`.
@@ -38,6 +38,24 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QTensor, s: usize) {
                 for si in 0..s {
                     let xs = &x[si * i..(si + 1) * i];
                     y[si * o + row] = dot_f32(xs, wr);
+                }
+            }
+        }
+        2 => {
+            // bf16: raw 2-byte values, no per-row scale. Decoding is a 16-bit shift, and
+            // the accumulation is the same f32 as the fmt-0 arm above, so a tensor stored
+            // this way produces bit-identical results to the F32 tier it replaces.
+            let q = w.q4.as_slice();
+            for row in 0..o {
+                let wr = &q[row * i * 2..(row + 1) * i * 2];
+                for si in 0..s {
+                    let xs = &x[si * i..(si + 1) * i];
+                    let mut a = 0f32;
+                    for k in 0..i {
+                        let h = u16::from_le_bytes([wr[2 * k], wr[2 * k + 1]]);
+                        a += bf16_to_f32(h) * xs[k];
+                    }
+                    y[si * o + row] = a;
                 }
             }
         }
@@ -216,6 +234,12 @@ pub fn qt_row_dequant(w: &QTensor, row: usize) -> Vec<f32> {
                 *dst = c as f32 * s;
             }
         }
+        2 => {
+            let q = &w.q4[row * i * 2..(row + 1) * i * 2];
+            for (k, dst) in out.iter_mut().enumerate() {
+                *dst = bf16_to_f32(u16::from_le_bytes([q[2 * k], q[2 * k + 1]]));
+            }
+        }
         3 => {
             let rb = (i + 3) / 4;
             let q = &w.q4[row * rb..(row + 1) * rb];
@@ -292,6 +316,12 @@ pub fn embed_row(embed: &QTensor, tok: usize, out: &mut [f32]) {
                 *dst = c as f32 * s;
             }
         }
+        2 => {
+            let q = &embed.q4[tok * d * 2..(tok + 1) * d * 2];
+            for (k, dst) in out.iter_mut().enumerate() {
+                *dst = bf16_to_f32(u16::from_le_bytes([q[2 * k], q[2 * k + 1]]));
+            }
+        }
         3 => {
             let rb = (d + 3) / 4;
             let q = &embed.q4[tok * rb..(tok + 1) * rb];
@@ -303,6 +333,112 @@ pub fn embed_row(embed: &QTensor, tok: usize, out: &mut [f32]) {
             }
         }
         other => panic!("embed_row: unknown format {other}"),
+    }
+}
+
+#[cfg(test)]
+mod bf16_io_tier_tests {
+    use super::*;
+    use colibri_core::f32_to_bf16;
+
+    /// Build the same weight as an F32 tensor and a BF16 tensor.
+    fn pair(o: usize, i: usize, w: &[f32]) -> (QTensor, QTensor) {
+        let mut bytes = Vec::with_capacity(w.len() * 2);
+        for &v in w {
+            bytes.extend_from_slice(&f32_to_bf16(v).to_le_bytes());
+        }
+        (
+            QTensor {
+                fmt_code: 0,
+                o: o as i32,
+                i: i as i32,
+                qf: w.to_vec(),
+                ..Default::default()
+            },
+            QTensor {
+                fmt_code: 2,
+                o: o as i32,
+                i: i as i32,
+                q4: bytes.into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The whole justification for the tier: for a weight that came from bf16, storing it
+    /// as bf16 instead of f32 must change *nothing* about the output — not "within a
+    /// tolerance", but bit-for-bit. A tolerance-based assert here would pass just as
+    /// happily on a genuinely lossy format and quietly retire the exactness claim.
+    #[test]
+    fn bf16_matmul_is_bit_identical_to_f32() {
+        let (o, i, s) = (7usize, 40usize, 3usize);
+        // Values that are exactly representable in bf16 (they came from bf16), which is
+        // the case this tier is built for.
+        let w: Vec<f32> = (0..o * i)
+            .map(|k| colibri_core::bf16_to_f32(f32_to_bf16(((k as f32) * 0.37).sin())))
+            .collect();
+        let x: Vec<f32> = (0..s * i).map(|k| ((k as f32) * 0.11).cos()).collect();
+        let (wf, wb) = pair(o, i, &w);
+
+        let mut yf = vec![0f32; s * o];
+        let mut yb = vec![0f32; s * o];
+        matmul_qt(&mut yf, &x, &wf, s);
+        matmul_qt(&mut yb, &x, &wb, s);
+        assert_eq!(
+            yf.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            yb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "BF16 IO tier must be bit-identical to F32 for a bf16-representable weight"
+        );
+    }
+
+    /// bf16 has no per-row scale. `QTensor::s` is empty, and every consumer must go
+    /// through the format check rather than reading it — this is the CPU-side twin of the
+    /// CUDA `has_row_scale` fix, and it would panic on an out-of-bounds index if some arm
+    /// still assumed a scale exists.
+    #[test]
+    fn bf16_needs_no_row_scale() {
+        let (o, i) = (4usize, 8usize);
+        let w: Vec<f32> = (0..o * i).map(|k| k as f32 * 0.5).collect();
+        let (_, wb) = pair(o, i, &w);
+        assert!(wb.s.is_empty());
+        let mut y = vec![0f32; o];
+        matmul_qt(&mut y, &vec![1f32; i], &wb, 1);
+        // Row sums, unscaled — a spurious scale multiply would not produce these.
+        for row in 0..o {
+            let want: f32 = w[row * i..(row + 1) * i].iter().sum();
+            assert_eq!(y[row], want);
+        }
+        assert_eq!(colibri_core::QFormat::from_code(2).unwrap().has_row_scale(), false);
+    }
+
+    /// `qt_row_dequant` and `embed_row` are separate decoders of the same bytes; both are
+    /// live for a bf16 tensor (`lm_head` and the embedding share this tier), so they must
+    /// agree with the values that went in.
+    #[test]
+    fn bf16_row_decoders_round_trip() {
+        let (o, i) = (5usize, 16usize);
+        let w: Vec<f32> = (0..o * i)
+            .map(|k| colibri_core::bf16_to_f32(f32_to_bf16((k as f32) * 0.013 - 0.4)))
+            .collect();
+        let (_, wb) = pair(o, i, &w);
+        for row in 0..o {
+            assert_eq!(qt_row_dequant(&wb, row), &w[row * i..(row + 1) * i]);
+            let mut e = vec![0f32; i];
+            embed_row(&wb, row, &mut e);
+            assert_eq!(e, &w[row * i..(row + 1) * i]);
+        }
+    }
+
+    /// Resident-byte accounting drives the RAM guard and the coverage number every
+    /// dispatch decision keys off. A format the accounting does not know contributes
+    /// ZERO bytes (the `_ => 0` arm), which reads as "free" and would silently overcommit.
+    #[test]
+    fn bf16_bytes_are_accounted() {
+        let (o, i) = (5usize, 16usize);
+        let w: Vec<f32> = vec![0.25; o * i];
+        let (wf, wb) = pair(o, i, &w);
+        assert_eq!(wb.bytes(), (o * i * 2) as i64);
+        assert_eq!(wb.bytes() * 2, wf.bytes(), "bf16 must be exactly half of f32");
     }
 }
 

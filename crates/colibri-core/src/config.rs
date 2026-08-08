@@ -70,6 +70,46 @@ pub enum Arch {
     /// Dense/resident weights are fp8 e4m3 with **128x128** E8M0 block scales — a third
     /// scale layout, neither NVFP4's `ceil(I/16)` nor MXFP4's `ceil(I/32)`.
     DeepseekV4,
+    /// Maple (`deepgrove/maple-preview`): the GQA family again — 16Q/4KV, `head_dim` 128,
+    /// partial RoPE 64, per-layer QK-norm, clamped SwiGLU, 256 experts top-8, no shared
+    /// expert, all-MoE — so it reuses M2/M3's attention and MoE paths. Three things are
+    /// its own, and all three are correctness-critical:
+    ///
+    /// 1. **A softmax router**, not sigmoid+bias. Selection is unaffected (softmax is
+    ///    monotone), but the *weights* are not: renormalising the chosen softmax scores
+    ///    is `exp(z_i) / Σ_{j∈S} exp(z_j)`, which is a softmax over the top-k logits
+    ///    alone. See [`RouterScore`] — and note `sigmoid_route` is NOT that switch.
+    /// 2. **A 3:1 sliding/full attention interleave** (`layer_swa`): 18 of 24 layers see
+    ///    only the last [`Config::swa_window`] (512) keys. This is architectural, not a
+    ///    retrofit — the negative recorded for bolting SWA onto GLM does not apply.
+    /// 3. **NoPE on the global layers** ([`Config::nope_on_global`]): the reference
+    ///    applies RoPE *only* when a layer has a sliding window
+    ///    (`modeling_maple.py`, `MapleAttention::forward`), so the 6 full-attention
+    ///    layers carry no positional encoding at all.
+    ///
+    /// Every expert and attention projection in the released checkpoint is **exactly
+    /// per-row ternary** — `{-s, 0, +s}` with one BF16 scale per output row — so they
+    /// store as `fmt 3` int2 (`value = field - 2`, using only `{-1, 0, +1}`) **bit-for-bit**,
+    /// not approximately. The router, norms, embeddings and `lm_head` are genuinely dense
+    /// and are NOT ternary; converting them as if they were is silent quality loss.
+    Maple,
+}
+
+/// How a MoE router turns logits into the weights of the chosen experts.
+///
+/// This exists because [`Config::sigmoid_route`] is **not** the switch it appears to be:
+/// it is parsed from `scoring_func` and then consumed by nothing in the workspace, while
+/// `moe::route` applies `sigmoid` unconditionally. GLM carries `sigmoid_route == false`
+/// and runs the sigmoid path regardless — so "wiring up the existing flag" would silently
+/// change a shipped model's expert weights. Every pre-Maple arch is [`RouterScore::Sigmoid`]
+/// here by construction, which keeps them bit-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterScore {
+    /// `sigmoid(logit)`, selected on `sigmoid(logit) + bias`. Every arch before Maple.
+    Sigmoid,
+    /// `softmax(logit)` over all experts, then top-k, then renormalise over the chosen
+    /// set — algebraically a softmax over the top-k logits. No routing bias.
+    Softmax,
 }
 
 /// Per-layer mixer type for a hybrid architecture. Homogeneous arches leave
@@ -102,12 +142,19 @@ pub enum LayerKind {
 }
 
 impl Arch {
-    /// The GQA family (MiniMax M3/M2): standard q/k/v projections + a KV cache of
+    /// The GQA family (MiniMax M3/M2, Maple): standard q/k/v projections + a KV cache of
     /// `n_kv_heads`, as opposed to GLM's MLA latent attention + DSA indexer. The
     /// engine's attention/KV/loader paths branch on this rather than a specific
     /// variant so every GQA model shares one code path.
+    ///
+    /// **This is a closed set that a new arch does not join by default**, and the default
+    /// is the dangerous one: a `false` here sends a GQA model down the MLA path, which is
+    /// a build error nowhere and a wrong answer everywhere. Maple builds and runs with it
+    /// omitted. Whenever an `Arch` variant is added, this predicate and
+    /// [`Arch::routed_experts_are_latent`] both have to be revisited deliberately —
+    /// `matches!` gives no compiler help.
     pub fn is_gqa(&self) -> bool {
-        matches!(self, Arch::MinimaxM3 | Arch::MinimaxM2)
+        matches!(self, Arch::MinimaxM3 | Arch::MinimaxM2 | Arch::Maple)
     }
 
     /// Whether routed experts live in the low-rank `moe_latent` space rather than at
@@ -240,7 +287,34 @@ pub struct Config {
     pub window: i32,
     /// Sigmoid expert scoring with an additive routing bias (MiniMax-M3
     /// `scoring_func == "sigmoid"` + `e_score_correction_bias`); `false` = GLM.
+    ///
+    /// **Parsed but not consumed.** `moe::route` sigmoids unconditionally; the live
+    /// switch is [`Config::router_score`]. Kept because it records what the source
+    /// config said, but do not branch on it — see [`RouterScore`].
     pub sigmoid_route: bool,
+    /// How the router scores experts. See [`RouterScore`] for why this is a separate
+    /// axis from `sigmoid_route` rather than a use of it.
+    pub router_score: RouterScore,
+
+    // ---- Maple (sliding/full attention interleave) fields ----
+    // Homogeneous-attention arches leave `layer_swa` empty and `swa_window` 0.
+    /// Sliding-attention window in tokens (Maple `sliding_window`, 512). A layer with
+    /// [`Config::layer_is_swa`] attends only to the last `swa_window` keys, inclusive of
+    /// the query's own position.
+    ///
+    /// Deliberately NOT [`Config::window`], which is DeepSeek-V4's raw-KV **ring size** —
+    /// a memory-tier knob, not a mask. Two different quantities sharing one field is the
+    /// shape that made M2.7 look unstable for a week; they stay apart.
+    pub swa_window: i32,
+    /// Per-layer attention span, one entry per layer, from `layer_types`
+    /// (`sliding_attention` → `true`, `full_attention` → `false`). Empty means every
+    /// layer is full attention, which is every arch before Maple.
+    pub layer_swa: Vec<bool>,
+    /// Maple `nope_on_global_attention`: apply RoPE **only** on sliding layers, leaving
+    /// the full-attention layers with no positional encoding. Ask
+    /// [`Config::layer_uses_rope`] rather than combining this with `layer_swa` at the
+    /// call site.
+    pub nope_on_global: bool,
 
     // ---- Nemotron-H (hybrid Mamba2/GQA/latent-MoE) fields ----
     // (GLM/MiniMax leave `layer_kind` empty and the Mamba/latent fields at 0.)
@@ -471,6 +545,13 @@ impl Config {
             let t = r.get("text_config").unwrap_or(r);
             return Config::from_json_kimi(r, t);
         }
+        // Maple. Like the arms above, this MUST precede the M3 fallthrough — that one
+        // claims any config carrying a `text_config`. Maple carries none today, so it
+        // would currently land in `from_json_glm` and be parsed as MLA: wrong attention
+        // family entirely, and nothing would say so.
+        if model_type == Some("maple") || arch_is("MapleForCausalLM") {
+            return Config::from_json_maple(r);
+        }
         // MiniMax-M3 VL: hyperparameters nested under `text_config`.
         let is_m3 = model_type == Some("minimax_m3_vl") || r.get("text_config").is_some();
         if is_m3 {
@@ -548,6 +629,13 @@ impl Config {
             hc_eps: 0.0,
             window: 0,
             sigmoid_route: false,
+            // Pre-Maple arches: sigmoid scoring, no sliding/full interleave, RoPE on
+            // every layer. `RouterScore::Sigmoid` here (rather than deriving it from
+            // `sigmoid_route`) is what keeps these bit-identical — see `RouterScore`.
+            router_score: RouterScore::Sigmoid,
+            swa_window: 0,
+            layer_swa: Vec::new(),
+            nope_on_global: false,
             // Nemotron-H-only fields (unused by GLM).
             layer_kind: Vec::new(),
             mtp_layer_kind: Vec::new(),
@@ -759,6 +847,13 @@ impl Config {
             hc_eps: 0.0,
             window: 0,
             sigmoid_route: scoring == "sigmoid",
+            // Pre-Maple arches: sigmoid scoring, no sliding/full interleave, RoPE on
+            // every layer. `RouterScore::Sigmoid` here (rather than deriving it from
+            // `sigmoid_route`) is what keeps these bit-identical — see `RouterScore`.
+            router_score: RouterScore::Sigmoid,
+            swa_window: 0,
+            layer_swa: Vec::new(),
+            nope_on_global: false,
             // Nemotron-H-only fields (unused by MiniMax).
             layer_kind: Vec::new(),
             mtp_layer_kind: Vec::new(),
@@ -798,6 +893,191 @@ impl Config {
         Ok(c)
     }
 
+    /// Maple (`maple`) parse — a flat config, everything at the root.
+    ///
+    /// Shares the GQA family's geometry encoding with MiniMax: `qk_rope` is the rotary
+    /// sub-dimension and `qk_nope` the remainder, so the attention path needs no new
+    /// branch. Maple states the split as a **fraction** (`partial_rotary_factor` 0.5)
+    /// where MiniMax states it as an absolute `rotary_dim`, which is the only geometry
+    /// difference.
+    ///
+    /// What is genuinely Maple's, and what a reader should check against
+    /// `modeling_maple.py` rather than against another arch here:
+    ///
+    /// - **`num_experts`**, not MiniMax's `num_local_experts` and not GLM's
+    ///   `n_routed_experts`. All three name the same quantity.
+    /// - **`moe_intermediate_size` (512) is the expert width**, and `intermediate_size`
+    ///   (4096) describes a dense FFN this checkpoint does not contain — every layer is
+    ///   MoE (`first_dense == 0`) and there is no shared expert. Reading the wrong one
+    ///   sizes every expert 8x too wide.
+    /// - **The router is softmax**, with no `e_score_correction_bias`. See
+    ///   [`RouterScore`]; `scoring_func` is absent from this config entirely.
+    /// - **`layer_types`** gives the sliding/full interleave, and
+    ///   **`nope_on_global_attention`** makes the full layers positionless.
+    /// - **The activation is the clamped SwiGLU**, expressed as a bare
+    ///   `hidden_act: "silu"` plus hard-coded clamps in `MapleMLP.forward`
+    ///   (`gate` clamped above at 7.0, `up` clamped to [-7, 7]) — NOT the `swigluoai`
+    ///   spelling, and with no `swiglu_alpha` sigmoid gate. That is exactly V4's variant,
+    ///   so it sets `swiglu_oai: false` with `swiglu_limit: 7.0`, matching
+    ///   `from_json_deepseek_v4`. Taking `hidden_act` at face value and running a plain
+    ///   SiLU silently drops both clamps.
+    fn from_json_maple(r: &Json) -> Result<Config, ConfigError> {
+        let gi = |k: &str| gi_in(r, k);
+
+        let n_heads = gi("num_attention_heads");
+        let head_dim = {
+            let hd = gi("head_dim");
+            if hd > 0 {
+                hd
+            } else if n_heads > 0 {
+                gi("hidden_size") / n_heads
+            } else {
+                0
+            }
+        };
+        // Partial RoPE as a fraction of head_dim. The reference derives the rotary width
+        // from `cos.shape[-1]`, which is `2 * len(inv_freq)` and works out to
+        // `head_dim * partial_rotary_factor` — 64 here.
+        let frac = r
+            .get("partial_rotary_factor")
+            .and_then(Json::as_f64)
+            .unwrap_or(1.0);
+        let rotary_dim = ((head_dim as f64) * frac) as i32;
+
+        let n_layers = gi("num_hidden_layers");
+        let nlc = (n_layers.max(0) as usize).min(MAX_LAYERS_IDX);
+        // `layer_types` is authoritative. If it is absent, every layer is FULL attention:
+        // that is the conservative default (attend to everything) — the opposite guess
+        // would silently truncate context on a model that never asked for a window.
+        let layer_swa: Vec<bool> = match r.get("layer_types").and_then(Json::as_array) {
+            Some(arr) => (0..nlc)
+                .map(|i| arr.get(i).and_then(Json::as_str) == Some("sliding_attention"))
+                .collect(),
+            None => vec![false; nlc],
+        };
+        // A window only means anything if some layer actually uses one.
+        let swa_window = if layer_swa.iter().any(|b| *b) {
+            gi("sliding_window")
+        } else {
+            0
+        };
+
+        let mut c = Config {
+            hidden: gi("hidden_size"),
+            n_layers,
+            n_heads,
+            n_experts: gi("num_experts"),
+            topk: gi("num_experts_per_tok"),
+            moe_inter: gi("moe_intermediate_size"),
+            // No dense FFN anywhere in this checkpoint; `intermediate_size` describes one
+            // that does not exist. Left at 0 so a dense-FFN read fails loudly.
+            dense_inter: 0,
+            first_dense: 0,
+            q_lora: 0,
+            o_lora: 0,
+            o_groups: 0,
+            kv_lora: 0,
+            qk_nope: head_dim - rotary_dim,
+            qk_rope: rotary_dim,
+            qk_head: head_dim,
+            v_head: head_dim,
+            n_shared: r
+                .get("num_shared_experts")
+                .and_then(Json::as_i64)
+                .unwrap_or(0) as i32,
+            vocab: gi("vocab_size"),
+            max_ctx: gi("max_position_embeddings"),
+            n_group: 1,
+            topk_group: 1,
+            // `MapleGate.forward` divides the chosen scores by their sum unconditionally;
+            // `norm_topk_prob: true` in the config agrees.
+            norm_topk: true,
+            stop_ids: Vec::new(),
+            index_topk: 0,
+            index_nh: 0,
+            index_hd: 0,
+            index_block_size: 0,
+            index_topk_blocks: 0,
+            index_local_blocks: 0,
+            idx_type: Vec::new(),
+            eps: r.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
+            theta: r
+                .get("rope_theta")
+                .and_then(Json::as_f64)
+                .unwrap_or(10000.0) as f32,
+            attn_scale: if head_dim > 0 {
+                1.0 / (head_dim as f32).sqrt()
+            } else {
+                0.0
+            },
+            // No `routed_scaling_factor` in this config, and none in the reference —
+            // the renormalised softmax weights are used as-is.
+            routed_scale: 1.0,
+            arch: Arch::Maple,
+            n_kv_heads: gi("num_key_value_heads"),
+            shared_inter: 0,
+            qk_norm: r.get("use_qk_norm").and_then(Json::as_bool).unwrap_or(false),
+            gemma_norm: false,
+            // Clamped SwiGLU without the OAI sigmoid gate — V4's variant. See the note
+            // on this function.
+            swiglu_oai: false,
+            swiglu_alpha: 0.0,
+            swiglu_limit: 7.0,
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
+            n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            // NOT the sliding window — `window` is V4's raw-KV ring size. See `swa_window`.
+            window: 0,
+            // `scoring_func` is absent from this config; recorded as false to match, and
+            // unread either way.
+            sigmoid_route: false,
+            router_score: RouterScore::Softmax,
+            swa_window,
+            layer_swa,
+            nope_on_global: r
+                .get("nope_on_global_attention")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+            layer_kind: Vec::new(),
+            mtp_layer_kind: Vec::new(),
+            mamba_d_state: 0,
+            mamba_d_conv: 0,
+            mamba_n_heads: 0,
+            mamba_head_dim: 0,
+            mamba_n_groups: 0,
+            mamba_inter: 0,
+            mamba_chunk: 0,
+            moe_latent: 0,
+            relu2: false,
+            mamba_dt_min: 0.0,
+            situ: false,
+            situ_beta: 0.0,
+            situ_linear_beta: 0.0,
+            mla_nope: false,
+            kda_n_heads: 0,
+            kda_head_dim: 0,
+            kda_d_conv: 0,
+            attn_res_block_size: 0,
+        };
+
+        parse_stop_ids(r, &mut c.stop_ids);
+
+        c.validate_common()?;
+        ckr!("head_dim", head_dim, 1, 1 << 16);
+        ckr!("rotary_dim", rotary_dim, 1, head_dim);
+        ckr!("num_key_value_heads", c.n_kv_heads, 1, c.n_heads);
+        // 0 is legal (no sliding layers); a window that exists must be a real span.
+        ckr!("sliding_window", c.swa_window, 0, 1 << 24);
+        Ok(c)
+    }
+
     /// The MoE layers as `(count, index_of_one)`. The index is somewhere to probe a
     /// real expert on disk, to size one from its true on-disk format.
     ///
@@ -825,6 +1105,37 @@ impl Config {
                 (self.n_layers - self.first_dense).max(0) as usize,
                 self.first_dense.max(0) as usize,
             )
+        }
+    }
+
+    /// Does layer `i` attend only to the last [`Config::swa_window`] keys?
+    ///
+    /// `false` for every arch that leaves `layer_swa` empty, which is every arch before
+    /// Maple — so an out-of-range index reads as full attention, the conservative answer
+    /// (attend to everything) rather than the silently-truncating one.
+    pub fn layer_is_swa(&self, i: usize) -> bool {
+        self.swa_window > 0 && self.layer_swa.get(i).copied().unwrap_or(false)
+    }
+
+    /// Does layer `i` apply RoPE?
+    ///
+    /// Only Maple answers `false` anywhere, and only on its full-attention layers: the
+    /// reference gates `apply_rotary_pos_emb` on `self.sliding_window is not None`, so
+    /// "global" and "no positional encoding" are the same condition there. This is a
+    /// named predicate rather than `!nope_on_global || layer_is_swa(i)` at three call
+    /// sites, because the two that agree and the one that doesn't produce a model that
+    /// still generates fluent text — just positionally wrong.
+    pub fn layer_uses_rope(&self, i: usize) -> bool {
+        !self.nope_on_global || self.layer_is_swa(i)
+    }
+
+    /// The number of KV entries layer `i` can ever hold, given a context of `ctx` tokens.
+    /// Sliding layers are bounded by the window however long the context runs.
+    pub fn layer_kv_span(&self, i: usize, ctx: usize) -> usize {
+        if self.layer_is_swa(i) {
+            ctx.min(self.swa_window.max(0) as usize)
+        } else {
+            ctx
         }
     }
 
@@ -974,6 +1285,13 @@ impl Config {
             // softmax arm this bool selects between. Left false so it cannot silently take
             // the sigmoid path; the real scorer is a V4-specific one still to be written.
             sigmoid_route: false,
+            // Pre-Maple arches: sigmoid scoring, no sliding/full interleave, RoPE on
+            // every layer. `RouterScore::Sigmoid` here (rather than deriving it from
+            // `sigmoid_route`) is what keeps these bit-identical — see `RouterScore`.
+            router_score: RouterScore::Sigmoid,
+            swa_window: 0,
+            layer_swa: Vec::new(),
+            nope_on_global: false,
             // Homogeneous on the mixer axis: every layer is attention + MoE. The
             // heterogeneity in V4 is the Compressor (41/43) and Indexer (21/43), which are
             // sub-modules of attention rather than a different mixer, so `layer_kind`
@@ -1111,6 +1429,13 @@ impl Config {
             window: 0,
             sigmoid_route: t.get("moe_router_activation_func").and_then(Json::as_str)
                 == Some("sigmoid"),
+            // Pre-Maple arches: sigmoid scoring, no sliding/full interleave, RoPE on
+            // every layer. `RouterScore::Sigmoid` here (rather than deriving it from
+            // `sigmoid_route`) is what keeps these bit-identical — see `RouterScore`.
+            router_score: RouterScore::Sigmoid,
+            swa_window: 0,
+            layer_swa: Vec::new(),
+            nope_on_global: false,
             layer_kind,
             mtp_layer_kind: Vec::new(),
             mamba_d_state: 0,
@@ -1300,6 +1625,13 @@ impl Config {
             window: 0,
             // DeepSeek-style sigmoid router with an additive correction bias.
             sigmoid_route: true,
+            // Pre-Maple arches: sigmoid scoring, no sliding/full interleave, RoPE on
+            // every layer. `RouterScore::Sigmoid` here (rather than deriving it from
+            // `sigmoid_route`) is what keeps these bit-identical — see `RouterScore`.
+            router_score: RouterScore::Sigmoid,
+            swa_window: 0,
+            layer_swa: Vec::new(),
+            nope_on_global: false,
             layer_kind,
             mtp_layer_kind,
             mamba_d_state: gi("ssm_state_size"),
@@ -1470,6 +1802,158 @@ mod tests {
             }
         }"#;
         Json::parse(text).unwrap()
+    }
+
+    /// The real `deepgrove/maple-preview` config.json, trimmed only of fields no arch
+    /// reads (dropout rates, `transformers_version`, `auto_map`). `layer_types` is
+    /// verbatim: three sliding then one full, six times over.
+    fn maple_json() -> Json {
+        let text = r#"{
+            "architectures": ["MapleForCausalLM"],
+            "bos_token_id": 151643, "eos_token_id": 151645,
+            "head_dim": 128, "hidden_act": "silu", "hidden_size": 2048,
+            "intermediate_size": 4096,
+            "layer_types": [
+                "sliding_attention","sliding_attention","sliding_attention","full_attention",
+                "sliding_attention","sliding_attention","sliding_attention","full_attention",
+                "sliding_attention","sliding_attention","sliding_attention","full_attention",
+                "sliding_attention","sliding_attention","sliding_attention","full_attention",
+                "sliding_attention","sliding_attention","sliding_attention","full_attention",
+                "sliding_attention","sliding_attention","sliding_attention","full_attention"],
+            "max_position_embeddings": 131072, "max_window_layers": 24,
+            "moe_intermediate_size": 512, "moe_router_enable_expert_bias": false,
+            "nope_on_global_attention": true, "norm_topk_prob": true,
+            "num_attention_heads": 16, "num_experts": 256, "num_experts_per_tok": 8,
+            "num_hidden_layers": 24, "num_key_value_heads": 4, "num_shared_experts": 0,
+            "partial_rotary_factor": 0.5, "quantize": true, "rms_norm_eps": 1e-06,
+            "rope_scaling": null, "rope_theta": 10000, "router_dtype": "fp32",
+            "sliding_window": 512, "tie_word_embeddings": false,
+            "use_cache": true, "use_qk_norm": true, "use_rmsnorm": true,
+            "vocab_size": 151936
+        }"#;
+        Json::parse(text).unwrap()
+    }
+
+    #[test]
+    fn loads_maple_shape() {
+        let c = Config::from_json(&maple_json()).unwrap();
+        assert_eq!(c.arch, Arch::Maple);
+        assert_eq!(c.hidden, 2048);
+        assert_eq!(c.n_layers, 24);
+        assert_eq!(c.n_heads, 16);
+        assert_eq!(c.n_kv_heads, 4);
+        // partial_rotary_factor 0.5 of head_dim 128 -> 64 roped, 64 passed through.
+        assert_eq!(c.qk_head, 128);
+        assert_eq!(c.qk_rope, 64);
+        assert_eq!(c.qk_nope, 64);
+        assert_eq!(c.v_head, 128);
+        assert_eq!(c.n_experts, 256);
+        assert_eq!(c.topk, 8);
+        // The expert width is `moe_intermediate_size` (512). `intermediate_size` (4096)
+        // describes a dense FFN this checkpoint has none of — reading it sizes every
+        // expert 8x too wide, which loads and generates rather than failing.
+        assert_eq!(c.moe_inter, 512);
+        assert_eq!(c.dense_inter, 0);
+        // All-MoE, no shared expert.
+        assert_eq!(c.first_dense, 0);
+        assert_eq!(c.n_shared, 0);
+        assert_eq!(c.moe_layers(), (24, 0));
+        assert!(c.qk_norm);
+        assert!(!c.gemma_norm);
+        // Clamped SwiGLU without the OAI sigmoid gate, despite `hidden_act: "silu"`.
+        assert!(!c.swiglu_oai);
+        assert_eq!(c.swiglu_limit, 7.0);
+        assert!(c.norm_topk);
+        assert_eq!(c.stop_ids, vec![151645]);
+        assert!((c.attn_scale - 1.0 / (128f32).sqrt()).abs() < 1e-6);
+    }
+
+    /// The router axis is `router_score`, NOT `sigmoid_route` — which is parsed and read
+    /// by nothing. If someone ever wires the old flag up, GLM (false, yet running the
+    /// sigmoid path) breaks; this pins both halves of that.
+    #[test]
+    fn maple_routes_by_softmax_and_sigmoid_route_stays_dead() {
+        let m = Config::from_json(&maple_json()).unwrap();
+        assert_eq!(m.router_score, RouterScore::Softmax);
+        for (name, c) in [
+            ("glm", Config::from_json(&glm_json()).unwrap()),
+            ("minimax", Config::from_json(&minimax_json()).unwrap()),
+        ] {
+            assert_eq!(
+                c.router_score,
+                RouterScore::Sigmoid,
+                "{name} must keep the unconditional sigmoid `route()` applies today"
+            );
+        }
+    }
+
+    /// The 3:1 interleave, and the fact that RoPE tracks it. Layers 3, 7, 11, 15, 19, 23
+    /// are the global ones, and under `nope_on_global_attention` they carry no positional
+    /// encoding — a model that ropes them anyway still emits fluent text.
+    #[test]
+    fn maple_sliding_full_interleave_and_nope_on_global() {
+        let c = Config::from_json(&maple_json()).unwrap();
+        assert_eq!(c.swa_window, 512);
+        assert!(c.nope_on_global);
+        assert_eq!(c.layer_swa.len(), 24);
+        for i in 0..24 {
+            let global = i % 4 == 3;
+            assert_eq!(c.layer_is_swa(i), !global, "layer {i}");
+            assert_eq!(c.layer_uses_rope(i), !global, "layer {i} rope");
+        }
+        assert_eq!(c.layer_swa.iter().filter(|b| **b).count(), 18);
+
+        // A sliding layer's KV is bounded by the window however long the context; a
+        // global layer's is not. This is what makes 131k context cheap here.
+        assert_eq!(c.layer_kv_span(0, 131_072), 512);
+        assert_eq!(c.layer_kv_span(3, 131_072), 131_072);
+        assert_eq!(c.layer_kv_span(0, 100), 100, "window is a cap, not a floor");
+
+        // `swa_window` is not V4's raw-KV ring; they must not alias.
+        assert_eq!(c.window, 0);
+    }
+
+    /// Every pre-Maple arch must answer "full attention, roped" for every layer, so the
+    /// new per-layer predicates are inert on the shipped fleet.
+    #[test]
+    fn swa_predicates_are_inert_on_every_other_arch() {
+        for (name, c) in [
+            ("glm", Config::from_json(&glm_json()).unwrap()),
+            ("minimax", Config::from_json(&minimax_json()).unwrap()),
+        ] {
+            assert!(c.layer_swa.is_empty(), "{name}");
+            assert_eq!(c.swa_window, 0, "{name}");
+            assert!(!c.nope_on_global, "{name}");
+            for i in 0..(c.n_layers as usize) {
+                assert!(!c.layer_is_swa(i), "{name} layer {i}");
+                assert!(c.layer_uses_rope(i), "{name} layer {i}");
+                assert_eq!(c.layer_kv_span(i, 4096), 4096, "{name} layer {i}");
+            }
+        }
+    }
+
+    /// Maple carries no `text_config`, so without its own arm it lands in
+    /// `from_json_glm` and parses as MLA — a different attention family, silently.
+    #[test]
+    fn maple_is_not_swallowed_by_the_glm_fallthrough() {
+        let c = Config::from_json(&maple_json()).unwrap();
+        assert_eq!(c.arch, Arch::Maple, "must not fall through to GLM");
+        assert_eq!(c.kv_lora, 0, "GQA, not MLA: no latent KV");
+        assert_eq!(c.q_lora, 0);
+    }
+
+    /// `is_gqa` is a `matches!` over a closed set, so a new arch defaults OUT of it — and
+    /// the default is wrong for Maple in the silent direction: a GQA model routed down
+    /// the MLA path. Nothing in the build catches that, so it is pinned here.
+    #[test]
+    fn maple_is_in_the_gqa_family_and_not_latent_moe() {
+        let c = Config::from_json(&maple_json()).unwrap();
+        assert!(c.arch.is_gqa(), "Maple is q/k/v + a KV cache of n_kv_heads");
+        assert!(
+            !c.arch.routed_experts_are_latent(),
+            "Maple's experts are at model hidden (2048 -> 512), not in a moe_latent bottleneck"
+        );
+        assert_eq!(c.moe_latent, 0);
     }
 
     #[test]

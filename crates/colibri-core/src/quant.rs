@@ -7,11 +7,18 @@
 //! `fmt_code` checks elsewhere, not by this enum.
 
 /// Storage format of a quantized tensor. The discriminants match the C `fmt`
-/// field (0 F32, 1 INT8, 3 INT2 packed 4/byte).
+/// field (0 F32, 1 INT8, 2 BF16, 3 INT2 packed 4/byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QFormat {
     F32 = 0,
     Int8 = 1,
+    /// Raw bf16 in `q4`, 2 bytes/weight, **no per-row scale** — the values are already
+    /// real numbers, not codes. Used for the embedding / `lm_head` IO tier of a
+    /// checkpoint that is itself BF16: widening those to F32 doubles the bytes read per
+    /// decoded token and adds no information, because every stored value is exactly a
+    /// bf16. Decoding is a 16-bit left shift, so an f32-accumulating kernel produces
+    /// bit-identical results to the F32 tier.
+    Bf16 = 2,
     Int2 = 3,
 }
 
@@ -20,6 +27,7 @@ impl QFormat {
         match fmt {
             0 => Some(QFormat::F32),
             1 => Some(QFormat::Int8),
+            2 => Some(QFormat::Bf16),
             3 => Some(QFormat::Int2),
             _ => None,
         }
@@ -29,8 +37,22 @@ impl QFormat {
     pub fn bits(self) -> i32 {
         match self {
             QFormat::F32 => 32,
+            QFormat::Bf16 => 16,
             QFormat::Int8 => 8,
             QFormat::Int2 => 2,
+        }
+    }
+
+    /// Whether weights in this format carry a **per-row f32 scale** in `QTensor::s`.
+    ///
+    /// F32 and BF16 store real values and have none. Every quantized format does. This
+    /// exists as a named predicate because the equivalent inline test kept being written
+    /// as `fmt != 0` — which silently means "everything except F32 is scaled" and was
+    /// correct only while F32 was the sole unscaled format.
+    pub fn has_row_scale(self) -> bool {
+        match self {
+            QFormat::F32 | QFormat::Bf16 => false,
+            QFormat::Int8 | QFormat::Int2 => true,
         }
     }
 }
@@ -734,6 +756,7 @@ impl QTensor {
         match self.fmt_code {
             0 => n * 4,
             1 => n + self.o as i64 * 4,
+            2 => n * 2, // bf16: raw 2-byte values, no per-row scale
             4 => n + self.o as i64 * 4, // e4m3 fp8: 1 byte/weight + scales
             // NVFP4: ceil(I/2) nibbles + ceil(I/16) ue4m3 block scales per row + 1 global.
             5 => {
@@ -786,8 +809,27 @@ mod tests {
         assert_eq!(QFormat::Int8.bits(), 8);
         assert_eq!(QFormat::from_code(3), Some(QFormat::Int2));
         assert_eq!(QFormat::Int2.bits(), 2);
-        assert_eq!(QFormat::from_code(2), None); // int4 removed
+        // Code 2 was int4's, freed when int4 was removed, and is now bf16.
+        assert_eq!(QFormat::from_code(2), Some(QFormat::Bf16));
+        assert_eq!(QFormat::Bf16.bits(), 16);
         assert_eq!(QFormat::from_code(9), None);
+    }
+
+    #[test]
+    fn only_coded_formats_carry_row_scales() {
+        // The predicate that replaced `fmt != 0` at ~15 call sites. Pinned per variant so
+        // adding an unscaled format cannot re-open the trap by inheriting a default.
+        assert!(!QFormat::F32.has_row_scale());
+        assert!(!QFormat::Bf16.has_row_scale());
+        assert!(QFormat::Int8.has_row_scale());
+        assert!(QFormat::Int2.has_row_scale());
+    }
+
+    #[test]
+    fn bf16_bytes_are_half_of_f32() {
+        // bf16: O*I*2, no scale vector — the entire point of the IO tier.
+        assert_eq!(qt(2, 10, 20).bytes(), 10 * 20 * 2);
+        assert_eq!(qt(2, 10, 20).bytes() * 2, qt(0, 10, 20).bytes());
     }
 
     #[test]

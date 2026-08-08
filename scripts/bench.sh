@@ -70,10 +70,10 @@ suite_decode() {
   # coli emits one `[timing] decode tok N: X ms (Y tok/s)` line per generated token.
   # Steady-state = MEDIAN of the per-token rates (robust to the cold first tokens and
   # the ±40% expert-load cache spikes); `best` = the compute-floor token.
-  local meds=() toks=()
+  local meds=() toks=() heads=()
   mem_reset
   COLI_NGEN="$ngen" COLI_TIMING=1 "$COLI_BIN" gen "$CONTAINER" $PROMPT_TOKENS >/dev/null 2>&1 || true
-  local i out med best tok
+  local i out med best tok head
   for i in $(seq 1 "$REPS"); do
     out=$(COLI_NGEN="$ngen" COLI_TIMING=1 "$COLI_BIN" gen "$CONTAINER" $PROMPT_TOKENS 2>&1)
     local rates_all=()
@@ -81,10 +81,24 @@ suite_decode() {
     med=$(median "${rates_all[@]}")
     best=$(printf "%s\n" "${rates_all[@]}" | sort -n | tail -1)
     tok=$(field "$out" 'generated \(\d+ tok\): \K\[[0-9, ]+\]')
-    meds+=("$med"); toks+=("$tok")
+    # The per-token `decode tok N:` lines time `forward()` and STOP BEFORE `lm_head`, so
+    # `med` is a forward-pass rate, not a token rate. Pull the head cost off the steady-state
+    # line and report both — on Maple the head is ~30% of a token, and that gap once hid an
+    # entire regression (an f32-vs-int8 A/B read IDENTICAL here while serve showed 1.18x,
+    # because the one weight that differed was the one excluded).
+    head=$(grep -oP 'lm_head \K[0-9.]+' <<<"$out" | tail -1)
+    meds+=("$med"); toks+=("$tok"); heads+=("${head:-0}")
     printf "  run %d: decode median=%s tok/s  best=%s tok/s  (%d steps)\n" "$i" "$med" "${best:-NA}" "${#rates_all[@]}"
   done
-  printf "  MEDIAN across reps: %s tok/s\n" "$(median "${meds[@]}")"
+  local mmed mhead
+  mmed=$(median "${meds[@]}"); mhead=$(median "${heads[@]}")
+  printf "  MEDIAN across reps: %s tok/s   [forward only]\n" "$mmed"
+  # e2e is derived from the MEDIAN rate, not from gen's mean-based line, so it stays
+  # comparable to the forward-only figure printed directly above it.
+  awk -v m="$mmed" -v h="$mhead" 'BEGIN{
+    if (m>0) printf "  END-TO-END:         %.2f tok/s   [+ lm_head %.1f ms => %.1f ms/token]\n",
+      1000/(1000/m + h), h, 1000/m + h;
+  }'
   gate_tokens "${toks[@]}"
   mem_reset
 }

@@ -78,6 +78,49 @@ pub fn qt_load(shards: &Shards, name: &str, o: usize, i: usize, bits: u32) -> io
             ..Default::default()
         });
     }
+    // BF16 IO tier. A container may store the embedding / `lm_head` as a plain BF16
+    // safetensors tensor, and at `bits >= 16` it is kept in that form instead of being
+    // widened to F32 on the way in.
+    //
+    // The stored **dtype is the format tag** here — no `.qs` sidecar and no byte-count
+    // inference (the `.qs` branch below has to guess int8-vs-int2 from a length, which
+    // only works because those two disagree). BF16 and F32 tensors are self-describing,
+    // so there is nothing to guess.
+    //
+    // `bits >= 16` is what keeps this from changing any existing behaviour: the ordinary
+    // path loads an original HF checkpoint — every weight of which is BF16 — at 8 bits and
+    // must still runtime-quantize it. Only a caller that has explicitly asked for a
+    // 16-bit-or-better tier gets the raw bf16 back.
+    //
+    // Widening is pure loss here: an f32 built from a bf16 carries 16 zero mantissa bits,
+    // so it doubles both resident bytes and the per-token read while adding no
+    // information. `weight_at` sign-extends back to the identical f32 in-kernel, and the
+    // accumulation is f32 either way, so the logits are bit-identical.
+    if bits >= 16 {
+        if let Some(t) = shards.find(name) {
+            if t.dtype == colibri_core::DType::Bf16 {
+                let nb = o * i * 2;
+                if shards.nbytes(name) as usize != nb {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{name}: BF16 tensor is {} bytes, expected {nb} for [{o},{i}]",
+                            shards.nbytes(name)
+                        ),
+                    ));
+                }
+                let mut raw = vec![0u8; nb];
+                shards.read_raw(name, &mut raw)?;
+                return Ok(QTensor {
+                    fmt_code: 2,
+                    o: o as i32,
+                    i: i as i32,
+                    q4: raw.into(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
     let qs = format!("{name}.qs");
     if shards.has(&qs) {
         // Pre-quantized container: raw codes + separate f32 scales.

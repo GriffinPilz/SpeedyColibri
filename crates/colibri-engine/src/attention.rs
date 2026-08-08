@@ -309,7 +309,19 @@ pub fn attention_gqa(
     //   * RoPE: only the GQA family (M3/M2) applies partial rotary. Nemotron-H attention
     //     is NoPE — position comes from its Mamba2 layers — so the whole rotary step drops.
     let use_qk_norm = !l.q_norm.is_empty();
-    let use_rope = cfg.arch.is_gqa();
+    //   * NoPE per LAYER: Maple ropes only its sliding layers and leaves the six
+    //     full-attention ones with no positional encoding at all
+    //     (`MapleAttention::forward` gates `apply_rotary_pos_emb` on `sliding_window is
+    //     not None`). `layer_uses_rope` is `true` for every layer of every other arch, so
+    //     this is inert on the shipped fleet. Getting it wrong is invisible in a smoke
+    //     test: the model still produces fluent text, just positionally wrong.
+    let use_rope = cfg.arch.is_gqa() && cfg.layer_uses_rope(layer);
+    // Sliding attention: 0 = unwindowed (every layer of every other arch).
+    let win = if cfg.layer_is_swa(layer) {
+        cfg.swa_window as usize
+    } else {
+        0
+    };
     let _tr = std::time::Instant::now();
     for s in 0..s_len {
         let pos = pos_base + s;
@@ -376,6 +388,7 @@ pub fn attention_gqa(
             t_full,
             scale,
             gqa_kernel_mode(),
+            win,
         );
         // COLI_GQA_DEBUG=1: report the first few decode-shaped calls. `gpu_done=false`
         // here means the kernel DECLINED and the CPU core below silently ran anyway —
@@ -415,8 +428,13 @@ pub fn attention_gqa(
                         skeys.extend(lo..hi);
                     }
                 }
-                let nk = if sparse { skeys.len() } else { tk - st0 };
-                let key = |i: usize| if sparse { skeys[i] } else { st0 + i };
+                // Sliding attention shifts the dense range's LOWER bound: query `pos`
+                // sees `[max(st0, pos+1-win), tk)`. Applied here rather than to `tk` so
+                // the block-sparse path (which selects its own keys) is untouched — the
+                // two features are independent and no model uses both.
+                let lo = if win > 0 { st0.max(tk.saturating_sub(win)) } else { st0 };
+                let nk = if sparse { skeys.len() } else { tk - lo };
+                let key = |i: usize| if sparse { skeys[i] } else { lo + i };
                 scores.clear();
                 scores.resize(nk, 0.0);
                 for (i, sc) in scores.iter_mut().enumerate() {
@@ -1299,6 +1317,133 @@ mod tests {
             );
         }
         assert!(out2.iter().all(|v| v.is_finite()));
+    }
+
+    /// Sliding attention (Maple): a query must be UNABLE to see past the window, and a
+    /// global layer in the same model must still see everything.
+    ///
+    /// The test drives it by contradiction — change a token that lies outside the window
+    /// and the later query's output must not move; change one inside and it must. A
+    /// window that is silently ignored passes every shape and finiteness check, so the
+    /// only way to catch it is to make the dependency itself the assertion.
+    #[test]
+    fn sliding_window_bounds_what_a_query_can_see() {
+        let mut c = gqa_cfg();
+        // Two layers: 0 slides with a window of 2, 1 is global. `layer_uses_rope` is left
+        // true for both (nope_on_global is exercised separately) so this isolates the mask.
+        c.swa_window = 2;
+        c.layer_swa = vec![true, false];
+        c.nope_on_global = false;
+        let l = make_gqa_layer(&c);
+        let d = c.hidden as usize;
+        let s_len = 4;
+
+        let run = |layer: usize, x: &[f32]| {
+            let mut kv = KvCache::new(2, c.kv_lora as usize, c.qk_rope as usize, 8);
+            kv.enable_gqa(c.n_kv_heads as usize * c.qk_head as usize);
+            let mut out = vec![0f32; s_len * d];
+            attention_gqa(&c, &l, layer, &mut kv, x, s_len, 0, &mut out);
+            out
+        };
+
+        let base = vecf(s_len * d, 7);
+        // Perturb token 0. With window 2, query 3 sees only tokens {2, 3}.
+        let mut perturbed = base.clone();
+        for j in 0..d {
+            perturbed[j] += 1.0;
+        }
+
+        let a = run(0, &base);
+        let b = run(0, &perturbed);
+        let q3 = 3 * d;
+        for j in 0..d {
+            assert!(
+                (a[q3 + j] - b[q3 + j]).abs() < 1e-6,
+                "windowed layer: query 3 must not see token 0, differs at {j}"
+            );
+        }
+        // Query 1 DOES see token 0 (positions {0, 1}), so it must move — otherwise the
+        // test above would also pass on a model that ignores its whole input.
+        let q1 = 1 * d;
+        assert!(
+            (0..d).any(|j| (a[q1 + j] - b[q1 + j]).abs() > 1e-6),
+            "windowed layer: query 1 must still see token 0"
+        );
+
+        // The global layer sees everything, so query 3 must move.
+        let ga = run(1, &base);
+        let gb = run(1, &perturbed);
+        assert!(
+            (0..d).any(|j| (ga[q3 + j] - gb[q3 + j]).abs() > 1e-6),
+            "global layer: query 3 must see token 0"
+        );
+    }
+
+    /// `nope_on_global_attention`: RoPE is applied on sliding layers and NOT on global
+    /// ones.
+    ///
+    /// Compares layer 0 (sliding → roped) against layer 1 (global → NoPE) on the SAME
+    /// weights and the same input, with the window wide enough to mask nothing. The only
+    /// thing that then differs between the two calls is `use_rope`, so:
+    ///   * with `nope_on_global` ON  the two layers must disagree, and
+    ///   * with it OFF they must agree exactly.
+    /// The second half is what makes the first mean "rope" rather than "something".
+    ///
+    /// Note what this deliberately does NOT do: run one token at `pos_base > 0` against a
+    /// fresh cache. That state is not reachable in the engine — the query would attend to
+    /// unwritten zero rows — and it makes a correct NoPE layer look position-dependent.
+    #[test]
+    fn nope_applies_to_global_layers_only() {
+        let mut c = gqa_cfg();
+        c.swa_window = 64; // wider than S: masks nothing, so only rope can differ
+        c.layer_swa = vec![true, false];
+        let l = make_gqa_layer(&c);
+        let d = c.hidden as usize;
+        let s_len = 3;
+
+        let run = |c: &Config, layer: usize| {
+            let mut kv = KvCache::new(2, c.kv_lora as usize, c.qk_rope as usize, 8);
+            kv.enable_gqa(c.n_kv_heads as usize * c.qk_head as usize);
+            let x = vecf(s_len * d, 7);
+            let mut out = vec![0f32; s_len * d];
+            attention_gqa(c, &l, layer, &mut kv, &x, s_len, 0, &mut out);
+            out
+        };
+
+        c.nope_on_global = true;
+        let roped = run(&c, 0);
+        let nope = run(&c, 1);
+        assert!(
+            (0..s_len * d).any(|j| (roped[j] - nope[j]).abs() > 1e-6),
+            "with nope_on_global the global layer must skip RoPE and so differ from the sliding one"
+        );
+
+        // Same two layers with the flag off: rope everywhere, so they must now agree
+        // exactly. If they still differed, the assertion above would be proving nothing.
+        c.nope_on_global = false;
+        let a = run(&c, 0);
+        let b = run(&c, 1);
+        for j in 0..s_len * d {
+            assert!(
+                (a[j] - b[j]).abs() < 1e-6,
+                "without nope_on_global both layers rope; differ at {j}"
+            );
+        }
+        // And the roped-both result must match the earlier sliding layer, which was roped
+        // in both configurations — the flag must not have touched it.
+        for j in 0..s_len * d {
+            assert!((a[j] - roped[j]).abs() < 1e-6, "sliding layer changed at {j}");
+        }
+    }
+
+    /// Every other arch must be untouched: no window, rope everywhere.
+    #[test]
+    fn unwindowed_arches_are_unaffected_by_the_new_predicates() {
+        let c = gqa_cfg();
+        assert_eq!(c.swa_window, 0);
+        assert!(c.layer_swa.is_empty());
+        assert!(!c.layer_is_swa(0));
+        assert!(c.layer_uses_rope(0));
     }
 
     #[test]

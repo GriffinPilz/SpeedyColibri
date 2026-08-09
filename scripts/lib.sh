@@ -19,8 +19,69 @@ load_model() {
 model_names() { "$PY" "$HARNESS_DIR/model.py" list | awk '{print $1}' | paste -sd, -; }
 
 need_coli()      { [[ -x "$COLI_BIN" ]] || die "coli not found at $COLI_BIN — run scripts/build.sh (or set COLI_BIN)"; }
-need_container() { [[ -d "$CONTAINER" ]] || die "container missing: $CONTAINER (model '$COLI_MODEL' not materialized on this host)"; }
+# Strict: measurement paths must never turn into a download (see fetch_container below).
+# The message names the fix when the registry knows one, so "not materialized" is not a
+# dead end.
+need_container() {
+  [[ -d "$CONTAINER" ]] && return 0
+  local hint=""
+  [[ -n "${HF_REPO:-}" ]] && hint=" — fetch it with: scripts/fetch.sh $COLI_MODEL"
+  die "container missing: $CONTAINER (model '$COLI_MODEL' not materialized on this host)$hint"
+}
 need_source()    { [[ -d "$SOURCE" ]]    || die "source missing: $SOURCE (model '$COLI_MODEL')"; }
+
+# ---- materializing a container from the Hub -----------------------------------------
+#
+# `hf_repo` in the registry is the CONTAINER, not the upstream checkpoint, so this is a
+# download and never a conversion. The docker path has done this since the entrypoint was
+# written; the bare-metal scripts did not, so `scripts/serve.sh <model>` on a fresh host hit
+# `need_container` and stopped at "container missing" with no route forward — while the
+# README told the reader to convert a model that was already published ready-to-run.
+#
+# The CLI is looked up in $HOME/.local/bin too. `hf` installs there by default and that
+# directory is NOT on PATH under a non-interactive ssh (login shells source the profile that
+# adds it; `ssh host 'cmd'` does not). `command -v hf` therefore fails on exactly the hosts
+# this is most likely to run on.
+hf_cli() {
+  local c
+  c=$(command -v hf || command -v huggingface-cli) && { echo "$c"; return 0; }
+  for c in "$HOME/.local/bin/hf" "$HOME/.local/bin/huggingface-cli"; do
+    [[ -x "$c" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+# Download this model's container into $CONTAINER. Idempotent: `hf download` fetches only
+# what is missing or the wrong size, so re-running it verifies an existing directory instead
+# of re-transferring it.
+#
+# That holds for a container this host BUILT as well as one it downloaded, which is the case
+# that matters — running this against a 145 GB convert-built container would be expensive if
+# it did not. Measured 2026-08-08: a 55.7 MB shard placed by hand, with no
+# `.cache/huggingface` metadata beside it, re-downloaded in 0 s and 0 bytes off the wire.
+# Size match alone is enough for `hf` to skip it.
+fetch_container() {
+  local cli
+  [[ -n "${HF_REPO:-}" ]] || die "no hf_repo for '$COLI_MODEL' in scripts/models.toml — nothing to fetch"
+  cli=$(hf_cli) || die "no hf CLI found (tried PATH and ~/.local/bin) — pip install huggingface_hub"
+  # A container download is hundreds of GB on most of these models. Running one against the
+  # same NVMe a benchmark is reading does not merely add noise to that benchmark, it changes
+  # the quantity being measured — see the note on bench_lock_acquire above.
+  if bench_lock_held; then
+    die "a measurement is running (lock $BENCH_LOCK) — refusing to start a bulk download beside it"
+  fi
+  echo "[fetch] $COLI_MODEL: $HF_REPO -> $CONTAINER"
+  "$cli" download "$HF_REPO" --local-dir "$CONTAINER" >&2 || die "hf download failed for $HF_REPO"
+  [[ -f "$CONTAINER/config.json" ]] || die "downloaded $HF_REPO but $CONTAINER has no config.json"
+}
+
+# Container if present, download if not. Callers that SERVE use this; callers that MEASURE
+# use `need_container`, so a benchmark can never silently turn into a download.
+ensure_container() {
+  [[ -d "$CONTAINER" && -f "$CONTAINER/config.json" ]] && return 0
+  [[ -n "${HF_REPO:-}" ]] || die "container missing: $CONTAINER, and '$COLI_MODEL' has no hf_repo to fetch from"
+  fetch_container
+}
 
 # Reset memory state between benchmark arms.
 #

@@ -6,7 +6,7 @@
 #   docker/run-dgx.sh -h hf_xxxxxxxxxxxxxxxxxxxx -p 8080 -m m2.7
 #     -h <token>   Hugging Face token (first download only; also HF_TOKEN env)
 #     -p <port>    port to serve on                    (default 8080)
-#     -m <model>   nemotron | m2.7 | m3 | glm | k3 | v4  (or any org/repo)
+#     -m <model>   nemotron | m2.7 | m3 | glm | k3 | v4 | maple  (or any org/repo)
 #                  (default glm). Names come from scripts/models.toml, and each
 #                  resolves to a PREBUILT container — no conversion on a fresh host.
 #   With flags and no subcommand it runs `serve`.
@@ -56,6 +56,7 @@ model_canon() {
     glm|glm5.2|glm52)               echo "glm-5.2" ;;
     k3|kimi|kimi-k3)                echo "kimi-k3" ;;
     v4|deepseek|deepseek-v4|deepseek-v4-flash) echo "deepseek-v4-flash" ;;
+    maple|maple-preview)            echo "maple-preview" ;;
     *)                              echo "$1" ;;
   esac
 }
@@ -89,7 +90,7 @@ while [[ "${1:-}" == -[hpm] || "${1:-}" == --hf-token || "${1:-}" == --port || "
         if command -v python3 >/dev/null; then
           python3 "$here/../scripts/model.py" list 2>/dev/null | awk '{printf "[run-dgx]   %s\n", $1}' >&2
         fi
-        echo "[run-dgx] short forms: nemotron, m2.7, m3, glm, k3, v4 — or any org/repo" >&2
+        echo "[run-dgx] short forms: nemotron, m2.7, m3, glm, k3, v4, maple — or any org/repo" >&2
         exit 2
       fi
       case "$(model_canon "$2")" in

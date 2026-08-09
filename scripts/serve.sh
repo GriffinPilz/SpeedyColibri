@@ -3,14 +3,20 @@
 # paths — switch models by changing the name).
 #   Usage: scripts/serve.sh <model> [port]
 #   Env:   SERVE_PORT (default 8080), SERVE_DETACH=1 (background + wait for ready + exit),
-#          COLI_BIN, COLI_MODELS_ROOT.
+#          COLI_BIN, COLI_MODELS_ROOT, SERVE_NO_FETCH=1 (fail instead of downloading).
 # Foreground by default (Ctrl-C to stop). `coli serve` binds 0.0.0.0 only AFTER the
 # model is fully loaded, so a live listener == ready.
+#
+# A container that is not on this host is DOWNLOADED from the registry's `hf_repo` (which is
+# the container, not the upstream checkpoint — no conversion). Set SERVE_NO_FETCH=1 to get
+# the old hard failure instead; the benchmark scripts always take that path, so a
+# measurement can never quietly become a multi-hundred-GB transfer.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 [[ $# -ge 1 ]] || die "usage: scripts/serve.sh <model> [port]   (models: $(model_names))"
 
-load_model "$1"; need_coli; need_container
+load_model "$1"; need_coli
+if [[ "${SERVE_NO_FETCH:-0}" == "1" ]]; then need_container; else ensure_container; fi
 PORT="${2:-${SERVE_PORT:-8080}}"
 HOST="$(hostname 2>/dev/null || echo localhost)"
 

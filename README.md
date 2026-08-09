@@ -343,16 +343,12 @@ behaviour, and Maple sits at ~2300% of it, far outside the range the other six o
 
 ## 3 — How to run each model
 
-Every model is published as a ready-to-run container, so a fresh host downloads one instead
-of paying a multi-hour conversion. Maple can also just be re-converted — it is small enough
-that the whole pass takes ~25 s:
+**All seven are published as ready-to-run containers, so a fresh host downloads one instead
+of paying a conversion.** `hf_repo` in the registry is the container — the engine loads it
+directly, and nothing is converted at any point below.
 
 ```bash
-docker/run-dgx.sh -m nemotron -p 8080     # or: m2.7 · m3 · glm · k3 · v4
-
-# maple: convert once from the upstream BF16 checkpoint, then serve by name
-./target/release/coli convert /path/to/deepgrove/maple-preview /path/to/maple-container
-scripts/serve.sh maple-preview 8080
+docker/run-dgx.sh -m maple -p 8080        # or: nemotron · m2.7 · m3 · glm · k3 · v4
 ```
 
 Add `-h <hf_token>` (or set `HF_TOKEN`) on the **first** run only — it is needed to pull the
@@ -361,9 +357,16 @@ container, not to serve it.
 Without Docker, by registry name:
 
 ```bash
-scripts/serve.sh nemotron-3-super         # resolves the container, waits for listen
+scripts/fetch.sh maple-preview            # download the container (~5.9 GB)
+scripts/serve.sh maple-preview 8080       # …or just this: serve fetches what's missing
 scripts/model.py list                     # what's registered
 ```
+
+`serve.sh` downloads a container that isn't on the host; `fetch.sh` is the same download on
+its own, for when you want it to happen at a time you chose. Both are idempotent — over a
+complete directory they verify it, over an interrupted one they finish it. `SERVE_NO_FETCH=1`
+restores the old "container missing" failure. **The benchmark scripts never fetch**, so a
+measurement cannot quietly become a several-hundred-GB transfer.
 
 Then any OpenAI client:
 
@@ -376,6 +379,14 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -
 **One model per process** — which one loads is decided by the container you point at.
 `kimi-k3` wants `COLI_O_DIRECT=1` (1.09× prefill / 1.13× decode expert-load, tokens
 identical; off by default because it *loses* on GLM and the mechanism is unexplained).
+
+Converting from the upstream checkpoint is the other route, and it is only worth it if you
+want to change how the model is packed. Maple is the cheap one to try — ~25 s for the whole
+pass, though the source download is 40.4 GB against the container's 5.9:
+
+```bash
+scripts/convert.sh maple-preview          # registry paths + the model's convert_env
+```
 
 Build, the low-level `gen`/`genbatch` tools, and the repo layout are in
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Every `COLI_*` knob is in
@@ -401,8 +412,9 @@ would rather convert it yourself.
 | `kimi-k3` | [`Kanposer/Kimi-K3-speedy-colibri-mxfp4`](https://huggingface.co/Kanposer/Kimi-K3-speedy-colibri-mxfp4) | `unsloth/Kimi-K3` |
 | `maple-preview` | [`Kanposer/maple-preview-speedy-colibri-int2`](https://huggingface.co/Kanposer/maple-preview-speedy-colibri-int2) | [`deepgrove/maple-preview`](https://huggingface.co/deepgrove/maple-preview) |
 
-All seven containers are on the Hub. `scripts/models.toml` is the only registry —
-`run-dgx.sh` reads it rather than keeping its own copy.
+All seven containers are on the Hub, and `scripts/fetch.sh <model>` pulls any of them by
+registry name. `scripts/models.toml` is the only registry — `run-dgx.sh` and `fetch.sh` read
+it rather than keeping their own copies.
 
 ---
 

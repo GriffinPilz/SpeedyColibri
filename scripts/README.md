@@ -31,6 +31,7 @@ nowhere else. Quick checks: `model.py list`, `model.py path <name>`.
 | script | what |
 |---|---|
 | `build.sh` | Build+verify the CUDA `coli` binary (guards the silent CPU-only-binary trap). Model-agnostic. |
+| `fetch.sh <model>` \| `--all` | Download the model's ready-to-run **container** from its registry `hf_repo`. No conversion. |
 | `convert.sh <model>` | `coli convert` source → container using the model's registry paths + `convert_env`. |
 | `bench.sh <model> [suite]` | Benchmark battery. Suites: `prefill`, `decode`, `batch`, `serve`, `all` (default). |
 | `serve.sh <model> [port]` | Serve a model over HTTP (container from the registry). Foreground; `SERVE_DETACH=1` to background. |
@@ -87,17 +88,17 @@ SERVE_DETACH=1 scripts/serve.sh glm-5.2 8081     # second model, second port
 Decode is ~1.4 tok/s, so size `max_tokens` accordingly (64 ≈ 45 s).
 
 ### Bringing a model online before you can switch to it
-A registry entry only names a model; the container has to exist on the host. If
-`bench.sh`/`serve.sh` says *"container missing"*, materialize it first:
+A registry entry only names a model; the container has to exist on the host.
 
 ```bash
-# from its HF container (if the entry has hf_repo):
-huggingface-cli download "$(scripts/model.py get glm-5.2 hf_repo)" \
-  --local-dir "$(scripts/model.py path glm-5.2)"
-
-# …or convert it from the source checkpoint:
-scripts/convert.sh glm-5.2
+scripts/fetch.sh glm-5.2          # download the published container (no conversion)
+scripts/convert.sh glm-5.2        # …or build it from the source checkpoint
 ```
+
+`serve.sh` calls the fetch itself when the container is missing, so serving a model this
+host has never seen is one command. **`bench.sh` deliberately does not** — it still fails
+with *"container missing"* (now naming the `fetch.sh` line to run), because a benchmark that
+starts a bulk download is measuring the download.
 
 Point the whole registry at a different host/disk with `COLI_MODELS_ROOT=/other/path`;
 point a single model elsewhere by giving its `container`/`source` an absolute path.

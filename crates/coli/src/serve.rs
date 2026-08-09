@@ -21,7 +21,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use colibri_engine::{ExpertCache, KvCache, Model, ShardsExpertProvider};
 use colibri_json::Json;
@@ -511,6 +511,67 @@ fn mk_kv(model: &Model, max_t: usize) -> KvCache {
     KvCache::for_model(model, max_t)
 }
 
+/// Per-request stage timing. Off unless `COLI_SERVE_TIMING=1`, same convention as
+/// `COLI_TIMING` in the engine.
+///
+/// This exists because the serve column is a **32-token request rate**, so anything paid
+/// once per request is divided across only 32 tokens and shows up as a slower engine. The
+/// first 100 ms of that turned out to be the accept loop sleeping, and it was found by
+/// timing `GET /health` — a route with no model in it — rather than by reading the request
+/// path. What remains after that fix (51 ms on maple, 617 ms on nemotron, measured
+/// 2026-08-08) is still unattributed, and guessing at it from the source has a poor record
+/// in this repo. So: measure per stage, and let the numbers say which one it is.
+struct Stages {
+    on: bool,
+    start: Instant,
+    last: Instant,
+    marks: Vec<(&'static str, f64)>,
+}
+
+impl Stages {
+    fn new() -> Self {
+        let on = std::env::var("COLI_SERVE_TIMING").ok().as_deref() == Some("1");
+        let now = Instant::now();
+        Stages {
+            on,
+            start: now,
+            last: now,
+            marks: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        if !self.on {
+            return;
+        }
+        let now = Instant::now();
+        self.marks
+            .push((name, (now - self.last).as_secs_f64() * 1e3));
+        self.last = now;
+    }
+
+    /// One line per request. `total` is measured independently of the marks rather than
+    /// summed from them, so any stage that is not covered shows up as a gap instead of
+    /// being silently absorbed — the failure mode that made the head-cost figure wrong
+    /// twice.
+    fn report(&self, prompt_tokens: usize, gen_tokens: usize) {
+        if !self.on {
+            return;
+        }
+        let total = self.start.elapsed().as_secs_f64() * 1e3;
+        let summed: f64 = self.marks.iter().map(|(_, ms)| ms).sum();
+        let mut s = String::new();
+        for (n, ms) in &self.marks {
+            s.push_str(&format!("  {n} {ms:.2}"));
+        }
+        eprintln!(
+            "[serve][timing] prompt {prompt_tokens} tok, gen {gen_tokens} tok, \
+             total {total:.2} ms |{s}  (unaccounted {:.2})",
+            total - summed
+        );
+    }
+}
+
 /// Derive a display model id from the snapshot path (the HF repo dir name, or the
 /// leaf directory).
 fn model_id_from(snap: &str) -> String {
@@ -655,6 +716,7 @@ fn complete(
     chat: bool,
     ctx_len: usize,
 ) {
+    let mut stages = Stages::new();
     let req = match Json::parse(body) {
         Some(j) => j,
         None => {
@@ -670,6 +732,7 @@ fn complete(
         }
     };
 
+    stages.mark("json");
     let requested_max = obj
         .get("max_tokens")
         .and_then(|v| v.as_i64())
@@ -696,6 +759,7 @@ fn complete(
             }
         }
     };
+    stages.mark("tokenize");
     if ids.is_empty() {
         send_json(
             stream,
@@ -791,6 +855,7 @@ fn complete(
     // an admitted request looks the same as one that always fitted, and a client timeout
     // cannot distinguish "admitted and prefilling" from "queued" — which is precisely how
     // an earlier attempt to observe this mis-reported itself.
+    stages.mark("reserve_ram");
     let experts_after = colibri_engine::ram::manager()
         .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
         .unwrap_or(0);
@@ -899,7 +964,9 @@ fn complete(
             return;
         }
     };
+    stages.mark("admit");
     let mut kv = mk_kv(model, ids.len() + max_tokens);
+    stages.mark("kv_alloc");
 
     if stream_mode {
         stream_completion(
@@ -910,6 +977,8 @@ fn complete(
             stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv,
         );
     }
+    stages.mark("generate+send");
+    stages.report(ids.len(), max_tokens);
     drop(kv); // free the KV before the commitment that covers it
 }
 

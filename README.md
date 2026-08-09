@@ -19,11 +19,11 @@ fails loudly instead of being reported as a win.
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
 | **`maple-preview`** (20B-A1B) | 5.9 GB | **160.2 tok/s** (3.2 s) | **157.0 tok/s** (112.8 e2e) | **91.1 tok/s** |
-| **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **10.0 tok/s** |
-| **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **5.9 tok/s** |
+| **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **9.97 tok/s** |
+| **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **6.0 tok/s** |
 | **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
 | **`minimax-m3`** | 229 GB | **16.7 tok/s** (30.6 s) | **2.5 tok/s** | **2.6 tok/s** |
-| **`glm-5.2`** (744B) | 403 GB | **6.9 tok/s** (74.6 s) | **0.9 tok/s** | **0.84 tok/s** |
+| **`glm-5.2`** (744B) | 403 GB | **6.9 tok/s** (74.6 s) | **0.9 tok/s** | **0.92 tok/s** |
 | **`kimi-k3`** (1.5T) | 1.4 TB | **1.8 tok/s** (4.6 min) | **0.35 tok/s** | — |
 
 Measured 2026-08-07 on branch `ffn-devcopy-coverage-gate`, which is ahead of `main`. All 15
@@ -48,6 +48,14 @@ Maple's 91.1 is `52 ms + 9.36 ms x 32 tok`; the 9.36 is the same engine the deco
 measures, and `bench_serve.py` now prints the split so the two columns can be reconciled
 instead of guessed at. That number was **70.5** until the accept loop stopped napping
 100 ms between connections — below.
+
+**All six serve figures were re-measured 2026-08-08 after that fix, and only Maple moved.**
+That is the expected shape, not a disappointment: the ~100 ms is a constant, so it is 24% of
+Maple's request and 0.3% of GLM's. m2.7 went 5.9 → 6.0 (+1.9%, close to the ~2% predicted
+from its token cost), v4 4.4 → 4.38 and m3 2.6 → 2.60 — both flat. **GLM read 0.84 → 0.92,
+and that is NOT the fix**: its own 12 prompts spread 0.73–1.24 tok/s in the same run, so 0.84
+sits inside the noise of 0.92. K3 was not re-run; its suite takes hours and it would gain
+0.1%.
 
 **The biggest single win came from the phase nobody was looking at.** Everything above about
 Maple concerns the expert path, because that is where a short-context profile said the time
@@ -151,6 +159,25 @@ TCP connect at 0.1 ms. Waiting on the socket with `poll` instead of on the clock
 bounded shutdown check and removes the latency: **`/health` 63–97 → 0.09 ms**, a 1-token
 request **152.5 → 50.9 ms**, and Maple's serve median **70.5 → 91.1 tok/s**. Every model
 gains the same ~100 ms; only a model whose token costs 8 ms notices.
+
+**What is left of the per-request cost is a SHORT PREFILL, and the expert path declines to
+group it.** With the nap gone, a request still pays a fixed 51 ms on Maple before the
+per-token rate applies — and 270 (m2.7), 472 (m3), 575 (v4), 617 (nemotron), 941 (GLM).
+`COLI_SERVE_TIMING=1` marks every stage of a request, and the answer is not where reading
+the code suggested: JSON, tokenize, `reserve_ram`, ledger admission and KV allocation
+together cost **0.08 ms**. All of it is inside generation, and the engine's own per-request
+counters localize it further — for a 5-token prompt, **moe 38.4 ms** against 2.6 ms for a
+one-row decode step, fifteen times the cost for five times the rows.
+
+The cause is a gate doing exactly what it says. `try_expert_group_int2_decode` requires
+*one row per expert, all the same token*; a 5-token prefill routes each expert a different
+row set, so it declines and the per-expert path runs ~30–40 launch triples per layer across
+24 layers. At the ~38 µs per dispatch already measured for this model, ~800–960 dispatches
+is 30–36 ms — which is the 38 ms. The gate was written against prefill at 512 tokens, where
+per-dispatch overhead is ~12% and grouping does not pay; at 5 tokens there is almost no work
+to hide it behind and the overhead is nearly all of it. **The right gate is rows-per-expert,
+not prefill-versus-decode** — the same lesson as three earlier expert-path defaults. Not yet
+fixed: a multi-row grouped kernel is a real change, not a threshold edit.
 
 **Verified against the reference implementation.** Maple's own `modeling_maple.py` was run
 unmodified (only `fa3.py` swapped for an SDPA-backed equivalent, since the published one

@@ -268,6 +268,8 @@ pub fn attention_gqa(
     // separate synchronized GPU dispatch (~25% of decode across q/k/v/o × 60 layers). The
     // separate-proj path is the fallback for unit tests that build q/k/v_proj directly.
     let _tp = std::time::Instant::now();
+    // Pooled — see `AttnScratch`. The bindings stay owned `Vec<f32>`, so every use site
+    // below is unchanged; only where they come from and where they go changes.
     let mut q = vec![0f32; s_len * h * hd];
     let mut k = vec![0f32; s_len * kv_dim];
     let mut v = vec![0f32; s_len * kv_dim];
@@ -389,11 +391,26 @@ pub fn attention_gqa(
     //      `profile_on()`, both `Instant` + `as_micros()`), and truncation across ~300 calls
     //      per prefill is under a millisecond.
     //
-    // What is left: every remaining untimed statement here is scalar setup, so the time is
-    // not attributable to a line. The one hypothesis not yet tested is an EXIT PATH that
-    // skips `atime(CORE)`/`atime(OPROJ)` — time inside `ATTN_US` that no sub-timer can ever
-    // reach. Settle it by bracketing the whole function body and differencing, not by
-    // another bisect: the wall-keyed one already landed on 750fd10 and would again.
+    // ANSWERED, and then the answer turned out not to be the regression. Bracketing the
+    // whole body settled where: `body` matches the sub-timer sum EXACTLY (6246 vs 6246),
+    // so `attn - body` = 786/714 ms is OUTSIDE the body, where the only thing that happens
+    // is the locals being dropped. Moving `drop(ctx)` inside cut it to 339/349, confirming
+    // the frees. Per layer call that is ~55 MB (q 16.8, qkv_out ~18.9, ctx 16.8, k/v ~1.05
+    // each) and ~3.3 GB over 60 layers, each past `mallopt`'s 2 MB mmap threshold.
+    //
+    // **BUT REMOVING THEM BUYS NOTHING.** Pooling all five buffers in a thread-local — token
+    // gates identical on m3, m2.7, maple and nemotron — measured NEUTRAL on m3 prefill:
+    // 30206.6/30803.7 unpooled vs 30167.8/30942.6 pooled, alternating, medians of 3. That
+    // is 0.16% the wrong way, inside each arm's ~700 ms spread. So the pooling was NOT
+    // shipped.
+    //
+    // The frees are real CPU time and OFF THE CRITICAL PATH: expert-load is 12.5-16 s of a
+    // 30 s prefill, so the CPU has slack and freeing memory overlaps async GPU work. A
+    // phase timer measures CPU wall, which is why it saw them at all.
+    //
+    // So the ~700 ms hole is explained and the 2.9% WALL GAP VS JULY IS STILL NOT. Do not
+    // re-derive the gap from this number — they are not the same thing, and treating them
+    // as one is the mistake this comment exists to prevent.
     let st0 = kv.kv_start[layer];
     let _tx = std::time::Instant::now();
     let mut ctx = vec![0f32; s_len * h * hd];
@@ -499,9 +516,8 @@ pub fn attention_gqa(
     let _to = std::time::Instant::now();
     matmul_qt(out, &ctx, &l.o, s_len);
     atime(&crate::forward::ATTN_OPROJ_US, _to);
-    // Drop the big locals INSIDE the body bracket. They are freed at the closing brace
-    // otherwise — inside `timed(&ATTN_US, ..)` but outside every sub-timer, which is
-    // exactly where ~750 ms was hiding.
+    // `drop(ctx)` inside the bracket, so `body` accounts for the largest free rather than
+    // leaving it outside every timer. It costs nothing — see the retraction above.
     drop(ctx);
     atime(&crate::forward::ATTN_BODY_US, _tb);
 }

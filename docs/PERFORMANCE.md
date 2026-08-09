@@ -41,9 +41,12 @@ resource the previous one used. That reframes the remaining work:
   running the shared expert during the routed experts' disk wait — hides 100% of its cost
   and is still a **15× loss**, because concurrent GPU work from a second thread takes an
   illegal memory access and a sticky CUDA error drops every expert to the CPU.
-- **The bandwidth ceiling is MEASURED, not quoted.** `coli gpubench` streams a 1 GiB device
-  buffer with a do-nothing read kernel and gets **257 GB/s** — 94% of the GB10's 273 GB/s
-  paper figure. Compare every achieved GB/s to that, not to the spec sheet. It also times
+- **There are THREE memory tiers, and mixing them misreads everything.** `coli gpubench`
+  measures all three with the same do-nothing read kernel: a **device** read is **256 GB/s**
+  (94% of the GB10's 273 GB/s paper figure), a kernel reading **host memory in place** is
+  **161 GB/s**, and a **pageable H2D copy** is **44 GB/s**. That ordering is why zero-copy
+  KV won: it replaced (copy at 44 + device read) with a single host read at 161. Quote an
+  achieved GB/s against the tier the code actually uses. Compare every achieved GB/s to that, not to the spec sheet. It also times
   `lm_head` [151936, 2048] in isolation: **bf16 250 GB/s (98% of ceiling)**, f32 262, int8
   199. The output projection has no kernel headroom left; see
   [the BF16 IO tier](#the-bf16-io-tier).

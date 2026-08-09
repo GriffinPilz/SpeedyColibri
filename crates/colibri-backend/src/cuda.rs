@@ -43,6 +43,7 @@ extern "C" {
     ) -> c_int;
     fn coli_cuda_device_sync(device: c_int) -> c_int;
     fn coli_cuda_h2d_bandwidth(device: c_int, bytes: usize, reps: c_int, best_ms: *mut f64) -> c_int;
+    fn coli_cuda_zc_bandwidth(device: c_int, bytes: usize, reps: c_int, best_ms: *mut f64) -> c_int;
 
     fn coli_cuda_tensor_upload(
         tensor: *mut *mut ColiCudaTensor,
@@ -390,6 +391,21 @@ pub fn h2d_gbs(bytes: usize, reps: i32) -> Option<f64> {
     let mut ms = 0f64;
     // SAFETY: `ms` is a live local; the callee owns both its host and device buffers.
     let ok = unsafe { coli_cuda_h2d_bandwidth(0, bytes, reps, &mut ms as *mut f64) };
+    if ok == 0 || ms <= 0.0 {
+        return None;
+    }
+    Some(bytes as f64 / (ms / 1e3) / 1e9)
+}
+
+/// Kernel streaming-read of pageable HOST memory, GB/s. `None` if unavailable.
+///
+/// The third memory tier, and the one decode attention reads on now that the KV cache is
+/// zero-copy. Device read, H2D copy and in-place host read are three different numbers;
+/// quoting attention's achieved GB/s against the wrong one misreads it entirely.
+pub fn zc_gbs(bytes: usize, reps: i32) -> Option<f64> {
+    let mut ms = 0f64;
+    // SAFETY: `ms` is a live local; the callee owns its host allocation.
+    let ok = unsafe { coli_cuda_zc_bandwidth(0, bytes, reps, &mut ms as *mut f64) };
     if ok == 0 || ms <= 0.0 {
         return None;
     }

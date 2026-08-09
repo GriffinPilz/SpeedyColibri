@@ -625,6 +625,36 @@ extern "C" int coli_cuda_h2d_bandwidth(int device, size_t bytes, int reps, doubl
     return 1;
 }
 
+/* Streaming read of PAGEABLE HOST memory by a kernel — the tier the decode attention now
+ * lives on, since it reads the KV cache zero-copy instead of copying it in.
+ *
+ * This is a third tier, distinct from both of the others, and conflating them misreads every
+ * attention number: a device read is ~256 GB/s, a pageable H2D copy ~43 GB/s, and a kernel
+ * reading host memory in place is neither. Without it there is no honest denominator for
+ * "attention achieves N GB/s". */
+extern "C" int coli_cuda_zc_bandwidth(int device, size_t bytes, int reps, double *best_ms) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx) || bytes < (1u << 20) || reps < 1 || !best_ms) return 0;
+    if (!coli_cuda_pageable_access(device)) return 0;
+    size_t n4 = bytes / sizeof(uint4);
+    void *host = std::malloc(n4 * sizeof(uint4));
+    if (!host) return 0;
+    std::memset(host, 1, n4 * sizeof(uint4));   // fault the pages in; measure reads, not faults
+    double best = 1e30;
+    for (int r = 0; r < reps + 1; r++) {
+        cudaDeviceSynchronize();
+        auto t0 = std::chrono::steady_clock::now();
+        stream_read<<<4096, 256>>>((float *)host, (const uint4 *)host, n4, 0xFFFFFFFFu);
+        if (!cuda_ok(cudaDeviceSynchronize(), "zc bandwidth run")) { std::free(host); return 0; }
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+        if (r && ms < best) best = ms;
+    }
+    std::free(host);
+    *best_ms = best;
+    return 1;
+}
+
 extern "C" int coli_cuda_bandwidth(int device, size_t bytes, int reps, double *best_ms) {
     DeviceContext *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx) || bytes < (1u << 20) || reps < 1 || !best_ms) return 0;

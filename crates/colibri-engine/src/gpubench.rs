@@ -650,6 +650,11 @@ pub fn report(s: usize, reps: usize) {
     if let Some(h) = h2d_gbs_1mib() {
         println!("  pageable host->device copy (1 MiB)             = {h:.0} GB/s");
     }
+    // The tier decode attention reads on since the KV cache went zero-copy.
+    #[cfg(feature = "cuda")]
+    if let Some(z) = colibri_backend::cuda::zc_gbs(1 << 28, 5) {
+        println!("  kernel read of HOST memory, in place (256 MiB) = {z:.0} GB/s");
+    }
     println!();
     println!("  {:<10} {:>6} {:>6} {:>7} {:>10} {:>11} {:>9} {:>8}  {}", "shape", "O", "I", "fmt", "us/call", "over-floor", "MB", "GB/s", "on-gpu");
     for r in &rows {

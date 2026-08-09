@@ -38,6 +38,9 @@ COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_
 COLI_CUDA_DLLEXPORT int coli_cuda_bandwidth(int device, size_t bytes, int reps, double *best_ms);
 /* Pageable host->device copy bandwidth — the tier the attention KV upload actually uses. */
 COLI_CUDA_DLLEXPORT int coli_cuda_h2d_bandwidth(int device, size_t bytes, int reps, double *best_ms);
+/* Kernel streaming-read of PAGEABLE HOST memory — the tier zero-copy KV attention reads on.
+ * A third, distinct tier: device read != H2D copy != in-place host read. */
+COLI_CUDA_DLLEXPORT int coli_cuda_zc_bandwidth(int device, size_t bytes, int reps, double *best_ms);
 /* Drain queued GPU work. A measurement aid for phase attribution — not a fast path. */
 COLI_CUDA_DLLEXPORT int coli_cuda_device_sync(int device);
 /* device < 0 returns aggregate statistics for all configured devices. */

@@ -363,6 +363,36 @@ pub fn attention_gqa(
     // double-counts — which it did on first writing, inflating `core` by the alloc and
     // making the sub-timer sum look closer to `attn` than it is. The twin in
     // `attention_with_heads` allocates before its core timer, so only this path was wrong.
+    //
+    // ---- ~700 ms of `ATTN_US` IS STILL UNBRACKETED ON M3, AND HERE IS WHAT IT IS NOT ----
+    //
+    // `timed(&ATTN_US, ..)` wraps this function and nothing else, yet exceeds the sum of the
+    // sub-timers by 568-810 ms across eight runs (mean ~700) while the July binary leaves
+    // 3 ms, twice. It is the steadiest signal in this phase: `core` swings 868-1413 and
+    // `proj` spans 2266-3371 on July alone, so neither can be used to chase it.
+    //
+    // Eliminated, each by measurement rather than by reading:
+    //   1. the `ctx` allocation — 16.8 MB/call, 1.01 GB over 60 layers, and `mallopt` mmaps
+    //      anything past 2 MB. Predicted ~700 ms from that; it measures 118-209. Real cost,
+    //      ~20% of the hole, now its own `ctx-alloc` sub-timer.
+    //   2. `dsa-indexer` — genuinely 0 ms on m3, closing an assumption previously made from
+    //      code reading alone.
+    //   3. THE EXPERT PATH'S ASYNC TAIL. This file warns never to compare `attn` across arms
+    //      with different expert dispatch, so that warning was used as the test: switching
+    //      per-expert -> grouped zero-copy moved `attn` ~790 ms, and ALL of it landed in the
+    //      SUB-TIMERS (6667 -> 5960). The unaccounted remainder held at 778 vs 698, arms
+    //      overlapping. The tail is real and lands in `proj`/`core`; it is not this.
+    //   4. `m3_block_select` above — the one function call in an untimed gap, and it returns
+    //      immediately unless COLI_M3_SPARSE=1, which is off by default.
+    //   5. a timer-mechanism asymmetry — `timed` and `atime` are identical (both gate on
+    //      `profile_on()`, both `Instant` + `as_micros()`), and truncation across ~300 calls
+    //      per prefill is under a millisecond.
+    //
+    // What is left: every remaining untimed statement here is scalar setup, so the time is
+    // not attributable to a line. The one hypothesis not yet tested is an EXIT PATH that
+    // skips `atime(CORE)`/`atime(OPROJ)` — time inside `ATTN_US` that no sub-timer can ever
+    // reach. Settle it by bracketing the whole function body and differencing, not by
+    // another bisect: the wall-keyed one already landed on 750fd10 and would again.
     let st0 = kv.kv_start[layer];
     let _tx = std::time::Instant::now();
     let mut ctx = vec![0f32; s_len * h * hd];

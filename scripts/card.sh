@@ -109,7 +109,14 @@ while read -r line; do
   [[ -n "$n" ]] || continue
   # Skip a figure that is still current — only the superseded ones matter.
   case "$n" in "$PF_TPS"|"$DEC_E2E"|"$DEC_FWD"|"$SRV") continue ;; esac
-  hits=$(grep -nF "$n" "$CARD" | grep -vE '^\s*[0-9]+:\| (prefill|decode|serving) \|' || true)
+  # `<!--hist-->` marks a line that cites an old number ON PURPOSE. This repo records
+  # superseded figures constantly — "it read X until Y" is how a correction is made legible —
+  # and without an opt-out the check fires on exactly the prose that is doing the right
+  # thing. Found by using it: the first real correction it gated was blocked by its own
+  # explanation of the correction.
+  hits=$(grep -nF "$n" "$CARD" |
+         grep -vE '^\s*[0-9]+:\| (prefill|decode|serving) \|' |
+         grep -vF '<!--hist-->' || true)
   if [[ -n "$hits" ]]; then
     [[ "$stale" == 0 ]] && echo "[card] STALE PROSE — these superseded numbers still appear outside the table:"
     stale=1

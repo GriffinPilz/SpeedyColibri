@@ -378,6 +378,21 @@ is the same mechanism the expert weights already use.
 Measured, n=5 per arm: **forward-only 129.9 → 158.1 tok/s (1.22×)**, end-to-end ~99.6 →
 ~112.8. Tokens identical, bit-exact by construction.
 
+**NEGATIVE, tried and reverted: sharing the KV read across a GQA group.** `kvh = h/(H/Hkv)`
+means four query-head blocks each read the same K/V rows, so decode attention issues ~203.6
+MB of reads where the cache holds 50.9 — a 4× amplification, and against the 161 GB/s
+host-read tier that put it at ~29% of ceiling. A variant giving one block per KV head, each
+lane loading an element once and doing `g` MACs with it (with `nsplit` multiplied by `g` so
+the block count did not collapse — the trap that cost the int2 wide read 38%), measured
+**NEUTRAL**: share 154.2/157.8 against per-head 161.4/140.7, ranges overlapping, tokens
+identical. Reverted.
+
+The lesson is about the metric, not the kernel: **an achieved-GB/s figure counts bytes
+*requested*, not bytes fetched from DRAM.** Those four blocks were already hitting cache, so
+the amplification existed in instruction count and not in traffic, and removing it bought
+nothing. A read-amplification argument needs a cache-miss measurement behind it, not an
+arithmetic one.
+
 **Honest caveat: it is less consistent than the upload.** Zero-copy spans 140–161 tok/s
 across runs against the upload's 129.6–132.9, and the first run after a build read 111.85
 before settling. Faster in six runs of seven. `COLI_GQA_ZEROCOPY=0` restores the uploads.

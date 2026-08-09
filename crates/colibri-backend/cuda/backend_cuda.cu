@@ -4790,13 +4790,6 @@ extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const 
     DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
     std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     size_t qb = (size_t)S * H * D * sizeof(float), kb = (size_t)T * Hkv * D * sizeof(float);
-    if (!reserve(&dc->aq, &dc->aq_cap, qb) || !reserve(&dc->al, &dc->al_cap, kb) ||
-        !reserve(&dc->ar, &dc->ar_cap, kb) || !reserve(&dc->ac, &dc->ac_cap, qb))
-        return 0;
-    if (!cuda_ok(cudaMemcpyAsync(dc->aq, q, qb, cudaMemcpyHostToDevice, dc->stream), "gqa q upload") ||
-        !cuda_ok(cudaMemcpyAsync(dc->al, k, kb, cudaMemcpyHostToDevice, dc->stream), "gqa k upload") ||
-        !cuda_ok(cudaMemcpyAsync(dc->ar, v, kb, cudaMemcpyHostToDevice, dc->stream), "gqa v upload"))
-        return 0;
     // DECODE (S==1): split the key range across blocks instead of giving the whole layer H.
     // Both kernels below are shaped for prefill and launch grid=(H,S) — 16 blocks on Maple —
     // and flash additionally wastes 15/16 of a GQA_QT=16-row query tile on a single row.
@@ -4806,6 +4799,30 @@ extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const 
     int nt1 = T;                                   // S==1 => the single query is at T-1
     int tt0 = (win > 0 && nt1 > win) ? nt1 - win : 0;
     int span = nt1 - tt0;
+    /* Read K/V straight out of host memory instead of copying them in first.
+     *
+     * The uploads below re-send the ENTIRE K and V history on every call: `T*Hkv*D*4` each,
+     * ~52.7 MB per decoded token at a 512-token context across 24 layers, when exactly one
+     * row changed since the previous token. Measured pageable H2D is 43 GB/s against
+     * 256 GB/s for a device read, so that is ~1.23 ms/token — a quarter of what attention
+     * now costs.
+     *
+     * The obvious fix is a device-resident KV appended one row at a time, and it is NOT what
+     * this does. A cached device copy has to be invalidated whenever the host rows change,
+     * and they do: a rejected MTP draft rewrites positions, and `serve` reuses a cache
+     * across requests. A device KV that silently goes stale is wrong output, not slow
+     * output, and this codebase has already shipped one pointer-keyed device cache that
+     * served the wrong bytes.
+     *
+     * Zero-copy has no such failure mode because there is no second copy to go stale: the
+     * kernel reads whatever the host most recently wrote. It is the same mechanism the
+     * expert weights already use, and it needs `cudaDevAttrPageableMemoryAccess` (true on
+     * GB10). COLI_GQA_ZEROCOPY=0 restores the uploads for A/B. */
+    static int s_kvzc = -1;
+    if (s_kvzc < 0) {
+        const char *e = getenv("COLI_GQA_ZEROCOPY");
+        s_kvzc = (!e || strcmp(e, "0") != 0) && coli_cuda_pageable_access(device);
+    }
     if (s_split && S == 1 && span > 0) {
         // Enough keys per split to keep a warp-per-key loop fed; more splits than that just
         // adds combine work and shrinks each block's slice below a warp's width.
@@ -4817,11 +4834,23 @@ extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const 
         size_t pn = (size_t)H * nsplit;
         size_t shS = (size_t)(D + per + tpb) * sizeof(float);
         if (shS <= 48u * 1024u &&
+            reserve(&dc->aq, &dc->aq_cap, qb) && reserve(&dc->ac, &dc->ac_cap, qb) &&
+            (s_kvzc || (reserve(&dc->al, &dc->al_cap, kb) && reserve(&dc->ar, &dc->ar_cap, kb))) &&
             reserve(&dc->asp, &dc->asp_cap, pn * D * sizeof(float)) &&
             reserve(&dc->asm_, &dc->asm_cap, pn * sizeof(float)) &&
             reserve(&dc->asl, &dc->asl_cap, pn * sizeof(float))) {
+            // q is one row (H*D floats, 8 KB) — always uploaded; it is not the cost here.
+            if (!cuda_ok(cudaMemcpyAsync(dc->aq, q, qb, cudaMemcpyHostToDevice, dc->stream), "gqa q upload"))
+                return 0;
+            const float *kdev = k, *vdev = v;      // zero-copy: the host pointers themselves
+            if (!s_kvzc) {
+                if (!cuda_ok(cudaMemcpyAsync(dc->al, k, kb, cudaMemcpyHostToDevice, dc->stream), "gqa k upload") ||
+                    !cuda_ok(cudaMemcpyAsync(dc->ar, v, kb, cudaMemcpyHostToDevice, dc->stream), "gqa v upload"))
+                    return 0;
+                kdev = dc->al; vdev = dc->ar;
+            }
             gqa_attn_split<<<dim3(H, nsplit), tpb, shS, dc->stream>>>(
-                dc->asp, dc->asm_, dc->asl, dc->aq, dc->al, dc->ar,
+                dc->asp, dc->asm_, dc->asl, dc->aq, kdev, vdev,
                 H, Hkv, D, tt0, nt1, nsplit, scale);
             gqa_attn_combine<<<H, tpb, 0, dc->stream>>>(dc->ac, dc->asp, dc->asm_, dc->asl,
                                                         D, nsplit);
@@ -4832,8 +4861,18 @@ extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const 
             return 1;
         }
         // Scratch or shared-memory budget refused: fall through to the original kernels
-        // rather than return 0, which the caller cannot tell from "no GPU".
+        // rather than return 0, which the caller cannot tell from "no GPU". They do their
+        // own reserve + upload below, so nothing here is left half-done.
     }
+    // Prefill / fall-through: these kernels index k and v by absolute position across all S
+    // queries, so they take the full history and cannot use the decode window trick above.
+    if (!reserve(&dc->aq, &dc->aq_cap, qb) || !reserve(&dc->al, &dc->al_cap, kb) ||
+        !reserve(&dc->ar, &dc->ar_cap, kb) || !reserve(&dc->ac, &dc->ac_cap, qb))
+        return 0;
+    if (!cuda_ok(cudaMemcpyAsync(dc->aq, q, qb, cudaMemcpyHostToDevice, dc->stream), "gqa q upload") ||
+        !cuda_ok(cudaMemcpyAsync(dc->al, k, kb, cudaMemcpyHostToDevice, dc->stream), "gqa k upload") ||
+        !cuda_ok(cudaMemcpyAsync(dc->ar, v, kb, cudaMemcpyHostToDevice, dc->stream), "gqa v upload"))
+        return 0;
     if (flash) {
         size_t shW = (size_t)GQA_QT * 8 * D;   // QA+KB (fp16, 4D) + acc (f32, 4D) per 16 rows
         if (!cuda_ok(cudaFuncSetAttribute(tc_gqa_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shW), "gqa flash shared attr")) return 0;

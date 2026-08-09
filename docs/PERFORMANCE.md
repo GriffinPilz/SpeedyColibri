@@ -355,11 +355,31 @@ that suite uses short prompts: few keys, `nsplit` → 1, kernel degenerates to t
 Prefill untouched (S>1 never takes this path). Nemotron 12.54 vs 12.68, tokens identical —
 neutral, as expected when decode is expert-streaming with 8 GQA layers.
 
-Still open on this path: `coli_cuda_gqa_attn` re-uploads the ENTIRE K and V history every
-call — ~52.7 MB per decoded token at a 512-token context, against a measured **43 GB/s**
-pageable H2D (vs 256 GB/s for a device read), so ~1.23 ms/token — when one row changed. The
-fix is a device-resident per-layer KV appended one row at a time; it was left alone here
-because a stale device KV is a silent-corruption risk this repo has already been bitten by.
+### Zero-copy KV, not a device KV cache — 2026-08-08
+
+`coli_cuda_gqa_attn` re-uploaded the ENTIRE K and V history every call: ~52.7 MB per decoded
+token at a 512-token context, against a measured **43 GB/s** pageable H2D (vs 256 GB/s for a
+device read) — ~1.23 ms/token, a quarter of attention after split-K, when exactly one row had
+changed.
+
+**The device-resident KV that everyone reaches for first was rejected on correctness, not
+performance.** It has to be invalidated whenever the host rows change, and they do: a
+rejected MTP draft rewrites positions, and `serve` reuses a cache across requests. A stale
+device KV is wrong output, not slow output — and this repo has already shipped a
+pointer-keyed device cache that served the wrong bytes (see the expert-weight incident).
+
+Zero-copy has no such failure mode: there is no second copy to go stale, so the kernel reads
+whatever the host last wrote. Needs `cudaDevAttrPageableMemoryAccess`, true on GB10, and it
+is the same mechanism the expert weights already use.
+
+Measured, n=5 per arm: **forward-only 129.9 → 158.1 tok/s (1.22×)**, end-to-end ~99.6 →
+~112.8. Tokens identical, bit-exact by construction.
+
+**Honest caveat: it is less consistent than the upload.** Zero-copy spans 140–161 tok/s
+across runs against the upload's 129.6–132.9, and the first run after a build read 111.85
+before settling. Faster in six runs of seven. `COLI_GQA_ZEROCOPY=0` restores the uploads.
+Prefill still uploads — it indexes k/v by absolute position across all S queries and cannot
+use the decode window.
 
 ### Short rows starve block-per-row kernels — 2026-08-08
 

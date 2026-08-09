@@ -18,7 +18,7 @@ fails loudly instead of being reported as a win.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`maple-preview`** (20B-A1B) | 5.9 GB | **155.2 tok/s** (3.3 s) | **131.4 tok/s** (98.9 e2e) | **69.8 tok/s** |
+| **`maple-preview`** (20B-A1B) | 5.9 GB | **160.2 tok/s** (3.2 s) | **157.0 tok/s** (112.8 e2e) | **70.5 tok/s** |
 | **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **10.0 tok/s** |
 | **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **5.9 tok/s** |
 | **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
@@ -36,11 +36,11 @@ because there isn't one.
 timer brackets `forward()` and stops before the `lm_head` matmul, so every decode figure in
 this table excludes the output projection. On the streaming models that is a rounding error
 (GLM spends ~1100 ms/token, the head is single-digit ms). **On Maple it is not**: the head is
-2.5 ms of a 10.1 ms token, so Maple's honest end-to-end decode is **98.9 tok/s** against the
-131.4 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
+2.5 ms of an 8.9 ms token, so Maple's honest end-to-end decode is **112.8 tok/s** against the
+157.0 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
 print the pair for every model, so the omission is visible rather than inferred. Maple's row
 was re-measured in full on 2026-08-08 (BF16 IO tier + warp-per-row expert kernels + split-K
-decode attention); the other six rows are unchanged from 2026-08-07.
+decode attention + zero-copy KV); the other six rows are unchanged from 2026-08-07.
 
 **The biggest single win came from the phase nobody was looking at.** Everything above about
 Maple concerns the expert path, because that is where a short-context profile said the time
@@ -75,6 +75,27 @@ collapses to 1, and the kernel degenerates to the old shape. Prefill is untouche
 S>1 and never takes this path. Nemotron, which shares the kernel, measured 12.54 vs 12.68
 with identical tokens: neutral, as expected for a model whose decode is expert-streaming
 with only 8 GQA layers. `COLI_GQA_SPLIT=0` restores the old kernels.
+
+**Then the KV stopped being copied at all.** `coli_cuda_gqa_attn` re-uploaded the ENTIRE K and
+V history on every call — `T*Hkv*D*4` each, ~52.7 MB per decoded token across 24 layers, when
+exactly one row had changed. Measured pageable H2D is **43 GB/s** against 256 GB/s for a
+device read, so that was ~1.23 ms/token, a quarter of what attention cost after split-K.
+
+The obvious fix is a device-resident KV appended one row at a time, and it is deliberately
+**not** what shipped: a cached device copy must be invalidated whenever the host rows change,
+and they do — a rejected MTP draft rewrites positions, and `serve` reuses a cache across
+requests. A device KV that silently goes stale is *wrong output*, not slow output, and this
+repo has already shipped one pointer-keyed device cache that served the wrong bytes. Reading
+the host buffer **zero-copy** has no such failure mode, because there is no second copy to go
+stale — the kernel sees whatever the host last wrote. It is the same mechanism the expert
+weights already use.
+
+Measured, n=5 per arm: **forward-only 129.9 → 158.1 tok/s (1.22×)**, end-to-end ~99.6 →
+~112.8. Tokens identical, and bit-exact by construction — the same bytes, just not copied
+first. One caveat worth stating: zero-copy is **less consistent** than the upload it replaces
+(140–161 tok/s across runs, against 129.6–132.9), and the very first run after a build read
+111.85 before settling. It is faster in six runs of seven; `COLI_GQA_ZEROCOPY=0` restores the
+uploads.
 
 This is also why `serving` sits below `decode` for every row. The column is left as-is
 rather than silently re-baselined, because every historical measurement in this repo is

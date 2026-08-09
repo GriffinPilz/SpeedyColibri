@@ -408,9 +408,24 @@ pub fn attention_gqa(
     // 30 s prefill, so the CPU has slack and freeing memory overlaps async GPU work. A
     // phase timer measures CPU wall, which is why it saw them at all.
     //
-    // So the ~700 ms hole is explained and the 2.9% WALL GAP VS JULY IS STILL NOT. Do not
-    // re-derive the gap from this number — they are not the same thing, and treating them
-    // as one is the mistake this comment exists to prevent.
+    // So the ~700 ms hole is explained. AND THE WALL GAP IT WAS BEING CHASED FOR DOES NOT
+    // EXIST. Three measurements of m3 prefill against the July binary, same alternating
+    // design, increasing power:
+    //
+    //   medians-of-3, n=2      +884 ms  (+2.9%)
+    //   medians-of-3, n=2      +106 ms  (+0.35%)   <- repeat of the identical design
+    //   medians-of-8, n=2       -85 ms  (main FASTER)
+    //
+    // The sign flips. At 16 reps per arm JULY is 30868 and MAIN 30783, arms interleaving.
+    // The 6.6% this started from was cross-session; the 2.9% that replaced it was n=2
+    // medians-of-3 whose arms happened to land 0.13% apart, which read as confidence and
+    // was luck. `median()` in scripts/lib.sh is not a power guarantee.
+    //
+    // Every phase agrees: at medians the `attn` phase on main is if anything FASTER than
+    // July's (4017 vs 4465), which is the opposite of the premise the whole search rested
+    // on. Seven eliminations found nothing in the attention phase because there was nothing
+    // to find. They are kept above because they are true and cheap to re-read — not because
+    // they narrowed anything.
     let st0 = kv.kv_start[layer];
     let _tx = std::time::Instant::now();
     let mut ctx = vec![0f32; s_len * h * hd];

@@ -4469,8 +4469,17 @@ extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
      * W bytes of weights, reading them zero-copy costs R*W/51 GB/s; staging costs the CPU
      * pack (W/40, measured) plus the H2D (W/56, measured) plus R*W/273 for the device reads.
      * Staging wins when R*(1/51 - 1/273) > 1/40 + 1/56, i.e. R > 2.7. Decode is R=1 and
-     * loses; a 128-token prefill at top-8 over 256 experts is R=4 and wins, which is exactly
-     * the split the two measurements show.
+     * loses; a short prefill clears the bar and wins, which is exactly the split the two
+     * measurements show.
+     *
+     * The example here used to read "a 128-token prefill at top-8 over 256 experts is R=4",
+     * deriving R as tokens*top_k/n_experts. That derivation is WRONG — it assumes routing
+     * spreads over every expert, and it concentrates on roughly half, so the real R is about
+     * double. The same mistake set the int2 group gate to 16 when 32 was needed and grouped
+     * almost nothing while looking correct. The CODE is unaffected: `stage_pays` below
+     * compares the actual `total` against the actual `count`, never the config. Only the
+     * illustration was off, and it is corrected here so nobody re-derives a threshold from
+     * it. Measure R, do not compute it.
      *
      * Deliberately expressed per EXPERT, not per token or per phase: `rows` is what the
      * arithmetic is about, it is already known here, and it needs no caller to classify

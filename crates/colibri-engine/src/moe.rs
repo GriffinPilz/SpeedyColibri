@@ -3772,8 +3772,31 @@ fn nvfp4_group_moe() -> bool {
 /// not in reading experts off the drive; it is the staging itself, which is the same
 /// ~0.74 GB/s transfer the MXFP4 twin was measured 10% worse on.
 ///
-/// The lead this leaves open is a zero-copy grouped NVFP4 kernel, which would be a different
-/// path rather than a different threshold. Raising this number is not that.
+/// **FOLLOW-UP, and it CLOSES the lead this note used to leave open.** The A/B above forced
+/// the gate while leaving staging at its default, so what it actually measured was
+/// grouping-WITH-staging; blaming the staging was inference from a flat `expert-load`, not
+/// isolation. `COLI_LAYER_RESIDENT=0` already gives grouped-but-zero-copy — no new kernel is
+/// needed to separate them — so all three arms are measurable today (prefill suite, median
+/// of 3, token gates passing on every arm):
+///
+/// ```text
+///                                          m2.7                 glm
+///   A  per-expert zero-copy (default)   24193 ms / 21.2    68430 ms / 7.5
+///   B  grouped + staging                26927    / 19.0        (see above)
+///   C  grouped + ZERO-COPY              24562    / 20.8    70675    / 7.2
+/// ```
+///
+/// **Staging is the whole cost; grouping itself is neutral.** C lands 1.5% (m2.7) and 3.3%
+/// (glm) behind A, both inside this metric's ~6.6% run-to-run spread — collapsing 13374 and
+/// 17121 per-expert dispatches respectively bought nothing measurable, which is the ~3%
+/// grouping ceiling this file already recorded, arrived at from the other direction.
+///
+/// So a bespoke zero-copy grouped NVFP4 kernel would reproduce arm C and is NOT worth
+/// building. The lead is closed, not open. Launch count is not the lever for this format —
+/// same conclusion the MXFP4 twin reached, and for the same reason.
+///
+/// Caveat on the numbers above: m2.7 read 18% for arm B in the first session and 11.3% in
+/// the second. The direction held; the magnitude is soft, and should not be quoted tightly.
 fn nvfp4_group_rows_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {

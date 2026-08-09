@@ -3734,6 +3734,46 @@ fn nvfp4_group_moe() -> bool {
 ///
 /// Corollary worth knowing: **GLM steady-state decode is ~1.23–1.33 tok/s**, not the ~1.0 a
 /// 24-token run reports. At ~1 tok/s that window is nearly all warm-up.
+///
+/// ---
+///
+/// **8 MEANS "DECODE ONLY", AND THAT IS LOAD-BEARING — DO NOT RAISE IT.** Measured
+/// 2026-08-08; this note exists because the value looked like an untested guess and was not.
+///
+/// The gate never passes during a 512-token prefill on any of the three NVFP4 models: the
+/// dispatch count at the default is byte-identical to disabling the arm outright, so the
+/// grouped path is decode-only in practice.
+///
+/// ```text
+///                arm OFF   default(8)   forced on
+///   m2.7          13374      13374           0
+///   m3             4805       4805          60
+///   glm           17121      17121          78
+/// ```
+///
+/// That pattern is exactly what a dead gate looks like, and the int2 twin next door WAS a
+/// dead gate — `try_expert_group_int2_decode` refused every prefill and cost 1.44x of
+/// maple's prefill until it was generalized. So the obvious inference is that this one is
+/// the same defect on three more models. **It is not.** Forcing it on, prefill suite,
+/// median of 3, token gates passing on both arms:
+///
+/// ```text
+///          default (declines)      forced on        delta
+///   m2.7   24280 ms / 21.1 t/s   28702 / 17.8      18% WORSE
+///   m3     30622    / 16.7       36140 / 14.2      18% WORSE
+///   glm    66491    /  7.7       92490 /  5.5      39% WORSE
+/// ```
+///
+/// The mechanism is the difference between the two grouped paths, not between the two
+/// models. int2 groups ZERO-COPY — nothing is staged, the kernel reads the weights in place
+/// — so collapsing launches is pure win. This path STAGES, through a pinned host buffer and
+/// a device arena, replacing a per-expert path that was zero-copy. `expert-load` is flat
+/// across every pair above (13269 vs 13051, 12044 vs 12114, 9877 vs 9311), so the loss is
+/// not in reading experts off the drive; it is the staging itself, which is the same
+/// ~0.74 GB/s transfer the MXFP4 twin was measured 10% worse on.
+///
+/// The lead this leaves open is a zero-copy grouped NVFP4 kernel, which would be a different
+/// path rather than a different threshold. Raising this number is not that.
 fn nvfp4_group_rows_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {

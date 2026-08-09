@@ -176,6 +176,15 @@ pub(crate) static ATTN_OPROJ_US: AtomicU64 = AtomicU64::new(0);
 /// PER LAYER CALL, 1.01 GB over 60 layers, and `mallopt` pins anything past 2 MB to mmap —
 /// so every call is a fresh mapping that page-faults on first touch while being zeroed.
 pub(crate) static ATTN_CTX_US: AtomicU64 = AtomicU64::new(0);
+/// The WHOLE body of `attention_gqa`, to answer one binary question: is the ~700 ms that
+/// `ATTN_US` holds beyond its sub-timers INSIDE the function or OUTSIDE it?
+///
+/// Six candidates are already eliminated (see the block in `attention.rs`), including the
+/// expert path's async tail, and the function has no early exits — no `return`, no `?` —
+/// so every call reaches every sub-timer. If this lands on `ATTN_US` the time is inside the
+/// body between the timers, and my reading of those gaps as scalar-only is wrong. If it
+/// lands on the sub-timer sum instead, the time is in the call itself, outside the body.
+pub(crate) static ATTN_BODY_US: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic forward-pass counter — one per `forward` call, i.e. per decode token
 /// (prefill is a single step over the whole prompt). Used only to key the optional
@@ -2037,13 +2046,14 @@ where
             (ms(&MOE_US) - moe_parts).max(0.0),
         );
         eprintln!(
-            "[profile] attn breakdown: proj {:.0} ms | rope+cache {:.0} ms | dsa-indexer {:.0} ms | ctx-alloc {:.0} ms | core {:.0} ms | o-proj {:.0} ms",
+            "[profile] attn breakdown: proj {:.0} ms | rope+cache {:.0} ms | dsa-indexer {:.0} ms | ctx-alloc {:.0} ms | core {:.0} ms | o-proj {:.0} ms || body {:.0} ms",
             ms(&ATTN_PROJ_US),
             ms(&ATTN_ROPE_US),
             ms(&ATTN_INDEX_US),
             ms(&ATTN_CTX_US),
             ms(&ATTN_CORE_US),
             ms(&ATTN_OPROJ_US),
+            ms(&ATTN_BODY_US),
         );
         eprintln!(
             "[profile] mamba breakdown: scan {:.0} ms | in/out-proj {:.0} ms | conv {:.0} ms | gated-norm {:.0} ms | other {:.0} ms",

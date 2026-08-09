@@ -252,6 +252,7 @@ pub fn attention_gqa(
     pos_base: usize,
     out: &mut [f32],
 ) {
+    let _tb = std::time::Instant::now();
     let h = cfg.n_heads as usize;
     let kvh = cfg.n_kv_heads as usize;
     let hd = cfg.qk_head as usize; // head_dim
@@ -498,6 +499,11 @@ pub fn attention_gqa(
     let _to = std::time::Instant::now();
     matmul_qt(out, &ctx, &l.o, s_len);
     atime(&crate::forward::ATTN_OPROJ_US, _to);
+    // Drop the big locals INSIDE the body bracket. They are freed at the closing brace
+    // otherwise — inside `timed(&ATTN_US, ..)` but outside every sub-timer, which is
+    // exactly where ~750 ms was hiding.
+    drop(ctx);
+    atime(&crate::forward::ATTN_BODY_US, _tb);
 }
 
 /// As [`attention`], but selecting the core explicitly and optionally restricting each

@@ -18,7 +18,7 @@ fails loudly instead of being reported as a win.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`maple-preview`** (20B-A1B) | 5.9 GB | **230.0 tok/s** (2.2 s) | **161.3 tok/s** (116.3 e2e) | **109.0 tok/s** |
+| **`maple-preview`** (20B-A1B) | 5.9 GB | **230.0 tok/s** (2.2 s) | **155.8 tok/s** (112.1 e2e) | **109.0 tok/s** |
 | **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **9.97 tok/s** |
 | **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **6.0 tok/s** |
 | **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
@@ -32,12 +32,20 @@ suite alone takes ~1.5 h — and is unaffected by anything that changed since. M
 and measured 2026-08-07 on the same box; its numbers are not comparable to a prior release
 because there isn't one.
 
+**The decode figure is a median of 8, not 3, and that correction is mine.** It read 116.3
+here until four suites at `BENCH_REPS=8` put it at 112.1: three warm suites agreed at 112.80,
+112.13 and 110.62, and a cold first suite read 85.47. The 116.3 came from a single
+median-of-3 — the top of a distribution whose other draws that same day were 113.12 and
+107.15. It is the same under-powering that made an m3 "regression" appear and then vanish
+(§6), caught this time on my own number rather than an inherited one. **`decode` is the
+noisiest column here**; treat any single suite of it as one draw.
+
 **Read the `decode` column as a FORWARD-PASS rate, not a token rate.** `coli gen`'s decode
 timer brackets `forward()` and stops before the `lm_head` matmul, so every decode figure in
 this table excludes the output projection. On the streaming models that is a rounding error
 (GLM spends ~1100 ms/token, the head is single-digit ms). **On Maple it is not**: the head is
-2.5 ms of an 8.9 ms token, so Maple's honest end-to-end decode is **112.8 tok/s** against the
-157.0 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
+2.5 ms of an 8.9 ms token, so Maple's honest end-to-end decode is **112.1 tok/s** against the
+155.8 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
 print the pair for every model, so the omission is visible rather than inferred. Maple's row
 was re-measured in full on 2026-08-08 (BF16 IO tier + warp-per-row expert kernels + split-K
 decode attention + zero-copy KV); the other six rows are unchanged from 2026-08-07.

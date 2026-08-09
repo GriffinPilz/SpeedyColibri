@@ -18,7 +18,7 @@ fails loudly instead of being reported as a win.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`maple-preview`** (20B-A1B) | 5.9 GB | **160.2 tok/s** (3.2 s) | **157.0 tok/s** (112.8 e2e) | **91.1 tok/s** |
+| **`maple-preview`** (20B-A1B) | 5.9 GB | **230.0 tok/s** (2.2 s) | **161.3 tok/s** (116.3 e2e) | **109.0 tok/s** |
 | **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **9.97 tok/s** |
 | **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **6.0 tok/s** |
 | **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
@@ -44,10 +44,11 @@ decode attention + zero-copy KV); the other six rows are unchanged from 2026-08-
 
 **And read the `serving` column as a 32-token REQUEST rate, not a token rate.** It divides
 by the whole HTTP round trip, so a per-request cost paid once lands on all 32 tokens.
-Maple's 91.1 is `52 ms + 9.36 ms x 32 tok`; the 9.36 is the same engine the decode column
-measures, and `bench_serve.py` now prints the split so the two columns can be reconciled
-instead of guessed at. That number was **70.5** until the accept loop stopped napping
-100 ms between connections — below.
+Maple's 109.0 is `19 ms + 8.57 ms x 32 tok`; the 8.57 is the same engine the decode column
+measures, and `bench_serve.py` prints the split so the two columns can be reconciled instead
+of guessed at. That number was **70.5** until the accept loop stopped napping 100 ms between
+connections, and **91.1** until the expert path stopped refusing to group a prefill — both
+below.
 
 **All six serve figures were re-measured 2026-08-08 after that fix, and only Maple moved.**
 That is the expected shape, not a disappointment: the ~100 ms is a constant, so it is 24% of
@@ -160,24 +161,50 @@ bounded shutdown check and removes the latency: **`/health` 63–97 → 0.09 ms*
 request **152.5 → 50.9 ms**, and Maple's serve median **70.5 → 91.1 tok/s**. Every model
 gains the same ~100 ms; only a model whose token costs 8 ms notices.
 
-**What is left of the per-request cost is a SHORT PREFILL, and the expert path declines to
-group it.** With the nap gone, a request still pays a fixed 51 ms on Maple before the
-per-token rate applies — and 270 (m2.7), 472 (m3), 575 (v4), 617 (nemotron), 941 (GLM).
-`COLI_SERVE_TIMING=1` marks every stage of a request, and the answer is not where reading
-the code suggested: JSON, tokenize, `reserve_ram`, ledger admission and KV allocation
-together cost **0.08 ms**. All of it is inside generation, and the engine's own per-request
-counters localize it further — for a 5-token prompt, **moe 38.4 ms** against 2.6 ms for a
-one-row decode step, fifteen times the cost for five times the rows.
+**The expert path declined to group any prefill, and that cost 1.44x of prefill as well as
+most of the per-request fixed cost.** With the accept nap gone, a request still paid a fixed
+51 ms on Maple before the per-token rate applied. `COLI_SERVE_TIMING=1` marks every stage,
+and the answer was not where reading the code suggested: JSON, tokenize, `reserve_ram`,
+ledger admission and KV allocation together cost **0.08 ms**. All of it was inside
+generation, and the engine's per-request counters localized it — for a 5-token prompt,
+**moe 38.4 ms** against 2.6 ms for a one-row decode step.
 
-The cause is a gate doing exactly what it says. `try_expert_group_int2_decode` requires
-*one row per expert, all the same token*; a 5-token prefill routes each expert a different
-row set, so it declines and the per-expert path runs ~30–40 launch triples per layer across
-24 layers. At the ~38 µs per dispatch already measured for this model, ~800–960 dispatches
-is 30–36 ms — which is the 38 ms. The gate was written against prefill at 512 tokens, where
-per-dispatch overhead is ~12% and grouping does not pay; at 5 tokens there is almost no work
-to hide it behind and the overhead is nearly all of it. **The right gate is rows-per-expert,
-not prefill-versus-decode** — the same lesson as three earlier expert-path defaults. Not yet
-fixed: a multi-row grouped kernel is a real change, not a threshold edit.
+`try_expert_group_int2_decode` required *one row per expert, all the same token*, so any
+prefill declined and ran ~30-40 launch triples per layer over 24 layers. The kernel now takes
+`xoff`/`yoff`/`nr` per expert and a `blockIdx.z` row index, so decode is the `xoff=0, nr=1`
+case of the same code and a prefill is a contiguous run of rows. Tokens identical at both a
+5-token and a 512-token prompt; `INT2_GRP_MAX` went 16 -> 32 because five tokens at top-8
+reach up to 40 distinct experts and the group was declining on expert COUNT before the row
+test ever ran.
+
+**The gate's own comment claimed grouping stops paying on long prefill. It was never true.**
+It said per-dispatch overhead is ~12% there, so grouping would not help — and that assertion
+was repeated in this README before anyone measured it. Forcing the path on across prompt
+length says grouped wins everywhere it was tried (min of 3 per point, prefill wall time):
+
+| S | grouped | per-expert | ratio |
+|---|---|---|---|
+| 4 | 31.9 ms | 66.0 ms | **2.07x** |
+| 32 | 129.7 | 287.0 | **2.21x** |
+| 128 | 367.2 | 831.0 | **2.26x** |
+| 512 | 1884.2 | 3305.6 | **1.75x** |
+
+So the gate is now the largest rows-per-expert at which the widest swept prompt FULLY
+engages, and it declines past that because that is unmeasured, not because it was measured
+to lose. **That value is 32 and it had to be measured, not derived.** The obvious arithmetic
+— 512 tokens at top-8 over 256 experts is 16 rows per expert — assumes routing spreads
+across every expert. It concentrates on about half of them, so the real figure is ~32, and a
+default of 16 set from that arithmetic grouped almost nothing while looking correct. The
+DISPATCH COUNTER caught it; the wall clock could not, because a half-engaged gate reads as
+run-to-run noise:
+
+| `rows_max` | 0 | 8 | 16 | 20 | 32 |
+|---|---|---|---|---|---|
+| per-expert dispatches at S=512 | 4438 | 4438 | 4193 | 3358 | **0** |
+
+That counter settled three questions the clock left ambiguous today: 668 -> 0 proved the
+short-prefill collapse was real, 4438 = 4438 proved prefill was untouched at the old default
+(a 9.2% "regression" that was pure spread), and 4193 != 0 caught the dead gate.
 
 **Verified against the reference implementation.** Maple's own `modeling_maple.py` was run
 unmodified (only `fa3.py` swapped for an SDPA-backed equivalent, since the published one

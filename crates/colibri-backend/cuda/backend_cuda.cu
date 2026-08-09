@@ -3228,20 +3228,35 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
  * applied last, same `act_mul` (so the activation stays defined in exactly one place),
  * and the routed-weight combine is left on the host untouched. Only the launch geometry
  * changes. */
-#define INT2_GRP_MAX 16
-struct Int2Ref { const void *gw,*uw,*dw; const float *gs,*us,*ds; };
+/* 32, not 16, because a SHORT PREFILL activates far more experts than a decode step does.
+ * One token routes to top-8; five tokens route to up to 40 distinct experts, and at 16 the
+ * group declined on expert count before it ever reached the row-shape test. The struct goes
+ * by value as a kernel argument: 32 * (6 pointers + 3 ints) = 1920 bytes, comfortably inside
+ * the 4 KB parameter limit. Rust chunks anything larger. */
+#define INT2_GRP_MAX 32
+
+/* `xoff` / `nr` / `yoff` are what let ONE kernel serve both shapes.
+ *
+ * Decode: every expert consumes the same single activation row, so xoff = 0 for all of them,
+ * nr = 1, and yoff = k. Prefill: each expert owns a contiguous run of rows in an
+ * expert-major `x`, so xoff is that run's start and nr its length. yoff is the prefix sum of
+ * nr either way, which is what makes the host-side combine loop identical between them. */
+struct Int2Ref { const void *gw,*uw,*dw; const float *gs,*us,*ds; int xoff, yoff, nr; };
 struct Int2Grp { Int2Ref e[INT2_GRP_MAX]; };
 
 /* gate/up for every expert in one launch. grid = (I, K): block (i,k) produces the i-th
  * hidden unit of expert k. Both projections share the x reads. */
 __global__ static void int2_group_gate_up(float *gate_out, float *up_out, const float *x,
                                           Int2Grp grp, int K, int D, int I) {
-    int i = blockIdx.x, k = blockIdx.y;
+    int i = blockIdx.x, k = blockIdx.y, rr = blockIdx.z;
     if (k >= K || i >= I) return;
     Int2Ref r = grp.e[k];
+    if (rr >= r.nr) return;   // block-uniform: every thread in the block agrees
+    const float *xr = x + (size_t)(r.xoff + rr) * D;
+    size_t g = (size_t)(r.yoff + rr);
     size_t rb = (size_t)((D + 3) / 4), row = (size_t)i * rb;
-    float sg = int2_partial(static_cast<const uint8_t *>(r.gw) + row, x, D, threadIdx.x, blockDim.x);
-    float su = int2_partial(static_cast<const uint8_t *>(r.uw) + row, x, D, threadIdx.x, blockDim.x);
+    float sg = int2_partial(static_cast<const uint8_t *>(r.gw) + row, xr, D, threadIdx.x, blockDim.x);
+    float su = int2_partial(static_cast<const uint8_t *>(r.uw) + row, xr, D, threadIdx.x, blockDim.x);
     __shared__ float pg[256], pu[256];
     pg[threadIdx.x] = sg; pu[threadIdx.x] = su;
     __syncthreads();
@@ -3251,8 +3266,8 @@ __global__ static void int2_group_gate_up(float *gate_out, float *up_out, const 
         __syncthreads();
     }
     if (!threadIdx.x) {
-        gate_out[(size_t)k * I + i] = pg[0] * r.gs[i];
-        up_out[(size_t)k * I + i]   = pu[0] * r.us[i];
+        gate_out[g * I + i] = pg[0] * r.gs[i];
+        up_out[g * I + i]   = pu[0] * r.us[i];
     }
 }
 
@@ -3284,49 +3299,59 @@ __global__ static void int2_group_gate_up(float *gate_out, float *up_out, const 
  *
  * Reduction order differs from the block version (32 partials, not 256), and f32 addition is
  * not associative — so the token gate is the acceptance test, not a byte compare. */
+/* `blockIdx.z` is the row WITHIN an expert, so grid.z is the widest run any expert owns and
+ * the shorter ones return early. Both that test and the `i >= I` one are warp-uniform — `r`
+ * comes from blockIdx, `i` from the warp index and never the lane — so the full-mask
+ * shuffles below stay safe. */
 __global__ static void int2_group_gate_up_w(float *gate_out, float *up_out, const float *x,
                                             Int2Grp grp, int K, int D, int I) {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int i = blockIdx.x * (int)(blockDim.x >> 5) + warp, k = blockIdx.y;
+    int i = blockIdx.x * (int)(blockDim.x >> 5) + warp, k = blockIdx.y, rr = blockIdx.z;
     if (k >= K || i >= I) return;
     Int2Ref r = grp.e[k];
+    if (rr >= r.nr) return;
+    const float *xr = x + (size_t)(r.xoff + rr) * D;
+    size_t g = (size_t)(r.yoff + rr);
     size_t rb = (size_t)((D + 3) / 4), row = (size_t)i * rb;
-    float sg = int2_partial(static_cast<const uint8_t *>(r.gw) + row, x, D, lane, 32);
-    float su = int2_partial(static_cast<const uint8_t *>(r.uw) + row, x, D, lane, 32);
+    float sg = int2_partial(static_cast<const uint8_t *>(r.gw) + row, xr, D, lane, 32);
+    float su = int2_partial(static_cast<const uint8_t *>(r.uw) + row, xr, D, lane, 32);
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         sg += __shfl_down_sync(0xffffffffu, sg, o);
         su += __shfl_down_sync(0xffffffffu, su, o);
     }
     if (!lane) {
-        gate_out[(size_t)k * I + i] = sg * r.gs[i];
-        up_out[(size_t)k * I + i]   = su * r.us[i];
+        gate_out[g * I + i] = sg * r.gs[i];
+        up_out[g * I + i]   = su * r.us[i];
     }
 }
 
 __global__ static void int2_group_down_w(float *y, const float *h, Int2Grp grp,
                                          int K, int D, int I) {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int o = blockIdx.x * (int)(blockDim.x >> 5) + warp, k = blockIdx.y;
+    int o = blockIdx.x * (int)(blockDim.x >> 5) + warp, k = blockIdx.y, rr = blockIdx.z;
     if (k >= K || o >= D) return;
     Int2Ref r = grp.e[k];
+    if (rr >= r.nr) return;
+    size_t g = (size_t)(r.yoff + rr);
     size_t rb = (size_t)((I + 3) / 4), row = (size_t)o * rb;
-    float s = int2_partial(static_cast<const uint8_t *>(r.dw) + row, h + (size_t)k * I, I,
-                           lane, 32);
+    float s = int2_partial(static_cast<const uint8_t *>(r.dw) + row, h + g * I, I, lane, 32);
     #pragma unroll
     for (int n = 16; n > 0; n >>= 1) s += __shfl_down_sync(0xffffffffu, s, n);
-    if (!lane) y[(size_t)k * D + o] = s * r.ds[o];
+    if (!lane) y[g * D + o] = s * r.ds[o];
 }
 
 /* down for every expert in one launch. grid = (D, K). Writes y[k][d]; the caller applies
  * the routing weights and accumulates, exactly as it does for the per-expert path. */
 __global__ static void int2_group_down(float *y, const float *h, Int2Grp grp,
                                        int K, int D, int I) {
-    int o = blockIdx.x, k = blockIdx.y;
+    int o = blockIdx.x, k = blockIdx.y, rr = blockIdx.z;
     if (k >= K || o >= D) return;
     Int2Ref r = grp.e[k];
+    if (rr >= r.nr) return;
+    size_t g = (size_t)(r.yoff + rr);
     size_t rb = (size_t)((I + 3) / 4), row = (size_t)o * rb;
-    const float *hk = h + (size_t)k * I;
+    const float *hk = h + g * I;
     float s = int2_partial(static_cast<const uint8_t *>(r.dw) + row, hk, I, threadIdx.x, blockDim.x);
     __shared__ float p[256];
     p[threadIdx.x] = s;
@@ -3335,30 +3360,46 @@ __global__ static void int2_group_down(float *y, const float *h, Int2Grp grp,
         if (threadIdx.x < n) p[threadIdx.x] += p[threadIdx.x + n];
         __syncthreads();
     }
-    if (!threadIdx.x) y[(size_t)k * D + o] = p[0] * r.ds[o];
+    if (!threadIdx.x) y[g * D + o] = p[0] * r.ds[o];
 }
 
-/* Run K int2 experts over ONE shared input row `x[D]`, writing `y[K][D]`.
+/* Run K int2 experts over an expert-major activation matrix `x[xrows][D]`, where expert k
+ * consumes `nrows[k]` rows starting at `xoff[k]`, writing `y[sum(nrows)][D]` in the same
+ * expert-major order. The caller applies the routing weights and accumulates.
  *
- * Single-row only — the decode shape, and the one where the per-dispatch overhead is 69%
- * rather than 12%. Gated on the row count at the decision point, not on a phase flag:
- * prefill hands each expert a different row set, which this deliberately does not model. */
-extern "C" int coli_cuda_expert_group_int2(int device, float *y, const float *x,
+ * This covers BOTH shapes, which is the whole point of the change. Decode is the special
+ * case xoff[k]=0, nrows[k]=1 — every expert reading the same row — and short prefill is
+ * xoff[k] = the start of that expert's run. The old entry point modelled only the first and
+ * declined on the second, so a 5-token prompt fell to the per-expert path: ~30-40 launch
+ * triples per layer over 24 layers, ~800-960 dispatches at ~38 us of launch overhead each.
+ * Measured 2026-08-08 on maple, that was 38.4 ms of a 51 ms fixed per-request cost — the
+ * whole gap between its 112.8 tok/s decode and its 91.1 tok/s serve.
+ *
+ * What this does NOT do is model LONG prefill. With hundreds of rows per expert the weight
+ * read dominates and the per-expert path (one quant_matmul over all of an expert's rows,
+ * weights read once) wins; the caller gates on rows-per-expert for that reason. */
+extern "C" int coli_cuda_expert_group_int2_rows(int device, float *y, const float *x,
         const void **gw, const void **uw, const void **dw,
         const float **gs, const float **us, const float **ds,
-        int K, int D, int I) {
-    if (!y || !x || K < 1 || K > INT2_GRP_MAX || D < 1 || I < 1) return 0;
+        const int *xoff, const int *nrows, int K, int D, int I, int xrows) {
+    if (!y || !x || !xoff || !nrows || K < 1 || K > INT2_GRP_MAX || D < 1 || I < 1 ||
+        xrows < 1) return 0;
     DeviceContext *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
     std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
     Int2Grp grp{};
+    int total = 0, maxr = 0;
     for (int k = 0; k < K; k++) {
         if (!gw[k] || !uw[k] || !dw[k] || !gs[k] || !us[k] || !ds[k]) return 0;
-        grp.e[k] = Int2Ref{ gw[k], uw[k], dw[k], gs[k], us[k], ds[k] };
+        // Every row an expert claims must exist in `x`, or the kernel would read past it.
+        if (nrows[k] < 1 || xoff[k] < 0 || xoff[k] + nrows[k] > xrows) return 0;
+        grp.e[k] = Int2Ref{ gw[k], uw[k], dw[k], gs[k], us[k], ds[k], xoff[k], total, nrows[k] };
+        total += nrows[k];
+        if (nrows[k] > maxr) maxr = nrows[k];
     }
-    size_t xb = (size_t)D * sizeof(float);
-    size_t hb = (size_t)K * I * sizeof(float);
-    size_t yb = (size_t)K * D * sizeof(float);
+    size_t xb = (size_t)xrows * D * sizeof(float);
+    size_t hb = (size_t)total * I * sizeof(float);
+    size_t yb = (size_t)total * D * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->gate, &ctx->gate_cap, hb) ||
         !reserve(&ctx->up, &ctx->up_cap, hb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpyAsync(ctx->x, x, xb, cudaMemcpyHostToDevice, ctx->stream),
@@ -3368,23 +3409,41 @@ extern "C" int coli_cuda_expert_group_int2(int device, float *y, const float *x,
     if (s_warp < 0) { const char *e = getenv("COLI_INT2_WARP"); s_warp = !e || strcmp(e, "0") != 0; }
     const int tpb = 256, rpb = tpb / 32;   // 8 rows per block
     if (s_warp) {
-        int2_group_gate_up_w<<<dim3((unsigned)((I + rpb - 1) / rpb), (unsigned)K), tpb, 0,
+        int2_group_gate_up_w<<<dim3((unsigned)((I + rpb - 1) / rpb), (unsigned)K,
+                                    (unsigned)maxr), tpb, 0,
                                ctx->stream>>>(ctx->gate, ctx->up, ctx->x, grp, K, D, I);
-        act_mul(ctx->gate, ctx->up, (size_t)K * I, ctx->stream);
-        int2_group_down_w<<<dim3((unsigned)((D + rpb - 1) / rpb), (unsigned)K), tpb, 0,
+        act_mul(ctx->gate, ctx->up, (size_t)total * I, ctx->stream);
+        int2_group_down_w<<<dim3((unsigned)((D + rpb - 1) / rpb), (unsigned)K,
+                                 (unsigned)maxr), tpb, 0,
                             ctx->stream>>>(ctx->y, ctx->gate, grp, K, D, I);
     } else {
-        int2_group_gate_up<<<dim3((unsigned)I, (unsigned)K), 256, 0, ctx->stream>>>(
-            ctx->gate, ctx->up, ctx->x, grp, K, D, I);
-        act_mul(ctx->gate, ctx->up, (size_t)K * I, ctx->stream);
-        int2_group_down<<<dim3((unsigned)D, (unsigned)K), 256, 0, ctx->stream>>>(
-            ctx->y, ctx->gate, grp, K, D, I);
+        int2_group_gate_up<<<dim3((unsigned)I, (unsigned)K, (unsigned)maxr), 256, 0,
+                             ctx->stream>>>(ctx->gate, ctx->up, ctx->x, grp, K, D, I);
+        act_mul(ctx->gate, ctx->up, (size_t)total * I, ctx->stream);
+        int2_group_down<<<dim3((unsigned)D, (unsigned)K, (unsigned)maxr), 256, 0,
+                          ctx->stream>>>(ctx->y, ctx->gate, grp, K, D, I);
     }
     if (!cuda_ok(cudaGetLastError(), "int2 group launch") ||
         !cuda_ok(cudaMemcpyAsync(y, ctx->y, yb, cudaMemcpyDeviceToHost, ctx->stream),
                  "int2 group output download") ||
         !cuda_ok(cudaStreamSynchronize(ctx->stream), "int2 group synchronize")) return 0;
     return 1;
+}
+
+/* Decode shape: K experts over ONE shared input row `x[D]`, writing `y[K][D]`.
+ *
+ * Kept as its own entry because the single row is worth uploading once rather than K times,
+ * and because it is the call every decode token makes. It is now a thin wrapper — the
+ * kernels are shared, so the two shapes cannot drift apart. */
+extern "C" int coli_cuda_expert_group_int2(int device, float *y, const float *x,
+        const void **gw, const void **uw, const void **dw,
+        const float **gs, const float **us, const float **ds,
+        int K, int D, int I) {
+    if (K < 1 || K > INT2_GRP_MAX) return 0;
+    int xoff[INT2_GRP_MAX], nrows[INT2_GRP_MAX];
+    for (int k = 0; k < K; k++) { xoff[k] = 0; nrows[k] = 1; }
+    return coli_cuda_expert_group_int2_rows(device, y, x, gw, uw, dw, gs, us, ds,
+                                            xoff, nrows, K, D, I, 1);
 }
 
 /* Tiled FP8 (e4m3 weights, fp16 activations) expert FFN — the tensor-core replacement

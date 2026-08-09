@@ -1416,10 +1416,14 @@ pub fn compute_experts_partial_into<P: ExpertProvider>(
         // and would read a gate tensor these experts don't ship.
         let grouped = if !active.is_empty()
             && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 3)
-            && crate::gpu::try_expert_group_int2_decode(&active, activations, d, out)
+            && (crate::gpu::try_expert_group_int2_decode(&active, activations, d, out)
+                || crate::gpu::try_expert_group_int2_rows(&active, activations, d, out))
         {
-            // Grouped int2 (Maple). Declines on anything but the decode shape, so prefill
-            // and every other format fall through to the arms below unchanged.
+            // Grouped int2 (Maple). The decode arm is tried first — it uploads one shared
+            // activation row instead of one per expert — and the rows arm picks up SHORT
+            // PREFILL, which used to fall through here and pay ~800-960 dispatches per
+            // forward. Both decline on long prefill (gated on rows-per-expert), where the
+            // per-expert path reads each expert's weights once for all of its rows.
             true
         } else if activation().relu2 {
             crate::gpu::try_expert_group_relu2(&active, activations, d, out)

@@ -1558,6 +1558,213 @@ pub fn try_expert_group_int2_decode(
     true
 }
 
+/// Largest average rows-per-expert this path will take. `COLI_INT2_GROUP_ROWS` overrides.
+///
+/// The gate is rows-per-expert, NOT prefill-versus-decode, and that distinction is the whole
+/// bug this fixes. The decode-only version gated on "one row per expert, all the same token",
+/// which reads as a shape test but is really a phase test — and it sent every SHORT prefill
+/// to the per-expert path. A serving workload prefills a handful of tokens on every request,
+/// so that was the common case, not the rare one.
+///
+/// **16 is measurement COVERAGE, not a measured optimum, and the difference matters.** The
+/// expectation going in was a crossover: at one row per expert a launch has no work to hide
+/// its overhead behind, so grouping is everything, while at hundreds the per-expert path
+/// reads each expert's weights once for all of its rows and should win. The sweep found no
+/// such crossover anywhere it looked — grouped won at every prompt length, by 1.58x to 2.26x
+/// (maple, 2026-08-08, min of 3 per point, prefill wall time):
+///
+/// ```text
+///      S    grouped   per-expert   ratio   rows/expert
+///      4     31.9 ms     66.0 ms   2.07x     1.0
+///     32    129.7        287.0     2.21x     1.0
+///    128    367.2        831.0     2.26x     4.0
+///    512   1884.2       3305.6     1.75x    16.0
+/// ```
+///
+/// So the default is the smallest value at which the largest swept prompt FULLY engages,
+/// and past that the path declines to the per-expert arm — not because grouping was measured
+/// to lose there, but because it was not measured at all, and the gather buffers grow
+/// linearly with total rows. Anyone extending the sweep should raise this rather than assume
+/// the ceiling means something.
+///
+/// **That value is 32, and it was measured rather than derived.** The obvious arithmetic —
+/// S=512 at top-8 over 256 experts gives 512*8/256 = 16 rows per expert — is wrong, because
+/// routing CONCENTRATES: only about half the experts are active in a given layer, so the
+/// real figure is ~32. A default of 16 set from that arithmetic looked right and grouped
+/// almost nothing. The dispatch counter is what caught it, at S=512:
+///
+/// ```text
+///   rows_max     0      8     16     20     32
+///   per-expert
+///   dispatches 4438   4438   4193   3358      0
+/// ```
+///
+/// Count the dispatches when changing this. A gate that half-engages costs the win and
+/// shows up as noise in the wall clock, which is exactly how it went unnoticed for one
+/// round of measurement here.
+pub fn int2_group_rows_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_INT2_GROUP_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// Every expert must be a gpu-eligible three-tensor int2 SwiGLU of the expected shape.
+/// Returns the shared intermediate width, or `None` to decline.
+fn int2_group_shape(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    d: usize,
+) -> Option<usize> {
+    let inter = active.first()?.0.gate.o as usize;
+    active
+        .iter()
+        .all(|(ex, _, _)| {
+            ex.gate.fmt_code == 3
+                && ex.up.fmt_code == 3
+                && ex.down.fmt_code == 3
+                && ex.gate.gpu_eligible
+                && ex.up.gpu_eligible
+                && ex.down.gpu_eligible
+                && ex.gate.i as usize == d
+                && ex.up.i as usize == d
+                && ex.down.o as usize == d
+                && ex.gate.o as usize == inter
+                && ex.up.o as usize == inter
+                && ex.down.i as usize == inter
+                && ex.gate.s.len() == inter
+                && ex.up.s.len() == inter
+                && ex.down.s.len() == d
+        })
+        .then_some(inter)
+}
+
+/// Grouped int2 experts for a SHORT PREFILL — each expert its own run of rows.
+///
+/// The decode twin above requires one row per expert, all the same token, so a 5-token
+/// prompt declined and fell to the per-expert path: ~30-40 launch triples per layer over 24
+/// layers, ~800-960 dispatches at ~38 us of launch overhead each. Measured 2026-08-08 on
+/// maple, that was 38.4 ms of moe against 2.6 ms for a one-row decode step — the entire
+/// fixed per-request cost that separated its 112.8 tok/s decode from its 91.1 tok/s serve.
+///
+/// Rows are gathered expert-major so each expert owns a contiguous run, which is what lets
+/// the kernel index by `(xoff + r)` and lets the host combine loop below run in exactly the
+/// per-expert path's order — same expert order, same `+=` per output row.
+///
+/// Chunked at `INT2_GRP_MAX` because the group rides as a by-value kernel parameter and a
+/// short prefill activates far more experts than a decode step: five tokens at top-8 reach
+/// up to 40 distinct experts against a decode step's 8.
+pub fn try_expert_group_int2_rows(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+) -> bool {
+    const CHUNK: usize = 32; // must match INT2_GRP_MAX in backend_cuda.cu
+    if !available() || !int2_group_enabled() || active.is_empty() {
+        return false;
+    }
+    let Some(inter) = int2_group_shape(active, d) else {
+        return false;
+    };
+    let total: usize = active.iter().map(|(_, r, _)| r.len()).sum();
+    if total == 0 || total / active.len() > int2_group_rows_max() {
+        return false;
+    }
+
+    // Gather expert-major. `token_of`/`weight_of` keep the scatter honest: the row a result
+    // belongs to is carried alongside it rather than recomputed.
+    let mut gsc = GROUP_SCRATCH.with(|c| c.take());
+    let x_all = fit_f32(&mut gsc.x_all, total * d);
+    let token_of = fit_usize(&mut gsc.token_of, total);
+    let weight_of = fit_f32(&mut gsc.weight_of, total);
+    let mut g = 0usize;
+    for (_, rows, rw) in active {
+        for (r, &t) in rows.iter().enumerate() {
+            x_all[g * d..(g + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
+            token_of[g] = t;
+            weight_of[g] = rw[r];
+            g += 1;
+        }
+    }
+    let y_all = fit_f32(&mut gsc.y_all, total * d);
+
+    let mut ok = true;
+    let mut done = 0usize; // rows consumed, so each chunk slices its own window of x_all
+    for part in active.chunks(CHUNK) {
+        let part_rows: usize = part.iter().map(|(_, r, _)| r.len()).sum();
+        let (mut gw, mut uw, mut dw) = (
+            Vec::with_capacity(part.len()),
+            Vec::with_capacity(part.len()),
+            Vec::with_capacity(part.len()),
+        );
+        let (mut gs, mut us, mut ds) = (
+            Vec::with_capacity(part.len()),
+            Vec::with_capacity(part.len()),
+            Vec::with_capacity(part.len()),
+        );
+        let mut xoff: Vec<i32> = Vec::with_capacity(part.len());
+        let mut nrows: Vec<i32> = Vec::with_capacity(part.len());
+        let mut off = 0i32; // relative to this chunk's window, not to x_all
+        for (ex, rows, _) in part {
+            gw.push(ex.gate.q4.as_ptr() as *const c_void);
+            uw.push(ex.up.q4.as_ptr() as *const c_void);
+            dw.push(ex.down.q4.as_ptr() as *const c_void);
+            gs.push(ex.gate.s.as_ptr());
+            us.push(ex.up.s.as_ptr());
+            ds.push(ex.down.s.as_ptr());
+            xoff.push(off);
+            nrows.push(rows.len() as i32);
+            off += rows.len() as i32;
+        }
+        // SAFETY: the windows hold `part_rows * d` floats each; the six pointer arrays hold
+        // `part.len()` pointers into live expert buffers, which outlive this synchronous
+        // call; every `xoff + nrows` equals `part_rows` by construction above.
+        let called = unsafe {
+            let (yp, xp) = (
+                y_all[done * d..(done + part_rows) * d].as_mut_ptr(),
+                x_all[done * d..(done + part_rows) * d].as_ptr(),
+            );
+            cuda::expert_group_int2_rows_raw(
+                yp,
+                xp,
+                &gw,
+                &uw,
+                &dw,
+                &gs,
+                &us,
+                &ds,
+                &xoff,
+                &nrows,
+                part.len() as i32,
+                d as i32,
+                inter as i32,
+                part_rows as i32,
+            )
+        };
+        if !called {
+            ok = false;
+            break;
+        }
+        done += part_rows;
+    }
+    if ok {
+        // Identical to the per-expert scatter: same expert order, same accumulation.
+        for gg in 0..total {
+            let (t, wgt) = (token_of[gg], weight_of[gg]);
+            let ys = &y_all[gg * d..(gg + 1) * d];
+            let os = &mut out[t * d..(t + 1) * d];
+            for dd in 0..d {
+                os[dd] += wgt * ys[dd];
+            }
+        }
+    }
+    GROUP_SCRATCH.with(|c| c.set(gsc));
+    ok
+}
+
 /// Grouped SwiGLU experts for a packed 4-bit format — NVFP4 (`fmt` 5) or MXFP4 (`fmt` 6).
 ///
 /// Parameterised rather than duplicated: the gather/scatter, the chunking, and the RAM

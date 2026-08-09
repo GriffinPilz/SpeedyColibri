@@ -249,6 +249,24 @@ extern "C" {
         d: c_int,
         i: c_int,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn coli_cuda_expert_group_int2_rows(
+        device: c_int,
+        y: *mut f32,
+        x: *const f32,
+        gw: *const *const c_void,
+        uw: *const *const c_void,
+        dw: *const *const c_void,
+        gs: *const *const f32,
+        us: *const *const f32,
+        ds: *const *const f32,
+        xoff: *const c_int,
+        nrows: *const c_int,
+        k: c_int,
+        d: c_int,
+        i: c_int,
+        xrows: c_int,
+    ) -> c_int;
     fn coli_cuda_gqa_attn(
         device: c_int,
         ctx: *mut f32,
@@ -1135,6 +1153,52 @@ pub unsafe fn expert_group_int2_raw(
         k,
         d,
         i,
+    ) != 0
+}
+
+/// Multi-row grouped int2 experts: expert `k` consumes `nrows[k]` rows of `x[xrows, d]`
+/// starting at `xoff[k]`, and `y` is `[sum(nrows), d]` in the same expert-major order.
+///
+/// The decode entry above is the `xoff = 0, nrows = 1` case of this one; they share the
+/// kernels, so the two shapes cannot drift apart.
+///
+/// # Safety
+/// `x` must hold `xrows * d` floats and `y` must hold `sum(nrows) * d`. Each pointer array
+/// must hold `k` live entries pointing at the experts' weight/scale buffers, and `xoff`
+/// and `nrows` must each hold `k` entries with every `xoff[j] + nrows[j] <= xrows`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn expert_group_int2_rows_raw(
+    y: *mut f32,
+    x: *const f32,
+    gw: &[*const c_void],
+    uw: &[*const c_void],
+    dw: &[*const c_void],
+    gs: &[*const f32],
+    us: &[*const f32],
+    ds: &[*const f32],
+    xoff: &[i32],
+    nrows: &[i32],
+    k: i32,
+    d: i32,
+    i: i32,
+    xrows: i32,
+) -> bool {
+    coli_cuda_expert_group_int2_rows(
+        0,
+        y,
+        x,
+        gw.as_ptr(),
+        uw.as_ptr(),
+        dw.as_ptr(),
+        gs.as_ptr(),
+        us.as_ptr(),
+        ds.as_ptr(),
+        xoff.as_ptr(),
+        nrows.as_ptr(),
+        k,
+        d,
+        i,
+        xrows,
     ) != 0
 }
 

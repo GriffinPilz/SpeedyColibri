@@ -179,6 +179,17 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_int2(int device,float *y,const fl
                                      const float **gs,const float **us,const float **ds,
                                      int K,int D,int I);
 
+/* Multi-row form: expert k consumes nrows[k] rows of x[xrows][D] starting at xoff[k], and
+ * y is [sum(nrows)][D] in the same expert-major order. Covers both shapes — decode is
+ * xoff=0/nrows=1 — and is what lets a SHORT PREFILL group instead of falling to one launch
+ * triple per expert. Long prefill should still take the per-expert path; the caller gates
+ * on rows-per-expert. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_int2_rows(int device,float *y,const float *x,
+                                     const void **gw,const void **uw,const void **dw,
+                                     const float **gs,const float **us,const float **ds,
+                                     const int *xoff,const int *nrows,
+                                     int K,int D,int I,int xrows);
+
 /* Standard GQA prefill (MiniMax-M3): q[S,H,D], full k/v[T,Hkv,D], ctx[S,H,D] out.
  * mode 0 = scalar gqa_attn_kernel; mode 1 = WMMA flash tc_gqa_attn (D%16==0).
  * win > 0 = sliding attention over the last `win` keys (Maple); win <= 0 = unwindowed. */

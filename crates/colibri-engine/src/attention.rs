@@ -359,9 +359,16 @@ pub fn attention_gqa(
     let block_sel = m3_block_select(cfg, l, x, s_len, pos_base);
     let bsize = (cfg.index_block_size as usize).max(1);
 
-    let _tc = std::time::Instant::now();
+    // `_tc` starts AFTER the ctx allocation, or the two timers overlap and the breakdown
+    // double-counts — which it did on first writing, inflating `core` by the alloc and
+    // making the sub-timer sum look closer to `attn` than it is. The twin in
+    // `attention_with_heads` allocates before its core timer, so only this path was wrong.
     let st0 = kv.kv_start[layer];
+    let _tx = std::time::Instant::now();
     let mut ctx = vec![0f32; s_len * h * hd];
+    atime(&crate::forward::ATTN_CTX_US, _tx);
+
+    let _tc = std::time::Instant::now();
 
     // GPU dense core over a fresh cache. Only the block-sparse path stays on the CPU.
     //
@@ -594,7 +601,9 @@ pub fn attention_with_heads(
     atime(&crate::forward::ATTN_INDEX_US, _ti);
     let sel = sel.or(dsa_selection.as_deref());
 
+    let _tx = std::time::Instant::now();
     let mut ctx = vec![0f32; s_len * h * vh];
+    atime(&crate::forward::ATTN_CTX_US, _tx);
 
     let _tc = std::time::Instant::now();
     // GPU weight-absorption attention core for resident kv_b (falls back to CPU).

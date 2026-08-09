@@ -166,6 +166,16 @@ pub(crate) static ATTN_ROPE_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ATTN_INDEX_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ATTN_CORE_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ATTN_OPROJ_US: AtomicU64 = AtomicU64::new(0);
+/// The `ctx` output buffer's ALLOCATION, which is not free and was not bracketed.
+///
+/// The five timers above summed to `ATTN_US` exactly on the July binary (3 ms unaccounted,
+/// twice) and left ~700 ms unaccounted on current main (685 and 711, twice) — a gap far
+/// steadier than `core`, whose 75% swing makes it useless as a signal. This is the one
+/// statement in the attention phase between the indexer timer and the core timer, so it is
+/// where that time has to be. On m3 it is `s_len * h * vh` = 512*64*128 floats = 16.8 MB
+/// PER LAYER CALL, 1.01 GB over 60 layers, and `mallopt` pins anything past 2 MB to mmap —
+/// so every call is a fresh mapping that page-faults on first touch while being zeroed.
+pub(crate) static ATTN_CTX_US: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic forward-pass counter — one per `forward` call, i.e. per decode token
 /// (prefill is a single step over the whole prompt). Used only to key the optional
@@ -2027,10 +2037,11 @@ where
             (ms(&MOE_US) - moe_parts).max(0.0),
         );
         eprintln!(
-            "[profile] attn breakdown: proj {:.0} ms | rope+cache {:.0} ms | dsa-indexer {:.0} ms | core {:.0} ms | o-proj {:.0} ms",
+            "[profile] attn breakdown: proj {:.0} ms | rope+cache {:.0} ms | dsa-indexer {:.0} ms | ctx-alloc {:.0} ms | core {:.0} ms | o-proj {:.0} ms",
             ms(&ATTN_PROJ_US),
             ms(&ATTN_ROPE_US),
             ms(&ATTN_INDEX_US),
+            ms(&ATTN_CTX_US),
             ms(&ATTN_CORE_US),
             ms(&ATTN_OPROJ_US),
         );

@@ -32,6 +32,7 @@ nowhere else. Quick checks: `model.py list`, `model.py path <name>`.
 |---|---|
 | `build.sh` | Build+verify the CUDA `coli` binary (guards the silent CPU-only-binary trap). Model-agnostic. |
 | `fetch.sh <model>` \| `--all` | Download the model's ready-to-run **container** from its registry `hf_repo`. No conversion. |
+| `card.sh <model> [--upload]` | Regenerate the HF model card's measurement rows from a bench run, and flag prose still quoting the old numbers. Local-only unless `--upload`. |
 | `convert.sh <model>` | `coli convert` source → container using the model's registry paths + `convert_env`. |
 | `bench.sh <model> [suite]` | Benchmark battery. Suites: `prefill`, `decode`, `batch`, `serve`, `all` (default). |
 | `serve.sh <model> [port]` | Serve a model over HTTP (container from the registry). Foreground; `SERVE_DETACH=1` to background. |

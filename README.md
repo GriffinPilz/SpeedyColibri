@@ -18,7 +18,7 @@ fails loudly instead of being reported as a win.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`maple-preview`** (20B-A1B) | 5.9 GB | **160.2 tok/s** (3.2 s) | **157.0 tok/s** (112.8 e2e) | **70.5 tok/s** |
+| **`maple-preview`** (20B-A1B) | 5.9 GB | **160.2 tok/s** (3.2 s) | **157.0 tok/s** (112.8 e2e) | **91.1 tok/s** |
 | **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **10.0 tok/s** |
 | **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **5.9 tok/s** |
 | **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
@@ -41,6 +41,13 @@ this table excludes the output projection. On the streaming models that is a rou
 print the pair for every model, so the omission is visible rather than inferred. Maple's row
 was re-measured in full on 2026-08-08 (BF16 IO tier + warp-per-row expert kernels + split-K
 decode attention + zero-copy KV); the other six rows are unchanged from 2026-08-07.
+
+**And read the `serving` column as a 32-token REQUEST rate, not a token rate.** It divides
+by the whole HTTP round trip, so a per-request cost paid once lands on all 32 tokens.
+Maple's 91.1 is `52 ms + 9.36 ms x 32 tok`; the 9.36 is the same engine the decode column
+measures, and `bench_serve.py` now prints the split so the two columns can be reconciled
+instead of guessed at. That number was **70.5** until the accept loop stopped napping
+100 ms between connections — below.
 
 **The biggest single win came from the phase nobody was looking at.** Everything above about
 Maple concerns the expert path, because that is where a short-context profile said the time
@@ -133,6 +140,17 @@ triple, with the weights still read **zero-copy in place**, gives **decode 44.4 
 and serving 43.7 → 56.6**, tokens bit-identical, ranges disjoint. Prefill is unchanged: the
 grouped path is gated on the row count at the decision point and declines outside the decode
 shape. `COLI_INT2_GROUP=0` restores the per-expert arm for comparison.
+
+**The server was napping 100 ms between connections, and only Maple was fast enough to
+show it.** The accept loop polled a non-blocking listener and slept 100 ms whenever nothing
+was pending, justified in its own comment as "nothing next to a multi-second generation" —
+true of GLM at ~1100 ms/token, false of Maple at 8.2. A sequential client pays the *whole*
+nap, not half of it: its next request lands microseconds into a fresh one. The proof needed
+no model at all — `GET /health`, a route that returns a constant, measured **63–97 ms** with
+TCP connect at 0.1 ms. Waiting on the socket with `poll` instead of on the clock keeps the
+bounded shutdown check and removes the latency: **`/health` 63–97 → 0.09 ms**, a 1-token
+request **152.5 → 50.9 ms**, and Maple's serve median **70.5 → 91.1 tok/s**. Every model
+gains the same ~100 ms; only a model whose token costs 8 ms notices.
 
 **Verified against the reference implementation.** Maple's own `modeling_maple.py` was run
 unmodified (only `fa3.py` swapped for an SDPA-backed equivalent, since the published one

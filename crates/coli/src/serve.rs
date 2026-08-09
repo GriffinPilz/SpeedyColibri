@@ -428,11 +428,22 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
                 let _ = stream.set_nonblocking(false);
                 handle(stream, model, &*provider, &tok, &model_id, ctx_len);
             }
-            // No pending connection: nap briefly, then re-check SHUTDOWN. 100 ms of
-            // accept latency is nothing next to a multi-second generation, and it
-            // bounds how long Ctrl-C takes to be noticed.
+            // No pending connection: WAIT ON THE SOCKET, not on the clock.
+            //
+            // This used to be `sleep(100ms)`, justified as "100 ms of accept latency is
+            // nothing next to a multi-second generation". That was true of the model it
+            // was written for — GLM spends ~1100 ms per token — and false of maple, which
+            // spends 8.2. A connection arriving just after a nap waited out the rest of
+            // it, so `GET /health`, a route that returns a constant and never touches the
+            // model, measured 63-97 ms (2026-08-08, curl and urllib agreeing, TCP connect
+            // 0.1 ms). On a 32-token maple request that was 15-24% of the wall clock, and
+            // it is most of the gap between maple's 112.8 tok/s decode and its 70.5 serve.
+            //
+            // `poll` gives back both properties at once: it returns the instant a
+            // connection lands, AND it returns after the timeout so SHUTDOWN is still
+            // re-checked ~10x/second. Nothing else about the loop changes.
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
+                wait_for_connection(&listener, 100);
             }
             // EINTR from the signal itself: loop and let the SHUTDOWN check handle it.
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -444,6 +455,30 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // remaining ~2s is the kernel reclaiming this ~60 GB process, unavoidable and well
     // inside docker's grace — see shutdown_exit's docs.
     crate::shutdown_exit()
+}
+
+/// Block until the listener has a pending connection or `timeout_ms` elapses.
+///
+/// The accept loop needs both: no latency when a client is waiting, and a bounded nap so
+/// the shutdown flag gets re-checked. A sleep only gives the second. `poll` gives both.
+/// EINTR is not an error here — a signal arriving is precisely what the caller wants to
+/// return and re-check for.
+#[cfg(unix)]
+fn wait_for_connection(listener: &TcpListener, timeout_ms: i32) {
+    use std::os::unix::io::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+}
+
+/// Non-unix fallback: the old behaviour. Windows is not a target this repo builds for,
+/// so this exists to keep the code compiling rather than because it is good.
+#[cfg(not(unix))]
+fn wait_for_connection(_listener: &TcpListener, timeout_ms: i32) {
+    std::thread::sleep(Duration::from_millis(timeout_ms.max(0) as u64));
 }
 
 fn mk_kv(model: &Model, max_t: usize) -> KvCache {

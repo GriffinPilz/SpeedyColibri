@@ -75,6 +75,30 @@ def one(url, prompt, n_tokens):
     return tokens / dt, tokens, dt
 
 
+def measure_fixed_cost(url, reps=5):
+    """Seconds a request costs before the per-token rate applies.
+
+    A 1-token request is one decode step plus everything that is paid once: the accept,
+    the HTTP parse, tokenization, prefill of a short prompt, detokenization. Subtracting
+    one token's marginal cost would need the rate we are trying to derive, so this returns
+    the whole 1-token time and the caller absorbs that single token — the error is one
+    token's worth, which is under 1% of a 32-token request.
+
+    This exists because the serve column read as a mystery without it. maple measured
+    70.5 tok/s serving against 112.8 tok/s decoding, and the whole difference was a fixed
+    cost divided by only 32 tokens — not a slower engine. Reporting one number invited the
+    wrong conclusion twice, so now both are printed.
+    """
+    ts = []
+    for _ in range(reps + 1):  # first is a warmup, discarded
+        r = one(url, PROMPTS[0], 1)
+        if r is not None:
+            ts.append(r[2])
+    if len(ts) < 2:
+        return None
+    return min(ts[1:])  # min, not median: this is a floor, and noise only adds
+
+
 def main():
     hostport = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:8080"
     n_tokens = int(sys.argv[2]) if len(sys.argv) > 2 else 32
@@ -117,6 +141,22 @@ def main():
     if len(rates) > 1:
         print(f"stdev      : {statistics.stdev(rates):.2f}")
     print(f"first req  : {rates[0]:.2f} tok/s (cold cache; excluded from nothing, just noted)")
+
+    fixed = measure_fixed_cost(url)
+    if fixed is not None:
+        med_dt = statistics.median(
+            [t / r for t, r in zip(toks, rates)]  # seconds per request
+        )
+        med_tok = statistics.median(toks)
+        gen_s = med_dt - fixed
+        print()
+        print(f"fixed cost : {fixed * 1000:.0f} ms per request, before the first token")
+        if gen_s > 0:
+            print(f"marginal   : {med_tok / gen_s:.2f} tok/s   <- compare THIS to the decode column")
+            print(f"             ({fixed * 1000:.0f} ms + {gen_s / med_tok * 1000:.2f} ms x {med_tok:.0f} tok "
+                  f"= {med_dt * 1000:.0f} ms)")
+        else:
+            print("marginal   : n/a (fixed cost exceeds the median request — raise the token count)")
 
 
 if __name__ == "__main__":

@@ -369,6 +369,43 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         );
     }
 
+    // ---- discover peers, BEFORE binding -----------------------------------
+    //
+    // Scan the ConnectX/RoCE fabric and print the other Sparks we can see, so the operator
+    // can verify the multi-node wiring at startup. COLI_DISCOVER_SECS=0 skips it.
+    //
+    // This runs before the bind, and the ordering is the point. It used to sit between the
+    // bind and the accept loop, which meant the socket was LISTENING for ~3 s while nothing
+    // was accepting. Everything in this repo treats a live listener as "ready" —
+    // `scripts/serve.sh` polls `ss -ltn`, and the comment in that script says so outright —
+    // so "ready" was announced 3 s early and the first real request stalled for the
+    // remainder of the scan. Measured 2026-08-08: first `GET /health` after startup took
+    // **3.315 s**, against 0.0003 s with COLI_DISCOVER_SECS=0.
+    //
+    // Scanning first costs 3 s before the port opens, which is nothing beside a model load
+    // that already ran for seconds to minutes, and it makes the invariant true instead of
+    // nearly true. The beacon stays AFTER the bind on purpose: announcing this node's port
+    // before anything can accept on it invites a peer to connect into the same gap.
+    //
+    // The signal handlers go in before the scan, not after the bind where they used to sit.
+    // Moving the scan earlier would otherwise have left a 3 s window running under the
+    // DEFAULT signal disposition. That still exits — it is not a hang — but it skips this
+    // binary's deliberate path, and the window is exactly when an operator notices they
+    // started the wrong model. Measured after the move: SIGTERM mid-scan exits in 1 ms.
+    crate::install_shutdown_handlers();
+    let disc_secs = std::env::var("COLI_DISCOVER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(3.0);
+    let rank: u32 = std::env::var("COLI_NODE_RANK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if disc_secs > 0.0 {
+        let d = colibri_cluster::discover(rank, port, Duration::from_secs_f64(disc_secs));
+        let _ = colibri_cluster::discovery::print_report(&d, &mut std::io::stdout());
+    }
+
     // ---- listen -----------------------------------------------------------
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr) {
@@ -378,10 +415,10 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Handle SIGINT/SIGTERM so the server (often PID 1 under Docker) stops on Ctrl-C or
-    // `docker stop` instead of hanging until SIGKILL. Nonblocking accept + a poll of
-    // the shutdown flag is what lets the blocking loop below actually notice it.
-    crate::install_shutdown_handlers();
+    // SIGINT/SIGTERM handling (installed above, before the fabric scan) is what stops the
+    // server — often PID 1 under Docker — on Ctrl-C or `docker stop` instead of hanging
+    // until SIGKILL. A nonblocking listener plus the poll below is what lets this loop
+    // actually notice the flag.
     if let Err(e) = listener.set_nonblocking(true) {
         eprintln!("[serve] warning: set_nonblocking failed ({e}); Ctrl-C may be slow");
     }
@@ -403,20 +440,9 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         "[serve]   POST /v1/chat/completions   POST /v1/completions   GET /v1/models   GET /health"
     );
 
-    // Scan the ConnectX/RoCE fabric and print the other Sparks we can see, so the
-    // operator can verify the multi-node wiring at startup, then keep beaconing so
-    // peers that start later discover this node too. COLI_DISCOVER_SECS=0 skips.
-    let disc_secs = std::env::var("COLI_DISCOVER_SECS")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(3.0);
+    // Keep beaconing so peers that start later discover this node too. The scan itself
+    // already ran above; only the announcement waits for a socket that can answer.
     if disc_secs > 0.0 {
-        let rank: u32 = std::env::var("COLI_NODE_RANK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let d = colibri_cluster::discover(rank, port, Duration::from_secs_f64(disc_secs));
-        let _ = colibri_cluster::discovery::print_report(&d, &mut std::io::stdout());
         colibri_cluster::discovery::spawn_beacon(rank, port);
     }
 

@@ -321,6 +321,46 @@ fits the cache, so every step still streams ~the whole expert set. The real leve
 **RAM-resident experts across a cluster**, which lifts the whole curve; a continuous-batching
 scheduler pairs with that, not with a single node.
 
+### Split-K decode attention — 2026-08-08
+
+**Measured decode-only** (phase counters differenced from end-of-prefill; the cumulative
+totals are ~96% prefill at a 512-token prompt and cannot answer this), Maple:
+
+| phase | ms/token | share |
+|---|---|---|
+| **attn** | **10.33** | **66%** |
+| moe | 2.68 | 17% |
+| logits | 2.62 | 17% |
+
+Attention, not the expert path — which measures 42–49% of the memory ceiling and ~1.44
+ms/token. The whole prior effort had been aimed at experts on the strength of a
+short-context profile.
+
+Cause: at `S == 1` both GQA kernels launch `grid = (H, S)` = **16 blocks for a layer**, and
+`tc_gqa_attn` fills a `GQA_QT=16`-row query tile with one real row. Prefill-shaped kernels in
+the decode regime — the same error as the block-per-row expert kernels, one level up. Inside
+`gqa_attn_kernel` the V accumulation strides `d < D`, so at D=128 against 1024 threads only
+128 threads are live and each walks all `nt` keys.
+
+Split-K partitions keys across `nsplit` blocks per head, each with a local softmax, combined
+against a global max (`acc * exp(m_split − M)`). ABBA, one knob, tokens identical:
+
+| | prefill-shaped | split-K |
+|---|---|---|
+| decode (forward-only) | 75.59 / 76.44 | **130.35 / 132.40 tok/s** (1.73×) |
+| decode (end-to-end) | 63.58 / 64.18 | **98.31 / 99.47 tok/s** (1.55×) |
+
+**It scales with context and is neutral without it.** `serving` moved 69.1 → 69.8 because
+that suite uses short prompts: few keys, `nsplit` → 1, kernel degenerates to the old shape.
+Prefill untouched (S>1 never takes this path). Nemotron 12.54 vs 12.68, tokens identical —
+neutral, as expected when decode is expert-streaming with 8 GQA layers.
+
+Still open on this path: `coli_cuda_gqa_attn` re-uploads the ENTIRE K and V history every
+call — ~52.7 MB per decoded token at a 512-token context, against a measured **43 GB/s**
+pageable H2D (vs 256 GB/s for a device read), so ~1.23 ms/token — when one row changed. The
+fix is a device-resident per-layer KV appended one row at a time; it was left alone here
+because a stale device KV is a silent-corruption risk this repo has already been bitten by.
+
 ### Short rows starve block-per-row kernels — 2026-08-08
 
 **Check `row_bytes / blockDim` before concluding a GEMV is ALU-bound.** The grouped int2

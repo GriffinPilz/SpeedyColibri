@@ -18,7 +18,7 @@ fails loudly instead of being reported as a win.
 
 | model | on disk | prefill | decode | serving |
 |---|---|---|---|---|
-| **`maple-preview`** (20B-A1B) | 5.9 GB | **148.1 tok/s** (3.5 s) | **76.9 tok/s** (64.5 e2e) | **69.1 tok/s** |
+| **`maple-preview`** (20B-A1B) | 5.9 GB | **155.2 tok/s** (3.3 s) | **131.4 tok/s** (98.9 e2e) | **69.8 tok/s** |
 | **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **10.0 tok/s** |
 | **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **5.9 tok/s** |
 | **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
@@ -36,11 +36,45 @@ because there isn't one.
 timer brackets `forward()` and stops before the `lm_head` matmul, so every decode figure in
 this table excludes the output projection. On the streaming models that is a rounding error
 (GLM spends ~1100 ms/token, the head is single-digit ms). **On Maple it is not**: the head is
-2.5 ms of a 15.4 ms token, so Maple's honest end-to-end decode is **64.5 tok/s** against the
-76.9 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
+2.5 ms of a 10.1 ms token, so Maple's honest end-to-end decode is **98.9 tok/s** against the
+131.4 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
 print the pair for every model, so the omission is visible rather than inferred. Maple's row
-was re-measured in full on 2026-08-08 (BF16 IO tier + warp-per-row expert kernels); the other
-six rows are unchanged from 2026-08-07.
+was re-measured in full on 2026-08-08 (BF16 IO tier + warp-per-row expert kernels + split-K
+decode attention); the other six rows are unchanged from 2026-08-07.
+
+**The biggest single win came from the phase nobody was looking at.** Everything above about
+Maple concerns the expert path, because that is where a short-context profile said the time
+went. Measured properly — decode only, prefill excluded, at the 512-token context the table
+actually uses — the split is:
+
+| phase | ms/token | share |
+|---|---|---|
+| **attn** | **10.33** | **66%** |
+| moe | 2.68 | 17% |
+| logits | 2.62 | 17% |
+
+Attention, not experts. And the cause was the same mistake as the expert kernels, one level
+up: at `S == 1` both GQA paths launch `grid = (H, S)` — **16 blocks for an entire layer** —
+and the WMMA path fills a 16-row query tile with **one** real row. They are prefill-shaped
+kernels running the decode regime. Inside the scalar one the tail is worse than the head: the
+final V accumulation strides `d < D`, so with D=128 against 1024 threads only 128 are live and
+each walks all 536 keys.
+
+**Split-K (flash-decoding)** partitions the key range across `nsplit` blocks per head, each
+taking a local softmax, then rescales and combines against a global max. Blocks go from H to
+H×nsplit and each thread's V loop shrinks by `nsplit`. ABBA, one knob, tokens identical:
+
+| | prefill-shaped | split-K |
+|---|---|---|
+| decode (forward-only) | 75.59 / 76.44 | **130.35 / 132.40 tok/s** (1.73×) |
+| decode (end-to-end) | 63.58 / 64.18 | **98.31 / 99.47 tok/s** (1.55×) |
+
+**The win scales with context and is ~neutral without it**, which is why `serving` barely
+moves (69.1 → 69.8): that suite uses short prompts, so there are few keys to split, `nsplit`
+collapses to 1, and the kernel degenerates to the old shape. Prefill is untouched — it is
+S>1 and never takes this path. Nemotron, which shares the kernel, measured 12.54 vs 12.68
+with identical tokens: neutral, as expected for a model whose decode is expert-streaming
+with only 8 GQA layers. `COLI_GQA_SPLIT=0` restores the old kernels.
 
 This is also why `serving` sits below `decode` for every row. The column is left as-is
 rather than silently re-baselined, because every historical measurement in this repo is

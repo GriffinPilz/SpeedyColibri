@@ -61,6 +61,8 @@ typedef struct {
     uint8_t *lres; size_t lres_cap;
     float *host_lres; size_t host_lres_cap;   /* `float*` to match reserve_pinned; bytes underneath */
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
+    /* split-K decode attention: per-(head,split) partial V accumulator + its (max, sum). */
+    float *asp,*asm_,*asl; size_t asp_cap,asm_cap,asl_cap;
     /* Nemotron-H Mamba2 selective-scan decode scratch (state in/out + per-step inputs). */
     float *ms_state,*ms_x,*ms_y,*ms_b,*ms_c,*ms_dth,*ms_dah,*ms_d;
     size_t ms_state_cap,ms_x_cap,ms_y_cap,ms_b_cap,ms_c_cap,ms_dth_cap,ms_dah_cap,ms_d_cap;
@@ -2036,6 +2038,113 @@ __global__ static void mamba2_scan_seq_kernel(float *state, float *y, const floa
  * Missing it on any one of them is not a crash: the max/sum reductions would simply
  * include keys the query cannot see, and the model would emit fluent, subtly wrong text.
  * `scores[0, t0)` is left untouched and never read. */
+/* ==== Flash-decoding: split-K GQA attention for the S==1 (decode) regime ==============
+ *
+ * `gqa_attn_kernel` and `tc_gqa_attn` both launch `grid = (H, S)`. At S==1 that is **H
+ * blocks for an entire layer** — 16 on Maple — and the WMMA path additionally fills a
+ * GQA_QT=16-row query tile with ONE real row, wasting 15/16 of it. They are prefill-shaped
+ * kernels being run in the decode regime.
+ *
+ * It is the dominant cost. Measured decode-only at a 512-token context (phase counters
+ * differenced from end-of-prefill, because the cumulative totals are ~96% prefill):
+ *
+ *     attn 10.33 ms (66%) | moe 2.68 (17%) | logits 2.62 (17%)   of a 15.6 ms token
+ *
+ * Inside `gqa_attn_kernel` the tail is worse than the head: the final V accumulation loops
+ * `for (d = tid; d < D; d += blockDim.x)`, so with D=128 and 1024 threads only 128 threads
+ * are live and each walks ALL `nt` keys. Sixteen blocks x 128 useful threads is the whole
+ * layer.
+ *
+ * Split-K: partition the key range across `nsplit` blocks per head, each computing a partial
+ * (max, sum, weighted-V) over its slice with a local softmax, then combine. Blocks go from
+ * H to H*nsplit, and the V loop shrinks from `nt` to `nt/nsplit` per thread.
+ *
+ * NOT bit-identical to `gqa_attn_kernel`: one global max and one global sum become per-split
+ * ones recombined, and f32 addition is not associative. Same arithmetic, ~ULP-level
+ * difference — so the token gate is the acceptance test, as it was for the warp-per-row
+ * expert kernels.
+ *
+ * The combine is the standard flash-decoding rescale: a split holding
+ * `acc = sum_i exp(s_i - m_split) * V_i` and `l = sum_i exp(s_i - m_split)` contributes
+ * `acc * exp(m_split - M)` and `l * exp(m_split - M)` against the global max M. */
+#define GQA_SPLIT_MAX 32
+
+__global__ static void gqa_attn_split(float *pacc, float *pm, float *pl,
+        const float *Q, const float *K, const float *V,
+        int H, int Hkv, int D, int t0, int nt, int nsplit, float scale) {
+    int h = blockIdx.x, sp = blockIdx.y, tid = threadIdx.x;
+    int kvh = h / (H / Hkv);
+    int span = nt - t0;
+    int per = (span + nsplit - 1) / nsplit;
+    int lo = t0 + sp * per, hi = lo + per;
+    if (hi > nt) hi = nt;
+    int n = hi - lo;
+    size_t pbase = ((size_t)h * nsplit + sp) * D;
+    if (n <= 0) {                      // empty slice: contributes nothing to the combine
+        if (!tid) { pm[h * nsplit + sp] = -3.402823466e+38F; pl[h * nsplit + sp] = 0.f; }
+        for (int d = tid; d < D; d += blockDim.x) pacc[pbase + d] = 0.f;
+        return;
+    }
+    extern __shared__ float sm[];
+    float *qs = sm, *scores = qs + D, *red = scores + per;
+    const float *qrow = Q + (size_t)h * D;          // S == 1
+    for (int d = tid; d < D; d += blockDim.x) qs[d] = qrow[d];
+    __syncthreads();
+
+    // One WARP per key: the D-length dot product is split across 32 lanes and shuffled.
+    // Assigning one key per THREAD instead would idle most of the block whenever a slice is
+    // shorter than blockDim, which is exactly the regime split-K creates.
+    int lane = tid & 31, warp = tid >> 5, nwarp = blockDim.x >> 5;
+    for (int i = warp; i < n; i += nwarp) {
+        const float *kt = K + ((size_t)(lo + i) * Hkv + kvh) * D;
+        float a = 0.f;
+        for (int d = lane; d < D; d += 32) a += qs[d] * kt[d];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(0xffffffffu, a, o);
+        if (!lane) scores[i] = a * scale;
+    }
+    __syncthreads();
+
+    float local = -3.402823466e+38F;
+    for (int i = tid; i < n; i += blockDim.x) local = fmaxf(local, scores[i]);
+    red[tid] = local; __syncthreads();
+    for (int r = blockDim.x >> 1; r; r >>= 1) { if (tid < r) red[tid] = fmaxf(red[tid], red[tid + r]); __syncthreads(); }
+    float mx = red[0];
+    __syncthreads();
+    local = 0.f;
+    for (int i = tid; i < n; i += blockDim.x) { float e = expf(scores[i] - mx); scores[i] = e; local += e; }
+    red[tid] = local; __syncthreads();
+    for (int r = blockDim.x >> 1; r; r >>= 1) { if (tid < r) red[tid] += red[tid + r]; __syncthreads(); }
+    if (!tid) { pm[h * nsplit + sp] = mx; pl[h * nsplit + sp] = red[0]; }
+    __syncthreads();
+    // UNNORMALISED on purpose — the combine divides by the global sum once.
+    for (int d = tid; d < D; d += blockDim.x) {
+        float a = 0.f;
+        for (int i = 0; i < n; i++) a += scores[i] * V[((size_t)(lo + i) * Hkv + kvh) * D + d];
+        pacc[pbase + d] = a;
+    }
+}
+
+__global__ static void gqa_attn_combine(float *ctx, const float *pacc, const float *pm,
+                                        const float *pl, int D, int nsplit) {
+    int h = blockIdx.x, tid = threadIdx.x;
+    float M = -3.402823466e+38F;
+    for (int s = 0; s < nsplit; s++) M = fmaxf(M, pm[h * nsplit + s]);
+    if (M == -3.402823466e+38F) {          // every slice empty — cannot happen with nt>t0,
+        for (int d = tid; d < D; d += blockDim.x) ctx[(size_t)h * D + d] = 0.f;  // but do not
+        return;                                                                   // emit NaN
+    }
+    float z = 0.f;
+    for (int s = 0; s < nsplit; s++) z += pl[h * nsplit + s] * expf(pm[h * nsplit + s] - M);
+    float inv = 1.f / z;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float a = 0.f;
+        for (int s = 0; s < nsplit; s++)
+            a += pacc[((size_t)h * nsplit + s) * D + d] * expf(pm[h * nsplit + s] - M);
+        ctx[(size_t)h * D + d] = a * inv;
+    }
+}
+
 __global__ static void gqa_attn_kernel(float *ctx, const float *Q, const float *K,
         const float *V, int S, int H, int Hkv, int D, int T, float scale, int win) {
     int s = blockIdx.y, h = blockIdx.x, tid = threadIdx.x, nt = T - S + s + 1;
@@ -2531,6 +2640,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
+        if(ctx->asp)cudaFree(ctx->asp);if(ctx->asm_)cudaFree(ctx->asm_);if(ctx->asl)cudaFree(ctx->asl);
         if(ctx->ms_state)cudaFree(ctx->ms_state);if(ctx->ms_x)cudaFree(ctx->ms_x);if(ctx->ms_y)cudaFree(ctx->ms_y);
         if(ctx->ms_b)cudaFree(ctx->ms_b);if(ctx->ms_c)cudaFree(ctx->ms_c);
         if(ctx->ms_dth)cudaFree(ctx->ms_dth);if(ctx->ms_dah)cudaFree(ctx->ms_dah);if(ctx->ms_d)cudaFree(ctx->ms_d);
@@ -2546,6 +2656,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
+        ctx->asp=ctx->asm_=ctx->asl=nullptr;
         ctx->asel=ctx->acnt=nullptr;
         ctx->aqa=ctx->akb=ctx->amsk=nullptr;
         ctx->aqa_cap=ctx->akb_cap=ctx->amsk_cap=0;
@@ -2557,6 +2668,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
+        ctx->asp_cap=ctx->asm_cap=ctx->asl_cap=0;
         ctx->asel_cap=ctx->acnt_cap=0;
         ctx->host_x_cap=ctx->host_y_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
@@ -2660,6 +2772,7 @@ extern "C" size_t coli_cuda_scratch_bytes(int device) {
         t += c->ebsg_cap + c->ebsu_cap + c->ebsd_cap;
         t += c->lres_cap + c->host_lres_cap;                      /* host_lres is pinned */
         t += c->aq_cap + c->al_cap + c->ar_cap + c->ac_cap;
+        t += c->asp_cap + c->asm_cap + c->asl_cap;
         t += c->ms_state_cap + c->ms_x_cap + c->ms_y_cap + c->ms_b_cap + c->ms_c_cap;
         t += c->ms_dth_cap + c->ms_dah_cap + c->ms_d_cap;
         t += c->ms_pin_x_cap + c->ms_pin_y_cap + c->ms_pin_state_cap;   /* pinned */
@@ -4684,6 +4797,43 @@ extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const 
         !cuda_ok(cudaMemcpyAsync(dc->al, k, kb, cudaMemcpyHostToDevice, dc->stream), "gqa k upload") ||
         !cuda_ok(cudaMemcpyAsync(dc->ar, v, kb, cudaMemcpyHostToDevice, dc->stream), "gqa v upload"))
         return 0;
+    // DECODE (S==1): split the key range across blocks instead of giving the whole layer H.
+    // Both kernels below are shaped for prefill and launch grid=(H,S) — 16 blocks on Maple —
+    // and flash additionally wastes 15/16 of a GQA_QT=16-row query tile on a single row.
+    // COLI_GQA_SPLIT=0 restores them for A/B.
+    static int s_split = -1;
+    if (s_split < 0) { const char *e = getenv("COLI_GQA_SPLIT"); s_split = !e || strcmp(e, "0") != 0; }
+    int nt1 = T;                                   // S==1 => the single query is at T-1
+    int tt0 = (win > 0 && nt1 > win) ? nt1 - win : 0;
+    int span = nt1 - tt0;
+    if (s_split && S == 1 && span > 0) {
+        // Enough keys per split to keep a warp-per-key loop fed; more splits than that just
+        // adds combine work and shrinks each block's slice below a warp's width.
+        int nsplit = (span + 63) / 64;
+        if (nsplit < 1) nsplit = 1;
+        if (nsplit > GQA_SPLIT_MAX) nsplit = GQA_SPLIT_MAX;
+        int per = (span + nsplit - 1) / nsplit;
+        const int tpb = 128;
+        size_t pn = (size_t)H * nsplit;
+        size_t shS = (size_t)(D + per + tpb) * sizeof(float);
+        if (shS <= 48u * 1024u &&
+            reserve(&dc->asp, &dc->asp_cap, pn * D * sizeof(float)) &&
+            reserve(&dc->asm_, &dc->asm_cap, pn * sizeof(float)) &&
+            reserve(&dc->asl, &dc->asl_cap, pn * sizeof(float))) {
+            gqa_attn_split<<<dim3(H, nsplit), tpb, shS, dc->stream>>>(
+                dc->asp, dc->asm_, dc->asl, dc->aq, dc->al, dc->ar,
+                H, Hkv, D, tt0, nt1, nsplit, scale);
+            gqa_attn_combine<<<H, tpb, 0, dc->stream>>>(dc->ac, dc->asp, dc->asm_, dc->asl,
+                                                        D, nsplit);
+            if (!cuda_ok(cudaGetLastError(), "gqa split launch") ||
+                !cuda_ok(cudaMemcpyAsync(ctx, dc->ac, qb, cudaMemcpyDeviceToHost, dc->stream), "gqa ctx download") ||
+                !cuda_ok(cudaStreamSynchronize(dc->stream), "gqa sync"))
+                return 0;
+            return 1;
+        }
+        // Scratch or shared-memory budget refused: fall through to the original kernels
+        // rather than return 0, which the caller cannot tell from "no GPU".
+    }
     if (flash) {
         size_t shW = (size_t)GQA_QT * 8 * D;   // QA+KB (fp16, 4D) + acc (f32, 4D) per 16 rows
         if (!cuda_ok(cudaFuncSetAttribute(tc_gqa_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shW), "gqa flash shared attr")) return 0;

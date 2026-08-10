@@ -115,8 +115,15 @@ if [[ -z "$old_rows" ]]; then
 fi
 [[ -n "$old_rows" ]] || die "no measurement rows in $CARD — expected '| prefill | …' etc."
 
+# The heading dates the measurement, so it has to move with the numbers — a card reading
+# "Measured … 2026-08-07" above figures taken on the 9th misdates them, and the date is how
+# anyone reconciles a card against a commit. Taken from the LOG's mtime when one is passed,
+# so re-running card.sh next week against tonight's log still says tonight.
+if [[ -n "$FROM" ]]; then RUN_DATE=$(date -r "$FROM" +%F); else RUN_DATE=$(date +%F); fi
+
 tmp=$(mktemp)
-awk -v pf="$PF_TPS" -v pfs="$PF_S" -v dfwd="$DEC_FWD" -v de2e="$DEC_E2E" -v srv="$SRV" '
+awk -v pf="$PF_TPS" -v pfs="$PF_S" -v dfwd="$DEC_FWD" -v de2e="$DEC_E2E" -v srv="$SRV" -v rd="$RUN_DATE" '
+  /^## Measured on / { sub(/[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]*$/, rd); print; next }
   /^\| prefill \|/ && pf  != "" { printf "| prefill | **%s tok/s** (%s s) |\n", pf, pfs; next }
   /^\| decode \|/  && de2e != "" { printf "| decode | **%s tok/s** end-to-end (%s forward-only) |\n", de2e, dfwd; next }
   /^\| serving \|/ && srv != "" { printf "| serving | **%s tok/s** median, 12 diverse prompts over HTTP |\n", srv; next }

@@ -88,7 +88,13 @@ PF_S=""; [[ -n "$PF_MS" ]] && PF_S=$(awk "BEGIN{printf \"%.1f\", $PF_MS/1000}")
 # look like precision changes rather than measurement changes.
 # An `if` rather than `[[ … ]] && awk`: the && form returns 1 on an empty value, and under
 # `set -e` that kills the script mid-assignment with no message at all.
-r1() { if [[ -n "$1" ]]; then awk "BEGIN{printf \"%.1f\", $1}"; fi; }
+#
+# Two decimals below 1.0, one above. Not a style choice — at k3's 0.40 tok/s a single decimal
+# quantizes to ±12%, coarser than the 7.5% spread the measurement actually has, so it would
+# throw away a digit the number earned. Above 1.0 one decimal is already finer than any of
+# these spreads, and MORE digits would assert a precision the fleet does not have: m2.7's
+# decode swings 18% run to run, so publishing 5.51 rather than 5.5 would be false confidence.
+r1() { if [[ -n "$1" ]]; then awk "BEGIN{v=$1; printf (v<1 ? \"%.2f\" : \"%.1f\"), v}"; fi; }
 PF_TPS=$(r1 "$PF_TPS"); DEC_FWD=$(r1 "$DEC_FWD"); DEC_E2E=$(r1 "$DEC_E2E"); SRV=$(r1 "$SRV")
 
 # ---- rewrite the three rows --------------------------------------------------------
@@ -119,11 +125,17 @@ fi
 # "Measured … 2026-08-07" above figures taken on the 9th misdates them, and the date is how
 # anyone reconciles a card against a commit. Taken from the LOG's mtime when one is passed,
 # so re-running card.sh next week against tonight's log still says tonight.
+#
+# But ONLY when every row moved. On a partial refresh the heading would claim today's date
+# for rows it did not touch, which is a worse lie than a stale date — k3's prefill is from
+# 2026-08-06 and its decode from the 9th. One heading cannot describe both, so the script
+# leaves it and says so; the card needs a per-row note a generator has no business inventing.
 if [[ -n "$FROM" ]]; then RUN_DATE=$(date -r "$FROM" +%F); else RUN_DATE=$(date +%F); fi
+[[ ${#rows_left[@]} -eq 0 ]] || RUN_DATE=""
 
 tmp=$(mktemp)
 awk -v pf="$PF_TPS" -v pfs="$PF_S" -v dfwd="$DEC_FWD" -v de2e="$DEC_E2E" -v srv="$SRV" -v rd="$RUN_DATE" '
-  /^## Measured on / { sub(/[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]*$/, rd); print; next }
+  /^## Measured on / && rd != "" { sub(/[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]*$/, rd); print; next }
   /^\| prefill \|/ && pf  != "" { printf "| prefill | **%s tok/s** (%s s) |\n", pf, pfs; next }
   /^\| decode \|/  && de2e != "" { printf "| decode | **%s tok/s** end-to-end (%s forward-only) |\n", de2e, dfwd; next }
   /^\| serving \|/ && srv != "" { printf "| serving | **%s tok/s** median, 12 diverse prompts over HTTP |\n", srv; next }
@@ -136,6 +148,8 @@ grep -E '^\| (prefill|decode|serving) \|' "$CARD" | sed 's/^/    /'
 if [[ ${#rows_left[@]} -gt 0 ]]; then
   echo "[card] LEFT AS PUBLISHED — no figure parsed for: ${rows_left[*]}"
   echo "[card]   (deliberate? pass --allow-partial. otherwise a suite failed — check the log.)"
+  echo "[card] the '## Measured …' date was NOT touched — it cannot date a partial refresh."
+  echo "[card]   Say per row in the card which date each was taken on."
 fi
 
 # ---- the hard half: prose that quotes the old numbers -------------------------------

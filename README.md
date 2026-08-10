@@ -24,11 +24,13 @@ fails loudly instead of being reported as a win.
 | **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.65** / 4.7 tok/s | **4.3 tok/s** |
 | **`minimax-m3`** | 229 GB | **16.4 tok/s** (31.1 s) | **2.7** / 2.7 tok/s | **2.6 tok/s** |
 | **`glm-5.2`** (744B) | 403 GB | **7.7 tok/s** (66.9 s) | **1.0** / 1.0 tok/s | **1.0 tok/s** |
-| **`kimi-k3`** (1.5T) | 1.4 TB | **1.8 tok/s** (4.6 min) | 0.35 tok/s (forward-only) | — |
+| **`kimi-k3`** (1.5T) | 1.4 TB | **1.8 tok/s** (4.6 min) | **0.40** / 0.40 tok/s | — |
 
 Five rows measured 2026-08-09 on `main` at `ef2bf7f`, `BENCH_REPS=8`, all suites exited 0 and
-every token gate passed. Maple was measured 2026-08-08 and K3 on 2026-08-06 — K3's suite
-alone takes ~1.5 h, and it has no serving figure for the same reason. **The decode pair
+every token gate passed. Maple was measured 2026-08-08. K3's decode is also from the 9th, but
+its **prefill is still 2026-08-06** and it has no serving figure at all — a full K3 suite is
+~1.5 h and its prefill alone is ~8 min per rep, so it gets re-measured only when something
+plausibly moves it. **The decode pair
 collapses at one decimal on v4, m3 and glm**, which is the point: `lm_head` is under 1% of a
 token there. It is 28% of Maple's.
 

@@ -16,21 +16,35 @@ One Spark, single sequence, greedy, 512-token prompt. Every figure is a median o
 runs on **one build**, gated on token identity so a "faster" number that changed the output
 fails loudly instead of being reported as a win.
 
-| model | on disk | prefill | decode | serving |
+| model | on disk | prefill | decode (end-to-end / forward-only) | serving |
 |---|---|---|---|---|
-| **`maple-preview`** (20B-A1B) | 5.9 GB | **230.0 tok/s** (2.2 s) | **155.8 tok/s** (112.1 e2e) | **109.0 tok/s** |
-| **`nemotron-3-super`** | 69 GB | **45.7 tok/s** (11.2 s) | **12.9 tok/s** | **9.97 tok/s** |
-| **`minimax-m2.7`** | 122 GB | **21.0 tok/s** (24.4 s) | **5.1 tok/s** | **6.0 tok/s** |
-| **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.7 tok/s** | **4.4 tok/s** |
-| **`minimax-m3`** | 229 GB | **16.7 tok/s** (30.6 s) | **2.5 tok/s** | **2.6 tok/s** |
-| **`glm-5.2`** (744B) | 403 GB | **6.9 tok/s** (74.6 s) | **0.9 tok/s** | **0.92 tok/s** |
-| **`kimi-k3`** (1.5T) | 1.4 TB | **1.8 tok/s** (4.6 min) | **0.35 tok/s** | — |
+| **`maple-preview`** (20B-A1B) | 5.9 GB | **230.0 tok/s** (2.2 s) | **112.1** / 155.8 tok/s | **109.0 tok/s** |
+| **`nemotron-3-super`** | 69 GB | **45.3 tok/s** (11.3 s) | **12.8** / 13.2 tok/s | **10.0 tok/s** |
+| **`minimax-m2.7`** | 122 GB | **20.3 tok/s** (25.3 s) | **5.5** / 5.6 tok/s | **6.1 tok/s** |
+| **`deepseek-v4-flash`** | 145 GB | **13.8 tok/s** (37.1 s) | **4.65** / 4.7 tok/s | **4.3 tok/s** |
+| **`minimax-m3`** | 229 GB | **16.4 tok/s** (31.1 s) | **2.7** / 2.7 tok/s | **2.6 tok/s** |
+| **`glm-5.2`** (744B) | 403 GB | **7.7 tok/s** (66.9 s) | **1.0** / 1.0 tok/s | **1.0 tok/s** |
+| **`kimi-k3`** (1.5T) | 1.4 TB | **1.8 tok/s** (4.6 min) | 0.35 tok/s (forward-only) | — |
 
-Measured 2026-08-07 on branch `ffn-devcopy-coverage-gate`, which is ahead of `main`. All 15
-suites exited 0 and every token gate passed. K3 was measured separately on 2026-08-06 — its
-suite alone takes ~1.5 h — and is unaffected by anything that changed since. Maple was added
-and measured 2026-08-07 on the same box; its numbers are not comparable to a prior release
-because there isn't one.
+Five rows measured 2026-08-09 on `main` at `ef2bf7f`, `BENCH_REPS=8`, all suites exited 0 and
+every token gate passed. Maple was measured 2026-08-08 and K3 on 2026-08-06 — K3's suite
+alone takes ~1.5 h, and it has no serving figure for the same reason. **The decode pair
+collapses at one decimal on v4, m3 and glm**, which is the point: `lm_head` is under 1% of a
+token there. It is 28% of Maple's.
+
+**Do not read a change against an older revision of this table as a speedup.** Two of tonight's
+five rows moved ~8-10% on decode with nothing in the engine to explain it, and the per-rep
+data says why — the spread is a property of the model, not of the measurement:
+
+| | per-rep decode spread, one session, 8 reps |
+|---|---|
+| `nemotron-3-super` | **0.7%** (13.23-13.32) |
+| `deepseek-v4-flash` | 5.5% |
+| `minimax-m3` | 10% |
+| `minimax-m2.7` | **18%** (5.01-5.92) |
+
+m2.7's published 5.1 sits inside tonight's own low tail. A median-of-8 is the better estimate,
+which is why it is here — but the difference from a median-of-3 is not evidence of anything.
 
 **The decode figure is a median of 8, not 3, and that correction is mine.** It read 116.3
 here until four suites at `BENCH_REPS=8` put it at 112.1: three warm suites agreed at 112.80,
@@ -40,15 +54,19 @@ median-of-3 — the top of a distribution whose other draws that same day were 1
 (§6), caught this time on my own number rather than an inherited one. **`decode` is the
 noisiest column here**; treat any single suite of it as one draw.
 
-**Read the `decode` column as a FORWARD-PASS rate, not a token rate.** `coli gen`'s decode
-timer brackets `forward()` and stops before the `lm_head` matmul, so every decode figure in
-this table excludes the output projection. On the streaming models that is a rounding error
-(GLM spends ~1100 ms/token, the head is single-digit ms). **On Maple it is not**: the head is
-2.5 ms of an 8.9 ms token, so Maple's honest end-to-end decode is **112.1 tok/s** against the
-155.8 forward-only — which is why its row carries both. `coli gen` and `scripts/bench.sh` now
-print the pair for every model, so the omission is visible rather than inferred. Maple's row
-was re-measured in full on 2026-08-08 (BF16 IO tier + warp-per-row expert kernels + split-K
-decode attention + zero-copy KV); the other six rows are unchanged from 2026-08-07.
+**The decode column now carries BOTH rates, because the timer measures the smaller one.**
+`coli gen`'s decode timer brackets `forward()` and stops before the `lm_head` matmul, so a
+lone figure from it is a forward-pass rate, not a token rate. The gap is set by one number —
+the size of `lm_head` — and it is **not** uniform: only Maple stores it BF16 (2 B/weight),
+every other container stores it U8, so the fleet's heads cost 2.1-5.7 ms against Maple's 2.5
+on a far shorter token. Measured, not assumed: 28% on Maple, 3.1% on nemotron, ~1% on
+m2.7/m3/v4, 0.3% on glm.
+
+That asymmetry is why the omission mattered. It made Maple look 39% faster than a caller
+experiences while being genuinely immaterial elsewhere — so the six non-Maple cards published
+a forward-only figure for two days without anyone being much misled, and Maple's needed
+fixing the same day. `coli gen` and `scripts/bench.sh` print the pair for every model now,
+and every published model card carries it.
 
 **And read the `serving` column as a 32-token REQUEST rate, not a token rate.** It divides
 by the whole HTTP round trip, so a per-request cost paid once lands on all 32 tokens.
@@ -58,13 +76,24 @@ of guessed at. That number was **70.5** until the accept loop stopped napping 10
 connections, and **91.1** until the expert path stopped refusing to group a prefill — both
 below.
 
-**All six serve figures were re-measured 2026-08-08 after that fix, and only Maple moved.**
-That is the expected shape, not a disappointment: the ~100 ms is a constant, so it is 24% of
-Maple's request and 0.3% of GLM's. m2.7 went 5.9 → 6.0 (+1.9%, close to the ~2% predicted
-from its token cost), v4 4.4 → 4.38 and m3 2.6 → 2.60 — both flat. **GLM read 0.84 → 0.92,
-and that is NOT the fix**: its own 12 prompts spread 0.73–1.24 tok/s in the same run, so 0.84
-sits inside the noise of 0.92. K3 was not re-run; its suite takes hours and it would gain
-0.1%.
+**Only Maple moved on that fix, which is the expected shape rather than a disappointment:**
+the ~100 ms is a constant, so it is 24% of Maple's request and 0.3% of GLM's. Everything else
+was flat to within its own noise — GLM's 12 prompts spread 0.73-1.24 tok/s *inside a single
+run*, so nothing at GLM's scale can be read off one serve median.
+
+**GLM's old prefill figure of 6.9 tok/s (74.6 s) does not reproduce, and the cause is the
+box, not the code.** Re-measured 2026-08-09 it reads 7.7 (66.9 s), and the tempting conclusion
+— that something got 11% faster — is wrong. Built `bc8d164`, the last commit before that
+work, and ran both binaries alternating in one session, 4 reps per block, 2 blocks per arm:
+
+    OLD bc8d164   65146 / 65084 ms      NEW main   67002 / 66611 ms
+
+Neither arm comes near 74.6 s. **The published figure was a worse-conditions baseline**, the
+same trap that once turned a 4% serve delta into a reported 20% here — GLM prefill runs at
+~82% of the drive's ceiling, so it reads whatever the box's I/O state allows that day. The
+A/B also found the opposite of a win: `main` is **2.6% slower** than `bc8d164` on this
+prefill, cleanly outside the per-rep spread and with each arm repeating within 0.6%. It is
+unattributed and not the attention timers (`atime` accumulates only under `COLI_PROFILE`).
 
 **The biggest single win came from the phase nobody was looking at.** Everything above about
 Maple concerns the expert path, because that is where a short-context profile said the time
